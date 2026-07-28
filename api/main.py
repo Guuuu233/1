@@ -1119,34 +1119,31 @@ class RequireUser:
         self,
         credentials: Optional[HTTPAuthorizationCredentials] = Depends(_auth_scheme),
     ) -> UserDB:
-        if not credentials:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
-
-        token = credentials.credentials
-
         with get_db_ctx() as db:
-            # 1. 优先尝试 JWT (网页登录)
-            try:
-                payload = auth_service.decode_access_token(token)
-                user_id = str(payload.get("sub") or "")
-                user = auth_service.get_user_by_id(db, user_id)
-                if user and user.is_active:
-                    # expunge 使 ORM 对象脱离 session，close 后仍可访问属性
-                    db.expunge(user)
-                    return user
-            except Exception:
-                # 不是有效的 JWT 或已过期，尝试 API Token
-                pass
+            if credentials:
+                token = credentials.credentials
+                # 1. 优先尝试 JWT (网页登录)
+                try:
+                    payload = auth_service.decode_access_token(token)
+                    user_id = str(payload.get("sub") or "")
+                    user = auth_service.get_user_by_id(db, user_id)
+                    if user and user.is_active:
+                        db.expunge(user)
+                        return user
+                except Exception:
+                    pass
 
-            # 2. 尝试 API Token (仅在允许时)
-            if self.allow_api_token and token.startswith(token_service.TOKEN_PREFIX):
-                user = token_service.verify_token(db, token)
-                if user and user.is_active:
-                    db.expunge(user)
-                    return user
+                # 2. 尝试 API Token (仅在允许时)
+                if self.allow_api_token and token.startswith(token_service.TOKEN_PREFIX):
+                    user = token_service.verify_token(db, token)
+                    if user and user.is_active:
+                        db.expunge(user)
+                        return user
 
-        detail = "身份验证失败或该接口不支持 API Token 访问" if self.allow_api_token else "该接口仅限网页端登录访问"
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail)
+            # 本地单用户/未登录回退至默认本地账户
+            user = auth_service.get_or_create_default_user(db)
+            db.expunge(user)
+            return user
 
 
 # 快捷依赖定义
@@ -4315,6 +4312,105 @@ def update_runtime_config(
         "current": current_cfg,
         "warmup": warmup_payload,
     }
+
+
+
+class FetchModelsRequest(BaseModel):
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    provider_id: Optional[str] = None
+
+
+@app.post("/v1/models/fetch")
+def fetch_available_models(
+    payload: FetchModelsRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_api_user),
+):
+    """
+    从指定 Base URL 或 LLM 代理服务器自动抓取可用模型列表。
+    运行在 Docker 容器内时，自动将 localhost / 127.0.0.1 映射为 host.docker.internal。
+    """
+    base_url = (payload.base_url or "").strip()
+    api_key = (payload.api_key or "").strip()
+
+    if payload.provider_id:
+        provider = db.query(ProviderDB).filter(
+            ProviderDB.id == payload.provider_id,
+            ProviderDB.user_id == current_user.id
+        ).first()
+        if provider:
+            base_url = base_url or provider.base_url
+            if not api_key and provider.api_key_ciphertext:
+                api_key = auth_service.decrypt_secret(provider.api_key_ciphertext) or ""
+
+    if not base_url:
+        user_cfg = auth_service.get_user_llm_config(db, current_user.id)
+        if user_cfg:
+            base_url = user_cfg.custom_base_url or ""
+            if not api_key and user_cfg.llm_api_key_ciphertext:
+                api_key = auth_service.decrypt_secret(user_cfg.llm_api_key_ciphertext) or ""
+
+    if not base_url:
+        base_url = "http://host.docker.internal:8317/v1"
+
+    target_url = base_url.rstrip("/")
+    if os.path.exists("/.dockerenv") or os.environ.get("DOCKER_CONTAINER"):
+        target_url = target_url.replace("localhost", "host.docker.internal").replace("127.0.0.1", "host.docker.internal")
+
+    if not target_url.endswith("/models"):
+        if target_url.endswith("/v1"):
+            target_url = f"{target_url}/models"
+        else:
+            target_url = f"{target_url}/v1/models"
+
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        import urllib.request
+        import json
+        req = urllib.request.Request(target_url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=8) as response:
+            body = response.read().decode("utf-8")
+            data = json.loads(body)
+            models_list = []
+            if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+                for item in data["data"]:
+                    if isinstance(item, dict) and "id" in item:
+                        models_list.append(str(item["id"]))
+                    elif isinstance(item, str):
+                        models_list.append(item)
+            elif isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and "id" in item:
+                        models_list.append(str(item["id"]))
+                    elif isinstance(item, str):
+                        models_list.append(item)
+
+            models_sorted = sorted(list(set(models_list)))
+            return {
+                "ok": True,
+                "models": models_sorted,
+                "count": len(models_sorted),
+                "url": target_url,
+            }
+    except Exception as exc:
+        err_msg = str(exc)
+        if hasattr(exc, "read"):
+            try:
+                err_body = exc.read().decode("utf-8")
+                err_msg = f"{err_msg} ({err_body})"
+            except Exception:
+                pass
+        return {
+            "ok": False,
+            "error": f"无法从 {target_url} 获取模型列表: {err_msg}",
+            "models": [],
+            "count": 0,
+            "url": target_url,
+        }
 
 
 @app.post("/v1/config/warmup", response_model=UserRuntimeWarmupResponse)

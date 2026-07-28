@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react'
-import { Save, Key, Database, Loader2, Trash2, Link2, Copy, Plus, CheckCircle2, Mail, Flame, Webhook, Sparkles } from 'lucide-react'
+import { Save, Key, Database, Loader2, Trash2, Link2, Copy, Plus, CheckCircle2, Mail, Flame, Webhook, Sparkles, RefreshCw, ListFilter } from 'lucide-react'
 import { api } from '@/services/api'
 import RoleModelConfigSection from '@/components/RoleModelConfigSection'
 import { useAuthStore } from '@/stores/authStore'
@@ -63,6 +63,12 @@ export default function Settings() {
     const [emailReportEnabled, setEmailReportEnabled] = useState(true)
     const [wecomReportEnabled, setWecomReportEnabled] = useState(true)
     const [configLoading, setConfigLoading] = useState(false)
+    
+    const [fetchingModels, setFetchingModels] = useState(false)
+    const [fetchedModels, setFetchedModels] = useState<string[]>([])
+    const [fetchModelsError, setFetchModelsError] = useState<string | null>(null)
+    const [fetchModelsUrl, setFetchModelsUrl] = useState<string | null>(null)
+
     const [saving, setSaving] = useState(false)
     const [saveAllSaving, setSaveAllSaving] = useState(false)
     const [warmingUp, setWarmingUp] = useState(false)
@@ -267,6 +273,34 @@ export default function Settings() {
             setWarmingUp(false)
         }
     }
+    
+    const handleFetchModels = async () => {
+        setFetchingModels(true)
+        setFetchModelsError(null)
+        try {
+            const urlToUse = selectedPreset.editableBaseUrl ? customBaseUrl : selectedPreset.baseUrl
+            const res = await api.fetchAvailableModels({
+                base_url: urlToUse,
+                api_key: llmApiKey,
+            })
+            if (res.ok) {
+                setFetchedModels(res.models)
+                setFetchModelsUrl(res.url || null)
+                if (res.models.length > 0) {
+                    if (!quickThinkLlm) setQuickThinkLlm(res.models[0])
+                    if (!deepThinkLlm) setDeepThinkLlm(res.models[0])
+                }
+            } else {
+                setFetchModelsError(res.error || '获取模型列表失败')
+            }
+        } catch (err) {
+            setFetchModelsError(err instanceof Error ? err.message : '获取模型列表失败')
+        } finally {
+            setFetchingModels(false)
+        }
+    }
+
+
     const handleClearApiKey = async () => {
         if (!hasStoredApiKey) return
         setSaving(true)
@@ -482,6 +516,67 @@ export default function Settings() {
                         <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
                             保存模型配置后，系统会在后台自动测试连通性；也可以直接点击下方按钮，发送\u201c你好\u201d来验证模型是否正常响应。
                         </p>
+                    </div>
+
+                    
+                    <div className="md:col-span-2 rounded-2xl border border-indigo-200/80 bg-indigo-50/50 p-4 dark:border-indigo-900/50 dark:bg-indigo-950/20 space-y-3">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div>
+                                <div className="text-sm font-semibold text-indigo-900 dark:text-indigo-200 flex items-center gap-2">
+                                    <ListFilter className="w-4 h-4 text-indigo-500" />
+                                    代理服务器模型自动侦测
+                                </div>
+                                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                                    向代理服务（如 CLIProxyAPI / OpenAI 兼容接口）请求真实在运行的模型列表
+                                </p>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={handleFetchModels}
+                                disabled={fetchingModels || configLoading}
+                                className="btn-secondary inline-flex items-center gap-2 text-xs border-indigo-200 text-indigo-700 hover:bg-indigo-100 dark:border-indigo-800 dark:text-indigo-300 dark:hover:bg-indigo-900/40"
+                            >
+                                {fetchingModels ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                                {fetchingModels ? '正在拉取...' : '自动获取可用模型列表'}
+                            </button>
+                        </div>
+
+                        {fetchModelsError && (
+                            <div className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:border-rose-900/60 dark:bg-rose-950/30 dark:text-rose-300 whitespace-pre-wrap break-words">
+                                {fetchModelsError}
+                            </div>
+                        )}
+
+                        {fetchedModels.length > 0 && (
+                            <div className="space-y-2 pt-1">
+                                <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 font-medium">
+                                    <span>从 {fetchModelsUrl || 'API'} 成功获取到 {fetchedModels.length} 个模型（点击填入）：</span>
+                                </div>
+                                <div className="flex flex-wrap gap-2 max-h-40 overflow-y-auto p-2 bg-white/80 dark:bg-slate-900/80 rounded-xl border border-slate-200/80 dark:border-slate-800">
+                                    {fetchedModels.map((m) => (
+                                        <div key={m} className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-50 dark:bg-indigo-950/60 border border-indigo-200/80 dark:border-indigo-800 px-2.5 py-1 text-xs text-indigo-700 dark:text-indigo-300 font-mono">
+                                            <span>{m}</span>
+                                            <button
+                                                type="button"
+                                                onClick={() => setQuickThinkLlm(m)}
+                                                className="ml-1 px-1.5 py-0.5 rounded bg-indigo-200/70 hover:bg-indigo-300 dark:bg-indigo-800 dark:hover:bg-indigo-700 text-[10px] font-sans text-indigo-900 dark:text-indigo-100"
+                                                title="设为常规模型"
+                                            >
+                                                设为常规
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => setDeepThinkLlm(m)}
+                                                className="px-1.5 py-0.5 rounded bg-purple-200/70 hover:bg-purple-300 dark:bg-purple-800 dark:hover:bg-purple-700 text-[10px] font-sans text-purple-900 dark:text-purple-100"
+                                                title="设为推理模型"
+                                            >
+                                                设为推理
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
                     </div>
 
                     <div className="md:col-span-2 rounded-2xl border border-slate-200/80 dark:border-slate-700/80 bg-slate-50/80 dark:bg-slate-900/40 p-4 space-y-3">

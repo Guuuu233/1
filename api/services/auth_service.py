@@ -293,3 +293,22 @@ def upsert_user_llm_config(
     db.commit()
     db.refresh(row)
     return row
+
+
+def get_or_create_default_user(db: Session) -> UserDB:
+    DEFAULT_EMAIL = "local@tradingagents.local"
+    user = db.query(UserDB).filter(UserDB.email == DEFAULT_EMAIL).first()
+    if not user:
+        now = _utcnow()
+        user = UserDB(
+            id="local-default-user",
+            email=DEFAULT_EMAIL,
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+            last_login_at=now,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    return user

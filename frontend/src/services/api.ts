@@ -413,6 +413,14 @@ class ApiService {
         })
     }
 
+
+    async fetchAvailableModels(payload?: { base_url?: string; api_key?: string; provider_id?: string }): Promise<{ ok: boolean; models: string[]; count: number; error?: string; url?: string }> {
+        return this.request('/v1/models/fetch', {
+            method: 'POST',
+            body: JSON.stringify(payload || {}),
+        })
+    }
+
     async getResolvedRoles(): Promise<Record<string, ResolvedRole>> {
         return this.request<Record<string, ResolvedRole>>('/v1/role-bindings/resolved')
     }
