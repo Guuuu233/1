@@ -68,14 +68,65 @@ def create_market_analyst(llm, data_collector=None):
             )),
         ]
 
-        # ── 实现 Token 级流式输出 ──────────────────
+        # ── 实现 Token 级流式输出（含降级保障） ──────────────────
+
+
         tracker = current_tracker_var.get()
+
+
         full_content = ""
-        async for chunk in llm.astream(messages):
-            content = chunk.content if hasattr(chunk, "content") else str(chunk)
-            full_content += content
-            if tracker:
-                tracker._emit_token("Market Analyst", "market_report", content)
+
+
+        try:
+
+
+            async for chunk in llm.astream(messages):
+
+
+                content = chunk.content if hasattr(chunk, "content") else str(chunk)
+
+
+                full_content += content
+
+
+                if tracker:
+
+
+                    tracker._emit_token("Market Analyst", "market_report", content)
+
+
+        except Exception as exc:
+
+
+            print(f"[Market Analyst] Stream error: {exc}")
+
+
+
+        if not full_content.strip():
+
+
+            print(f"[Market Analyst] Stream yielded empty text, attempting invoke fallback...")
+
+
+            try:
+
+
+                res = await asyncio.to_thread(llm.invoke, messages)
+
+
+                full_content = res.content if hasattr(res, "content") else str(res)
+
+
+                if tracker:
+
+
+                    tracker._emit_token("Market Analyst", "market_report", full_content)
+
+
+            except Exception as exc:
+
+
+                full_content = f"分析报告生成失败：{exc}"
         
         verdict, confidence = extract_verdict(full_content)
 

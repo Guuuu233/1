@@ -263,12 +263,15 @@ class CnAkshareProvider(BaseMarketDataProvider):
         return out.sort_values("Date").reset_index(drop=True)
 
     @staticmethod
-    def _shrink_table(df: pd.DataFrame, max_rows: int = 12, max_cols: int = 16) -> pd.DataFrame:
+    def _shrink_table(df: pd.DataFrame, max_rows: int = 8, max_cols: int = 14) -> pd.DataFrame:
         if df is None or df.empty:
             return df
-        rows = min(max_rows, len(df))
-        cols = min(max_cols, len(df.columns))
-        return df.head(rows).iloc[:, :cols]
+        clean_df = df.dropna(how="all", axis=1)
+        if clean_df.empty:
+            clean_df = df
+        rows = min(max_rows, len(clean_df))
+        cols = min(max_cols, len(clean_df.columns))
+        return clean_df.head(rows).iloc[:, :cols]
 
     def _fetch_hist_df(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
         with AKSHARE_CALL_LOCK:
