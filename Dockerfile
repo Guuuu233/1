@@ -1,13 +1,3 @@
-# Stage 1: Build Frontend (始终在原生架构运行以提速)
-FROM --platform=$BUILDPLATFORM node:26-slim AS frontend-builder
-WORKDIR /app/frontend
-COPY frontend/package*.json ./
-# 开启缓存挂载，加速 npm 安装
-RUN --mount=type=cache,target=/root/.npm npm install
-COPY frontend/ ./
-RUN npm run build
-
-# Stage 2: Final Image (多架构目标镜像)
 FROM ghcr.io/astral-sh/uv:python3.10-bookworm-slim AS runtime
 WORKDIR /app
 
@@ -16,36 +6,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# 利用 uv 同步依赖（uv 在多架构环境下依然非常快）
-# 先只装第三方依赖（利用 Docker 层缓存）
+# 利用 uv 同步依赖
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --no-dev
 
-# 拷贝后端源码
+# 拷贝后端源码与脚本
 COPY api/ ./api/
 COPY tradingagents/ ./tradingagents/
 COPY scheduler/ ./scheduler/
 COPY docker-entrypoint.py ./docker-entrypoint.py
 
-# 安装项目本身，避免 uv run 启动时重复安装
+# 安装项目本身
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
-# 拷贝在 Stage 1 中快速构建好的前端产物
-COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
+# 拷贝前端产物
+COPY frontend/dist ./frontend/dist
 
 # 暴露端口
 EXPOSE 8000
 
-# 版本号：通过 --build-arg VERSION=v0.2.0 注入（通常取 git tag）
 ARG VERSION=dev
 ENV APP_VERSION=${VERSION}
 
-# 环境变量设置
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-# 启动命令（同一容器内运行 API 服务与定时任务调度器；
-# 只跑单进程时可覆盖命令，如 uv run --no-sync tradingagents-api）
 CMD ["/app/docker-entrypoint.py"]

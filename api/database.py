@@ -30,7 +30,7 @@ if DATABASE_URL.startswith("sqlite"):
         parent = pathlib.Path(db_path).resolve().parent
         return os.access(parent, os.W_OK)
 
-    _use_wal = _can_use_wal()
+    _use_wal = os.getenv("SQLITE_USE_WAL", "false").lower() == "true"
 
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_connection, connection_record):
