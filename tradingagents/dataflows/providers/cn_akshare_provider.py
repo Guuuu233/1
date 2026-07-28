@@ -1,4 +1,5 @@
 import os
+import logging
 import re
 import time
 import threading
@@ -11,6 +12,7 @@ from stockstats import wrap
 from .base import BaseMarketDataProvider, DataResult
 from ..trade_calendar import (
     DateDataUnavailable,
+    TradeCalendarUnavailableError,
     cn_market_phase,
     cn_no_data_reason,
     cn_today_str,
@@ -18,6 +20,8 @@ from ..trade_calendar import (
     is_cn_trading_day,
 )
 from ..utils import chronological, take_latest
+
+_provider_logger = logging.getLogger(__name__)
 
 
 # ── akshare 并发控制 ──
@@ -375,9 +379,17 @@ class CnAkshareProvider(BaseMarketDataProvider):
             return pd.DataFrame()
         kv = dict(zip(spot["item"].astype(str), spot["value"]))
 
-        date_val = pd.to_datetime(kv.get("时间"), errors="coerce")
+        raw_time = kv.get("时间")
+        date_val = pd.to_datetime(raw_time, errors="coerce")
         if pd.isna(date_val):
-            date_val = pd.to_datetime(cn_today_str())
+            # Never invent "today" for an unparseable vendor timestamp: that
+            # would stamp a mystery quote as the latest bar and poison TA.
+            _provider_logger.warning(
+                "refuse realtime bar for %s: unparseable spot time raw=%r",
+                symbol,
+                raw_time,
+            )
+            return pd.DataFrame()
         row = {
             "Date": pd.to_datetime(date_val).normalize(),
             "Open": pd.to_numeric(kv.get("今开"), errors="coerce"),
@@ -410,7 +422,18 @@ class CnAkshareProvider(BaseMarketDataProvider):
             today = pd.to_datetime(cn_today_str())
             if end_dt.normalize() < today:
                 return hist_df
-            if not is_cn_trading_day(today.strftime("%Y-%m-%d"), allow_weekday_fallback=True):
+            # Hard calendar only: on holiday/calendar outage do not invent a bar.
+            try:
+                if not is_cn_trading_day(
+                    today.strftime("%Y-%m-%d"), allow_weekday_fallback=False
+                ):
+                    return hist_df
+            except TradeCalendarUnavailableError as exc:
+                _provider_logger.warning(
+                    "refuse realtime bar for %s: trade calendar unavailable (%s)",
+                    symbol,
+                    exc,
+                )
                 return hist_df
 
             has_today = False
