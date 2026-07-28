@@ -21,7 +21,7 @@ def create_fundamentals_analyst(llm, data_collector=None):
 
         stock_name = get_cn_stock_name(ticker)
 
-        ticker_display = f"{ticker_display} ({stock_name})" if stock_name and stock_name != ticker else ticker
+        ticker_display = f"{ticker} ({stock_name})" if stock_name and stock_name != ticker else ticker
         horizon = "medium"  # 基本面固定中长期视角
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])

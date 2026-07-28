@@ -21,7 +21,7 @@ def create_smart_money_analyst(llm, data_collector=None):
 
         stock_name = get_cn_stock_name(ticker)
 
-        ticker_display = f"{ticker_display} ({stock_name})" if stock_name and stock_name != ticker else ticker
+        ticker_display = f"{ticker} ({stock_name})" if stock_name and stock_name != ticker else ticker
         print(f"[Smart Money Analyst] START {ticker_display} {current_date}")
         horizon = "short"  # 资金面固定短期视角
         user_intent = state.get("user_intent") or {}
