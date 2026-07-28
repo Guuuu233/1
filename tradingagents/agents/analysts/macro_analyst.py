@@ -1,3 +1,4 @@
+from tradingagents.agents.utils.context_utils import get_cn_stock_name
 import asyncio
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -17,7 +18,11 @@ def create_macro_analyst(llm, data_collector=None):
     async def macro_analyst_node(state):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
-        print(f"[Macro Analyst] START {ticker} {current_date}")
+
+        stock_name = get_cn_stock_name(ticker)
+
+        ticker_display = f"{ticker_display} ({stock_name})" if stock_name and stock_name != ticker else ticker
+        print(f"[Macro Analyst] START {ticker_display} {current_date}")
         horizon = "medium"  # 宏观面固定中长期视角
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])
@@ -55,7 +60,7 @@ def create_macro_analyst(llm, data_collector=None):
             )),
             HumanMessage(content=(
                 horizon_ctx + "\n"
-                f"请分析 {ticker} 在 {current_date} 的宏观与板块环境。\n\n"
+                f"请分析 {ticker_display} 在 {current_date} 的宏观与板块环境。\n\n"
                 f"【今日行业板块资金流向】\n{board_flow}\n\n"
                 f"【近期相关新闻】\n{recent_news}"
             )),
@@ -70,7 +75,7 @@ def create_macro_analyst(llm, data_collector=None):
             if tracker:
                 tracker._emit_token("Macro Analyst", "macro_report", content)
 
-        print(f"[Macro Analyst] DONE {ticker}, report length={len(full_content)}")
+        print(f"[Macro Analyst] DONE {ticker_display}, report length={len(full_content)}")
         verdict, confidence = extract_verdict(full_content)
         return {
             "macro_report": full_content,

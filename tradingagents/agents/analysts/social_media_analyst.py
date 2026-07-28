@@ -1,3 +1,4 @@
+from tradingagents.agents.utils.context_utils import get_cn_stock_name
 import asyncio
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -17,6 +18,10 @@ def create_social_media_analyst(llm, data_collector=None):
     async def social_media_analyst_node(state):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
+
+        stock_name = get_cn_stock_name(ticker)
+
+        ticker_display = f"{ticker_display} ({stock_name})" if stock_name and stock_name != ticker else ticker
         horizon = "short"  # 情绪面固定短期视角
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])
@@ -56,7 +61,7 @@ def create_social_media_analyst(llm, data_collector=None):
             )),
             HumanMessage(content=(
                 horizon_ctx + "\n"
-                f"以下是 {ticker} 在 {current_date} 的舆情近似资料。\n\n"
+                f"以下是 {ticker_display} 在 {current_date} 的舆情近似资料。\n\n"
                 f"【get_news】\n{news_text}\n\n"
                 f"【涨停池数据】\n{zt_data}\n\n"
                 f"【雪球热门股票】\n{hot_stocks}\n"

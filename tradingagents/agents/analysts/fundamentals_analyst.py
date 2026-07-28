@@ -1,3 +1,4 @@
+from tradingagents.agents.utils.context_utils import get_cn_stock_name
 import asyncio
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -17,6 +18,10 @@ def create_fundamentals_analyst(llm, data_collector=None):
     async def fundamentals_analyst_node(state):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
+
+        stock_name = get_cn_stock_name(ticker)
+
+        ticker_display = f"{ticker_display} ({stock_name})" if stock_name and stock_name != ticker else ticker
         horizon = "medium"  # 基本面固定中长期视角
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])
@@ -49,7 +54,7 @@ def create_fundamentals_analyst(llm, data_collector=None):
             SystemMessage(content=system_message + "\n\n请全程使用中文。"),
             HumanMessage(content=(
                 horizon_ctx + "\n"
-                f"以下是 {ticker} 在 {current_date} 的基本面资料。\n\n"
+                f"以下是 {ticker_display} 在 {current_date} 的基本面资料。\n\n"
                 f"【get_fundamentals】\n{outputs['fundamentals']}\n\n"
                 f"【get_balance_sheet】\n{outputs['balance_sheet']}\n\n"
                 f"【get_cashflow】\n{outputs['cashflow']}\n\n"

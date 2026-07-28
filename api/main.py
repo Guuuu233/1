@@ -3914,7 +3914,7 @@ def _invoke_runtime_warmup(
 
     _log(
         f"[LLM Warmup] user={user_id} invoking provider={provider} "
-        f"models={[model for model, _ in targets]} base_url={base_url or 'default'}"
+        f"models={[t[1] for t in targets]} base_url={base_url or 'default'}"
     )
 
     results: List[Dict[str, Any]] = []

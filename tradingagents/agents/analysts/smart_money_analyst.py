@@ -1,3 +1,4 @@
+from tradingagents.agents.utils.context_utils import get_cn_stock_name
 import asyncio
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -17,7 +18,11 @@ def create_smart_money_analyst(llm, data_collector=None):
     async def smart_money_analyst_node(state):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
-        print(f"[Smart Money Analyst] START {ticker} {current_date}")
+
+        stock_name = get_cn_stock_name(ticker)
+
+        ticker_display = f"{ticker_display} ({stock_name})" if stock_name and stock_name != ticker else ticker
+        print(f"[Smart Money Analyst] START {ticker_display} {current_date}")
         horizon = "short"  # 资金面固定短期视角
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])
@@ -56,7 +61,7 @@ def create_smart_money_analyst(llm, data_collector=None):
             )),
             HumanMessage(content=(
                 horizon_ctx + "\n"
-                f"请分析 {ticker} 在 {current_date} 的主力资金行为。\n\n"
+                f"请分析 {ticker_display} 在 {current_date} 的主力资金行为。\n\n"
                 f"【近5日主力资金净流向】\n{fund_flow}\n\n"
                 f"【龙虎榜数据】\n{lhb}\n\n"
                 f"【成交量指标(vwma)】\n{volume}"
@@ -72,7 +77,7 @@ def create_smart_money_analyst(llm, data_collector=None):
             if tracker:
                 tracker._emit_token("Smart Money Analyst", "smart_money_report", content)
 
-        print(f"[Smart Money Analyst] DONE {ticker}, report length={len(full_content)}")
+        print(f"[Smart Money Analyst] DONE {ticker_display}, report length={len(full_content)}")
         verdict, confidence = extract_verdict(full_content)
         return {
             "smart_money_report": full_content,

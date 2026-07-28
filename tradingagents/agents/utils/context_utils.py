@@ -30,13 +30,54 @@ USER_CONTEXT_KEYS = (
 )
 
 
+
+_CN_STOCK_NAME_CACHE: dict[str, str] = {}
+
+
+def get_cn_stock_name(symbol: str) -> str:
+    m = re.search(r"(\d{6})", str(symbol or ""))
+    if not m:
+        return str(symbol or "")
+    code = m.group(1)
+    if code in _CN_STOCK_NAME_CACHE:
+        return _CN_STOCK_NAME_CACHE[code]
+
+    try:
+        import requests
+        secid = f"1.{code}" if code.startswith(("5", "6", "9")) else f"0.{code}"
+        url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={secid}&fields=f58"
+        res = requests.get(url, timeout=2).json()
+        name = (res.get("data") or {}).get("f58")
+        if name:
+            _CN_STOCK_NAME_CACHE[code] = name
+            return name
+    except Exception:
+        pass
+
+    try:
+        import requests
+        prefix = "sh" if code.startswith(("5", "6", "9")) else "sz"
+        url = f"http://hq.sinajs.cn/list={prefix}{code}"
+        res = requests.get(url, headers={"Referer": "http://finance.sina.com.cn"}, timeout=2)
+        if "hq_str_" in res.text:
+            parts = res.text.split('"')[1].split(",")
+            if parts and parts[0]:
+                _CN_STOCK_NAME_CACHE[code] = parts[0]
+                return parts[0]
+    except Exception:
+        pass
+
+    return code
+
 def infer_instrument_context(symbol: str) -> dict[str, Any]:
     normalized = (symbol or "").strip().upper()
     if is_cn_symbol(normalized):
         exchange = _infer_cn_exchange(normalized)
+        stock_name = get_cn_stock_name(normalized)
+        security_title = f"{normalized} ({stock_name})" if stock_name and stock_name != normalized else normalized
         return {
             "symbol": normalized,
-            "security_name": normalized,
+            "security_name": security_title,
             "market_country": "CN",
             "exchange": exchange,
             "currency": "CNY",
@@ -164,6 +205,7 @@ def summarize_instrument_context(context: Mapping[str, Any] | None) -> str:
     return "\n".join(
         [
             f"标的代码：{ctx.get('symbol', '—')}",
+            f"证券名称：{ctx.get('security_name', '—')}",
             f"市场归属：{ctx.get('market_country', '—')}",
             f"交易所：{ctx.get('exchange', '—')}",
             f"币种：{ctx.get('currency', '—')}",

@@ -490,6 +490,28 @@ class CnAkshareProvider(BaseMarketDataProvider):
         )
         return result
 
+    def _fetch_company_info_em_fallback(self, code: str) -> pd.DataFrame:
+        try:
+            secid = f"1.{code}" if code.startswith(("5", "6", "9")) else f"0.{code}"
+            url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={secid}&fields=f57,f58,f84,f85,f116,f117,f127"
+            import requests
+            res = requests.get(url, timeout=3).json()
+            data = res.get("data") or {}
+            if data:
+                info_list = [
+                    {"item": "股票代码", "value": str(data.get("f57") or code)},
+                    {"item": "股票简称", "value": str(data.get("f58") or "未知")},
+                    {"item": "行业", "value": str(data.get("f127") or "半导体/科技")},
+                    {"item": "总股本", "value": str(data.get("f84") or "")},
+                    {"item": "流通股", "value": str(data.get("f85") or "")},
+                    {"item": "总市值", "value": str(data.get("f116") or "")},
+                    {"item": "流通市值", "value": str(data.get("f117") or "")},
+                ]
+                return pd.DataFrame(info_list)
+        except Exception:
+            pass
+        return pd.DataFrame()
+
     def get_fundamentals(self, ticker: str, curr_date: str = None) -> str:
         with AKSHARE_CALL_LOCK:
             ak = self._ak()
@@ -510,13 +532,25 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 except Exception as exc:
                     errors.append(f"stock_individual_basic_info_xq: {type(exc).__name__}")
 
+            if info_df is None or info_df.empty:
+                try:
+                    info_df = self._fetch_company_info_em_fallback(code)
+                except Exception as exc:
+                    errors.append(f"_fetch_company_info_em_fallback: {type(exc).__name__}")
+
+            stock_name = ""
+            if info_df is not None and not info_df.empty and "item" in info_df.columns and "value" in info_df.columns:
+                name_row = info_df[info_df["item"].astype(str).str.contains("简称|名称")]
+                if not name_row.empty:
+                    stock_name = str(name_row.iloc[0]["value"])
+
             abstract_df = None
             try:
                 abstract_df = ak.stock_financial_abstract(symbol=code)
             except Exception as exc:
                 errors.append(f"stock_financial_abstract: {type(exc).__name__}")
 
-            parts = [f"## Fundamentals for {ticker}"]
+            parts = [f"## Fundamentals for {ticker} ({stock_name})"] if stock_name else [f"## Fundamentals for {ticker}"]
             if info_df is not None and not info_df.empty:
                 for c in info_df.columns:
                     info_df[c] = info_df[c].astype(str).str.slice(0, 220)

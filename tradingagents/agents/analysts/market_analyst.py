@@ -1,3 +1,4 @@
+from tradingagents.agents.utils.context_utils import get_cn_stock_name
 import asyncio
 from datetime import datetime, timedelta
 
@@ -27,6 +28,10 @@ def create_market_analyst(llm, data_collector=None):
     async def market_analyst_node(state):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
+
+        stock_name = get_cn_stock_name(ticker)
+
+        ticker_display = f"{ticker_display} ({stock_name})" if stock_name and stock_name != ticker else ticker
         horizon = "short"  # 技术面固定短期视角
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])
@@ -57,7 +62,7 @@ def create_market_analyst(llm, data_collector=None):
             SystemMessage(content=system_message + "\n\n请全程使用中文。"),
             HumanMessage(content=(
                 horizon_ctx + "\n"
-                f"以下是 {ticker} 在 {current_date} 的 K 线数据与指标（数据窗口：{data_window}）。\n\n"
+                f"以下是 {ticker_display} 在 {current_date} 的 K 线数据与指标（数据窗口：{data_window}）。\n\n"
                 f"【get_stock_data】\n{stock_data}\n\n"
                 + "\n\n".join(indicator_blocks)
             )),

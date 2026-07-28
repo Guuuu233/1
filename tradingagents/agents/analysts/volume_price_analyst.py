@@ -1,3 +1,4 @@
+from tradingagents.agents.utils.context_utils import get_cn_stock_name
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from tradingagents.dataflows.config import get_config
@@ -10,6 +11,10 @@ def create_volume_price_analyst(llm, data_collector=None):
     async def volume_price_analyst_node(state):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
+
+        stock_name = get_cn_stock_name(ticker)
+
+        ticker_display = f"{ticker_display} ({stock_name})" if stock_name and stock_name != ticker else ticker
         horizon = "short"
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])
@@ -34,7 +39,7 @@ def create_volume_price_analyst(llm, data_collector=None):
         messages = [
             SystemMessage(content=horizon_ctx + system_message + "\n\n请全程使用中文。"),
             HumanMessage(content=(
-                f"以下是 {ticker} 在 {current_date} 的量价分析预计算数据（数据窗口：{data_window}）。\n\n"
+                f"以下是 {ticker_display} 在 {current_date} 的量价分析预计算数据（数据窗口：{data_window}）。\n\n"
                 f"{vpa_data}\n\n"
                 f"【原始 K 线数据参考】\n{stock_data}"
             )),
