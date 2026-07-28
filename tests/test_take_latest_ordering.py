@@ -211,3 +211,18 @@ def test_fund_flow_latest_five_independent_of_order(frame):
     assert str(oldest) not in text
     # chronological: second-latest appears before latest in the rendered block
     assert text.index(str(second)) < text.index(str(latest))
+
+
+def test_northbound_deprecated_no_network_and_no_old_dates():
+    """Commit 1b: daily northbound is hard-deprecated; no vendor call path."""
+
+    class _Probe(CnAkshareProvider):
+        def _ak(self):
+            raise AssertionError("get_northbound_flow must not touch akshare")
+
+    text = _Probe().get_northbound_flow("600519", curr_date="2026-07-28")
+    assert "停止披露" in text
+    assert "不可用" in text
+    assert "季度" in text
+    assert "2017-03-16" not in text
+    assert "2017" not in text

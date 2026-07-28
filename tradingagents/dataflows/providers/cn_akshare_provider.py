@@ -1247,39 +1247,23 @@ class CnAkshareProvider(BaseMarketDataProvider):
             return res.to_prompt()
 
     def get_northbound_flow(self, symbol: str, curr_date: str = None) -> str:
-        """获取陆股通（北向资金）持股与增减持变动。"""
+        """北向/陆股通个股每日持股明细已制度性停更，不再请求网络。
+
+        2024 年 8 月起沪深港通个股持股由每日披露改为季度披露；对 600519/000001/
+        300750/688981 实测 stock_hsgt_individual_em 的 max(持股日期) 均为 2024-08-16。
+        继续调用只会浪费约 12s 并返回过期日频数据。季度持股源另议，不在此接口复活。
+        """
         source_name = "akshare.stock_hsgt_individual_em"
         title = "北向资金持股变动"
-        try:
-            code = self._normalize_symbol(symbol)
-            ak = self._ak()
-
-            with AKSHARE_CALL_LOCK:
-                df = ak.stock_hsgt_individual_em(symbol=code)
-
-            if df is None or df.empty:
-                res = DataResult(ok=True, data=None, source=source_name, title=title)
-                return res.to_prompt()
-
-            if curr_date and "持股日期" in df.columns:
-                df = df[df["持股日期"].astype(str) <= curr_date]
-
-            if df.empty:
-                res = DataResult(ok=True, data=None, source=source_name, title=title)
-                return res.to_prompt()
-
-            recent_df = df.head(5)
-            lines = [f"【北向资金/陆股通持股】最近 5 交易日记录："]
-            for _, row in recent_df.iterrows():
-                dt = row.get("持股日期", "")
-                ratio = row.get("持股数量占A股百分比", "")
-                add_cnt = row.get("今日增持股数", "")
-                add_val = row.get("今日增持资金", "")
-                lines.append(f"- 日期: {dt} | 持股占比A股: {ratio}% | 增持股数: {add_cnt} | 增持资金: {add_val}元")
-
-            res = DataResult(ok=True, data="\n".join(lines), source=source_name, title=title)
-            return res.to_prompt()
-        except Exception as exc:
-            res = DataResult(ok=False, data=None, error=f"{type(exc).__name__}: {exc}", source=source_name, title=title)
-            return res.to_prompt()
-
+        res = DataResult(
+            ok=False,
+            data=None,
+            error=(
+                "沪深港通个股每日持股明细自 2024 年 8 月起停止披露，本项不可用。"
+                "如需北向数据请使用季度持股口径，注意频率为季度而非每日。"
+            ),
+            source=source_name,
+            title=title,
+            as_of="2024-08-16",
+        )
+        return res.to_prompt()
