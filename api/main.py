@@ -5053,6 +5053,26 @@ _uploads_dir = Path(os.getenv("UPLOAD_DIR", str(Path(__file__).parent.parent / "
 if _uploads_dir.is_dir():
     app.mount("/uploads", StaticFiles(directory=str(_uploads_dir)), name="uploads")
 
+@app.get("/v1/dataproviders/health")
+def check_data_providers_health():
+    """Return health status of integrated data providers."""
+    from tradingagents.dataflows.interface import TOOLS_CATEGORIES, _registry
+    providers_status = []
+    for name in _registry.list_names():
+        prov = _registry.get(name)
+        providers_status.append({
+            "name": name,
+            "status": "healthy",
+            "is_placeholder": getattr(prov, "is_placeholder", False),
+        })
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "providers": providers_status,
+        "categories": list(TOOLS_CATEGORIES.keys()),
+    }
+
+
 # Mount frontend if dist exists
 dist_path = os.path.join(os.getcwd(), "frontend/dist")
 if os.path.exists(dist_path):
@@ -5087,21 +5107,3 @@ def run() -> None:
     uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=False, log_config=log_config)
 
 
-@app.get("/v1/dataproviders/health")
-def check_data_providers_health():
-    """Return health status of integrated data providers."""
-    from tradingagents.dataflows.interface import TOOLS_CATEGORIES, _registry
-    providers_status = []
-    for name in _registry.list_names():
-        prov = _registry.get(name)
-        providers_status.append({
-            "name": name,
-            "status": "healthy",
-            "is_placeholder": getattr(prov, "is_placeholder", False),
-        })
-    return {
-        "status": "ok",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "providers": providers_status,
-        "categories": list(TOOLS_CATEGORIES.keys()),
-    }
