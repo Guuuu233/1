@@ -1193,12 +1193,48 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 return res.to_prompt()
 
             row = stock_df.iloc[0]
-            ratio = row.get("质押比例", "0")
-            count = row.get("质押笔数", "0")
-            industry = row.get("所属行业", "")
 
-            msg = f"【股权质押排查】整体质押比例：{ratio}% (质押笔数: {count} 笔, 行业: {industry})"
-            if float(str(ratio).replace("%", "") or 0) > 30:
+            def _field(col: str):
+                if col not in stock_df.columns:
+                    return None
+                val = row[col]
+                if pd.isna(val):
+                    return None
+                text = str(val).strip()
+                return text if text != "" else None
+
+            ratio = _field("质押比例")
+            count = _field("质押笔数")
+            industry = _field("所属行业")
+
+            missing = [name for name, val in (("质押比例", ratio), ("质押笔数", count)) if val is None]
+            if missing:
+                res = DataResult(
+                    ok=False,
+                    data=None,
+                    error=f"{'、'.join(missing)}字段缺失，质押风险未排查",
+                    source=source_name,
+                    title=title,
+                )
+                return res.to_prompt()
+
+            msg = (
+                f"【股权质押排查】整体质押比例：{ratio}% "
+                f"(质押笔数: {count} 笔, 行业: {industry or '未知'})"
+            )
+            try:
+                ratio_val = float(str(ratio).replace("%", ""))
+            except (TypeError, ValueError):
+                res = DataResult(
+                    ok=False,
+                    data=None,
+                    error=f"质押比例字段不可解析（raw={ratio!r}），质押风险未排查",
+                    source=source_name,
+                    title=title,
+                )
+                return res.to_prompt()
+
+            if ratio_val > 30:
                 msg += " ⚠️ [高风险警示] 该股票大股东质押比例超30%，需高度警惕平仓与流动性风险。"
 
             res = DataResult(ok=True, data=msg, source=source_name, title=title)
@@ -1346,9 +1382,33 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 return f"【融资融券】{day} 暂无该标的融资融券明细。"
 
             row = stock_df.iloc[0]
-            rzye = row.get("融资余额", "0")
-            rzbuy = row.get("融资买入额", "0")
-            rqyl = row.get("融券余量", "0")
+
+            def _margin_field(col: str):
+                if col not in stock_df.columns:
+                    return None
+                val = row[col]
+                if pd.isna(val):
+                    return None
+                text = str(val).strip()
+                return text if text != "" else None
+
+            rzye = _margin_field("融资余额")
+            rzbuy = _margin_field("融资买入额")
+            rqyl = _margin_field("融券余量")
+            missing = [
+                name
+                for name, val in (
+                    ("融资余额", rzye),
+                    ("融资买入额", rzbuy),
+                    ("融券余量", rqyl),
+                )
+                if val is None
+            ]
+            if missing:
+                return (
+                    f"【融资融券】{day} 关键字段缺失（{'、'.join(missing)}），"
+                    f"融资融券风险未排查"
+                )
             return (
                 f"【融资融券数据】日期: {day} | 融资余额: {rzye} 元"
                 f" | 融资买入额: {rzbuy} 元 | 融券余量: {rqyl}"
