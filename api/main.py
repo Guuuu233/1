@@ -40,9 +40,9 @@ from pydantic import BaseModel, Field, field_serializer
 from sqlalchemy.orm import Session
 import pandas as pd
 
-from api.database import UserDB, UserLLMConfigDB, VersionStatsDB, ReportDB, ImportedPortfolioPositionDB, FeedbackDB, SponsorDB, init_db, get_db, get_db_ctx
+from api.database import UserDB, UserLLMConfigDB, VersionStatsDB, ReportDB, ImportedPortfolioPositionDB, FeedbackDB, SponsorDB, ProviderDB, ModelProfileDB, RoleBindingDB, init_db, get_db, get_db_ctx
 from api.job_store import get_job_store as _new_job_store
-from api.services import auth_service, portfolio_import_service, report_service, token_service, watchlist_service, scheduled_service, tracking_board_service, feedback_service, sponsor_service
+from api.services import auth_service, portfolio_import_service, report_service, token_service, watchlist_service, scheduled_service, tracking_board_service, feedback_service, sponsor_service, role_routing_service
 
 def _get_real_ip(request: Request) -> Optional[str]:
     """Extract real client IP, preferring Cloudflare/proxy headers."""
@@ -886,6 +886,103 @@ class WecomWebhookWarmupResponse(BaseModel):
     webhook_display: Optional[str] = None
 
 
+class ProviderCreateRequest(BaseModel):
+    provider_type: str
+    display_name: str
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    enabled: bool = True
+
+
+class ProviderUpdateRequest(BaseModel):
+    display_name: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    enabled: Optional[bool] = None
+    clear_api_key: bool = False
+
+
+class ProviderResponse(BaseModel):
+    id: str
+    user_id: str
+    provider_type: str
+    display_name: str
+    base_url: Optional[str] = None
+    has_api_key: bool = False
+    api_key_masked: Optional[str] = None
+    enabled: bool = True
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class ModelProfileCreateRequest(BaseModel):
+    provider_id: str
+    model_name: str
+    display_name: str
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    extra_params: Optional[Dict[str, Any]] = None
+    tier: Optional[str] = None
+    is_default: bool = False
+
+
+class ModelProfileUpdateRequest(BaseModel):
+    provider_id: Optional[str] = None
+    model_name: Optional[str] = None
+    display_name: Optional[str] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    extra_params: Optional[Dict[str, Any]] = None
+    tier: Optional[str] = None
+    is_default: Optional[bool] = None
+
+
+class ModelProfileResponse(BaseModel):
+    id: str
+    user_id: str
+    provider_id: str
+    provider_display_name: Optional[str] = None
+    provider_type: Optional[str] = None
+    model_name: str
+    display_name: str
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    extra_params: Optional[Dict[str, Any]] = None
+    tier: Optional[str] = None
+    is_default: bool = False
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class RoleBindingItem(BaseModel):
+    target_type: str
+    target_key: str
+    model_profile_id: str
+
+
+class RoleBindingsUpdateRequest(BaseModel):
+    bindings: List[RoleBindingItem]
+
+
+class RoleBindingResponse(BaseModel):
+    id: str
+    target_type: str
+    target_key: str
+    model_profile_id: str
+    model_profile_display_name: Optional[str] = None
+    model_name: Optional[str] = None
+    provider_type: Optional[str] = None
+
+
+class PresetApplyRequest(BaseModel):
+    preset_mode: str
+    bull_profile_id: Optional[str] = None
+    bear_profile_id: Optional[str] = None
+    manager_profile_id: Optional[str] = None
+    quick_profile_id: Optional[str] = None
+    deep_profile_id: Optional[str] = None
+
+
 class PortfolioPositionItem(BaseModel):
     symbol: str = Field(..., description="股票代码，如 600519.SH 或 600519")
     name: Optional[str] = Field(None, description="股票名称")
@@ -1390,7 +1487,7 @@ class AgentProgressTracker:
         )
 
     def emit_debate_token(
-        self, debate: str, agent: str, round_num: int, token: str,
+        self, debate: str, agent: str, round_num: int, token: str, model_name: Optional[str] = None,
     ) -> None:
         """推送辩论 token（流式输出，每个 chunk 调用一次）"""
         if not token:
@@ -1405,6 +1502,7 @@ class AgentProgressTracker:
                     "round": round_num,
                     "token": token,
                     "horizon": self.horizon,
+                    "model_name": model_name,
                 },
             )
         except Exception:
@@ -1412,7 +1510,7 @@ class AgentProgressTracker:
 
     def emit_debate_message(
         self, debate: str, agent: str, round_num: int,
-        content: str, is_verdict: bool = False,
+        content: str, is_verdict: bool = False, model_name: Optional[str] = None,
     ) -> None:
         """推送辩论消息（每个 agent 每轮完成后调用一次）"""
         if not content:
@@ -1428,6 +1526,7 @@ class AgentProgressTracker:
                     "content": content,
                     "is_verdict": is_verdict,
                     "horizon": self.horizon,
+                    "model_name": model_name,
                 },
             )
         except Exception:
@@ -1990,11 +2089,24 @@ async def _run_job_inner(
             medium_r = graph._build_horizon_result("medium", horizon_states.get("medium") or {})
             primary_r = short_r if horizon_states.get("short") else medium_r
             decision = graph.process_signal(primary_r.get("final_trade_decision", "")) or "UNKNOWN"
+            model_snapshot = {
+                role: {
+                    "provider_type": cfg.get("provider_type"),
+                    "model_name": cfg.get("model_name"),
+                    "base_url": cfg.get("base_url"),
+                    "resolved_via": cfg.get("resolved_via"),
+                    "fallback_used": cfg.get("fallback_used"),
+                    "profile_display_name": cfg.get("profile_display_name"),
+                    "provider_display_name": cfg.get("provider_display_name"),
+                }
+                for role, cfg in getattr(graph, "role_resolved_configs", {}).items()
+            }
             result = {
                 "symbol": ticker,
                 "trade_date": request.trade_date,
                 "mode": "dual_horizon",
                 "user_intent": user_intent,
+                "model_config_snapshot": model_snapshot,
                 "short_term": short_r,
                 "medium_term": medium_r,
                 "decision": decision,
@@ -3774,7 +3886,31 @@ def _invoke_runtime_warmup(
     provider = str(config.get("llm_provider") or "openai")
     base_url = config.get("backend_url")
     api_key = config.get("api_key")
-    targets = _warmup_model_targets(config)
+
+    targets_dict: Dict[Tuple[str, str, Optional[str], Optional[str]], List[str]] = {}
+    for key in ("quick_think_llm", "deep_think_llm"):
+        m = str(config.get(key) or "").strip()
+        if m:
+            lbl = _CONFIG_MODEL_LABELS.get(key, key)
+            targets_dict.setdefault((provider, m, base_url, api_key), []).append(lbl)
+
+    try:
+        with get_db_ctx() as db:
+            resolved_roles = role_routing_service.resolve_all_roles(db, user_id, config)
+            for r_key, r_cfg in resolved_roles.items():
+                m = str(r_cfg.get("model_name") or "").strip()
+                prov = str(r_cfg.get("provider_type") or provider)
+                b_url = r_cfg.get("base_url") or base_url
+                a_key = r_cfg.get("api_key") or api_key
+                if m:
+                    lbl = f"角色: {r_key}"
+                    lbls = targets_dict.setdefault((prov, m, b_url, a_key), [])
+                    if lbl not in lbls:
+                        lbls.append(lbl)
+    except Exception as err:
+        logger.warning(f"[LLM Warmup] Failed resolving roles for warmup: {err}")
+
+    targets = [(prov, model, b_url, a_key, lbls) for (prov, model, b_url, a_key), lbls in targets_dict.items()]
 
     if not targets:
         raise HTTPException(status_code=400, detail="请先配置至少一个可用模型。")
@@ -3786,13 +3922,13 @@ def _invoke_runtime_warmup(
 
     results: List[Dict[str, Any]] = []
     errors: List[str] = []
-    for model, labels in targets:
+    for prov, model, b_url, a_key, labels in targets:
         try:
             client = create_llm_client(
-                provider=provider,
+                provider=prov,
                 model=model,
-                base_url=base_url,
-                api_key=api_key,
+                base_url=b_url,
+                api_key=a_key,
                 timeout=timeout,
                 max_retries=0,
             )
@@ -3892,6 +4028,182 @@ def verify_login_code(body: AuthVerifyCodeRequest, request: Request, db: Session
 @app.get("/v1/auth/me", response_model=UserResponse)
 def get_me(current_user: UserDB = Depends(_require_web_user)):
     return current_user
+
+
+
+
+# --- Multi-Provider & Role-Based Model Routing Endpoints ---
+
+@app.get("/v1/providers", response_model=List[ProviderResponse])
+def get_user_providers(
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    return role_routing_service.list_providers(db, current_user.id)
+
+
+@app.post("/v1/providers", response_model=ProviderResponse)
+def create_user_provider(
+    body: ProviderCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    return role_routing_service.create_provider(
+        db,
+        current_user.id,
+        provider_type=body.provider_type,
+        display_name=body.display_name,
+        base_url=body.base_url,
+        api_key=body.api_key,
+        enabled=body.enabled,
+    )
+
+
+@app.patch("/v1/providers/{provider_id}", response_model=ProviderResponse)
+def update_user_provider(
+    provider_id: str,
+    body: ProviderUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    res = role_routing_service.update_provider(
+        db,
+        current_user.id,
+        provider_id,
+        display_name=body.display_name,
+        base_url=body.base_url,
+        api_key=body.api_key,
+        enabled=body.enabled,
+        clear_api_key=body.clear_api_key,
+    )
+    if not res:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    return res
+
+
+@app.delete("/v1/providers/{provider_id}")
+def delete_user_provider(
+    provider_id: str,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    success = role_routing_service.delete_provider(db, current_user.id, provider_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    return {"status": "ok", "deleted_provider_id": provider_id}
+
+
+@app.get("/v1/model-profiles", response_model=List[ModelProfileResponse])
+def get_user_model_profiles(
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    return role_routing_service.list_model_profiles(db, current_user.id)
+
+
+@app.post("/v1/model-profiles", response_model=ModelProfileResponse)
+def create_user_model_profile(
+    body: ModelProfileCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    return role_routing_service.create_model_profile(
+        db,
+        current_user.id,
+        provider_id=body.provider_id,
+        model_name=body.model_name,
+        display_name=body.display_name,
+        temperature=body.temperature,
+        max_tokens=body.max_tokens,
+        extra_params=body.extra_params,
+        tier=body.tier,
+        is_default=body.is_default,
+    )
+
+
+@app.patch("/v1/model-profiles/{profile_id}", response_model=ModelProfileResponse)
+def update_user_model_profile(
+    profile_id: str,
+    body: ModelProfileUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    res = role_routing_service.update_model_profile(
+        db,
+        current_user.id,
+        profile_id,
+        provider_id=body.provider_id,
+        model_name=body.model_name,
+        display_name=body.display_name,
+        temperature=body.temperature,
+        max_tokens=body.max_tokens,
+        extra_params=body.extra_params,
+        tier=body.tier,
+        is_default=body.is_default,
+    )
+    if not res:
+        raise HTTPException(status_code=404, detail="Model profile not found")
+    return res
+
+
+@app.delete("/v1/model-profiles/{profile_id}")
+def delete_user_model_profile(
+    profile_id: str,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    success = role_routing_service.delete_model_profile(db, current_user.id, profile_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Model profile not found")
+    return {"status": "ok", "deleted_profile_id": profile_id}
+
+
+@app.get("/v1/role-bindings", response_model=List[RoleBindingResponse])
+def get_user_role_bindings(
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    return role_routing_service.get_role_bindings(db, current_user.id)
+
+
+@app.patch("/v1/role-bindings", response_model=List[RoleBindingResponse])
+def update_user_role_bindings(
+    body: RoleBindingsUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    raw_items = [item.model_dump() for item in body.bindings]
+    return role_routing_service.update_role_bindings(db, current_user.id, raw_items)
+
+
+@app.post("/v1/role-bindings/presets")
+def apply_user_role_preset(
+    body: PresetApplyRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    try:
+        return role_routing_service.apply_role_preset(
+            db,
+            current_user.id,
+            preset_mode=body.preset_mode,
+            bull_profile_id=body.bull_profile_id,
+            bear_profile_id=body.bear_profile_id,
+            manager_profile_id=body.manager_profile_id,
+            quick_profile_id=body.quick_profile_id,
+            deep_profile_id=body.deep_profile_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/role-bindings/resolved")
+def get_resolved_user_role_bindings(
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    runtime_cfg = _config_response_for_user(current_user, db).model_dump()
+    return role_routing_service.resolve_all_roles(db, current_user.id, runtime_cfg)
 
 
 @app.get("/v1/config", response_model=UserRuntimeConfigResponse)
@@ -4773,3 +5085,23 @@ def run() -> None:
 
     log_config = str(Path(__file__).parent / "logging_config.yaml")
     uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=False, log_config=log_config)
+
+
+@app.get("/v1/dataproviders/health")
+def check_data_providers_health():
+    """Return health status of integrated data providers."""
+    from tradingagents.dataflows.interface import TOOLS_CATEGORIES, _registry
+    providers_status = []
+    for name in _registry.list_names():
+        prov = _registry.get(name)
+        providers_status.append({
+            "name": name,
+            "status": "healthy",
+            "is_placeholder": getattr(prov, "is_placeholder", False),
+        })
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "providers": providers_status,
+        "categories": list(TOOLS_CATEGORIES.keys()),
+    }

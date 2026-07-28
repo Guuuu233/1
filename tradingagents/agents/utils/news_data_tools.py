@@ -53,3 +53,27 @@ def get_insider_transactions(
         str: A report of insider transaction data
     """
     return route_to_vendor("get_insider_transactions", ticker, curr_date=curr_date)
+
+@tool
+def get_restricted_release(
+    symbol: Annotated[str, "股票代码"],
+    curr_date: Annotated[str | None, "当前分析日期 YYYY-MM-DD"] = None,
+) -> str:
+    """获取限售股解禁数据与近期解禁风险。"""
+    return route_to_vendor("get_restricted_release", symbol, curr_date=curr_date)
+
+@tool
+def get_share_pledge(
+    symbol: Annotated[str, "股票代码"],
+    curr_date: Annotated[str | None, "当前分析日期 YYYY-MM-DD"] = None,
+) -> str:
+    """获取大股东股权质押比例与质押风险。"""
+    return route_to_vendor("get_share_pledge", symbol, curr_date=curr_date)
+
+@tool
+def get_earnings_forecast(
+    symbol: Annotated[str, "股票代码"],
+    curr_date: Annotated[str | None, "当前分析日期 YYYY-MM-DD"] = None,
+) -> str:
+    """获取上市公司业绩预告与业绩快报。"""
+    return route_to_vendor("get_earnings_forecast", symbol, curr_date=curr_date)

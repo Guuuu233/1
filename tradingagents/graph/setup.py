@@ -69,6 +69,7 @@ class GraphSetup:
         risk_manager_memory,
         conditional_logic: ConditionalLogic,
         data_collector=None,
+        role_llms: Optional[Dict[str, Any]] = None,
     ):
         """Initialize with required components."""
         self.quick_thinking_llm = quick_thinking_llm
@@ -81,6 +82,12 @@ class GraphSetup:
         self.risk_manager_memory = risk_manager_memory
         self.conditional_logic = conditional_logic
         self.data_collector = data_collector
+        self.role_llms = role_llms or {}
+
+    def _get_role_llm(self, role_key: str, fallback_llm: Any) -> Any:
+        if self.role_llms and role_key in self.role_llms:
+            return self.role_llms[role_key]
+        return fallback_llm
 
     def setup_graph(
         self, selected_analysts=["market", "social", "news", "fundamentals", "macro", "smart_money"],
@@ -107,71 +114,73 @@ class GraphSetup:
 
         if "market" in selected_analysts:
             analyst_nodes["market"] = factories["create_market_analyst"](
-                self.quick_thinking_llm, self.data_collector
+                self._get_role_llm("market", self.quick_thinking_llm), self.data_collector
             )
             tool_nodes["market"] = self.tool_nodes["market"]
             done_nodes["market"] = analyst_done_node
 
         if "social" in selected_analysts:
             analyst_nodes["social"] = factories["create_social_media_analyst"](
-                self.quick_thinking_llm, self.data_collector
+                self._get_role_llm("social", self.quick_thinking_llm), self.data_collector
             )
             tool_nodes["social"] = self.tool_nodes["social"]
             done_nodes["social"] = analyst_done_node
 
         if "news" in selected_analysts:
             analyst_nodes["news"] = factories["create_news_analyst"](
-                self.quick_thinking_llm, self.data_collector
+                self._get_role_llm("news", self.quick_thinking_llm), self.data_collector
             )
             tool_nodes["news"] = self.tool_nodes["news"]
             done_nodes["news"] = analyst_done_node
 
         if "fundamentals" in selected_analysts:
             analyst_nodes["fundamentals"] = factories["create_fundamentals_analyst"](
-                self.quick_thinking_llm, self.data_collector
+                self._get_role_llm("fundamentals", self.quick_thinking_llm), self.data_collector
             )
             tool_nodes["fundamentals"] = self.tool_nodes["fundamentals"]
             done_nodes["fundamentals"] = analyst_done_node
 
         if "macro" in selected_analysts:
             analyst_nodes["macro"] = factories["create_macro_analyst"](
-                self.quick_thinking_llm, self.data_collector
+                self._get_role_llm("macro", self.quick_thinking_llm), self.data_collector
             )
             tool_nodes["macro"] = self.tool_nodes["macro"]
             done_nodes["macro"] = analyst_done_node
 
         if "smart_money" in selected_analysts:
             analyst_nodes["smart_money"] = factories["create_smart_money_analyst"](
-                self.quick_thinking_llm, self.data_collector
+                self._get_role_llm("smart_money", self.quick_thinking_llm), self.data_collector
             )
             tool_nodes["smart_money"] = self.tool_nodes["smart_money"]
             done_nodes["smart_money"] = analyst_done_node
 
         if "volume_price" in selected_analysts:
             analyst_nodes["volume_price"] = factories["create_volume_price_analyst"](
-                self.quick_thinking_llm, self.data_collector
+                self._get_role_llm("volume_price", self.quick_thinking_llm), self.data_collector
             )
             tool_nodes["volume_price"] = self.tool_nodes["volume_price"]
             done_nodes["volume_price"] = analyst_done_node
 
         # Create researcher and manager nodes
         bull_researcher_node = factories["create_bull_researcher"](
-            self.quick_thinking_llm, self.bull_memory
+            self._get_role_llm("bull_researcher", self.quick_thinking_llm), self.bull_memory
         )
         bear_researcher_node = factories["create_bear_researcher"](
-            self.quick_thinking_llm, self.bear_memory
+            self._get_role_llm("bear_researcher", self.quick_thinking_llm), self.bear_memory
         )
         research_manager_node = factories["create_research_manager"](
-            self.deep_thinking_llm, self.invest_judge_memory
+            self._get_role_llm("research_manager", self.deep_thinking_llm), self.invest_judge_memory
         )
-        trader_node = factories["create_trader"](self.quick_thinking_llm, self.trader_memory)
+        trader_node = factories["create_trader"](
+            self._get_role_llm("trader", self.quick_thinking_llm), self.trader_memory
+        )
 
         # Create risk analysis nodes
-        aggressive_analyst = factories["create_aggressive_debator"](self.quick_thinking_llm)
-        neutral_analyst = factories["create_neutral_debator"](self.quick_thinking_llm)
-        conservative_analyst = factories["create_conservative_debator"](self.quick_thinking_llm)
+        aggressive_analyst = factories["create_aggressive_debator"](self._get_role_llm("aggressive_analyst", self.quick_thinking_llm))
+        neutral_analyst = factories["create_neutral_debator"](self._get_role_llm("neutral_analyst", self.quick_thinking_llm))
+        conservative_analyst = factories["create_conservative_debator"](self._get_role_llm("conservative_analyst", self.quick_thinking_llm))
         risk_manager_node = factories["create_risk_manager"](
-            self.deep_thinking_llm, self.risk_manager_memory
+            self._get_role_llm("risk_manager", self.deep_thinking_llm), self.risk_manager_memory
         )
 
         # Create workflow

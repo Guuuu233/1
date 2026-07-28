@@ -1,4 +1,4 @@
-import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse } from '@/types'
+import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, Provider, ProviderCreatePayload, ProviderUpdatePayload, ModelProfile, ModelProfileCreatePayload, ModelProfileUpdatePayload, RoleBinding, RoleBindingItem, ResolvedRole } from '@/types'
 
 export function getBaseUrl(): string {
     const envUrl = (import.meta.env.VITE_API_URL as string) || ''
@@ -344,6 +344,77 @@ class ApiService {
 
     async markFeedbackRead(id: string): Promise<void> {
         return this.request<void>(`/v1/feedbacks/${id}/read`, { method: 'POST' })
+    }
+
+    // Multi-Provider & Role-Based Model Routing API
+    async getProviders(): Promise<Provider[]> {
+        return this.request<Provider[]>('/v1/providers')
+    }
+
+    async createProvider(data: ProviderCreatePayload): Promise<Provider> {
+        return this.request<Provider>('/v1/providers', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        })
+    }
+
+    async updateProvider(id: string, data: ProviderUpdatePayload): Promise<Provider> {
+        return this.request<Provider>(`/v1/providers/${id}`, {
+            method: 'PATCH',
+            body: JSON.stringify(data),
+        })
+    }
+
+    async deleteProvider(id: string): Promise<void> {
+        return this.request<void>(`/v1/providers/${id}`, {
+            method: 'DELETE',
+        })
+    }
+
+    async getModelProfiles(): Promise<ModelProfile[]> {
+        return this.request<ModelProfile[]>('/v1/model-profiles')
+    }
+
+    async createModelProfile(data: ModelProfileCreatePayload): Promise<ModelProfile> {
+        return this.request<ModelProfile>('/v1/model-profiles', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        })
+    }
+
+    async updateModelProfile(id: string, data: ModelProfileUpdatePayload): Promise<ModelProfile> {
+        return this.request<ModelProfile>(`/v1/model-profiles/${id}`, {
+            method: 'PATCH',
+            body: JSON.stringify(data),
+        })
+    }
+
+    async deleteModelProfile(id: string): Promise<void> {
+        return this.request<void>(`/v1/model-profiles/${id}`, {
+            method: 'DELETE',
+        })
+    }
+
+    async getRoleBindings(): Promise<RoleBinding[]> {
+        return this.request<RoleBinding[]>('/v1/role-bindings')
+    }
+
+    async updateRoleBindings(bindings: RoleBindingItem[]): Promise<RoleBinding[]> {
+        return this.request<RoleBinding[]>('/v1/role-bindings', {
+            method: 'PATCH',
+            body: JSON.stringify({ bindings }),
+        })
+    }
+
+    async applyPreset(presetMode: string, payload?: Record<string, any>): Promise<any> {
+        return this.request('/v1/role-bindings/presets', {
+            method: 'POST',
+            body: JSON.stringify({ preset_mode: presetMode, ...payload }),
+        })
+    }
+
+    async getResolvedRoles(): Promise<Record<string, ResolvedRole>> {
+        return this.request<Record<string, ResolvedRole>>('/v1/role-bindings/resolved')
     }
 }
 

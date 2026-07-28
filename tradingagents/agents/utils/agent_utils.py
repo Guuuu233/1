@@ -16,7 +16,10 @@ from tradingagents.agents.utils.fundamental_data_tools import (
 from tradingagents.agents.utils.news_data_tools import (
     get_news,
     get_insider_transactions,
-    get_global_news
+    get_global_news,
+    get_restricted_release,
+    get_share_pledge,
+    get_earnings_forecast
 )
 from tradingagents.agents.utils.game_theory_tools import (
     get_board_fund_flow,
@@ -24,6 +27,9 @@ from tradingagents.agents.utils.game_theory_tools import (
     get_lhb_detail,
     get_zt_pool,
     get_hot_stocks_xq,
+    get_shareholder_count,
+    get_margin_trading,
+    get_northbound_flow,
 )
 
 def create_msg_delete():

@@ -89,21 +89,64 @@ class TradingAgentsGraph:
         if self.callbacks:
             llm_kwargs["callbacks"] = self.callbacks
 
+        # Resolve per-role model configurations
+        db = self.config.get("db")
+        user_id = self.config.get("user_id")
+        resolved_roles = {}
+        try:
+            from api.services.role_routing_service import resolve_all_roles
+            if db:
+                resolved_roles = resolve_all_roles(db, user_id, runtime_config=self.config)
+            elif user_id:
+                from api.database import get_db_ctx
+                with get_db_ctx() as session:
+                    resolved_roles = resolve_all_roles(session, user_id, runtime_config=self.config)
+        except Exception as err:
+            print(f"[TradingAgentsGraph] Warning: failed to resolve role configs: {err}")
+
+        self.role_llms = {}
+        self.role_resolved_configs = resolved_roles
+
+        from api.services.role_routing_service import ALL_ROLES, ROLE_DEFAULT_TIERS
+        for role_key in ALL_ROLES:
+            r_cfg = resolved_roles.get(role_key, {})
+            p_type = r_cfg.get("provider_type") or self.config.get("llm_provider") or "openai"
+            default_tier = ROLE_DEFAULT_TIERS.get(role_key, "quick")
+            m_name = r_cfg.get("model_name") or (self.config.get("deep_think_llm") if default_tier == "deep" else self.config.get("quick_think_llm")) or "gpt-4o-mini"
+            b_url = r_cfg.get("base_url") or self.config.get("backend_url")
+            a_key = r_cfg.get("api_key") or self.config.get("api_key")
+
+            r_kwargs = dict(llm_kwargs)
+            if r_cfg.get("temperature") is not None:
+                r_kwargs["temperature"] = r_cfg["temperature"]
+            if r_cfg.get("max_tokens") is not None:
+                r_kwargs["max_tokens"] = r_cfg["max_tokens"]
+            if a_key:
+                r_kwargs["api_key"] = a_key
+
+            role_client = create_llm_client(
+                provider=p_type,
+                model=m_name,
+                base_url=b_url,
+                **r_kwargs,
+            )
+            self.role_llms[role_key] = role_client.get_llm()
+
         deep_client = create_llm_client(
-            provider=self.config["llm_provider"],
-            model=self.config["deep_think_llm"],
+            provider=self.config.get("llm_provider", "openai"),
+            model=self.config.get("deep_think_llm", "gpt-4o"),
             base_url=self.config.get("backend_url"),
             **llm_kwargs,
         )
         quick_client = create_llm_client(
-            provider=self.config["llm_provider"],
-            model=self.config["quick_think_llm"],
+            provider=self.config.get("llm_provider", "openai"),
+            model=self.config.get("quick_think_llm", "gpt-4o-mini"),
             base_url=self.config.get("backend_url"),
             **llm_kwargs,
         )
 
-        self.deep_thinking_llm = deep_client.get_llm()
-        self.quick_thinking_llm = quick_client.get_llm()
+        self.deep_thinking_llm = self.role_llms.get("research_manager", deep_client.get_llm())
+        self.quick_thinking_llm = self.role_llms.get("market", quick_client.get_llm())
         
         # Initialize memories
         self.bull_memory = FinancialSituationMemory("bull_memory", self.config)
@@ -134,6 +177,7 @@ class TradingAgentsGraph:
             self.risk_manager_memory,
             self.conditional_logic,
             data_collector=self.data_collector,
+            role_llms=self.role_llms,
         )
 
         self.propagator = Propagator(

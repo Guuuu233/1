@@ -38,3 +38,27 @@ def get_zt_pool(
 def get_hot_stocks_xq() -> str:
     """获取雪球热搜股票列表，反映散户当前关注热点。"""
     return route_to_vendor("get_hot_stocks_xq")
+
+@tool
+def get_shareholder_count(
+    symbol: Annotated[str, "股票代码，格式如 600519"],
+    curr_date: Annotated[str | None, "当前分析日期 YYYY-MM-DD"] = None,
+) -> str:
+    """获取股东户数变动与筹码集中度。"""
+    return route_to_vendor("get_shareholder_count", symbol, curr_date=curr_date)
+
+@tool
+def get_margin_trading(
+    symbol: Annotated[str, "股票代码，格式如 600519"],
+    curr_date: Annotated[str | None, "当前分析日期 YYYY-MM-DD"] = None,
+) -> str:
+    """获取融资融券交易明细。"""
+    return route_to_vendor("get_margin_trading", symbol, curr_date=curr_date)
+
+@tool
+def get_northbound_flow(
+    symbol: Annotated[str, "股票代码，格式如 600519"],
+    curr_date: Annotated[str | None, "当前分析日期 YYYY-MM-DD"] = None,
+) -> str:
+    """获取北向资金（陆股通）持股变动。"""
+    return route_to_vendor("get_northbound_flow", symbol, curr_date=curr_date)

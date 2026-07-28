@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from 'react'
 import { Save, Key, Database, Loader2, Trash2, Link2, Copy, Plus, CheckCircle2, Mail, Flame, Webhook, Sparkles } from 'lucide-react'
 import { api } from '@/services/api'
+import RoleModelConfigSection from '@/components/RoleModelConfigSection'
 import { useAuthStore } from '@/stores/authStore'
 import type { RuntimeWarmupResult, UserToken } from '@/types'
 import { RELAY_PROMO } from '@/config/promo'
@@ -529,6 +530,8 @@ export default function Settings() {
                     </div>
                 </div>
             </div>
+
+            <RoleModelConfigSection />
 
             <div className="card space-y-4">
                 <div className="flex items-center gap-2">

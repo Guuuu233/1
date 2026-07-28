@@ -63,6 +63,7 @@ def create_bull_researcher(llm, memory):
             debate_round = int(investment_debate_state.get("count", 0) or 0) // 2 + 1
         except (ValueError, TypeError):
             debate_round = 1
+        model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None)
         full_content = ""
         async for chunk in llm.astream(prompt):
             content = chunk.content if hasattr(chunk, "content") else str(chunk)
@@ -71,14 +72,14 @@ def create_bull_researcher(llm, memory):
                 tracker._emit_token("Bull Researcher", "investment_debate_state", content)
                 tracker.emit_debate_token(
                     debate="research", agent="Bull Researcher",
-                    round_num=debate_round, token=content,
+                    round_num=debate_round, token=content, model_name=model_name,
                 )
 
         # ── 推送辩论完整消息（标记流式结束）──
         if tracker:
             tracker.emit_debate_message(
                 debate="research", agent="Bull Researcher",
-                round_num=debate_round, content=full_content,
+                round_num=debate_round, content=full_content, model_name=model_name,
             )
 
         new_investment_debate_state = update_debate_state_with_payload(

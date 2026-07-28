@@ -26,6 +26,12 @@ from tradingagents.agents.utils.agent_utils import (
     get_lhb_detail,
     get_zt_pool,
     get_hot_stocks_xq,
+    get_restricted_release,
+    get_share_pledge,
+    get_earnings_forecast,
+    get_shareholder_count,
+    get_margin_trading,
+    get_northbound_flow,
 )
 
 INDICATORS = [
@@ -283,6 +289,12 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         "insider_transactions": (get_insider_transactions, {"ticker": ticker, "curr_date": trade_date}),
         "zt_pool": (get_zt_pool, {"date": trade_date}),
         "hot_stocks": (get_hot_stocks_xq, {}),
+        "restricted_release": (get_restricted_release, {"symbol": ticker, "curr_date": trade_date}),
+        "share_pledge": (get_share_pledge, {"symbol": ticker, "curr_date": trade_date}),
+        "earnings_forecast": (get_earnings_forecast, {"symbol": ticker, "curr_date": trade_date}),
+        "shareholder_count": (get_shareholder_count, {"symbol": ticker, "curr_date": trade_date}),
+        "margin_trading": (get_margin_trading, {"symbol": ticker, "curr_date": trade_date}),
+        "northbound_flow": (get_northbound_flow, {"symbol": ticker, "curr_date": trade_date}),
     }
 
     # 财务报表类数据始终拉取，Research Manager 根据 horizon 自行判断权重

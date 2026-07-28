@@ -480,3 +480,52 @@ class ImportedPortfolioPositionDB(Base):
     )
 
 
+
+class ProviderDB(Base):
+    """LLM Provider credentials."""
+    __tablename__ = "providers"
+
+    id = Column(String(36), primary_key=True, index=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    provider_type = Column(String(50), nullable=False)  # e.g., 'openai', 'anthropic', 'google', 'deepseek'
+    base_url = Column(String(500), nullable=True)
+    api_key_encrypted = Column(Text, nullable=True)
+    display_name = Column(String(100), nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class ModelProfileDB(Base):
+    """Model Profile (Provider + Model + Hyperparameters)."""
+    __tablename__ = "model_profiles"
+
+    id = Column(String(36), primary_key=True, index=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    provider_id = Column(String(36), index=True, nullable=False)
+    model_name = Column(String(255), nullable=False)
+    temperature = Column(Float, nullable=True)
+    max_tokens = Column(Integer, nullable=True)
+    extra_params = Column(JSON, nullable=True)
+    display_name = Column(String(100), nullable=False)
+    tier = Column(String(20), nullable=True)  # 'quick' | 'deep' | None
+    is_default = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class RoleBindingDB(Base):
+    """Role or Group to Model Profile Binding."""
+    __tablename__ = "role_bindings"
+
+    id = Column(String(36), primary_key=True, index=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    target_type = Column(String(20), nullable=False)  # 'role' | 'group'
+    target_key = Column(String(50), nullable=False)   # e.g. 'bull_researcher', 'analysts'
+    model_profile_id = Column(String(36), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'target_type', 'target_key', name='uq_role_binding_user_target'),
+    )

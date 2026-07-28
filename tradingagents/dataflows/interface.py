@@ -43,6 +43,17 @@ TOOLS_CATEGORIES = {
             "get_lhb_detail",
             "get_zt_pool",
             "get_hot_stocks_xq",
+            "get_shareholder_count",
+            "get_margin_trading",
+            "get_northbound_flow",
+        ],
+    },
+    "institutional_risk": {
+        "description": "Governance, pledge, earnings forecast and restricted release risks",
+        "tools": [
+            "get_restricted_release",
+            "get_share_pledge",
+            "get_earnings_forecast",
         ],
     },
 }

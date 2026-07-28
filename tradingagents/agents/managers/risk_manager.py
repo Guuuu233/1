@@ -49,6 +49,7 @@ def create_risk_manager(llm, memory):
 
         # ── 流式输出 ──
         tracker = current_tracker_var.get()
+        model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None)
         full_content = ""
         async for chunk in llm.astream(prompt):
             content = chunk.content if hasattr(chunk, "content") else str(chunk)

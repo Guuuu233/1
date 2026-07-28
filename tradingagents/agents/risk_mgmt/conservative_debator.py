@@ -54,6 +54,7 @@ def create_conservative_debator(llm):
             debate_round = int(risk_debate_state.get("count", 0) or 0) // 3 + 1
         except (ValueError, TypeError):
             debate_round = 1
+        model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None)
         full_content = ""
         async for chunk in llm.astream(prompt):
             content = chunk.content if hasattr(chunk, "content") else str(chunk)
@@ -61,7 +62,7 @@ def create_conservative_debator(llm):
             if tracker:
                 tracker.emit_debate_token(
                     debate="risk", agent="Conservative Analyst",
-                    round_num=debate_round, token=content,
+                    round_num=debate_round, token=content, model_name=model_name,
                 )
 
         clean_response = strip_tagged_json(full_content, "RISK_STATE")

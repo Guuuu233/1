@@ -691,3 +691,103 @@ export interface DebateMessage {
     isVerdict?: boolean
     horizon?: string
 }
+
+// Role-Based Model Routing Types
+export interface Provider {
+    id: string
+    user_id: string
+    provider_type: string
+    display_name: string
+    base_url?: string | null
+    has_api_key: boolean
+    api_key_masked?: string | null
+    enabled: boolean
+    created_at?: string | null
+    updated_at?: string | null
+}
+
+export interface ProviderCreatePayload {
+    provider_type: string
+    display_name: string
+    base_url?: string | null
+    api_key?: string | null
+    enabled?: boolean
+}
+
+export interface ProviderUpdatePayload {
+    display_name?: string | null
+    base_url?: string | null
+    api_key?: string | null
+    enabled?: boolean
+    clear_api_key?: boolean
+}
+
+export interface ModelProfile {
+    id: string
+    user_id: string
+    provider_id: string
+    provider_display_name?: string | null
+    provider_type?: string | null
+    model_name: string
+    display_name: string
+    temperature?: number | null
+    max_tokens?: number | null
+    extra_params?: Record<string, any> | null
+    tier?: 'quick' | 'deep' | null
+    is_default: boolean
+    created_at?: string | null
+    updated_at?: string | null
+}
+
+export interface ModelProfileCreatePayload {
+    provider_id: string
+    model_name: string
+    display_name: string
+    temperature?: number | null
+    max_tokens?: number | null
+    extra_params?: Record<string, any> | null
+    tier?: 'quick' | 'deep' | null
+    is_default?: boolean
+}
+
+export interface ModelProfileUpdatePayload {
+    provider_id?: string
+    model_name?: string
+    display_name?: string
+    temperature?: number | null
+    max_tokens?: number | null
+    extra_params?: Record<string, any> | null
+    tier?: 'quick' | 'deep' | null
+    is_default?: boolean
+}
+
+export interface RoleBindingItem {
+    target_type: 'role' | 'group'
+    target_key: string
+    model_profile_id: string
+}
+
+export interface RoleBinding {
+    id: string
+    target_type: 'role' | 'group'
+    target_key: string
+    model_profile_id: string
+    model_profile_display_name?: string | null
+    model_name?: string | null
+    provider_type?: string | null
+}
+
+export interface ResolvedRole {
+    role_key: string
+    resolved_via: string
+    fallback_used: boolean
+    provider_type: string
+    model_name: string
+    base_url?: string | null
+    temperature?: number | null
+    max_tokens?: number | null
+    profile_id?: string | null
+    provider_id?: string | null
+    profile_display_name?: string | null
+    provider_display_name?: string | null
+}

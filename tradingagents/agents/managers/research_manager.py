@@ -66,6 +66,7 @@ def create_research_manager(llm, memory):
 
         # ── 实现 Token 级流式输出 ──────────────────
         tracker = current_tracker_var.get()
+        model_name = getattr(llm, "model_name", None) or getattr(llm, "model", None)
         full_content = ""
         reasoning_buf: list[str] = []
         first_token_at: float | None = None

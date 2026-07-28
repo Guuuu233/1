@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 from stockstats import wrap
 
-from .base import BaseMarketDataProvider
+from .base import BaseMarketDataProvider, DataResult
 from ..trade_calendar import cn_market_phase, cn_no_data_reason, cn_today_str, is_cn_trading_day
 
 
@@ -983,3 +983,237 @@ class CnAkshareProvider(BaseMarketDataProvider):
             return f"雪球热搜前20：\n{df.head(20).to_string(index=False)}"
         except Exception as exc:
             return f"雪球热搜数据获取失败：{type(exc).__name__}: {exc}"
+
+    # --- Data Source Extensions (Institutional Risk, Chip & Fund Flow) ---
+
+    def get_restricted_release(self, symbol: str, curr_date: str = None) -> str:
+        """获取限售股解禁数据与近期解禁风险。"""
+        source_name = "akshare.stock_restricted_release_detail_em"
+        title = "限售股解禁风险"
+        try:
+            code = self._normalize_symbol(symbol)
+            ak = self._ak()
+
+            if not curr_date:
+                curr_date = datetime.now().strftime("%Y-%m-%d")
+            
+            # Start: 30 days ago, End: 60 days ahead
+            dt_curr = datetime.strptime(curr_date, "%Y-%m-%d")
+            start_str = (dt_curr - timedelta(days=30)).strftime("%Y%m%d")
+            end_str = (dt_curr + timedelta(days=60)).strftime("%Y%m%d")
+
+            with AKSHARE_CALL_LOCK:
+                df = ak.stock_restricted_release_detail_em(start_date=start_str, end_date=end_str)
+
+            if df is None or df.empty:
+                res = DataResult(ok=True, data=None, source=source_name, title=title)
+                return res.to_prompt()
+
+            # Filter for specific stock code
+            stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
+            if stock_df.empty:
+                res = DataResult(ok=True, data="【解禁排查】距当前分析日期前后60日内无限售股解禁记录，无重大解禁冲击风险。", source=source_name, title=title)
+                return res.to_prompt()
+
+            summary_lines = [f"【限售解禁风险预警】找到 {len(stock_df)} 条近期解禁记录："]
+            for _, row in stock_df.iterrows():
+                rel_date = row.get("解禁时间", "未知日期")
+                rel_ratio = row.get("占解禁前流通市值比例", "未知")
+                rel_type = row.get("限售股类型", "限售股")
+                summary_lines.append(f"- 解禁日期: {rel_date} | 类型: {rel_type} | 占比流通市值: {rel_ratio}%")
+
+            res = DataResult(ok=True, data="\n".join(summary_lines), source=source_name, title=title)
+            return res.to_prompt()
+        except Exception as exc:
+            res = DataResult(ok=False, data=None, error=f"{type(exc).__name__}: {exc}", source=source_name, title=title)
+            return res.to_prompt()
+
+    def get_share_pledge(self, symbol: str, curr_date: str = None) -> str:
+        """获取大股东股权质押比例与质押风险。"""
+        source_name = "akshare.stock_gpzy_pledge_ratio_em"
+        title = "股权质押风险"
+        try:
+            code = self._normalize_symbol(symbol)
+            ak = self._ak()
+
+            with AKSHARE_CALL_LOCK:
+                df = ak.stock_gpzy_pledge_ratio_em()
+
+            if df is None or df.empty:
+                res = DataResult(ok=True, data=None, source=source_name, title=title)
+                return res.to_prompt()
+
+            stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
+            if stock_df.empty:
+                res = DataResult(ok=True, data="【股权质押排查】无大股东高比例质押记录，质押风险处于安全水平。", source=source_name, title=title)
+                return res.to_prompt()
+
+            row = stock_df.iloc[0]
+            ratio = row.get("质押比例", "0")
+            count = row.get("质押笔数", "0")
+            industry = row.get("所属行业", "")
+
+            msg = f"【股权质押排查】整体质押比例：{ratio}% (质押笔数: {count} 笔, 行业: {industry})"
+            if float(str(ratio).replace("%", "") or 0) > 30:
+                msg += " ⚠️ [高风险警示] 该股票大股东质押比例超30%，需高度警惕平仓与流动性风险。"
+
+            res = DataResult(ok=True, data=msg, source=source_name, title=title)
+            return res.to_prompt()
+        except Exception as exc:
+            res = DataResult(ok=False, data=None, error=f"{type(exc).__name__}: {exc}", source=source_name, title=title)
+            return res.to_prompt()
+
+    def get_earnings_forecast(self, symbol: str, curr_date: str = None) -> str:
+        """获取上市公司业绩预告与业绩快报。"""
+        source_name = "akshare.stock_yjyg_em"
+        title = "业绩预告与快报"
+        try:
+            code = self._normalize_symbol(symbol)
+            ak = self._ak()
+
+            if not curr_date:
+                curr_date = datetime.now().strftime("%Y-%m-%d")
+
+            # Determine recent report period end date (e.g. 20241231, 20240930)
+            year = datetime.strptime(curr_date, "%Y-%m-%d").year
+            date_param = f"{year-1}1231"
+
+            with AKSHARE_CALL_LOCK:
+                df = ak.stock_yjyg_em(date=date_param)
+
+            if df is None or df.empty:
+                res = DataResult(ok=True, data=None, source=source_name, title=title)
+                return res.to_prompt()
+
+            stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
+            if stock_df.empty:
+                res = DataResult(ok=True, data="【业绩预告排查】当前报告期暂无业绩预警/预增公告。", source=source_name, title=title)
+                return res.to_prompt()
+
+            lines = [f"【业绩预告/快报】找到 {len(stock_df)} 条预告记录："]
+            for _, row in stock_df.iterrows():
+                tp = row.get("预告类型", "")
+                chg = row.get("业绩变动", "")
+                reason = row.get("业绩变动原因", "")
+                ann_date = row.get("公告日期", "")
+                if curr_date and str(ann_date) > curr_date:
+                    continue  # Historical date truncation
+                lines.append(f"- 公告日: {ann_date} | 类型: {tp} | 变动: {chg}\n  原因摘要: {reason[:100]}")
+
+            res = DataResult(ok=True, data="\n".join(lines), source=source_name, title=title)
+            return res.to_prompt()
+        except Exception as exc:
+            res = DataResult(ok=False, data=None, error=f"{type(exc).__name__}: {exc}", source=source_name, title=title)
+            return res.to_prompt()
+
+    def get_shareholder_count(self, symbol: str, curr_date: str = None) -> str:
+        """获取股东户数变动与筹码集中度。"""
+        source_name = "akshare.stock_zh_a_gdhs_detail_em"
+        title = "股东户数与筹码集中度"
+        try:
+            code = self._normalize_symbol(symbol)
+            ak = self._ak()
+
+            with AKSHARE_CALL_LOCK:
+                df = ak.stock_zh_a_gdhs_detail_em(symbol=code)
+
+            if df is None or df.empty:
+                res = DataResult(ok=True, data=None, source=source_name, title=title)
+                return res.to_prompt()
+
+            # Truncate by curr_date if passed
+            if curr_date and "股东户数公告日期" in df.columns:
+                df = df[df["股东户数公告日期"].astype(str) <= curr_date]
+
+            if df.empty:
+                res = DataResult(ok=True, data=None, source=source_name, title=title)
+                return res.to_prompt()
+
+            recent_df = df.head(4)
+            lines = [f"【股东户数与筹码集中度】最近 {len(recent_df)} 期户数变动："]
+            for _, row in recent_df.iterrows():
+                dt = row.get("股东户数统计截止日", "")
+                cnt = row.get("股东户数-本次", "")
+                chg_ratio = row.get("股东户数-增减比例", "")
+                avg_val = row.get("户均持股市值", "")
+                lines.append(f"- 截止日: {dt} | 股东户数: {cnt} | 较上期变动: {chg_ratio}% | 户均市值: {avg_val} 元")
+
+            res = DataResult(ok=True, data="\n".join(lines), source=source_name, title=title)
+            return res.to_prompt()
+        except Exception as exc:
+            res = DataResult(ok=False, data=None, error=f"{type(exc).__name__}: {exc}", source=source_name, title=title)
+            return res.to_prompt()
+
+    def get_margin_trading(self, symbol: str, curr_date: str = None) -> str:
+        """获取融资融券交易明细。"""
+        source_name = "akshare.stock_margin_detail_sse/szse"
+        title = "融资融券交易"
+        try:
+            code = self._normalize_symbol(symbol)
+            ak = self._ak()
+
+            target_date = (curr_date or datetime.now().strftime("%Y-%m-%d")).replace("-", "")
+
+            with AKSHARE_CALL_LOCK:
+                if code.startswith("6"):
+                    df = ak.stock_margin_detail_sse(date=target_date)
+                else:
+                    df = ak.stock_margin_detail_szse(date=target_date)
+
+            if df is None or df.empty:
+                res = DataResult(ok=True, data=None, source=source_name, title=title)
+                return res.to_prompt()
+
+            stock_df = df[df["标的证券代码"].astype(str).str.zfill(6) == code.zfill(6)]
+            if stock_df.empty:
+                res = DataResult(ok=True, data="【融资融券】该日暂无融资融券异动明细。", source=source_name, title=title)
+                return res.to_prompt()
+
+            row = stock_df.iloc[0]
+            rzye = row.get("融资余额", "0")
+            rzbuy = row.get("融资买入额", "0")
+            rqyl = row.get("融券余量", "0")
+
+            msg = f"【融资融券数据】日期: {target_date} | 融资余额: {rzye} 元 | 融资买入额: {rzbuy} 元 | 融券余量: {rqyl}"
+            res = DataResult(ok=True, data=msg, source=source_name, title=title)
+            return res.to_prompt()
+        except Exception as exc:
+            res = DataResult(ok=False, data=None, error=f"{type(exc).__name__}: {exc}", source=source_name, title=title)
+            return res.to_prompt()
+
+    def get_northbound_flow(self, symbol: str, curr_date: str = None) -> str:
+        """获取陆股通（北向资金）持股与增减持变动。"""
+        source_name = "akshare.stock_hsgt_individual_em"
+        title = "北向资金持股变动"
+        try:
+            code = self._normalize_symbol(symbol)
+            ak = self._ak()
+
+            with AKSHARE_CALL_LOCK:
+                df = ak.stock_hsgt_individual_em(symbol=code)
+
+            if df is None or df.empty:
+                res = DataResult(ok=True, data=None, source=source_name, title=title)
+                return res.to_prompt()
+
+            if curr_date and "持股日期" in df.columns:
+                df = df[df["持股日期"].astype(str) <= curr_date]
+
+            if df.empty:
+                res = DataResult(ok=True, data=None, source=source_name, title=title)
+                return res.to_prompt()
+
+            recent_df = df.head(5)
+            lines = [f"【北向资金/陆股通持股】最近 5 交易日记录："]
+            for _, row in recent_df.iterrows():
+                dt = row.get("持股日期", "")
+                ratio = row.get("持股数量占A股百分比", "")
+                add_cnt = row.get("今日增持股数", "")
+                add_val = row.get("今日增持资金", "")
+                lines.append(f"- 日期: {dt} | 持股占比A股: {ratio}% | 增持股数: {add_cnt} | 增持资金: {add_val}元")
+
+            res = DataResult(ok=True, data="\n".join(lines), source=source_name, title=title)
+            return res.to_prompt()
+        except Exception as exc:
+            res = DataResult(ok=False, data=None, error=f"{type(exc).__name__}: {exc}", source=source_name, title=title)
+            return res.to_prompt()

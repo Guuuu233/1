@@ -7,6 +7,11 @@ services:
       - "8001:8000"
     volumes:
       - ./data:/app/data
+      - ./api:/app/api
+      - ./tradingagents:/app/tradingagents
+      - ./frontend/dist:/app/frontend/dist
+      - ./tests:/app/tests
+      - ./scripts:/app/scripts
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
