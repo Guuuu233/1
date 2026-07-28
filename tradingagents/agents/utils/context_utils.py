@@ -278,7 +278,7 @@ def build_agent_context_view(state: Mapping[str, Any], role: str) -> dict[str, s
 def _build_cn_market_context(trade_date: str, now: datetime | None = None) -> dict[str, Any]:
     now_dt = (now or datetime.now(CN_TZ)).astimezone(CN_TZ)
     today = now_dt.date().strftime("%Y-%m-%d")
-    is_trade_day = is_cn_trading_day(trade_date)
+    is_trade_day = is_cn_trading_day(trade_date, allow_weekday_fallback=True)
 
     if trade_date == today:
         market_session = cn_market_phase(now_dt)
@@ -353,7 +353,7 @@ def _determine_cn_analysis_mode(trade_date: str, today: str, market_session: str
             return "post_market"
         return "closed"
 
-    if trade_date == previous_cn_trading_day(today):
+    if trade_date == previous_cn_trading_day(today, allow_weekday_fallback=True):
         return "t_plus_1"
     if trade_date > today:
         return "forward_look"

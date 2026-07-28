@@ -1,13 +1,40 @@
 from __future__ import annotations
 
+import bisect
+import logging
 import re
-from datetime import date, datetime, time
-from functools import lru_cache
+import time
+from dataclasses import dataclass, field
+from datetime import date, datetime, time as dt_time
+from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 CN_TZ = ZoneInfo("Asia/Shanghai")
+
+logger = logging.getLogger(__name__)
+
+# If the newest cached trade day is older than the request by more than this
+# many calendar days, treat the calendar as unavailable (do not silently
+# snap far into the past).
+MAX_CALENDAR_STALENESS_DAYS = 10
+
+# Cache TTL for the sina trade-date table (seconds). Refresh at most once per day.
+_TRADE_DATE_TTL_SECONDS = 24 * 60 * 60
+_TRADE_DATES_CACHE: dict[str, Any] = {
+    "loaded_at": 0.0,
+    "dates": None,  # list[date] ascending
+    "dates_set": None,  # set[date]
+}
+
+
+class TradeCalendarUnavailableError(RuntimeError):
+    """Raised when the CN trade calendar cannot be loaded or has no usable dates."""
+
+
+class DateDataUnavailable(Exception):
+    """Raised by a date-scoped fetch when that specific day has no usable data yet."""
 
 
 def now_cn() -> datetime:
@@ -19,26 +46,81 @@ def cn_today_str() -> str:
 
 
 def _parse_date(date_str: str) -> date:
-    return datetime.strptime(date_str, "%Y-%m-%d").date()
+    text = str(date_str).strip()
+    if len(text) == 8 and text.isdigit():
+        text = f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return datetime.strptime(text, "%Y-%m-%d").date()
 
 
-@lru_cache(maxsize=1)
-def _load_cn_trade_dates() -> tuple[list[date], set[date]]:
-    try:
-        import akshare as ak  # type: ignore
+def _format_date(d: date) -> str:
+    return d.strftime("%Y-%m-%d")
 
-        df = ak.tool_trade_date_hist_sina()
-        if df is None or df.empty or "trade_date" not in df.columns:
-            raise ValueError("empty trade date table")
-        dates = sorted(
+
+def clear_cn_trade_date_cache() -> None:
+    """Test helper: drop the in-process trade-date cache."""
+    _TRADE_DATES_CACHE["loaded_at"] = 0.0
+    _TRADE_DATES_CACHE["dates"] = None
+    _TRADE_DATES_CACHE["dates_set"] = None
+
+
+def _fetch_cn_trade_dates_from_akshare() -> list[date]:
+    import akshare as ak  # type: ignore
+
+    df = ak.tool_trade_date_hist_sina()
+    if df is None or df.empty or "trade_date" not in df.columns:
+        raise TradeCalendarUnavailableError(
+            "交易日历不可用：akshare.tool_trade_date_hist_sina 返回空表"
+        )
+    dates = sorted(
+        {
             pd_dt.date()
             for pd_dt in pd.to_datetime(df["trade_date"], errors="coerce")
             if str(pd_dt) != "NaT"
+        }
+    )
+    if not dates:
+        raise TradeCalendarUnavailableError(
+            "交易日历不可用：akshare.tool_trade_date_hist_sina 无有效日期"
         )
-        return dates, set(dates)
+    return dates
+
+
+def _load_cn_trade_dates() -> tuple[list[date], set[date]]:
+    """Load/cached CN trading dates. On total failure returns empty containers.
+
+    Callers that must not silently degrade (normalize / fallback) must check for
+    empty and raise :class:`TradeCalendarUnavailableError` themselves, or use
+    :func:`require_cn_trade_dates`.
+    """
+    now = time.time()
+    cached_dates = _TRADE_DATES_CACHE["dates"]
+    loaded_at = float(_TRADE_DATES_CACHE["loaded_at"] or 0.0)
+    if cached_dates is not None and (now - loaded_at) < _TRADE_DATE_TTL_SECONDS:
+        return cached_dates, _TRADE_DATES_CACHE["dates_set"]
+
+    try:
+        dates = _fetch_cn_trade_dates_from_akshare()
     except Exception:
-        # Fallback: no holiday calendar, only weekend rule.
+        # Keep serving a previously successful calendar past TTL if present.
+        if cached_dates is not None:
+            return cached_dates, _TRADE_DATES_CACHE["dates_set"]
         return [], set()
+
+    dates_set = set(dates)
+    _TRADE_DATES_CACHE["dates"] = dates
+    _TRADE_DATES_CACHE["dates_set"] = dates_set
+    _TRADE_DATES_CACHE["loaded_at"] = now
+    return dates, dates_set
+
+
+def require_cn_trade_dates() -> tuple[list[date], set[date]]:
+    """Return the CN trade calendar or raise an explicit unavailable error."""
+    dates, dates_set = _load_cn_trade_dates()
+    if not dates:
+        raise TradeCalendarUnavailableError(
+            "交易日历不可用：无法从 akshare.tool_trade_date_hist_sina 加载有效交易日"
+        )
+    return dates, dates_set
 
 
 def is_cn_symbol(symbol: str) -> bool:
@@ -46,36 +128,219 @@ def is_cn_symbol(symbol: str) -> bool:
     return bool(re.match(r"^\d{6}(\.(SH|SZ|SS))?$", s))
 
 
-def is_cn_trading_day(date_str: str) -> bool:
+def is_cn_trading_day(date_str: str, allow_weekday_fallback: bool = False) -> bool:
+    """Return whether ``date_str`` is a CN trading day.
+
+    When the trade calendar cannot be loaded:
+    - ``allow_weekday_fallback=False`` (default): hard-fail with
+      :class:`TradeCalendarUnavailableError`. Date-query paths must not silently
+      treat Mon–Fri as trading days (Spring Festival / National Day gaps).
+    - ``allow_weekday_fallback=True``: degrade to weekday rule and emit a WARNING.
+      Call sites that opt in must pass True explicitly so the choice is visible.
+    """
     d = _parse_date(date_str)
     dates, dates_set = _load_cn_trade_dates()
     if dates:
         return d in dates_set
-    return d.weekday() < 5
+    if allow_weekday_fallback:
+        logger.warning(
+            "CN trade calendar unavailable; is_cn_trading_day(%s) using Mon-Fri fallback",
+            date_str,
+        )
+        return d.weekday() < 5
+    raise TradeCalendarUnavailableError(
+        "交易日历不可用：无法判断是否为交易日（is_cn_trading_day）"
+    )
 
 
-def previous_cn_trading_day(date_str: str) -> str:
+def previous_cn_trading_day(
+    date_str: str, allow_weekday_fallback: bool = False
+) -> str:
+    """Return the latest trading day strictly before ``date_str``.
+
+    Soft Mon–Fri rollback only when ``allow_weekday_fallback=True`` (explicit).
+    """
     d = _parse_date(date_str)
     dates, _ = _load_cn_trade_dates()
     if dates:
-        idx = 0
-        # 找到首个 >= d 的位置
-        lo, hi = 0, len(dates)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if dates[mid] < d:
-                lo = mid + 1
-            else:
-                hi = mid
-        idx = lo - 1
+        idx = bisect.bisect_left(dates, d) - 1
         if idx >= 0:
-            return dates[idx].strftime("%Y-%m-%d")
-    # Fallback to weekend-only rollback
+            return _format_date(dates[idx])
+        if not allow_weekday_fallback:
+            raise TradeCalendarUnavailableError(
+                f"交易日历不可用：无不早于 {_format_date(d)} 之前的交易日"
+            )
+    elif not allow_weekday_fallback:
+        raise TradeCalendarUnavailableError(
+            "交易日历不可用：无法计算前一交易日（previous_cn_trading_day）"
+        )
+
+    logger.warning(
+        "CN trade calendar unavailable or exhausted; previous_cn_trading_day(%s) using Mon-Fri fallback",
+        date_str,
+    )
     cur = d
     while True:
-        cur = cur.fromordinal(cur.toordinal() - 1)
+        cur = date.fromordinal(cur.toordinal() - 1)
         if cur.weekday() < 5:
-            return cur.strftime("%Y-%m-%d")
+            return _format_date(cur)
+
+
+def _ensure_calendar_not_stale_for(request_day: date, dates: list[date]) -> None:
+    """Reject a calendar whose newest day is too far before the request date."""
+    if not dates:
+        raise TradeCalendarUnavailableError("交易日历不可用：无有效交易日")
+    newest = dates[-1]
+    lag = (request_day - newest).days
+    if lag > MAX_CALENDAR_STALENESS_DAYS:
+        raise TradeCalendarUnavailableError(
+            "交易日历不可用：缓存最新交易日为 "
+            f"{_format_date(newest)}，早于请求日 {_format_date(request_day)} "
+            f"{lag} 个自然日（阈值 {MAX_CALENDAR_STALENESS_DAYS}）"
+        )
+
+
+def normalize_to_trading_day(date_str: str) -> str:
+    """Snap ``date_str`` to the latest trading day on or before it.
+
+    Never rounds forward (would leak future data into historical backtests).
+    Raises :class:`TradeCalendarUnavailableError` if the calendar cannot be loaded,
+    or if the newest cached trade day is more than
+    :data:`MAX_CALENDAR_STALENESS_DAYS` before the request date.
+    """
+    d = _parse_date(date_str)
+    dates, dates_set = require_cn_trade_dates()
+    _ensure_calendar_not_stale_for(d, dates)
+    if d in dates_set:
+        result = d
+    else:
+        idx = bisect.bisect_right(dates, d) - 1
+        if idx < 0:
+            raise TradeCalendarUnavailableError(
+                f"交易日历不可用：无不晚于 {_format_date(d)} 的交易日"
+            )
+        result = dates[idx]
+
+    if result > d:
+        raise AssertionError(
+            f"normalize_to_trading_day must not round forward: input={_format_date(d)} result={_format_date(result)}"
+        )
+    assert result <= d, "normalize_to_trading_day invariant: result <= input"
+    return _format_date(result)
+
+
+def trading_days_back(
+    date_str: str,
+    count: int,
+    *,
+    start_offset: int = 0,
+) -> list[str]:
+    """Return ``count`` trading days ending at normalize(date) - start_offset, newest first."""
+    if count <= 0:
+        raise ValueError(f"trading_days_back: count must be positive, got {count!r}")
+    if start_offset < 0:
+        raise ValueError(f"trading_days_back: start_offset must be >= 0, got {start_offset!r}")
+
+    dates, _ = require_cn_trade_dates()
+    base = _parse_date(normalize_to_trading_day(date_str))
+    end_idx = bisect.bisect_left(dates, base)
+    if end_idx >= len(dates) or dates[end_idx] != base:
+        # base must be in the calendar after normalize
+        end_idx = bisect.bisect_right(dates, base) - 1
+    end_idx -= start_offset
+    if end_idx < 0:
+        raise TradeCalendarUnavailableError(
+            f"交易日历不可用：从 {date_str} 回退 start_offset={start_offset} 后无交易日"
+        )
+    start_idx = max(0, end_idx - count + 1)
+    window = dates[start_idx : end_idx + 1]
+    return [_format_date(x) for x in reversed(window)]
+
+
+@dataclass
+class DateFetchResult:
+    ok: bool
+    data: Any = None
+    as_of: Optional[str] = None
+    request_date: Optional[str] = None
+    attempted: list[str] = field(default_factory=list)
+    error: Optional[str] = None
+
+    def date_header(self) -> str:
+        """LLM-visible actual data date, including rollback note when needed."""
+        if not self.as_of:
+            return ""
+        req = self.request_date or self.as_of
+        if self.as_of == req:
+            return f"【数据日期】{self.as_of}"
+        return (
+            f"【数据日期】{self.as_of}"
+            f"（请求 {req}，该日数据尚未发布，已回退）"
+        )
+
+
+def fetch_with_date_fallback(
+    fetch_fn: Callable[[str], Any],
+    date_str: str,
+    *,
+    max_back: int = 5,
+    start_offset: int = 0,
+) -> DateFetchResult:
+    """Try ``fetch_fn(day)`` over a backward trading-day window.
+
+    ``fetch_fn`` should return data on success and raise
+    :class:`DateDataUnavailable` (or any Exception) when that day should be
+    skipped. All failures produce an error that includes the attempted range.
+    """
+    request_date = _format_date(_parse_date(date_str))
+    try:
+        candidates = trading_days_back(
+            request_date, max_back, start_offset=start_offset
+        )
+    except TradeCalendarUnavailableError as exc:
+        return DateFetchResult(
+            ok=False,
+            request_date=request_date,
+            error=str(exc),
+        )
+    except Exception as exc:
+        return DateFetchResult(
+            ok=False,
+            request_date=request_date,
+            error=f"交易日历不可用：{type(exc).__name__}: {exc}",
+        )
+
+    last_err: Optional[str] = None
+    attempted: list[str] = []
+    for day in candidates:
+        attempted.append(day)
+        try:
+            data = fetch_fn(day)
+            return DateFetchResult(
+                ok=True,
+                data=data,
+                as_of=day,
+                request_date=request_date,
+                attempted=attempted,
+            )
+        except DateDataUnavailable as exc:
+            last_err = str(exc) or type(exc).__name__
+            continue
+        except Exception as exc:
+            last_err = f"{type(exc).__name__}: {exc}"
+            continue
+
+    first = attempted[0] if attempted else request_date
+    last = attempted[-1] if attempted else request_date
+    detail = f"：{last_err}" if last_err else ""
+    return DateFetchResult(
+        ok=False,
+        request_date=request_date,
+        attempted=attempted,
+        error=(
+            f"已尝试 {first} 至 {last} 共 {len(attempted)} 个交易日，均无数据{detail}"
+        ),
+    )
 
 
 def cn_market_phase(now: datetime | None = None) -> str:
@@ -86,23 +351,23 @@ def cn_market_phase(now: datetime | None = None) -> str:
         now_dt = now_dt.astimezone(CN_TZ)
 
     today = now_dt.date().strftime("%Y-%m-%d")
-    if not is_cn_trading_day(today):
+    if not is_cn_trading_day(today, allow_weekday_fallback=True):
         return "closed"
 
     t = now_dt.time()
-    if t < time(9, 30):
+    if t < dt_time(9, 30):
         return "pre_open"
-    if time(9, 30) <= t < time(11, 30):
+    if dt_time(9, 30) <= t < dt_time(11, 30):
         return "in_session"
-    if time(11, 30) <= t < time(13, 0):
+    if dt_time(11, 30) <= t < dt_time(13, 0):
         return "lunch_break"
-    if time(13, 0) <= t < time(15, 0):
+    if dt_time(13, 0) <= t < dt_time(15, 0):
         return "in_session"
     return "post_close"
 
 
 def cn_no_data_reason(date_str: str) -> str:
-    if not is_cn_trading_day(date_str):
+    if not is_cn_trading_day(date_str, allow_weekday_fallback=True):
         return "N/A：非交易日（A股休市）"
 
     today = cn_today_str()

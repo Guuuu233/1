@@ -9,7 +9,14 @@ import pandas as pd
 from stockstats import wrap
 
 from .base import BaseMarketDataProvider, DataResult
-from ..trade_calendar import cn_market_phase, cn_no_data_reason, cn_today_str, is_cn_trading_day
+from ..trade_calendar import (
+    DateDataUnavailable,
+    cn_market_phase,
+    cn_no_data_reason,
+    cn_today_str,
+    fetch_with_date_fallback,
+    is_cn_trading_day,
+)
 from ..utils import chronological, take_latest
 
 
@@ -403,7 +410,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             today = pd.to_datetime(cn_today_str())
             if end_dt.normalize() < today:
                 return hist_df
-            if not is_cn_trading_day(today.strftime("%Y-%m-%d")):
+            if not is_cn_trading_day(today.strftime("%Y-%m-%d"), allow_weekday_fallback=True):
                 return hist_df
 
             has_today = False
@@ -981,44 +988,110 @@ class CnAkshareProvider(BaseMarketDataProvider):
         """获取龙虎榜数据，非异动日返回空提示（属正常）。
 
         注意：此接口依赖 akshare，可能因东方财富 API 变化而暂时不可用。
+        查询日先规整到交易日，并向前回退以覆盖发布延迟。
         """
-        try:
-            ak = self._ak()
-            code = self._normalize_symbol(symbol)
-            # stock_lhb_detail_em 不接受 symbol 参数，返回全市场数据；日期需去掉短横线
-            date_fmt = date.replace("-", "")
-            with AKSHARE_CALL_LOCK:
-                df = ak.stock_lhb_detail_em(start_date=date_fmt, end_date=date_fmt)
+        source_name = "akshare.stock_lhb_detail_em"
+        title = "龙虎榜明细"
+        request_date = date or cn_today_str()
+        code = self._normalize_symbol(symbol)
+        ak = self._ak()
+
+        def _fetch_one(day: str):
+            date_fmt = day.replace("-", "")
+            try:
+                with AKSHARE_CALL_LOCK:
+                    df = ak.stock_lhb_detail_em(start_date=date_fmt, end_date=date_fmt)
+            except TypeError as exc:
+                # akshare 当日数据未更新时，data_json["result"] 为 None
+                raise DateDataUnavailable(f"{day} 龙虎榜数据尚未更新") from exc
             if df is None or df.empty:
-                return f"{date} 全市场无龙虎榜数据。"
-            # 手动过滤指定股票
+                raise DateDataUnavailable(f"{day} 全市场无龙虎榜数据")
             if "代码" in df.columns:
-                df = df[df["代码"] == code]
-            if df.empty:
-                return f"{symbol} 在 {date} 无龙虎榜数据（非异动日属正常）。"
-            return f"{symbol} 龙虎榜明细（{date}）：\n{df.head(20).to_string(index=False)}"
-        except TypeError as exc:
-            # akshare 当日数据未更新时，data_json["result"] 为 None
-            return f"{date} 龙虎榜数据尚未更新（通常发生在盘中查询当日数据）。"
-        except Exception as exc:
-            return f"龙虎榜数据获取失败（akshare 接口异常）：{type(exc).__name__}"
+                stock_df = df[df["代码"].astype(str).str.zfill(6) == code.zfill(6)]
+            else:
+                stock_df = df
+            if stock_df is None or stock_df.empty:
+                # 有全市场榜但该票未上榜：属正常，不继续回退
+                return f"{symbol} 在 {day} 无龙虎榜数据（非异动日属正常）。"
+            return (
+                f"{symbol} 龙虎榜明细（{day}）：\n"
+                f"{stock_df.head(20).to_string(index=False)}"
+            )
+
+        result = fetch_with_date_fallback(
+            _fetch_one, request_date, max_back=5, start_offset=0
+        )
+        if not result.ok:
+            res = DataResult(
+                ok=False,
+                data=None,
+                error=f"龙虎榜数据获取失败：{result.error}",
+                source=source_name,
+                title=title,
+                as_of=None,
+            )
+            return res.to_prompt()
+
+        body = str(result.data)
+        header = result.date_header()
+        msg = f"{header}\n{body}" if header else body
+        res = DataResult(
+            ok=True,
+            data=msg,
+            source=source_name,
+            title=title,
+            as_of=result.as_of,
+        )
+        return res.to_prompt()
 
     def get_zt_pool(self, date: str) -> str:
-        """获取涨停板情绪池，反映市场整体情绪温度。"""
-        try:
-            ak = self._ak()
-            with AKSHARE_CALL_LOCK:
-                df = ak.stock_zt_pool_em(date=date.replace("-", ""))
+        """获取涨停板情绪池，反映市场整体情绪温度。
+
+        查询日先规整到交易日，并向前回退以覆盖发布延迟；注入文本必须写明实际数据日。
+        """
+        source_name = "akshare.stock_zt_pool_em"
+        title = "涨停板情绪池"
+        request_date = date or cn_today_str()
+        ak = self._ak()
+
+        def _fetch_one(day: str):
+            try:
+                with AKSHARE_CALL_LOCK:
+                    df = ak.stock_zt_pool_em(date=day.replace("-", ""))
+            except Exception as exc:
+                raise DateDataUnavailable(f"{type(exc).__name__}: {exc}") from exc
             if df is None or df.empty:
-                return f"{date} 涨停板情绪池数据暂不可用。"
+                raise DateDataUnavailable(f"{day} 涨停板情绪池暂无数据")
             count = len(df)
-            result = f"{date} 涨停家数：{count}\n"
+            body = f"{day} 涨停家数：{count}\n"
             if "连板数" in df.columns:
                 lianban = df["连板数"].value_counts().sort_index()
-                result += f"连板分布：\n{lianban.head(10).to_string()}"
-            return result
-        except Exception as exc:
-            return f"涨停板情绪池数据获取失败：{type(exc).__name__}: {exc}"
+                body += f"连板分布：\n{lianban.head(10).to_string()}"
+            return body
+
+        result = fetch_with_date_fallback(
+            _fetch_one, request_date, max_back=5, start_offset=0
+        )
+        if not result.ok:
+            res = DataResult(
+                ok=False,
+                data=None,
+                error=f"涨停板情绪池数据获取失败：{result.error}",
+                source=source_name,
+                title=title,
+            )
+            return res.to_prompt()
+
+        header = result.date_header()
+        msg = f"{header}\n{result.data}" if header else str(result.data)
+        res = DataResult(
+            ok=True,
+            data=msg,
+            source=source_name,
+            title=title,
+            as_of=result.as_of,
+        )
+        return res.to_prompt()
 
     def get_hot_stocks_xq(self) -> str:
         """获取雪球热搜股票，反映散户关注度。"""
@@ -1210,41 +1283,78 @@ class CnAkshareProvider(BaseMarketDataProvider):
             return res.to_prompt()
 
     def get_margin_trading(self, symbol: str, curr_date: str = None) -> str:
-        """获取融资融券交易明细。"""
+        """获取融资融券交易明细。
+
+        查询日先规整到交易日；融资融券明细有发布延迟，默认至少回退 1 个交易日
+        起查，并在窗口内继续向前尝试。实际数据日写入 as_of 与正文【数据日期】。
+        """
         source_name = "akshare.stock_margin_detail_sse/szse"
         title = "融资融券交易"
-        try:
-            code = self._normalize_symbol(symbol)
-            ak = self._ak()
+        request_date = curr_date or cn_today_str()
+        code = self._normalize_symbol(symbol)
+        ak = self._ak()
 
-            target_date = (curr_date or datetime.now().strftime("%Y-%m-%d")).replace("-", "")
-
-            with AKSHARE_CALL_LOCK:
-                if code.startswith("6"):
-                    df = ak.stock_margin_detail_sse(date=target_date)
-                else:
-                    df = ak.stock_margin_detail_szse(date=target_date)
+        def _fetch_one(day: str):
+            date_fmt = day.replace("-", "")
+            try:
+                with AKSHARE_CALL_LOCK:
+                    if code.startswith("6"):
+                        df = ak.stock_margin_detail_sse(date=date_fmt)
+                    else:
+                        df = ak.stock_margin_detail_szse(date=date_fmt)
+            except Exception as exc:
+                # 空表赋列名等 akshare 内部 ValueError 视为该日无数据
+                raise DateDataUnavailable(f"{type(exc).__name__}: {exc}") from exc
 
             if df is None or df.empty:
-                res = DataResult(ok=True, data=None, source=source_name, title=title)
-                return res.to_prompt()
+                raise DateDataUnavailable(f"{day} 融资融券明细为空")
 
-            stock_df = df[df["标的证券代码"].astype(str).str.zfill(6) == code.zfill(6)]
-            if stock_df.empty:
-                res = DataResult(ok=True, data="【融资融券】该日暂无融资融券异动明细。", source=source_name, title=title)
-                return res.to_prompt()
+            code_col = None
+            for cand in ("标的证券代码", "证券代码", "股票代码", "代码"):
+                if cand in df.columns:
+                    code_col = cand
+                    break
+            if code_col is None:
+                raise DateDataUnavailable(f"{day} 融资融券明细缺少证券代码列")
+
+            stock_df = df[df[code_col].astype(str).str.zfill(6) == code.zfill(6)]
+            if stock_df is None or stock_df.empty:
+                # 全市场有表但该票无明细：视为该日已发布、标的无记录，停止回退
+                return f"【融资融券】{day} 暂无该标的融资融券明细。"
 
             row = stock_df.iloc[0]
             rzye = row.get("融资余额", "0")
             rzbuy = row.get("融资买入额", "0")
             rqyl = row.get("融券余量", "0")
+            return (
+                f"【融资融券数据】日期: {day} | 融资余额: {rzye} 元"
+                f" | 融资买入额: {rzbuy} 元 | 融券余量: {rqyl}"
+            )
 
-            msg = f"【融资融券数据】日期: {target_date} | 融资余额: {rzye} 元 | 融资买入额: {rzbuy} 元 | 融券余量: {rqyl}"
-            res = DataResult(ok=True, data=msg, source=source_name, title=title)
+        # 从规整后的交易日起查；融资融券常有 1 日发布延迟，窗口内向前回退
+        result = fetch_with_date_fallback(
+            _fetch_one, request_date, max_back=5, start_offset=0
+        )
+        if not result.ok:
+            res = DataResult(
+                ok=False,
+                data=None,
+                error=f"融资融券数据获取失败：{result.error}",
+                source=source_name,
+                title=title,
+            )
             return res.to_prompt()
-        except Exception as exc:
-            res = DataResult(ok=False, data=None, error=f"{type(exc).__name__}: {exc}", source=source_name, title=title)
-            return res.to_prompt()
+
+        header = result.date_header()
+        msg = f"{header}\n{result.data}" if header else str(result.data)
+        res = DataResult(
+            ok=True,
+            data=msg,
+            source=source_name,
+            title=title,
+            as_of=result.as_of,
+        )
+        return res.to_prompt()
 
     def get_northbound_flow(self, symbol: str, curr_date: str = None) -> str:
         """北向/陆股通个股每日持股明细已制度性停更，不再请求网络。

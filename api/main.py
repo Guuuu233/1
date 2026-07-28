@@ -112,9 +112,10 @@ def _report_version_stats() -> None:
 
 def _resolve_scheduled_trade_date(trade_date: str) -> str:
     """Use the requested trading day, or fall back to the latest CN trading day."""
-    from tradingagents.dataflows.trade_calendar import is_cn_trading_day, previous_cn_trading_day
+    from tradingagents.dataflows.trade_calendar import normalize_to_trading_day
 
-    return trade_date if is_cn_trading_day(trade_date) else previous_cn_trading_day(trade_date)
+    # Hard calendar path: never silently treat Mon-Fri as trading days.
+    return normalize_to_trading_day(trade_date)
 
 
 def _build_scheduled_analyze_request(

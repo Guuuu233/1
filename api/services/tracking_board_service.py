@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_tracking_board(db: Session, user_id: str) -> dict[str, Any]:
-    previous_trade_date = previous_cn_trading_day(cn_today_str())
+    previous_trade_date = previous_cn_trading_day(cn_today_str(), allow_weekday_fallback=True)
     rows = _list_imported_position_rows(db, user_id)
     symbols = [row.symbol for row in rows]
     quotes = _fetch_live_quotes(symbols)
