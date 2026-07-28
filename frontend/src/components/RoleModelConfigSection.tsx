@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from 'react'
 import {
     Users,
     Cpu,
+    Plus,
         AlertTriangle,
     Check,
     Loader2,
@@ -79,7 +80,12 @@ const ROLE_GROUPS = [
     },
 ]
 
-export default function RoleModelConfigSection() {
+interface RoleModelConfigSectionProps {
+    fetchedModels?: string[]
+    onRefreshRequired?: () => void
+}
+
+export default function RoleModelConfigSection({ fetchedModels = [] }: RoleModelConfigSectionProps) {
     const [loading, setLoading] = useState(false)
     const [saving, setSaving] = useState(false)
     const [presetLoading, setPresetLoading] = useState(false)
@@ -94,6 +100,8 @@ export default function RoleModelConfigSection() {
     // Draft role bindings state: role_key -> profile_id (empty string means inherit)
     const [draftBindings, setDraftBindings] = useState<Record<string, string>>({})
     const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({})
+    const [newCustomModel, setNewCustomModel] = useState('')
+    const [addingCustomModel, setAddingCustomModel] = useState(false)
 
     // Heterogeneous selection modal/inline states for Presets
     const [selectedPreset, setSelectedPreset] = useState<'single' | 'bull_bear_hetero' | 'three_way_hetero'>('single')
@@ -135,6 +143,37 @@ export default function RoleModelConfigSection() {
     useEffect(() => {
         fetchData()
     }, [])
+
+    useEffect(() => {
+        if (fetchedModels && fetchedModels.length > 0) {
+            api.syncModelProfiles(fetchedModels)
+                .then((updatedProfiles) => {
+                    setProfiles(updatedProfiles)
+                })
+                .catch((err) => console.warn('Failed auto sync fetched models', err))
+        }
+    }, [fetchedModels])
+
+    const handleAddCustomModel = async () => {
+        const trimmed = newCustomModel.trim()
+        if (!trimmed) return
+        setAddingCustomModel(true)
+        setError(null)
+        try {
+            await api.createModelProfile({
+                model_name: trimmed,
+                display_name: trimmed,
+            })
+            setNewCustomModel('')
+            setSuccessMsg("模型 Profile 已成功添加")
+            await fetchData()
+        } catch (err: any) {
+            setError(err.message || '创建模型 Profile 失败')
+        } finally {
+            setAddingCustomModel(false)
+        }
+    }
+
 
     const handleSaveBindings = async () => {
         setSaving(true)
@@ -238,6 +277,54 @@ export default function RoleModelConfigSection() {
                     <span>{successMsg}</span>
                 </div>
             )}
+
+            {/* Info Banner explaining global defaults vs per-role overrides */}
+            <div className="flex items-start gap-3 rounded-xl border border-blue-200/80 bg-blue-50/80 p-4 text-xs text-blue-900 dark:border-blue-900/50 dark:bg-blue-950/30 dark:text-blue-200">
+                <Info className="mt-0.5 w-4 h-4 shrink-0 text-blue-500" />
+                <div className="space-y-1.5 leading-relaxed">
+                    <div className="font-semibold text-sm text-blue-950 dark:text-blue-100 flex items-center gap-1.5">
+                        💡 常规/推理模型 与 分角色模型 协同工作说明（无冲突）
+                    </div>
+                    <p>
+                        • <strong>常规模型 / 推理模型</strong>（设置页面上方）：作为<span className="font-semibold underline">全局默认兜底模型</span>。未单独指定角色的分析师将自动使用这里的模型。
+                    </p>
+                    <p>
+                        • <strong>分角色模型</strong>（本区域下方）：用于为特定角色（如多头研究员、空头研究员）<span className="font-semibold underline">单独指定模型</span>（例如 Gemini、DeepSeek、Qwen）。选“继承 Tier 默认”则自动沿用常规/推理模型。
+                    </p>
+                    <p className="text-blue-700 dark:text-blue-300 font-medium">
+                        两者层级分明、互为补充：全局默认兜底，角色精准覆盖，没有任何冲突！
+                    </p>
+                </div>
+            </div>
+
+            {/* Quick Custom Model Add Form */}
+            <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-xl border border-slate-200/80 bg-slate-50/80 dark:border-slate-800 dark:bg-slate-900/50">
+                <div className="flex items-center gap-2">
+                    <Plus className="w-4 h-4 text-indigo-500" />
+                    <span className="text-xs text-slate-700 dark:text-slate-300 font-medium">
+                        手动添加/扩充模型 Profile：
+                    </span>
+                </div>
+                <div className="flex items-center gap-2 flex-1 max-w-md">
+                    <input
+                        type="text"
+                        value={newCustomModel}
+                        onChange={(e) => setNewCustomModel(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && handleAddCustomModel()}
+                        placeholder="输入模型 ID (如 gemini-2.5-flash 或 claude-3-5-sonnet)"
+                        className="text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 w-full text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    />
+                    <button
+                        type="button"
+                        onClick={handleAddCustomModel}
+                        disabled={addingCustomModel || !newCustomModel.trim()}
+                        className="btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1 shrink-0 disabled:opacity-50"
+                    >
+                        {addingCustomModel ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                        添加模型 Profile
+                    </button>
+                </div>
+            </div>
 
             {/* Section 1: Quick Presets */}
             <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50 p-4 space-y-3">

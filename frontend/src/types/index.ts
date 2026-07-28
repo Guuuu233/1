@@ -740,9 +740,9 @@ export interface ModelProfile {
 }
 
 export interface ModelProfileCreatePayload {
-    provider_id: string
+    provider_id?: string
     model_name: string
-    display_name: string
+    display_name?: string
     temperature?: number | null
     max_tokens?: number | null
     extra_params?: Record<string, any> | null

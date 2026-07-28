@@ -289,6 +289,11 @@ export default function Settings() {
                 if (res.models.length > 0) {
                     if (!quickThinkLlm) setQuickThinkLlm(res.models[0])
                     if (!deepThinkLlm) setDeepThinkLlm(res.models[0])
+                    try {
+                        await api.syncModelProfiles(res.models)
+                    } catch (syncErr) {
+                        console.warn('Sync fetched models profile error', syncErr)
+                    }
                 }
             } else {
                 setFetchModelsError(res.error || '获取模型列表失败')
@@ -626,7 +631,7 @@ export default function Settings() {
                 </div>
             </div>
 
-            <RoleModelConfigSection />
+            <RoleModelConfigSection fetchedModels={fetchedModels} />
 
             <div className="card space-y-4">
                 <div className="flex items-center gap-2">

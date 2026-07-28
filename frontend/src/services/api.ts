@@ -371,6 +371,13 @@ class ApiService {
         })
     }
 
+    async syncModelProfiles(models: string[], providerId?: string): Promise<ModelProfile[]> {
+        return this.request<ModelProfile[]>('/v1/model-profiles/sync', {
+            method: 'POST',
+            body: JSON.stringify({ models, provider_id: providerId }),
+        })
+    }
+
     async getModelProfiles(): Promise<ModelProfile[]> {
         return this.request<ModelProfile[]>('/v1/model-profiles')
     }

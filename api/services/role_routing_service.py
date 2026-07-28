@@ -410,12 +410,73 @@ def list_model_profiles(db: Session, user_id: str) -> List[Dict[str, Any]]:
     return res
 
 
+def sync_model_profiles_from_names(
+    db: Session,
+    user_id: str,
+    model_names: List[str],
+    provider_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Batch ensure ModelProfiles exist for a list of model names for the user."""
+    migrate_legacy_user_llm_config(db, user_id)
+    if not provider_id:
+        prov = (
+            db.query(ProviderDB)
+            .filter(ProviderDB.user_id == user_id, ProviderDB.enabled == True)
+            .first()
+            or db.query(ProviderDB).filter(ProviderDB.user_id == user_id).first()
+        )
+        if not prov:
+            now = _utcnow()
+            prov = ProviderDB(
+                id=uuid4().hex,
+                user_id=user_id,
+                provider_type="openai",
+                base_url=None,
+                display_name="默认厂商",
+                enabled=True,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(prov)
+            db.commit()
+            db.refresh(prov)
+        provider_id = prov.id
+
+    existing_profiles = db.query(ModelProfileDB).filter(ModelProfileDB.user_id == user_id).all()
+    existing_names = {p.model_name for p in existing_profiles}
+
+    now = _utcnow()
+    added = False
+    for m in model_names:
+        m_clean = (m or "").strip()
+        if m_clean and m_clean not in existing_names:
+            profile_id = uuid4().hex
+            new_profile = ModelProfileDB(
+                id=profile_id,
+                user_id=user_id,
+                provider_id=provider_id,
+                model_name=m_clean,
+                display_name=f"{m_clean}",
+                is_default=False,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(new_profile)
+            existing_names.add(m_clean)
+            added = True
+
+    if added:
+        db.commit()
+
+    return list_model_profiles(db, user_id)
+
+
 def create_model_profile(
     db: Session,
     user_id: str,
-    provider_id: str,
     model_name: str,
-    display_name: str,
+    display_name: Optional[str] = None,
+    provider_id: Optional[str] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     extra_params: Optional[Dict[str, Any]] = None,
@@ -423,6 +484,29 @@ def create_model_profile(
     is_default: bool = False,
 ) -> Dict[str, Any]:
     now = _utcnow()
+    migrate_legacy_user_llm_config(db, user_id)
+    if not provider_id:
+        prov = (
+            db.query(ProviderDB)
+            .filter(ProviderDB.user_id == user_id, ProviderDB.enabled == True)
+            .first()
+            or db.query(ProviderDB).filter(ProviderDB.user_id == user_id).first()
+        )
+        if not prov:
+            prov = ProviderDB(
+                id=uuid4().hex,
+                user_id=user_id,
+                provider_type="openai",
+                display_name="默认厂商",
+                enabled=True,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(prov)
+            db.commit()
+            db.refresh(prov)
+        provider_id = prov.id
+
     profile_id = uuid4().hex
 
     if is_default:

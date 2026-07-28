@@ -915,10 +915,14 @@ class ProviderResponse(BaseModel):
     updated_at: Optional[datetime] = None
 
 
+class ModelProfilesSyncRequest(BaseModel):
+    models: List[str]
+    provider_id: Optional[str] = None
+
 class ModelProfileCreateRequest(BaseModel):
-    provider_id: str
+    provider_id: Optional[str] = None
     model_name: str
-    display_name: str
+    display_name: Optional[str] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     extra_params: Optional[Dict[str, Any]] = None
@@ -4049,7 +4053,7 @@ def create_user_provider(
         db,
         current_user.id,
         provider_type=body.provider_type,
-        display_name=body.display_name,
+        display_name=body.display_name or body.model_name,
         base_url=body.base_url,
         api_key=body.api_key,
         enabled=body.enabled,
@@ -4067,7 +4071,7 @@ def update_user_provider(
         db,
         current_user.id,
         provider_id,
-        display_name=body.display_name,
+        display_name=body.display_name or body.model_name,
         base_url=body.base_url,
         api_key=body.api_key,
         enabled=body.enabled,
@@ -4090,6 +4094,16 @@ def delete_user_provider(
     return {"status": "ok", "deleted_provider_id": provider_id}
 
 
+@app.post("/v1/model-profiles/sync", response_model=List[ModelProfileResponse])
+def sync_user_model_profiles(
+    body: ModelProfilesSyncRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    return role_routing_service.sync_model_profiles_from_names(
+        db, current_user.id, body.models, body.provider_id
+    )
+
 @app.get("/v1/model-profiles", response_model=List[ModelProfileResponse])
 def get_user_model_profiles(
     db: Session = Depends(get_db),
@@ -4109,7 +4123,7 @@ def create_user_model_profile(
         current_user.id,
         provider_id=body.provider_id,
         model_name=body.model_name,
-        display_name=body.display_name,
+        display_name=body.display_name or body.model_name,
         temperature=body.temperature,
         max_tokens=body.max_tokens,
         extra_params=body.extra_params,
@@ -4131,7 +4145,7 @@ def update_user_model_profile(
         profile_id,
         provider_id=body.provider_id,
         model_name=body.model_name,
-        display_name=body.display_name,
+        display_name=body.display_name or body.model_name,
         temperature=body.temperature,
         max_tokens=body.max_tokens,
         extra_params=body.extra_params,
@@ -4390,6 +4404,11 @@ def fetch_available_models(
                         models_list.append(item)
 
             models_sorted = sorted(list(set(models_list)))
+            if models_sorted and current_user:
+                try:
+                    role_routing_service.sync_model_profiles_from_names(db, current_user.id, models_sorted)
+                except Exception as sync_err:
+                    print(f"[fetch_available_models] warning: auto-sync failed: {sync_err}")
             return {
                 "ok": True,
                 "models": models_sorted,
