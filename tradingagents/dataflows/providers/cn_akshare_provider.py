@@ -10,6 +10,7 @@ from stockstats import wrap
 
 from .base import BaseMarketDataProvider, DataResult
 from ..trade_calendar import cn_market_phase, cn_no_data_reason, cn_today_str, is_cn_trading_day
+from ..utils import chronological, take_latest
 
 
 # ── akshare 并发控制 ──
@@ -639,8 +640,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 if df.empty:
                     return f"No news found for {ticker} between {start_date} and {end_date}"
 
+                if date_col is not None:
+                    df = chronological(take_latest(df, date_col, 20), date_col)
+                else:
+                    df = df.head(20)
+
                 rows = []
-                for _, row in df.head(20).iterrows():
+                for _, row in df.iterrows():
                     title = str(row.get("新闻标题", row.get("标题", "No title")))
                     src = str(row.get("文章来源", row.get("来源", "Unknown")))
                     summary = str(row.get("新闻内容", row.get("内容", "")))
@@ -961,7 +967,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 df = ak.stock_individual_fund_flow(stock=code, market=market)
             if df is None or df.empty:
                 return f"{symbol} 近期主力资金流向数据暂不可用。"
-            df_recent = df.tail(5)
+            date_col = "日期" if "日期" in df.columns else None
+            if date_col is None:
+                return f"{symbol} 近期主力资金流向数据缺少日期列，无法判定最新记录。"
+            df_recent = chronological(take_latest(df, date_col, 5), date_col)
+            if df_recent is None or df_recent.empty:
+                return f"{symbol} 近期主力资金流向数据日期不可解析。"
             return f"{symbol} 近5日主力资金净流向：\n{df_recent.to_string(index=False)}"
         except Exception as exc:
             return f"个股资金流向数据获取失败：{type(exc).__name__}: {exc}"
@@ -1158,15 +1169,32 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 res = DataResult(ok=True, data=None, source=source_name, title=title)
                 return res.to_prompt()
 
-            # Truncate by curr_date if passed
-            if curr_date and "股东户数公告日期" in df.columns:
-                df = df[df["股东户数公告日期"].astype(str) <= curr_date]
+            # Truncate by curr_date if passed (datetime compare, not string)
+            date_col = "股东户数公告日期" if "股东户数公告日期" in df.columns else None
+            if curr_date and date_col:
+                cutoff = pd.to_datetime(curr_date, errors="coerce")
+                ann = pd.to_datetime(df[date_col], errors="coerce")
+                df = df[ann.notna() & (ann <= cutoff)]
 
             if df.empty:
                 res = DataResult(ok=True, data=None, source=source_name, title=title)
                 return res.to_prompt()
 
-            recent_df = df.head(4)
+            if not date_col:
+                res = DataResult(
+                    ok=False,
+                    data=None,
+                    error="缺少股东户数公告日期列，无法取最新记录",
+                    source=source_name,
+                    title=title,
+                )
+                return res.to_prompt()
+
+            # select latest N, then render oldest→newest for trend readability
+            recent_df = chronological(take_latest(df, date_col, 4), date_col)
+            if recent_df is None or recent_df.empty:
+                res = DataResult(ok=True, data=None, source=source_name, title=title)
+                return res.to_prompt()
             lines = [f"【股东户数与筹码集中度】最近 {len(recent_df)} 期户数变动："]
             for _, row in recent_df.iterrows():
                 dt = row.get("股东户数统计截止日", "")
@@ -1254,3 +1282,4 @@ class CnAkshareProvider(BaseMarketDataProvider):
         except Exception as exc:
             res = DataResult(ok=False, data=None, error=f"{type(exc).__name__}: {exc}", source=source_name, title=title)
             return res.to_prompt()
+
