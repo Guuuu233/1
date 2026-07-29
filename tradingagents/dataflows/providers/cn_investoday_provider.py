@@ -15,7 +15,7 @@ from stockstats import wrap
 
 from .base import BaseMarketDataProvider
 from ..config import get_config
-from ..trade_calendar import cn_no_data_reason
+from ..trade_calendar import cn_no_data_reason, snapshot_historical_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -585,7 +585,12 @@ class CnInvestodayProvider(BaseMarketDataProvider):
         if not code:
             raise NotImplementedError(f"cn_investoday 无法解析证券代码: {ticker}")
 
-        end_d = curr_date or datetime.now().strftime("%Y-%m-%d")
+        if not curr_date:
+            return (
+                f"【数据获取失败】{title_cn} 缺少 curr_date，"
+                "内部层不得默认今天，本项不可用。"
+            )
+        end_d = curr_date
         begin_d = (datetime.strptime(end_d, "%Y-%m-%d") - timedelta(days=365 * 8)).strftime(
             "%Y-%m-%d"
         )
@@ -624,8 +629,13 @@ class CnInvestodayProvider(BaseMarketDataProvider):
     def get_insider_transactions(self, symbol: str, curr_date: str = None) -> str:
         """高管持股变动：``GET /stock/exec-shrhld-chg``（口径异于全市场股东增减持）。
 
-        主路径用 datetime.now 写死区间，属当前快照/滚动窗口，历史分析直接拒绝。
+        curr_date 必填；当日路径以分析日为窗口终点，历史日期直接拒绝。
         """
+        if not curr_date:
+            return (
+                "【数据获取失败】高管持股变动缺少 curr_date，"
+                "内部层不得默认今天，本项不可用。"
+            )
         refusal = snapshot_historical_refusal(
             curr_date, source_label="高管持股变动（investoday，当前滚动窗口）"
         )
@@ -636,8 +646,10 @@ class CnInvestodayProvider(BaseMarketDataProvider):
         if not code:
             raise NotImplementedError(f"cn_investoday 无法解析证券代码: {symbol}")
 
-        end_d = datetime.now().strftime("%Y-%m-%d")
-        begin_d = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
+        end_d = curr_date
+        begin_d = (datetime.strptime(end_d, "%Y-%m-%d") - timedelta(days=730)).strftime(
+            "%Y-%m-%d"
+        )
         base_url = self._resolve_base_url()
         rows = self._fetch_paged_list(
             _EXEC_SHRHLD_CHG_PATH,

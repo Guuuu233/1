@@ -880,8 +880,14 @@ class CnAkshareProvider(BaseMarketDataProvider):
     def get_insider_transactions(self, symbol: str, curr_date: str = None) -> str:
         """股东持股/内部人相关（主路径为当前截面，非历史增减持序列）。
 
-        历史日期分析直接拒绝主路径快照；新闻降级亦不得伪装成历史增减持。
+        curr_date 必填：内部层不得默认今天。历史日期拒绝主路径快照；
+        新闻降级窗口也必须以分析日为终点。
         """
+        if not curr_date:
+            return (
+                "【数据获取失败】股东持股结构缺少 curr_date，"
+                "内部层不得默认今天，本项不可用。"
+            )
         refusal = snapshot_historical_refusal(
             curr_date, source_label="股东持股结构（当前快照）"
         )
@@ -904,8 +910,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
             errors.append(f"stock_main_stock_holder: {type(exc).__name__}")
 
         try:
-            # 退化为最近相关新闻，至少保证接口有可用输出
-            end_dt = datetime.strptime(curr_date, "%Y-%m-%d") if curr_date else datetime.now()
+            # 退化为分析日近两周相关新闻（不得用 wall-clock now）
+            end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
             end_date = end_dt.strftime("%Y-%m-%d")
             start_date = (end_dt - timedelta(days=14)).strftime("%Y-%m-%d")
             news = self.get_news(symbol, start_date, end_date)
@@ -1240,7 +1246,16 @@ class CnAkshareProvider(BaseMarketDataProvider):
         """
         source_name = "akshare.stock_lhb_detail_em"
         title = "龙虎榜明细"
-        request_date = date or cn_today_str()
+        if not date:
+            res = DataResult(
+                ok=False,
+                data=None,
+                error="缺少 date/curr_date，内部层不得默认今天",
+                source=source_name,
+                title=title,
+            )
+            return res.to_prompt()
+        request_date = date
         code = self._normalize_symbol(symbol)
         ak = self._ak()
 
@@ -1302,13 +1317,22 @@ class CnAkshareProvider(BaseMarketDataProvider):
         """
         source_name = "akshare.stock_zt_pool_em"
         title = "涨停板情绪池"
+        if not date:
+            res = DataResult(
+                ok=False,
+                data=None,
+                error="缺少 date/curr_date，内部层不得默认今天",
+                source=source_name,
+                title=title,
+            )
+            return res.to_prompt()
         refusal = snapshot_historical_refusal(
             date,
             source_label="涨停板情绪池（仅提供近窗，非全历史）",
         )
         if refusal:
             return refusal
-        request_date = date or cn_today_str()
+        request_date = date
         ak = self._ak()
 
         def _fetch_one(day: str):
@@ -1376,13 +1400,19 @@ class CnAkshareProvider(BaseMarketDataProvider):
         """获取限售股解禁数据与近期解禁风险。"""
         source_name = "akshare.stock_restricted_release_detail_em"
         title = "限售股解禁风险"
+        if not curr_date:
+            res = DataResult(
+                ok=False,
+                data=None,
+                error="缺少 curr_date，内部层不得默认今天",
+                source=source_name,
+                title=title,
+            )
+            return res.to_prompt()
         try:
             code = self._normalize_symbol(symbol)
             ak = self._ak()
 
-            if not curr_date:
-                curr_date = datetime.now().strftime("%Y-%m-%d")
-            
             # Start: 30 days ago, End: 60 days ahead
             dt_curr = datetime.strptime(curr_date, "%Y-%m-%d")
             start_str = (dt_curr - timedelta(days=30)).strftime("%Y%m%d")
@@ -1507,12 +1537,18 @@ class CnAkshareProvider(BaseMarketDataProvider):
         """获取上市公司业绩预告与业绩快报。"""
         source_name = "akshare.stock_yjyg_em"
         title = "业绩预告与快报"
+        if not curr_date:
+            res = DataResult(
+                ok=False,
+                data=None,
+                error="缺少 curr_date，内部层不得默认今天",
+                source=source_name,
+                title=title,
+            )
+            return res.to_prompt()
         try:
             code = self._normalize_symbol(symbol)
             ak = self._ak()
-
-            if not curr_date:
-                curr_date = datetime.now().strftime("%Y-%m-%d")
 
             # Determine recent report period end date (e.g. 20241231, 20240930)
             year = datetime.strptime(curr_date, "%Y-%m-%d").year
@@ -1652,7 +1688,16 @@ class CnAkshareProvider(BaseMarketDataProvider):
         """
         source_name = "akshare.stock_margin_detail_sse/szse"
         title = "融资融券交易"
-        request_date = curr_date or cn_today_str()
+        if not curr_date:
+            res = DataResult(
+                ok=False,
+                data=None,
+                error="缺少 curr_date，内部层不得默认今天",
+                source=source_name,
+                title=title,
+            )
+            return res.to_prompt()
+        request_date = curr_date
         code = self._normalize_symbol(symbol)
         ak = self._ak()
 
