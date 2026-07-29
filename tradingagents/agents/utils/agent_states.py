@@ -182,3 +182,39 @@ class AgentState(MessagesState):
     short_term_result: Annotated[Optional[dict], "Final short-term analysis result"]
     medium_term_result: Annotated[Optional[dict], "Final medium-term analysis result"]
     metadata: Annotated[dict[str, Any], "Optional runtime metadata"]
+
+
+import logging as _logging
+
+_degrade_logger = _logging.getLogger(__name__)
+
+_DEGRADE_WHITESPACE_RATIO = 0.50
+_DEGRADE_MAX_BYTES = 100_000
+
+
+def check_llm_output_degraded(text: str, agent_name: str) -> bool:
+    """Return True and log WARNING if text looks like a degenerate LLM output.
+
+    Degraded criteria (either triggers):
+    - Whitespace (space/tab/newline) ratio > 50 %
+    - Total byte length > 100 KB
+
+    Caller should replace the text with an explicit failure message when True.
+    """
+    n = len(text)
+    if n == 0:
+        return False
+    ws = sum(1 for c in text if c in " \t\n\r")
+    ratio = ws / n
+    too_much_ws = ratio > _DEGRADE_WHITESPACE_RATIO
+    too_long = len(text.encode("utf-8", errors="replace")) > _DEGRADE_MAX_BYTES
+    if too_much_ws or too_long:
+        _degrade_logger.warning(
+            "[%s] Degenerate LLM output detected: len=%d bytes, whitespace_ratio=%.3f "
+            "(limits: ws>%.0f%% or bytes>%d). Preview: %s",
+            agent_name, n, ratio,
+            _DEGRADE_WHITESPACE_RATIO * 100, _DEGRADE_MAX_BYTES,
+            repr(text[:500]),
+        )
+        return True
+    return False

@@ -47,3 +47,25 @@ def test_extract_verdict_missing():
 def test_extract_verdict_empty():
     direction, confidence = extract_verdict("")
     assert direction == "中性"
+
+
+def test_check_llm_output_degraded_whitespace():
+    from tradingagents.agents.utils.agent_states import check_llm_output_degraded
+    # 99% spaces → degraded
+    bad = "ok" + " " * 9998
+    assert check_llm_output_degraded(bad, "TestAgent") is True
+
+def test_check_llm_output_degraded_too_long():
+    from tradingagents.agents.utils.agent_states import check_llm_output_degraded
+    # 101 KB of varied text → degraded (length only)
+    big = "a" * (101 * 1024)
+    assert check_llm_output_degraded(big, "TestAgent") is True
+
+def test_check_llm_output_degraded_normal():
+    from tradingagents.agents.utils.agent_states import check_llm_output_degraded
+    normal = "## 基本面分析\n贵州茅台业绩稳健，营业收入同比增长 6.3%。\n" * 30
+    assert check_llm_output_degraded(normal, "TestAgent") is False
+
+def test_check_llm_output_degraded_empty():
+    from tradingagents.agents.utils.agent_states import check_llm_output_degraded
+    assert check_llm_output_degraded("", "TestAgent") is False

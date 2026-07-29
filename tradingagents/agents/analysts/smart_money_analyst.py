@@ -5,7 +5,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
 from tradingagents.graph.intent_parser import build_horizon_context
-from tradingagents.agents.utils.agent_states import current_tracker_var, extract_verdict
+from tradingagents.agents.utils.agent_states import current_tracker_var, extract_verdict, check_llm_output_degraded
+from api.database import log_llm_call
 
 
 def create_smart_money_analyst(llm, data_collector=None):
@@ -74,15 +75,17 @@ def create_smart_money_analyst(llm, data_collector=None):
         tracker = current_tracker_var.get()
 
 
+        import time as _time
         full_content = ""
+        _last_chunk = None
+        _t0 = _time.monotonic()
 
 
         try:
 
 
             async for chunk in llm.astream(messages):
-
-
+                _last_chunk = chunk
                 content = chunk.content if hasattr(chunk, "content") else str(chunk)
 
 
@@ -129,6 +132,22 @@ def create_smart_money_analyst(llm, data_collector=None):
                 full_content = f"分析报告生成失败：{exc}"
 
         print(f"[Smart Money Analyst] DONE {ticker_display}, report length={len(full_content)}")
+        if check_llm_output_degraded(full_content, "Smart Money Analyst"):
+            full_content = "主力资金分析生成异常（输出退化），本项不可用"
+        _elapsed = _time.monotonic() - _t0
+        _meta = getattr(_last_chunk, "response_metadata", {}) or {}
+        _usage = _meta.get("token_usage") or _meta.get("usage") or {}
+        log_llm_call(
+            agent_name="Smart Money Analyst",
+            model_name=getattr(llm, "model_name", None) or getattr(llm, "model", None),
+            finish_reason=_meta.get("finish_reason"),
+            prompt_tokens=_usage.get("prompt_tokens"),
+            completion_tokens=_usage.get("completion_tokens"),
+            total_tokens=_usage.get("total_tokens"),
+            elapsed_seconds=round(_elapsed, 2),
+            response_chars=len(full_content),
+            degraded=full_content.endswith("本项不可用"),
+        )
         verdict, confidence = extract_verdict(full_content)
         return {
             "smart_money_report": full_content,
