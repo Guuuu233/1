@@ -1530,15 +1530,36 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 res = DataResult(ok=True, data="【业绩预告排查】当前报告期暂无业绩预警/预增公告。", source=source_name, title=title)
                 return res.to_prompt()
 
-            lines = [f"【业绩预告/快报】找到 {len(stock_df)} 条预告记录："]
+            cutoff = pd.to_datetime(curr_date, errors="coerce") if curr_date else pd.NaT
+            kept_lines: list[str] = []
             for _, row in stock_df.iterrows():
                 tp = row.get("预告类型", "")
                 chg = row.get("业绩变动", "")
                 reason = row.get("业绩变动原因", "")
                 ann_date = row.get("公告日期", "")
-                if curr_date and str(ann_date) > curr_date:
-                    continue  # Historical date truncation
-                lines.append(f"- 公告日: {ann_date} | 类型: {tp} | 变动: {chg}\n  原因摘要: {reason[:100]}")
+                ann_dt = pd.to_datetime(ann_date, errors="coerce")
+                if pd.isna(ann_dt):
+                    _provider_logger.warning(
+                        "get_earnings_forecast: unparseable 公告日期=%r symbol=%s; skip row",
+                        ann_date,
+                        symbol,
+                    )
+                    continue
+                if pd.notna(cutoff) and ann_dt.normalize() > cutoff.normalize():
+                    continue  # Historical date truncation (datetime, not string)
+                kept_lines.append(
+                    f"- 公告日: {ann_date} | 类型: {tp} | 变动: {chg}\n  原因摘要: {str(reason)[:100]}"
+                )
+            if not kept_lines:
+                # All rows were future-of-curr_date or unparseable; do not claim a live count.
+                lines = [
+                    "【业绩预告排查】在分析日截断后无可用预告记录"
+                    + ("（公告日均晚于分析日或无法解析）。" if pd.notna(cutoff) else "。")
+                ]
+            else:
+                lines = [
+                    f"【业绩预告/快报】找到 {len(kept_lines)} 条预告记录："
+                ] + kept_lines
 
             res = DataResult(ok=True, data="\n".join(lines), source=source_name, title=title)
             return res.to_prompt()
