@@ -48,3 +48,67 @@ High risk (multi-provider chain + mixed date semantics):
 ### Regression guard
 
 3c-3 e2e guards (missing `curr_date` hard-fail, dual historical-date upper-bound comparison, provider signature whitelist) are intended to catch silent reintroduction of undated live data on historical paths. They do **not** replace a typed vendor-result redesign.
+
+---
+
+## Adjudicators have no first-hand access to analyst reports
+
+**Status:** Open (documented; not fixing this round)  
+**Discovered:** 2026-07-29 during 1.58MB output investigation
+
+### Symptom
+
+`research_manager`, `risk_manager`, and `trader` do **not** receive any analyst
+report directly in their prompt.  They only see debate history and summary fields.
+`fundamentals_report` (and others) are read from state only to construct
+`curr_situation`, which is used exclusively as a memory-retrieval embedding query —
+the string is never injected into the prompt template.
+
+### Prompt template coverage map (from `tradingagents/prompts/zh.py`)
+
+| Agent | market | sentiment | news | fundamentals | smart_money | volume_price | macro |
+|---|---|---|---|---|---|---|---|
+| bull_researcher | ✓ | ✓ | ✓ | ✓ | — | ✓ | — |
+| bear_researcher | ✓ | ✓ | ✓ | ✓ | — | ✓ | — |
+| aggressive_debator | ✓ | ✓ | ✓ | ✓ | — | ✓ | — |
+| conservative_debator | ✓ | ✓ | ✓ | ✓ | — | ✓ | — |
+| neutral_debator | ✓ | ✓ | ✓ | ✓ | — | ✓ | — |
+| **research_manager** | — | ✓ (smart_money only) | — | **✗** | ✓ | ✓ | — |
+| **trader** | — | — | — | **✗** | — | — | — |
+| **risk_manager** | — | — | — | **✗** | — | — | — |
+
+`research_manager` receives `smart_money_report`, `volume_price_report`, and
+`sentiment_report` as raw data for its "expected-value gap analysis", but none of
+market/news/fundamentals/macro.  `trader` and `risk_manager` receive only
+structured summaries built by `build_agent_context_view` — no analyst reports at
+all.
+
+### Why it matters
+
+Adjudicators decide direction and construct the final trade plan, but they can only
+compare *how persuasively each debater argued* — they cannot independently verify
+the underlying data.  In the 2026-07-29 600519 run, the fundamentals analyst gave
+"中性", yet `research_manager` reached "偏空" exclusively from debate text and
+volume-price signals; it had no way to cross-check the fundamentals claim.
+
+This is an inherent structural constraint, not a bug per se, but it creates a
+situation where strong rhetoric can outweigh weak evidence at the adjudication
+layer.
+
+### Suggested fix (future; do not implement until custom-prompt injection is live)
+
+Do **not** pass full analyst reports to adjudicators — that would blow up context.
+Instead, add a second output slot to each analyst:
+
+```python
+"fundamentals_evidence_summary": "<≤300字，仅包含A级事实和数字，无论断>"
+```
+
+Adjudicators receive the evidence summaries (not full reports) and can perform
+evidence-level cross-checks rather than pure rhetoric comparison.  This also
+enables `research_manager` to call out "多头方引用的基本面结论与原始数据不符"
+type disagreements.
+
+Implementation note: the 300-char cap is strict.  Evidence summaries must contain
+only verifiable facts (numbers, dates, named events), no interpretations.  The
+analyst's full report remains available in state for bull/bear to read.
