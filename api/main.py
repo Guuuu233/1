@@ -707,6 +707,10 @@ class ReportCreateRequest(BaseModel):
     trade_date: str = Field(..., description="交易日期 YYYY-MM-DD")
     decision: Optional[str] = Field(None, description="交易决策")
     result_data: Optional[Dict[str, Any]] = Field(None, description="完整分析结果")
+    probability: Optional[float] = None
+    data_gaps: List[str] = Field(default_factory=list)
+    falsification_conditions: List[str] = Field(default_factory=list)
+    not_applicable: bool = False
 
 
 class ReportResponse(BaseModel):
@@ -720,10 +724,14 @@ class ReportResponse(BaseModel):
     decision: Optional[str]
     direction: Optional[str]
     confidence: Optional[int]
+    probability: Optional[float] = None
     target_price: Optional[float]
     stop_loss_price: Optional[float]
     risk_items: Optional[List[Dict[str, Any]]] = None
     key_metrics: Optional[List[Dict[str, Any]]] = None
+    data_gaps: List[str] = Field(default_factory=list)
+    falsification_conditions: List[str] = Field(default_factory=list)
+    not_applicable: bool = False
     analyst_traces: Optional[List[Dict[str, Any]]] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -2173,6 +2181,10 @@ async def _run_job_inner(
             result.update({
                 "direction": resolved["direction"],
                 "confidence": resolved["confidence"],
+                "probability": structured.probability if structured else None,
+                "data_gaps": structured.data_gaps if structured else [],
+                "falsification_conditions": structured.falsification_conditions if structured else [],
+                "not_applicable": structured.not_applicable if structured else False,
                 "target_price": resolved["target_price"],
                 "stop_loss_price": resolved["stop_loss_price"],
             })
@@ -2190,6 +2202,10 @@ async def _run_job_inner(
                             user_id=user_id,
                             risk_items=([r.model_dump() for r in structured.risks] if structured else None),
                             key_metrics=([m.model_dump() for m in structured.key_metrics] if structured else None),
+                            probability=result["probability"],
+                            data_gaps=result["data_gaps"],
+                            falsification_conditions=result["falsification_conditions"],
+                            not_applicable=result["not_applicable"],
                             confidence_override=result["confidence"],
                             target_price_override=result["target_price"],
                             stop_loss_override=result["stop_loss_price"],
@@ -2211,6 +2227,10 @@ async def _run_job_inner(
                 "result": result, "mode": "dual_horizon",
                 "risk_items": [r.model_dump() for r in structured.risks] if structured else [],
                 "key_metrics": [m.model_dump() for m in structured.key_metrics] if structured else [],
+                "probability": result["probability"],
+                "data_gaps": result["data_gaps"],
+                "falsification_conditions": result["falsification_conditions"],
+                "not_applicable": result["not_applicable"],
                 "confidence": result["confidence"],
                 "target_price": result["target_price"],
                 "stop_loss_price": result["stop_loss_price"],
@@ -2410,6 +2430,10 @@ async def _run_job_inner(
         result.update({
             "direction": resolved["direction"],
             "confidence": resolved["confidence"],
+            "probability": structured.probability if structured else None,
+            "data_gaps": structured.data_gaps if structured else [],
+            "falsification_conditions": structured.falsification_conditions if structured else [],
+            "not_applicable": structured.not_applicable if structured else False,
             "target_price": resolved["target_price"],
             "stop_loss_price": resolved["stop_loss_price"],
         })
@@ -2427,6 +2451,10 @@ async def _run_job_inner(
                         user_id=user_id,
                         risk_items=([r.model_dump() for r in structured.risks] if structured else None),
                         key_metrics=([m.model_dump() for m in structured.key_metrics] if structured else None),
+                        probability=result["probability"],
+                        data_gaps=result["data_gaps"],
+                        falsification_conditions=result["falsification_conditions"],
+                        not_applicable=result["not_applicable"],
                         confidence_override=result["confidence"],
                         target_price_override=result["target_price"],
                         stop_loss_override=result["stop_loss_price"],
@@ -2457,6 +2485,10 @@ async def _run_job_inner(
                 "result": result,
                 "risk_items": [r.model_dump() for r in structured.risks] if structured else [],
                 "key_metrics": [m.model_dump() for m in structured.key_metrics] if structured else [],
+                "probability": result["probability"],
+                "data_gaps": result["data_gaps"],
+                "falsification_conditions": result["falsification_conditions"],
+                "not_applicable": result["not_applicable"],
                 "confidence": result["confidence"],
                 "target_price": result["target_price"],
                 "stop_loss_price": result["stop_loss_price"],
@@ -3553,6 +3585,10 @@ def create_report_endpoint(
         decision=request.decision,
         result_data=request.result_data,
         user_id=current_user.id,
+        probability=request.probability,
+        data_gaps=request.data_gaps,
+        falsification_conditions=request.falsification_conditions,
+        not_applicable=request.not_applicable,
     )
     return report
 
@@ -5242,5 +5278,3 @@ def run() -> None:
 
     log_config = str(Path(__file__).parent / "logging_config.yaml")
     uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=False, log_config=log_config)
-
-

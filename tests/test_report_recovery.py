@@ -117,3 +117,43 @@ def test_create_report_clears_previous_failure_error_on_success():
         assert finalized.decision == "BUY"
     finally:
         db.close()
+
+
+def test_structured_report_new_fields_default_when_missing_or_null():
+    missing = report_service.StructuredReport()
+    explicit_nulls = report_service.StructuredReport(
+        data_gaps=None,
+        falsification_conditions=None,
+        not_applicable=None,
+    )
+
+    for structured in (missing, explicit_nulls):
+        assert structured.probability is None
+        assert structured.data_gaps == []
+        assert structured.falsification_conditions == []
+        assert structured.not_applicable is False
+
+
+def test_create_report_persists_new_structured_fields():
+    db = _make_session()
+    try:
+        report = report_service.create_report(
+            db=db,
+            symbol="600519.SH",
+            trade_date="2026-07-29",
+            decision="HOLD",
+            result_data={"final_trade_decision": "结论：持有"},
+            probability=0.42,
+            data_gaps=["缺少盘中资金流"],
+            falsification_conditions=["收入增速连续两个季度回升"],
+            not_applicable=True,
+        )
+
+        persisted = db.query(ReportDB).filter(ReportDB.id == report.id).one()
+        assert persisted.probability == 0.42
+        assert persisted.data_gaps == ["缺少盘中资金流"]
+        assert persisted.falsification_conditions == ["收入增速连续两个季度回升"]
+        assert persisted.not_applicable is True
+        assert persisted.to_dict()["not_applicable"] is True
+    finally:
+        db.close()

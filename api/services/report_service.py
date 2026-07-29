@@ -27,10 +27,14 @@ REPORT_SUMMARY_COLUMNS = (
     ReportDB.decision,
     ReportDB.direction,
     ReportDB.confidence,
+    ReportDB.probability,
     ReportDB.target_price,
     ReportDB.stop_loss_price,
     ReportDB.risk_items,
     ReportDB.key_metrics,
+    ReportDB.data_gaps,
+    ReportDB.falsification_conditions,
+    ReportDB.not_applicable,
     ReportDB.analyst_traces,
     ReportDB.created_at,
     ReportDB.updated_at,
@@ -80,10 +84,24 @@ class KeyMetricSchema(BaseModel):
 class StructuredReport(BaseModel):
     decision: str = Field("HOLD", description="交易决策关键词：BUY/SELL/HOLD/增持/减持/持有")
     confidence: Optional[int] = Field(None, description="整体置信度 0-100")
+    probability: Optional[float] = Field(None, description="报告明确给出的上涨概率")
     target_price: Optional[float] = Field(None, description="目标价（数字，无单位）")
     stop_loss_price: Optional[float] = Field(None, description="止损价（数字，无单位）")
     risks: List[RiskItemSchema] = Field(default_factory=list, description="主要风险，最多5条")
     key_metrics: List[KeyMetricSchema] = Field(default_factory=list, description="关键指标，最多6条")
+    data_gaps: List[str] = Field(default_factory=list, description="报告明确列出的数据缺口")
+    falsification_conditions: List[str] = Field(default_factory=list, description="报告明确列出的证伪条件")
+    not_applicable: bool = Field(False, description="本分析框架是否明确不适用")
+
+    @field_validator("data_gaps", "falsification_conditions", mode="before")
+    @classmethod
+    def _coerce_string_list(cls, v):
+        return [] if v is None else v
+
+    @field_validator("not_applicable", mode="before")
+    @classmethod
+    def _coerce_not_applicable(cls, v):
+        return False if v is None else v
 
     @field_validator("target_price", "stop_loss_price", mode="before")
     @classmethod
@@ -127,7 +145,11 @@ def extract_structured_data(
             "2. confidence：整体置信度（0-100整数），若文中未明确给出则根据语气判断\n"
             "3. target_price / stop_loss_price：纯数字，若未提及则为 null\n"
             "4. risks：最多5条主要风险，每条包含名称（15字内）、等级（high/medium/low）、一句话说明\n"
-            "5. key_metrics：最多6条关键财务/估值指标，每条包含名称、值（含单位）、优劣（good/neutral/bad）"
+            "5. key_metrics：最多6条关键财务/估值指标，每条包含名称、值（含单位）、优劣（good/neutral/bad）\n"
+            "6. probability：报告明确给出的上涨概率；未明确给出则为 null，不要用 confidence 代填\n"
+            "7. data_gaps：报告明确列出的数据缺口字符串数组；未提及则为 []\n"
+            "8. falsification_conditions：报告明确列出的证伪条件字符串数组；未提及则为 []\n"
+            "9. not_applicable：报告明确表示本分析框架不适用时为 true，否则为 false"
         )
 
         response = llm.invoke([HumanMessage(content=prompt)])
@@ -378,6 +400,10 @@ def create_report(
     user_id: Optional[str] = None,
     risk_items: Optional[List[dict]] = None,
     key_metrics: Optional[List[dict]] = None,
+    probability: Optional[float] = None,
+    data_gaps: Optional[List[str]] = None,
+    falsification_conditions: Optional[List[str]] = None,
+    not_applicable: bool = False,
     analyst_traces: Optional[List[dict]] = None,
     confidence_override: Optional[int] = None,
     target_price_override: Optional[float] = None,
@@ -408,11 +434,15 @@ def create_report(
         db_report.decision = decision
         db_report.direction = resolved["direction"]
         db_report.confidence = resolved["confidence"]
+        db_report.probability = probability
         db_report.target_price = resolved["target_price"]
         db_report.stop_loss_price = resolved["stop_loss_price"]
         db_report.result_data = result_data
         db_report.risk_items = risk_items
         db_report.key_metrics = key_metrics
+        db_report.data_gaps = list(data_gaps or [])
+        db_report.falsification_conditions = list(falsification_conditions or [])
+        db_report.not_applicable = bool(not_applicable)
         db_report.analyst_traces = analyst_traces
         db_report.market_report = resolved["market_report"]
         db_report.sentiment_report = resolved["sentiment_report"]
@@ -437,11 +467,15 @@ def create_report(
             decision=decision,
             direction=resolved["direction"],
             confidence=resolved["confidence"],
+            probability=probability,
             target_price=resolved["target_price"],
             stop_loss_price=resolved["stop_loss_price"],
             result_data=result_data,
             risk_items=risk_items,
             key_metrics=key_metrics,
+            data_gaps=list(data_gaps or []),
+            falsification_conditions=list(falsification_conditions or []),
+            not_applicable=bool(not_applicable),
             analyst_traces=analyst_traces,
             market_report=resolved["market_report"],
             sentiment_report=resolved["sentiment_report"],

@@ -108,6 +108,14 @@ def _ensure_report_schema() -> None:
                 conn.execute(text("ALTER TABLE reports ADD COLUMN error TEXT"))
             if "analyst_traces" not in columns:
                 conn.execute(text("ALTER TABLE reports ADD COLUMN analyst_traces JSON"))
+            if "probability" not in columns:
+                conn.execute(text("ALTER TABLE reports ADD COLUMN probability FLOAT"))
+            if "data_gaps" not in columns:
+                conn.execute(text("ALTER TABLE reports ADD COLUMN data_gaps JSON NOT NULL DEFAULT '[]'"))
+            if "falsification_conditions" not in columns:
+                conn.execute(text("ALTER TABLE reports ADD COLUMN falsification_conditions JSON NOT NULL DEFAULT '[]'"))
+            if "not_applicable" not in columns:
+                conn.execute(text("ALTER TABLE reports ADD COLUMN not_applicable BOOLEAN NOT NULL DEFAULT 0"))
             if "macro_report" not in columns:
                 conn.execute(text("ALTER TABLE reports ADD COLUMN macro_report TEXT"))
             if "smart_money_report" not in columns:
@@ -258,6 +266,7 @@ class ReportDB(Base):
     decision = Column(String(50), nullable=True)  # BUY, SELL, HOLD, etc.
     direction = Column(String(50), nullable=True)  # 看多、偏多、中性、偏空、看空
     confidence = Column(Integer, nullable=True)  # 0-100
+    probability = Column(Float, nullable=True)
     target_price = Column(Float, nullable=True)
     stop_loss_price = Column(Float, nullable=True)
     
@@ -267,6 +276,9 @@ class ReportDB(Base):
     # LLM-extracted structured data
     risk_items = Column(JSON, nullable=True)   # [{"name": "...", "level": "high|medium|low", "description": "..."}]
     key_metrics = Column(JSON, nullable=True)  # [{"name": "...", "value": "...", "status": "good|neutral|bad"}]
+    data_gaps = Column(JSON, nullable=False, default=list, server_default="[]")
+    falsification_conditions = Column(JSON, nullable=False, default=list, server_default="[]")
+    not_applicable = Column(Boolean, nullable=False, default=False, server_default="0")
     analyst_traces = Column(JSON, nullable=True) # [{"agent": "...", "verdict": "...", "key_finding": "..."}]
 
     # Individual reports (for quick access)
@@ -296,11 +308,15 @@ class ReportDB(Base):
             "decision": self.decision,
             "direction": self.direction,
             "confidence": self.confidence,
+            "probability": self.probability,
             "target_price": self.target_price,
             "stop_loss_price": self.stop_loss_price,
             "result_data": self.result_data,
             "risk_items": self.risk_items,
             "key_metrics": self.key_metrics,
+            "data_gaps": self.data_gaps or [],
+            "falsification_conditions": self.falsification_conditions or [],
+            "not_applicable": bool(self.not_applicable),
             "analyst_traces": self.analyst_traces,
             "market_report": self.market_report,
             "sentiment_report": self.sentiment_report,
