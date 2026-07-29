@@ -45,6 +45,42 @@ def cn_today_str() -> str:
     return now_cn().date().strftime("%Y-%m-%d")
 
 
+SNAPSHOT_ONLY_REFUSAL = (
+    "该数据源仅提供当前快照，无法用于历史日期分析，本项不可用"
+)
+
+
+def is_historical_analysis_date(curr_date: str | None) -> bool:
+    """True when curr_date is a calendar day strictly before Asia/Shanghai today.
+
+    Missing / unparseable curr_date is treated as non-historical (live path).
+    Callers that must not run undated on historical analyses should require
+    curr_date at the API boundary separately (commit 3c).
+    """
+    if not curr_date:
+        return False
+    try:
+        d = _parse_date(str(curr_date))
+    except Exception:
+        return False
+    return d < now_cn().date()
+
+
+def snapshot_historical_refusal(
+    curr_date: str | None,
+    *,
+    source_label: str = "",
+) -> str | None:
+    """If analysis date is historical, return a fixed refusal string; else None.
+
+    Prompt text is stable so models and e2e scanners can detect snapshot refuse.
+    """
+    if not is_historical_analysis_date(curr_date):
+        return None
+    label = f"{source_label}：" if source_label else ""
+    return f"【数据获取失败】{label}{SNAPSHOT_ONLY_REFUSAL}"
+
+
 def _parse_date(date_str: str) -> date:
     text = str(date_str).strip()
     if len(text) == 8 and text.isdigit():

@@ -50,7 +50,7 @@ def create_social_media_analyst(llm, data_collector=None):
                     "ticker": ticker, "start_date": start_dt.strftime("%Y-%m-%d"), "end_date": current_date,
                 }),
                 _safe(get_zt_pool, {"date": current_date}),
-                _safe(get_hot_stocks_xq, {})
+                _safe(get_hot_stocks_xq, {"curr_date": current_date})
             )
             news_text, zt_data, hot_stocks = results
 

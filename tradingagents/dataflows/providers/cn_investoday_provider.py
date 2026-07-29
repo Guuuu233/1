@@ -271,8 +271,11 @@ class CnInvestodayProvider(BaseMarketDataProvider):
             "source": "investoday",
         }
 
-    def get_realtime_quotes(self, symbols: list[str]) -> str:
-        """批量拉取实时行情；返回 JSON 字符串。"""
+    def get_realtime_quotes(self, symbols: list[str], curr_date: str = None) -> str:
+        """批量拉取实时行情；返回 JSON 字符串。历史日期分析直接拒绝。"""
+        refusal = snapshot_historical_refusal(curr_date, source_label="实时行情（investoday）")
+        if refusal:
+            return refusal
         api_key = self._require_api_key()
 
         code_to_original: dict[str, str] = {}
@@ -514,7 +517,15 @@ class CnInvestodayProvider(BaseMarketDataProvider):
         return result
 
     def get_fundamentals(self, ticker: str, curr_date: str = None) -> str:
-        """公司基本信息：``GET /stock/company/profiles``。"""
+        """公司基本信息：``GET /stock/company/profiles``（当前快照）。
+
+        历史日期分析直接拒绝。
+        """
+        refusal = snapshot_historical_refusal(
+            curr_date, source_label="Company Profile（investoday 公司信息快照）"
+        )
+        if refusal:
+            return refusal
         api_key = self._require_api_key()
         code = self._normalize_stock_code(ticker)
         if not code:
@@ -611,8 +622,16 @@ class CnInvestodayProvider(BaseMarketDataProvider):
     ) -> str:
         return self._financial_report_markdown("income", "利润表", ticker, freq, curr_date)
 
-    def get_insider_transactions(self, symbol: str) -> str:
-        """高管持股变动：``GET /stock/exec-shrhld-chg``（口径异于全市场股东增减持）。"""
+    def get_insider_transactions(self, symbol: str, curr_date: str = None) -> str:
+        """高管持股变动：``GET /stock/exec-shrhld-chg``（口径异于全市场股东增减持）。
+
+        主路径用 datetime.now 写死区间，属当前快照/滚动窗口，历史分析直接拒绝。
+        """
+        refusal = snapshot_historical_refusal(
+            curr_date, source_label="高管持股变动（investoday，当前滚动窗口）"
+        )
+        if refusal:
+            return refusal
         api_key = self._require_api_key()
         code = self._normalize_stock_code(symbol)
         if not code:

@@ -46,7 +46,7 @@ def create_macro_analyst(llm, data_collector=None):
             
             # Parallelize fallback fetches
             results = await asyncio.gather(
-                _safe(get_board_fund_flow, {}),
+                _safe(get_board_fund_flow, {"curr_date": current_date}),
                 _safe(get_news, {
                     "ticker": ticker, "start_date": start_dt.strftime("%Y-%m-%d"), "end_date": current_date,
                 })

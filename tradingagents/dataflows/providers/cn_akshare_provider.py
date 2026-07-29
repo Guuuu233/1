@@ -18,6 +18,8 @@ from ..trade_calendar import (
     cn_today_str,
     fetch_with_date_fallback,
     is_cn_trading_day,
+    is_historical_analysis_date,
+    snapshot_historical_refusal,
 )
 from ..utils import chronological, take_latest
 from ..financial_announce import (
@@ -557,10 +559,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
     def get_fundamentals(self, ticker: str, curr_date: str = None) -> str:
         """Company profile (snapshot) + financial abstract (period-mapped cutoff).
 
-        Profile values are current-market snapshots and must not be used for
-        historical-date analysis (handled fully in 3b). For 3a we still return
-        profile on same-day analysis, and always try to truncate abstract period
-        columns via sina report-period → effective announce mapping.
+        Company Profile is a live market snapshot: on historical analysis dates
+        it is refused. Financial Abstract remains available with A4 period cutoff.
         """
         with AKSHARE_CALL_LOCK:
             ak = self._ak()
@@ -601,9 +601,15 @@ class CnAkshareProvider(BaseMarketDataProvider):
 
             parts = [f"## Fundamentals for {ticker} ({stock_name})"] if stock_name else [f"## Fundamentals for {ticker}"]
 
-            # Company Profile remains a live snapshot; historical refuse is 3b.
-            # 3a only maps Financial Abstract period columns by effective announce date.
-            if info_df is not None and not info_df.empty:
+            # Company Profile is a live snapshot — refuse on historical dates.
+            if is_historical_analysis_date(curr_date):
+                parts.append("### Company Profile")
+                parts.append(
+                    snapshot_historical_refusal(
+                        curr_date, source_label="Company Profile（总市值/PE/个股信息）"
+                    )
+                )
+            elif info_df is not None and not info_df.empty:
                 for c in info_df.columns:
                     info_df[c] = info_df[c].astype(str).str.slice(0, 220)
                 parts.append("### Company Profile")
@@ -873,6 +879,15 @@ class CnAkshareProvider(BaseMarketDataProvider):
         return f"{curr_date} 未获取到全球市场新闻"
 
     def get_insider_transactions(self, symbol: str, curr_date: str = None) -> str:
+        """股东持股/内部人相关（主路径为当前截面，非历史增减持序列）。
+
+        历史日期分析直接拒绝主路径快照；新闻降级亦不得伪装成历史增减持。
+        """
+        refusal = snapshot_historical_refusal(
+            curr_date, source_label="股东持股结构（当前快照）"
+        )
+        if refusal:
+            return refusal
         ak = self._ak()
         code = self._normalize_symbol(symbol)
         errors = []
@@ -974,8 +989,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
     _spot_cache_ts: float = 0.0
     _SPOT_CACHE_TTL: float = 8.0  # seconds
 
-    def get_realtime_quotes(self, symbols: list[str]) -> str:
-        """Fetch real-time A-share quotes. Tries Eastmoney first, falls back to Sina."""
+    def get_realtime_quotes(self, symbols: list[str], curr_date: str = None) -> str:
+        """Fetch real-time A-share quotes. Snapshot-only: refuse historical analysis dates."""
+        refusal = snapshot_historical_refusal(
+            curr_date, source_label="实时行情"
+        )
+        if refusal:
+            return refusal
         import json
         import time as _time
         import logging
@@ -1133,11 +1153,17 @@ class CnAkshareProvider(BaseMarketDataProvider):
         except (ValueError, TypeError):
             return None
 
-    def get_board_fund_flow(self) -> str:
-        """获取行业板块资金流向排名。
+    def get_board_fund_flow(self, curr_date: str = None) -> str:
+        """获取行业板块资金流向排名（即时快照）。
 
         注意：此接口依赖 akshare，可能因东方财富 API 变化而暂时不可用。
+        历史日期分析直接拒绝：接口无历史截面。
         """
+        refusal = snapshot_historical_refusal(
+            curr_date, source_label="板块资金流向（即时）"
+        )
+        if refusal:
+            return refusal
         try:
             ak = self._ak()
             # 使用正确的方法名 stock_fund_flow_industry
@@ -1316,8 +1342,16 @@ class CnAkshareProvider(BaseMarketDataProvider):
         )
         return res.to_prompt()
 
-    def get_hot_stocks_xq(self) -> str:
-        """获取雪球热搜股票，反映散户关注度。"""
+    def get_hot_stocks_xq(self, curr_date: str = None) -> str:
+        """获取雪球热搜股票（当前热度快照）。
+
+        历史日期分析直接拒绝：接口无历史截面。
+        """
+        refusal = snapshot_historical_refusal(
+            curr_date, source_label="雪球热搜"
+        )
+        if refusal:
+            return refusal
         try:
             ak = self._ak()
             with AKSHARE_CALL_LOCK:
@@ -1373,9 +1407,27 @@ class CnAkshareProvider(BaseMarketDataProvider):
             return res.to_prompt()
 
     def get_share_pledge(self, symbol: str, curr_date: str = None) -> str:
-        """获取大股东股权质押比例与质押风险。"""
+        """获取大股东股权质押比例与质押风险（全市场快照）。
+
+        历史日期分析直接拒绝：接口无 date 参数，返回的是当前质押截面。
+        """
         source_name = "akshare.stock_gpzy_pledge_ratio_em"
         title = "股权质押风险"
+        refusal = snapshot_historical_refusal(
+            curr_date, source_label="股权质押（全市场快照）"
+        )
+        if refusal:
+            res = DataResult(
+                ok=False,
+                data=None,
+                error=refusal.replace("【数据获取失败】", "", 1).strip()
+                if refusal.startswith("【数据获取失败】")
+                else refusal,
+                source=source_name,
+                title=title,
+            )
+            # Keep the fixed phrase in the prompt body for scanners / models.
+            return refusal if refusal.startswith("【数据获取失败】") else res.to_prompt()
         try:
             code = self._normalize_symbol(symbol)
             ak = self._ak()

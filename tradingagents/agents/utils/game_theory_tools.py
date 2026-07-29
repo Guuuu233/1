@@ -4,9 +4,11 @@ from tradingagents.dataflows.interface import route_to_vendor
 
 
 @tool
-def get_board_fund_flow() -> str:
-    """获取今日行业板块资金流向排名，用于判断板块轮动信号和个股所在板块的资金吸引力。"""
-    return route_to_vendor("get_board_fund_flow")
+def get_board_fund_flow(
+    curr_date: Annotated[str | None, "分析日期 YYYY-MM-DD；历史日拒绝即时板块资金流快照"] = None,
+) -> str:
+    """获取今日行业板块资金流向排名（即时快照）。历史日期分析不可用。"""
+    return route_to_vendor("get_board_fund_flow", curr_date)
 
 
 @tool
@@ -36,9 +38,11 @@ def get_zt_pool(
 
 
 @tool
-def get_hot_stocks_xq() -> str:
-    """获取雪球热搜股票列表，反映散户当前关注热点。"""
-    return route_to_vendor("get_hot_stocks_xq")
+def get_hot_stocks_xq(
+    curr_date: Annotated[str | None, "分析日期 YYYY-MM-DD；历史日拒绝雪球热搜快照"] = None,
+) -> str:
+    """获取雪球热搜股票列表（当前热度快照）。历史日期分析不可用。"""
+    return route_to_vendor("get_hot_stocks_xq", curr_date)
 
 @tool
 def get_shareholder_count(
