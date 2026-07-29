@@ -451,3 +451,62 @@ def periods_used_dropped_yoy(
         if eff is not None and eff.path == PATH_DROPPED_YOY_REFRESH:
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Earnings-forecast (业绩预告) report-period selection for Eastmoney pools
+# ---------------------------------------------------------------------------
+#
+# ``ak.stock_yjyg_em(date=YYYYMMDD)`` indexes by report-period end, not by
+# calendar day. Querying the wrong period (e.g. always prior-year annual)
+# yields "no forecast" when the live window is actually H1/Q1/Q3.
+#
+# Closed-window rule (实务口径; verify against current SSE/SZSE rules before
+# changing). A period's Eastmoney 业绩预告 pool is treated as the active
+# query target only after its forecast-disclosure window has closed:
+#
+# - Annual (YYYY1231): window closes Jan 31 of YYYY+1
+#   (common board practice: annual performance forecast within ~1 month
+#   after fiscal year end when required).
+# - Q1 (YYYY0331): window closes Apr 15
+# - H1 (YYYY0630): window closes Jul 15
+# - Q3 (YYYY0930): window closes Oct 15
+#
+# Given analysis day D, pick the latest period whose window closed on or
+# before D. Example: 2026-07-29 → 20260630 (not year-1 annual 20251231).
+
+_FORECAST_WINDOW_SPECS: tuple[tuple[str, int, int, int], ...] = (
+    # (period_md, close_month, close_day, year_offset_for_close)
+    # year_offset_for_close: 0 = same calendar year as period year;
+    # 1 = next calendar year (annual only).
+    ("0331", 4, 15, 0),
+    ("0630", 7, 15, 0),
+    ("0930", 10, 15, 0),
+    ("1231", 1, 31, 1),
+)
+
+
+def resolve_earnings_forecast_report_period(curr_date) -> str:
+    """Return YYYYMMDD report period for the latest closed 业绩预告 window.
+
+    Raises ValueError if ``curr_date`` cannot be parsed.
+    """
+    d = parse_yyyymmdd(curr_date)
+    if d is None:
+        raise ValueError(f"unparseable curr_date for earnings forecast: {curr_date!r}")
+
+    candidates: list[tuple[date, str]] = []
+    # Search a few surrounding years so Jan windows resolve correctly.
+    for year in range(d.year - 2, d.year + 2):
+        for period_md, cm, cd, y_off in _FORECAST_WINDOW_SPECS:
+            period = f"{year}{period_md}"
+            close = date(year + y_off, cm, cd)
+            if close <= d:
+                candidates.append((close, period))
+    if not candidates:
+        raise ValueError(
+            f"no closed earnings-forecast window on or before {d.isoformat()}"
+        )
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    return candidates[-1][1]
+

@@ -27,8 +27,10 @@ from ..financial_announce import (
     filter_abstract_period_columns,
     filter_financial_df_by_effective_announce,
     financial_cutoff_header,
+    format_report_period_label,
     parse_yyyymmdd,
     periods_used_dropped_yoy,
+    resolve_earnings_forecast_report_period,
 )
 
 _provider_logger = logging.getLogger(__name__)
@@ -1537,7 +1539,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
             return res.to_prompt()
 
     def get_earnings_forecast(self, symbol: str, curr_date: str = None) -> str:
-        """获取上市公司业绩预告与业绩快报。"""
+        """获取上市公司业绩预告与业绩快报。
+
+        报告期按分析日前最近一个**已关闭**的预告披露窗口选取（非 year-1 年报硬编码）。
+        文案标明「查询报告期 = …」，并区分「当期无预告」与「查询失败/未知」。
+        """
         source_name = "akshare.stock_yjyg_em"
         title = "业绩预告与快报"
         if not curr_date:
@@ -1553,23 +1559,54 @@ class CnAkshareProvider(BaseMarketDataProvider):
             code = self._normalize_symbol(symbol)
             ak = self._ak()
 
-            # Determine recent report period end date (e.g. 20241231, 20240930)
-            year = datetime.strptime(curr_date, "%Y-%m-%d").year
-            date_param = f"{year-1}1231"
+            try:
+                date_param = resolve_earnings_forecast_report_period(curr_date)
+            except ValueError as exc:
+                res = DataResult(
+                    ok=False,
+                    data=None,
+                    error=f"无法推导业绩预告报告期：{exc}",
+                    source=source_name,
+                    title=title,
+                )
+                return res.to_prompt()
+
+            period_label = format_report_period_label(date_param)
 
             with AKSHARE_CALL_LOCK:
                 df = ak.stock_yjyg_em(date=date_param)
 
+            header = f"查询报告期 = {date_param}（{period_label}）"
+
             if df is None or df.empty:
-                res = DataResult(ok=True, data=None, source=source_name, title=title)
+                # Market-wide empty for a standard period is treated as query failure /
+                # unknown — not "confirmed no forecast for this ticker".
+                res = DataResult(
+                    ok=False,
+                    data=None,
+                    error=(
+                        f"{header}；全市场业绩预告池为空或接口无返回，"
+                        "预告情况未知，不得据此判断无预告"
+                    ),
+                    source=source_name,
+                    title=title,
+                )
                 return res.to_prompt()
 
             stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
             if stock_df.empty:
-                res = DataResult(ok=True, data="【业绩预告排查】当前报告期暂无业绩预警/预增公告。", source=source_name, title=title)
+                res = DataResult(
+                    ok=True,
+                    data=(
+                        f"【业绩预告排查】{header}。该标的在本报告期暂无业绩预警/预增公告"
+                        "（查询成功，确认无预告）。"
+                    ),
+                    source=source_name,
+                    title=title,
+                )
                 return res.to_prompt()
 
-            cutoff = pd.to_datetime(curr_date, errors="coerce") if curr_date else pd.NaT
+            cutoff = pd.to_datetime(curr_date, errors="coerce")
             kept_lines: list[str] = []
             for _, row in stock_df.iterrows():
                 tp = row.get("预告类型", "")
@@ -1590,14 +1627,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     f"- 公告日: {ann_date} | 类型: {tp} | 变动: {chg}\n  原因摘要: {str(reason)[:100]}"
                 )
             if not kept_lines:
-                # All rows were future-of-curr_date or unparseable; do not claim a live count.
                 lines = [
-                    "【业绩预告排查】在分析日截断后无可用预告记录"
-                    + ("（公告日均晚于分析日或无法解析）。" if pd.notna(cutoff) else "。")
+                    f"【业绩预告排查】{header}。在分析日截断后无可用预告记录"
+                    "（公告日均晚于分析日或无法解析）。"
                 ]
             else:
                 lines = [
-                    f"【业绩预告/快报】找到 {len(kept_lines)} 条预告记录："
+                    f"【业绩预告/快报】{header}。找到 {len(kept_lines)} 条预告记录："
                 ] + kept_lines
 
             res = DataResult(ok=True, data="\n".join(lines), source=source_name, title=title)
