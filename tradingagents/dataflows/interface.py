@@ -3,6 +3,7 @@ import os
 from .alpha_vantage_common import AlphaVantageRateLimitError
 from .config import get_config
 from .providers import build_default_registry
+from .trade_calendar import is_historical_analysis_date
 
 # Tools organized by category
 TOOLS_CATEGORIES = {
@@ -133,6 +134,51 @@ def _resolve_vendor_chain(method: str, configured_vendor: str) -> list[str]:
     return fallback
 
 
+# Methods whose historical coverage is not reproducible across the whole vendor
+# chain. Refuse at the router so no provider (including yfinance fallback) is hit.
+# investoday may later be re-enabled only as an explicit same-source whitelist for
+# both live and historical modes — never via silent fallback.
+_HISTORICAL_NEAR_WINDOW_NEWS_METHODS = {
+    "get_global_news": (
+        "全球快讯为实时直播流，不提供可复现的历史切片，历史日期分析下本项不可用"
+    ),
+    "get_news": (
+        "个股新闻源仅覆盖近期，历史日期不可用"
+    ),
+}
+
+
+def _analysis_date_for_method(method: str, args: tuple, kwargs: dict) -> str | None:
+    """Extract the analysis/as-of date used for historical near-window refusal."""
+    if method == "get_global_news":
+        if "curr_date" in kwargs and kwargs["curr_date"] is not None:
+            return str(kwargs["curr_date"])
+        if args:
+            return str(args[0])
+        return None
+    if method == "get_news":
+        # Signature: (ticker, start_date, end_date); end_date is the analysis date.
+        if "end_date" in kwargs and kwargs["end_date"] is not None:
+            return str(kwargs["end_date"])
+        if len(args) >= 3:
+            return str(args[2])
+        return None
+    return None
+
+
+def _historical_near_window_news_refusal(
+    method: str, args: tuple, kwargs: dict
+) -> str | None:
+    """Return a fixed refusal for historical near-window news methods, else None."""
+    reason = _HISTORICAL_NEAR_WINDOW_NEWS_METHODS.get(method)
+    if not reason:
+        return None
+    analysis_date = _analysis_date_for_method(method, args, kwargs)
+    if not is_historical_analysis_date(analysis_date):
+        return None
+    return f"【数据获取失败】{reason}"
+
+
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to provider implementations with fallback support."""
     category = get_category_for_method(method)
@@ -144,6 +190,14 @@ def route_to_vendor(method: str, *args, **kwargs):
         f"method={method} {args_summary} category={category} "
         f"configured='{vendor_config}' chain={fallback_vendors}"
     )
+
+    refusal = _historical_near_window_news_refusal(method, args, kwargs)
+    if refusal is not None:
+        _trace(
+            f"method={method} {args_summary} status=historical-refuse "
+            f"reason=near-window-news providers_hit=0"
+        )
+        return refusal
 
     for vendor in fallback_vendors:
         provider = _registry.get(vendor)
