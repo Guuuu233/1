@@ -266,8 +266,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         out["Date"] = pd.to_datetime(out["Date"]).dt.strftime("%Y-%m-%d")
 
         header = f"# Stock data for {symbol} from {start} to {end}\n"
-        header += f"# Total records: {len(out)}\n"
-        header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        header += f"# Total records: {len(out)}\n\n"
         return header + out.to_csv(index=False)
 
     @staticmethod
