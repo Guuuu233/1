@@ -89,8 +89,13 @@ class BaseMarketDataProvider(ABC):
     def get_insider_transactions(self, symbol: str, curr_date: str = None) -> str:
         raise NotImplementedError
 
-    def get_realtime_quotes(self, symbols: list[str]) -> str:
-        """Return real-time quotes for a list of symbols as a JSON string."""
+    def get_realtime_quotes(self, symbols: list[str], curr_date: str = None) -> str:
+        """Return real-time quotes for a list of symbols as a JSON string.
+
+        ``curr_date`` is required by time-sensitive providers so historical
+        analysis can refuse snapshot quotes; base default is None for
+        providers that only support live bars.
+        """
         raise NotImplementedError
 
     def get_restricted_release(self, symbol: str, curr_date: str = None) -> str:

@@ -731,12 +731,20 @@ class CnAkshareProvider(BaseMarketDataProvider):
         Historical-date analysis refuses the THS abstract fallback because it has
         no announcement-date field and cannot be proven public-by-curr_date.
         """
+        if not curr_date:
+            return (
+                "【数据获取失败】财务报表缺少 curr_date，无法按公告生效日截断，"
+                f"{report_name} 本项不可用。"
+            )
         with AKSHARE_CALL_LOCK:
             ak = self._ak()
             symbol = self._sina_symbol(ticker)
             errors: list[str] = []
             today = cn_today_str()
-            is_historical = bool(curr_date) and parse_yyyymmdd(curr_date) is not None and parse_yyyymmdd(curr_date) < parse_yyyymmdd(today)
+            is_historical = (
+                parse_yyyymmdd(curr_date) is not None
+                and parse_yyyymmdd(curr_date) < parse_yyyymmdd(today)
+            )
 
             tables = self._load_sina_financial_tables(ticker, assume_locked=True)
             sina_df = tables.get(report_name)
@@ -744,11 +752,6 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 errors.append(f"stock_financial_report_sina: missing {report_name}")
 
             if sina_df is not None:
-                if not curr_date:
-                    return (
-                        "【数据获取失败】财务报表缺少 curr_date，无法按公告生效日截断，"
-                        f"{report_name} 本项不可用。"
-                    )
                 if "报告日" not in sina_df.columns or "公告日期" not in sina_df.columns:
                     return (
                         f"【数据获取失败】{report_name} 缺少 报告日/公告日期 列，"
