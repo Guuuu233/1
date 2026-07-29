@@ -21,7 +21,7 @@ from ..trade_calendar import (
     is_historical_analysis_date,
     snapshot_historical_refusal,
 )
-from ..utils import chronological, take_latest
+from ..utils import chronological, shrink_table, take_latest
 from ..financial_announce import (
     build_effective_announce_map,
     filter_abstract_period_columns,
@@ -286,15 +286,30 @@ class CnAkshareProvider(BaseMarketDataProvider):
         return out.sort_values("Date").reset_index(drop=True)
 
     @staticmethod
-    def _shrink_table(df: pd.DataFrame, max_rows: int = 8, max_cols: int = 14) -> pd.DataFrame:
-        if df is None or df.empty:
-            return df
-        clean_df = df.dropna(how="all", axis=1)
-        if clean_df.empty:
-            clean_df = df
-        rows = min(max_rows, len(clean_df))
-        cols = min(max_cols, len(clean_df.columns))
-        return clean_df.head(rows).iloc[:, :cols]
+    def _shrink_table(
+        df: pd.DataFrame,
+        max_rows: int = 8,
+        max_cols: int = 14,
+        *,
+        table_kind: str | None = "generic",
+        require_core_fields: bool = False,
+        max_prompt_chars: int | None = None,
+    ) -> str:
+        """Clean and render a vendor table for LLM injection.
+
+        ``max_cols`` is retained for call-site compatibility but ignored:
+        column selection is name-based only (no positional iloc slice).
+        """
+        kwargs = {
+            "max_rows": max_rows,
+            "table_kind": table_kind,
+            "require_core_fields": require_core_fields,
+        }
+        if max_prompt_chars is not None:
+            kwargs["max_prompt_chars"] = max_prompt_chars
+        # max_cols intentionally unused — positional column cuts are forbidden.
+        _ = max_cols
+        return shrink_table(df, **kwargs)
 
     def _fetch_hist_df(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
         with AKSHARE_CALL_LOCK:
@@ -645,7 +660,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
                             top_cols = metric_cols[:8]
                             cols = [c for c in ("选项", "指标") if c in filtered.columns] + top_cols
                             parts.append(
-                                self._shrink_table(filtered[cols], max_rows=20, max_cols=10).to_markdown(index=False)
+                                self._shrink_table(
+                                    filtered[cols],
+                                    max_rows=20,
+                                    max_cols=10,
+                                    table_kind="abstract",
+                                )
                             )
                     except Exception as exc:
                         _provider_logger.warning(
@@ -786,7 +806,22 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 header = financial_cutoff_header(
                     latest, curr_date, yoy_disclaimer=yoy_note
                 )
-                table = self._shrink_table(work, max_rows=12, max_cols=18).to_markdown(index=False)
+                kind_map = {
+                    "资产负债表": "balance",
+                    "利润表": "income",
+                    "现金流量表": "cashflow",
+                }
+                table = self._shrink_table(
+                    work,
+                    max_rows=12,
+                    max_cols=18,
+                    table_kind=kind_map.get(report_name, "generic"),
+                    # Core-four gate only applies to balance sheet: income/cashflow
+                    # never contain 总资产/总负债/净资产 together.
+                    require_core_fields=(report_name == "资产负债表"),
+                )
+                if table.startswith("【数据获取失败】"):
+                    return f"{header}\n\n{table}"
                 return f"{header}\n\n{table}"
 
             # Sina failed → THS fallback only allowed for same-day (non-historical) analysis.
@@ -803,7 +838,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 df = ak.stock_financial_abstract_new_ths(symbol=code, indicator=indicator)
                 if df is None or df.empty:
                     raise ValueError("empty dataframe")
-                table = self._shrink_table(df, max_rows=12, max_cols=18).to_markdown(index=False)
+                table = self._shrink_table(
+                    df,
+                    max_rows=12,
+                    max_cols=18,
+                    table_kind="abstract",
+                    require_core_fields=False,
+                )
                 return (
                     f"【备用数据源】同花顺财务摘要（无公告日字段，仅当日分析可用）\n\n{table}"
                 )

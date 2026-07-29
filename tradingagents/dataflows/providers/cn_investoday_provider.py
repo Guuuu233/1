@@ -16,6 +16,7 @@ from stockstats import wrap
 from .base import BaseMarketDataProvider
 from ..config import get_config
 from ..trade_calendar import cn_no_data_reason, snapshot_historical_refusal
+from ..utils import shrink_table
 
 logger = logging.getLogger(__name__)
 
@@ -545,16 +546,29 @@ class CnInvestodayProvider(BaseMarketDataProvider):
         if not isinstance(row, dict):
             return f"## Fundamentals for {ticker}\n\n未获取到公司基本信息。"
         df = pd.DataFrame([{k: str(v)[:500] for k, v in row.items()}])
-        table = self._shrink_table(df, max_rows=2, max_cols=24).to_string(index=False)
+        table = self._shrink_table(df, max_rows=2, max_cols=24, table_kind="generic")
         return f"## Fundamentals for {ticker}（今日投资 company/profiles）\n\n{table}"
 
     @staticmethod
-    def _shrink_table(df: pd.DataFrame, max_rows: int = 12, max_cols: int = 16) -> pd.DataFrame:
-        if df is None or df.empty:
-            return df
-        rows = min(max_rows, len(df))
-        cols = min(max_cols, len(df.columns))
-        return df.head(rows).iloc[:, :cols]
+    def _shrink_table(
+        df: pd.DataFrame,
+        max_rows: int = 12,
+        max_cols: int = 16,
+        *,
+        table_kind: str | None = "generic",
+        require_core_fields: bool = False,
+        max_prompt_chars: int | None = None,
+    ) -> str:
+        """Clean and render a vendor table for LLM injection (name-based only)."""
+        kwargs = {
+            "max_rows": max_rows,
+            "table_kind": table_kind,
+            "require_core_fields": require_core_fields,
+        }
+        if max_prompt_chars is not None:
+            kwargs["max_prompt_chars"] = max_prompt_chars
+        _ = max_cols  # positional column cuts are forbidden
+        return shrink_table(df, **kwargs)
 
     @staticmethod
     def _is_quarterly_freq(freq: str) -> bool:
@@ -605,7 +619,7 @@ class CnInvestodayProvider(BaseMarketDataProvider):
         if not rows:
             return f"## {title_cn} ({ticker})\n\n未获取到报表数据（今日投资 {path}）。"
         df = pd.DataFrame(rows)
-        table = self._shrink_table(df, max_rows=12, max_cols=18).to_string(index=False)
+        table = self._shrink_table(df, max_rows=12, max_cols=18, table_kind="generic", require_core_fields=False)
         freq_note = "单季度" if self._is_quarterly_freq(freq) else "合并/报告期口径以接口为准"
         return (
             f"## {title_cn} ({ticker}) — 今日投资 {path}（{freq_note}）\n\n{table}"
@@ -664,7 +678,7 @@ class CnInvestodayProvider(BaseMarketDataProvider):
                 "说明：本接口为「高管持股变动明细」，不等同全量股东增减持或大宗交易。"
             )
         df = pd.DataFrame(rows)
-        table = self._shrink_table(df, max_rows=25, max_cols=14).to_string(index=False)
+        table = self._shrink_table(df, max_rows=25, max_cols=14, table_kind="generic")
         return (
             f"## Insider Transactions for {symbol}\n\n"
             "数据来源：今日投资「高管持股变动明细」`/stock/exec-shrhld-chg`，"
