@@ -112,3 +112,18 @@ def test_same_day_board_does_not_auto_refuse(provider):
     """Today is not historical; refusal helper returns None (network still may fail)."""
     today = cn_today_str()
     assert snapshot_historical_refusal(today, source_label="板块") is None
+
+
+def test_zt_pool_refuses_historical(provider):
+    """stock_zt_pool_em is near-window only; historical analysis must refuse."""
+    past = (now_cn().date() - timedelta(days=90)).isoformat()
+    with patch.object(provider, "_ak", side_effect=AssertionError("must not call network")):
+        out = provider.get_zt_pool(past)
+    assert SNAPSHOT_ONLY_REFUSAL in out
+    assert out.startswith("【数据获取失败】")
+
+
+def test_zt_pool_same_day_does_not_auto_refuse(provider):
+    today = cn_today_str()
+    assert snapshot_historical_refusal(today, source_label="涨停") is None
+

@@ -1295,10 +1295,19 @@ class CnAkshareProvider(BaseMarketDataProvider):
     def get_zt_pool(self, date: str) -> str:
         """获取涨停板情绪池，反映市场整体情绪温度。
 
-        查询日先规整到交易日，并向前回退以覆盖发布延迟；注入文本必须写明实际数据日。
+        ``stock_zt_pool_em`` 仅保留近窗截面（探测：约 15 个交易日，更早全空），
+        不是可回测的历史序列。历史日期分析直接拒绝，避免 5 日回退空结果
+        被当成「当日无涨停」的情绪信号。
+        当日分析仍可规整交易日 + 发布延迟回退，并写明实际数据日。
         """
         source_name = "akshare.stock_zt_pool_em"
         title = "涨停板情绪池"
+        refusal = snapshot_historical_refusal(
+            date,
+            source_label="涨停板情绪池（仅提供近窗，非全历史）",
+        )
+        if refusal:
+            return refusal
         request_date = date or cn_today_str()
         ak = self._ak()
 
