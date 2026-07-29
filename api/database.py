@@ -93,6 +93,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_report_schema()
     _ensure_user_schema()
+    _ensure_llm_call_log_schema()
 
 
 def _ensure_report_schema() -> None:
@@ -248,6 +249,53 @@ def _migrate_api_keys_reencrypt() -> None:
 
 
 # Report Model
+def _ensure_llm_call_log_schema() -> None:
+    """Create llm_call_logs table on first boot (safe for existing deployments)."""
+    try:
+        Base.metadata.create_all(bind=engine, tables=[LLMCallLogDB.__table__], checkfirst=True)
+    except Exception as e:
+        logger.error("Failed to ensure llm_call_log schema: %s", e)
+
+
+def log_llm_call(
+    *,
+    agent_name: str,
+    model_name: str | None = None,
+    finish_reason: str | None = None,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    total_tokens: int | None = None,
+    elapsed_seconds: float | None = None,
+    response_chars: int | None = None,
+    degraded: bool = False,
+    report_id: str | None = None,
+) -> None:
+    """Fire-and-forget: write one LLM call record to llm_call_logs.
+
+    Errors are swallowed so a log failure never breaks analysis.
+    """
+    from uuid import uuid4
+    try:
+        with get_db_ctx() as db:
+            db.add(LLMCallLogDB(
+                id=uuid4().hex,
+                report_id=report_id,
+                agent_name=agent_name,
+                model_name=model_name,
+                finish_reason=finish_reason,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                elapsed_seconds=elapsed_seconds,
+                response_chars=response_chars,
+                degraded=degraded,
+            ))
+            db.commit()
+    except Exception as exc:
+        logger.warning("log_llm_call failed (non-fatal): %s", exc)
+
+
+
 class ReportDB(Base):
     """Report database model."""
     
@@ -545,3 +593,21 @@ class RoleBindingDB(Base):
     __table_args__ = (
         UniqueConstraint('user_id', 'target_type', 'target_key', name='uq_role_binding_user_target'),
     )
+
+
+class LLMCallLogDB(Base):
+    """Structured log of every LLM call made during analysis."""
+    __tablename__ = "llm_call_logs"
+
+    id = Column(String(64), primary_key=True, index=True)
+    report_id = Column(String(64), nullable=True, index=True)
+    agent_name = Column(String(100), nullable=False, index=True)
+    model_name = Column(String(255), nullable=True)
+    finish_reason = Column(String(50), nullable=True)
+    prompt_tokens = Column(Integer, nullable=True)
+    completion_tokens = Column(Integer, nullable=True)
+    total_tokens = Column(Integer, nullable=True)
+    elapsed_seconds = Column(Float, nullable=True)
+    response_chars = Column(Integer, nullable=True)
+    degraded = Column(Boolean, nullable=False, default=False, server_default="0")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
