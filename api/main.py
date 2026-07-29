@@ -268,6 +268,27 @@ async def lifespan(app: FastAPI):
     # Pre-load stock + ETF name map
     await asyncio.to_thread(_load_cn_stock_map)
     _log("Stock map pre-loaded on startup.")
+
+    # Recover orphan pending/running reports left by interrupted processes.
+    # Without this, DB "running" zombies accumulate and any UI/scheduler that
+    # keys off active status keeps fighting real work for LLM capacity.
+    try:
+        from api.services import report_service as _report_service
+
+        with get_db_ctx() as _db:
+            # No in-memory jobs are live yet at startup (store was just cleared).
+            stats = _report_service.recover_stale_active_reports(
+                _db,
+                active_job_ids=[],
+                error_message="进程中断，启动恢复流程标记",
+            )
+        _log(
+            f"Recovered stale active reports: failed={stats.get('failed', 0)} "
+            f"(error marked as process-interrupt recovery)."
+        )
+    except Exception as exc:
+        _log(f"Stale report recovery failed (non-fatal): {exc}")
+
     yield
     _log("Shutting down: Cleaning up resources...")
     _executor.shutdown(wait=True)
