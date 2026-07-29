@@ -284,7 +284,7 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         "news": (get_news, {"ticker": ticker, "start_date": (end_dt - timedelta(days=lookback)).strftime("%Y-%m-%d"), "end_date": trade_date}),
         "global_news": (get_global_news, {"curr_date": trade_date, "look_back_days": lookback, "limit": 30}),
         "fund_flow_board": (get_board_fund_flow, {}),
-        "fund_flow_individual": (get_individual_fund_flow, {"symbol": ticker}),
+        "fund_flow_individual": (get_individual_fund_flow, {"symbol": ticker, "curr_date": trade_date}),
         "lhb": (get_lhb_detail, {"symbol": ticker, "date": trade_date}),
         "insider_transactions": (get_insider_transactions, {"ticker": ticker, "curr_date": trade_date}),
         "zt_pool": (get_zt_pool, {"date": trade_date}),

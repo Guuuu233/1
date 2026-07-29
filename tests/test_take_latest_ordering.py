@@ -202,15 +202,16 @@ def test_news_selects_latest_and_renders_chronologically(frame_factory):
 def test_fund_flow_latest_five_independent_of_order(frame):
     """Function-level fund flow: asc/desc same latest 5, chronological render."""
     provider = _FundFlowFixtureProvider(frame)
-    text = provider.get_individual_fund_flow("600519")
+    text = provider.get_individual_fund_flow("600519", curr_date="2026-07-28")
     latest = sorted(frame["日期"])[-1]
     second = sorted(frame["日期"])[-2]
     oldest = sorted(frame["日期"])[0]
     assert str(latest) in text
     assert str(second) in text
     assert str(oldest) not in text
-    # chronological: second-latest appears before latest in the rendered block
-    assert text.index(str(second)) < text.index(str(latest))
+    # Header may mention latest data day; compare order only inside the table body.
+    body = text.split("：", 1)[-1]
+    assert body.index(str(second)) < body.index(str(latest))
 
 
 def test_northbound_deprecated_no_network_and_no_old_dates():

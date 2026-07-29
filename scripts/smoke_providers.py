@@ -12,7 +12,7 @@ METHODS = [
     ("新闻资讯", "get_news", lambda s, d: (s, "2025-01-01", d)),
     ("高管增减持", "get_insider_transactions", lambda s, d: (s, d)),
     ("板块资金流", "get_board_fund_flow", lambda s, d: ()),
-    ("个股资金流", "get_individual_fund_flow", lambda s, d: (s,)),
+    ("个股资金流", "get_individual_fund_flow", lambda s, d: (s, d)),
     ("龙虎榜", "get_lhb_detail", lambda s, d: (s, d)),
     ("涨停池", "get_zt_pool", lambda s, d: (d,)),
     ("雪球热股", "get_hot_stocks_xq", lambda s, d: ()),

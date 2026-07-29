@@ -20,6 +20,14 @@ from ..trade_calendar import (
     is_cn_trading_day,
 )
 from ..utils import chronological, take_latest
+from ..financial_announce import (
+    build_effective_announce_map,
+    filter_abstract_period_columns,
+    filter_financial_df_by_effective_announce,
+    financial_cutoff_header,
+    parse_yyyymmdd,
+    periods_used_dropped_yoy,
+)
 
 _provider_logger = logging.getLogger(__name__)
 
@@ -547,6 +555,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
         return pd.DataFrame()
 
     def get_fundamentals(self, ticker: str, curr_date: str = None) -> str:
+        """Company profile (snapshot) + financial abstract (period-mapped cutoff).
+
+        Profile values are current-market snapshots and must not be used for
+        historical-date analysis (handled fully in 3b). For 3a we still return
+        profile on same-day analysis, and always try to truncate abstract period
+        columns via sina report-period → effective announce mapping.
+        """
         with AKSHARE_CALL_LOCK:
             ak = self._ak()
             code = self._normalize_symbol(ticker)
@@ -585,17 +600,61 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 errors.append(f"stock_financial_abstract: {type(exc).__name__}")
 
             parts = [f"## Fundamentals for {ticker} ({stock_name})"] if stock_name else [f"## Fundamentals for {ticker}"]
+
+            # Company Profile remains a live snapshot; historical refuse is 3b.
+            # 3a only maps Financial Abstract period columns by effective announce date.
             if info_df is not None and not info_df.empty:
                 for c in info_df.columns:
                     info_df[c] = info_df[c].astype(str).str.slice(0, 220)
                 parts.append("### Company Profile")
                 parts.append(info_df.head(40).to_markdown(index=False))
+
             if abstract_df is not None and not abstract_df.empty:
-                parts.append("### Financial Abstract (latest available columns)")
-                metric_cols = [c for c in abstract_df.columns if c not in ("选项", "指标")]
-                top_cols = metric_cols[:8]
-                cols = [c for c in ("选项", "指标") if c in abstract_df.columns] + top_cols
-                parts.append(self._shrink_table(abstract_df[cols], max_rows=20, max_cols=10).to_markdown(index=False))
+                if curr_date:
+                    try:
+                        eff_map = self._sina_effective_announce_map(ticker, assume_locked=True)
+                        filtered, latest = filter_abstract_period_columns(
+                            abstract_df, eff_map, curr_date
+                        )
+                        parts.append("### Financial Abstract")
+                        yoy_note = False
+                        if filtered is not None and not filtered.empty:
+                            period_cols = [
+                                c for c in filtered.columns if c not in ("选项", "指标")
+                            ]
+                            yoy_note = periods_used_dropped_yoy(eff_map, period_cols)
+                        parts.append(
+                            financial_cutoff_header(
+                                latest, curr_date, yoy_disclaimer=yoy_note
+                            )
+                        )
+                        if latest is None or filtered is None or filtered.empty:
+                            parts.append(
+                                f"【数据获取失败】财务摘要在 {curr_date} 及之前无已公开报告期列。"
+                            )
+                        else:
+                            metric_cols = [c for c in filtered.columns if c not in ("选项", "指标")]
+                            # Prefer newest periods for display (column order often newest-first).
+                            top_cols = metric_cols[:8]
+                            cols = [c for c in ("选项", "指标") if c in filtered.columns] + top_cols
+                            parts.append(
+                                self._shrink_table(filtered[cols], max_rows=20, max_cols=10).to_markdown(index=False)
+                            )
+                    except Exception as exc:
+                        _provider_logger.warning(
+                            "financial abstract cutoff failed for %s: %s", ticker, exc
+                        )
+                        parts.append("### Financial Abstract")
+                        parts.append(
+                            "【数据获取失败】财务摘要无法按公告生效日截断"
+                            f"（{type(exc).__name__}: {exc}），本项不可用。"
+                        )
+                else:
+                    # No analysis date → cannot prove periods are public; refuse abstract.
+                    parts.append("### Financial Abstract")
+                    parts.append(
+                        "【数据获取失败】财务摘要缺少 curr_date，无法做公告日截断，本项不可用。"
+                    )
 
             if len(parts) > 1:
                 return "\n\n".join(parts)
@@ -605,27 +664,139 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 + "; ".join(errors)
             )
 
-    def _financial_report_sina(self, ticker: str, report_name: str) -> str:
+    def _load_sina_financial_tables(self, ticker: str, assume_locked: bool = False) -> dict[str, pd.DataFrame]:
+        """Fetch raw sina balance/income/cashflow frames (no truncation).
+
+        Short-lived per-ticker cache of **raw uncut DataFrames** only.
+        Key is ticker code alone (NOT curr_date). Truncation by effective
+        announce date always happens after this cache returns, so two
+        analyses with different curr_date in the same 120s window cannot
+        share a post-cutoff result or leak future periods.
+        """
+        code = self._normalize_symbol(ticker)
+        cache = getattr(self, "_sina_fin_tables_cache", None)
+        if cache is None:
+            self._sina_fin_tables_cache = {}
+            cache = self._sina_fin_tables_cache
+        hit = cache.get(code)
+        if hit is not None:
+            loaded_at, tables = hit
+            # Raw tables only; safe to reuse across curr_date values.
+            if time.monotonic() - loaded_at < 120 and tables:
+                return tables
+
+        ak = self._ak()
+        symbol = self._sina_symbol(ticker)
+        names = ("资产负债表", "利润表", "现金流量表")
+        out: dict[str, pd.DataFrame] = {}
+
+        def _one(report_name: str) -> pd.DataFrame:
+            df = ak.stock_financial_report_sina(stock=symbol, symbol=report_name)
+            if df is None or df.empty:
+                raise ValueError("empty dataframe")
+            return df
+
+        def _fill() -> None:
+            for name in names:
+                try:
+                    out[name] = _one(name)
+                except Exception as exc:
+                    _provider_logger.warning(
+                        "sina financial table %s failed for %s: %s", name, ticker, exc
+                    )
+
+        if assume_locked:
+            _fill()
+        else:
+            with AKSHARE_CALL_LOCK:
+                _fill()
+
+        cache[code] = (time.monotonic(), out)
+        return out
+
+    def _sina_effective_announce_map(self, ticker: str, assume_locked: bool = False):
+        tables = self._load_sina_financial_tables(ticker, assume_locked=assume_locked)
+        return build_effective_announce_map(tables)
+
+    def _financial_report_sina(
+        self, ticker: str, report_name: str, curr_date: str = None
+    ) -> str:
+        """Return one sina financial statement markdown, truncated by A4 effective announce date.
+
+        Historical-date analysis refuses the THS abstract fallback because it has
+        no announcement-date field and cannot be proven public-by-curr_date.
+        """
         with AKSHARE_CALL_LOCK:
             ak = self._ak()
             symbol = self._sina_symbol(ticker)
-            errors = []
-            try:
-                df = ak.stock_financial_report_sina(stock=symbol, symbol=report_name)
-                if df is None or df.empty:
-                    raise ValueError("empty dataframe")
-                return self._shrink_table(df, max_rows=12, max_cols=18).to_markdown(index=False)
-            except Exception as exc:
-                errors.append(f"stock_financial_report_sina: {type(exc).__name__}")
+            errors: list[str] = []
+            today = cn_today_str()
+            is_historical = bool(curr_date) and parse_yyyymmdd(curr_date) is not None and parse_yyyymmdd(curr_date) < parse_yyyymmdd(today)
+
+            tables = self._load_sina_financial_tables(ticker, assume_locked=True)
+            sina_df = tables.get(report_name)
+            if sina_df is None:
+                errors.append(f"stock_financial_report_sina: missing {report_name}")
+
+            if sina_df is not None:
+                if not curr_date:
+                    return (
+                        "【数据获取失败】财务报表缺少 curr_date，无法按公告生效日截断，"
+                        f"{report_name} 本项不可用。"
+                    )
+                if "报告日" not in sina_df.columns or "公告日期" not in sina_df.columns:
+                    return (
+                        f"【数据获取失败】{report_name} 缺少 报告日/公告日期 列，"
+                        "无法做历史截断，本项不可用。"
+                    )
+                try:
+                    # Map uses all three tables so IS/CF YoY refresh is capped by
+                    # statutory deadline and cross-checked with BS announce dates.
+                    eff_map = build_effective_announce_map(tables)
+                    filtered, latest = filter_financial_df_by_effective_announce(
+                        sina_df, eff_map, curr_date
+                    )
+                except Exception as exc:
+                    return (
+                        f"【数据获取失败】{report_name} 公告生效日截断失败"
+                        f"（{type(exc).__name__}: {exc}），本项不可用。"
+                    )
+                if filtered is None or filtered.empty or latest is None:
+                    header = financial_cutoff_header(latest, curr_date)
+                    return (
+                        f"{header}\n"
+                        f"【数据获取失败】{report_name} 在 {curr_date} 及之前无已公开报告期。"
+                    )
+                # Newest first for LLM: sort by report period descending.
+                work = filtered.copy()
+                work["__period"] = work["报告日"].map(lambda x: parse_yyyymmdd(x))
+                work = work.dropna(subset=["__period"]).sort_values("__period", ascending=False)
+                work = work.drop(columns=["__period"])
+                yoy_note = periods_used_dropped_yoy(eff_map, work["报告日"])
+                header = financial_cutoff_header(
+                    latest, curr_date, yoy_disclaimer=yoy_note
+                )
+                table = self._shrink_table(work, max_rows=12, max_cols=18).to_markdown(index=False)
+                return f"{header}\n\n{table}"
+
+            # Sina failed → THS fallback only allowed for same-day (non-historical) analysis.
+            if is_historical:
+                return (
+                    f"【数据获取失败】主数据源新浪财报不可用，备用源同花顺摘要无公告日字段，"
+                    f"历史日期分析（{curr_date}）下 {report_name} 不可用。"
+                    + (f" 原因：{'; '.join(errors)}" if errors else "")
+                )
 
             code = self._normalize_symbol(ticker)
             indicator = "按报告期"
             try:
-                # 同花顺摘要表作为备用，口径不完全一致但可作为降级保障
                 df = ak.stock_financial_abstract_new_ths(symbol=code, indicator=indicator)
                 if df is None or df.empty:
                     raise ValueError("empty dataframe")
-                return self._shrink_table(df, max_rows=12, max_cols=18).to_markdown(index=False)
+                table = self._shrink_table(df, max_rows=12, max_cols=18).to_markdown(index=False)
+                return (
+                    f"【备用数据源】同花顺财务摘要（无公告日字段，仅当日分析可用）\n\n{table}"
+                )
             except Exception as exc:
                 errors.append(f"stock_financial_abstract_new_ths: {type(exc).__name__}")
 
@@ -636,19 +807,19 @@ class CnAkshareProvider(BaseMarketDataProvider):
     def get_balance_sheet(
         self, ticker: str, freq: str = "quarterly", curr_date: str = None
     ) -> str:
-        table = self._financial_report_sina(ticker, "资产负债表")
+        table = self._financial_report_sina(ticker, "资产负债表", curr_date=curr_date)
         return f"## Balance Sheet ({ticker})\n\n{table}"
 
     def get_cashflow(
         self, ticker: str, freq: str = "quarterly", curr_date: str = None
     ) -> str:
-        table = self._financial_report_sina(ticker, "现金流量表")
+        table = self._financial_report_sina(ticker, "现金流量表", curr_date=curr_date)
         return f"## Cashflow ({ticker})\n\n{table}"
 
     def get_income_statement(
         self, ticker: str, freq: str = "quarterly", curr_date: str = None
     ) -> str:
-        table = self._financial_report_sina(ticker, "利润表")
+        table = self._financial_report_sina(ticker, "利润表", curr_date=curr_date)
         return f"## Income Statement ({ticker})\n\n{table}"
 
     def get_news(self, ticker: str, start_date: str, end_date: str) -> str:
@@ -986,9 +1157,22 @@ class CnAkshareProvider(BaseMarketDataProvider):
         except Exception as exc:
             return f"板块资金流向数据暂时不可用（akshare 接口问题）：{type(exc).__name__}"
 
-    def get_individual_fund_flow(self, symbol: str) -> str:
-        """获取个股近期主力资金净流向。"""
+    def get_individual_fund_flow(self, symbol: str, curr_date: str = None) -> str:
+        """获取个股近期主力资金净流向，并按 curr_date 截断。
+
+        东财个股资金流仅覆盖约最近 120 个交易日；过滤后为空时返回明确失败，
+        不返回空表。
+        """
         try:
+            if not curr_date:
+                return (
+                    f"【数据获取失败】个股资金流向缺少 curr_date，无法做日期截断，"
+                    f"{symbol} 本项不可用。"
+                )
+            cutoff = parse_yyyymmdd(curr_date)
+            if cutoff is None:
+                return f"【数据获取失败】个股资金流向 curr_date 无法解析：{curr_date!r}"
+
             ak = self._ak()
             code = self._normalize_symbol(symbol)
             # 沪市：以 5、6、9 开头；其余为深市
@@ -1000,10 +1184,26 @@ class CnAkshareProvider(BaseMarketDataProvider):
             date_col = "日期" if "日期" in df.columns else None
             if date_col is None:
                 return f"{symbol} 近期主力资金流向数据缺少日期列，无法判定最新记录。"
+
+            dates = pd.to_datetime(df[date_col], errors="coerce")
+            df = df.loc[dates.notna()].copy()
+            df[date_col] = dates[dates.notna()]
+            df = df[df[date_col] <= pd.Timestamp(cutoff)]
+            if df.empty:
+                return (
+                    f"【数据获取失败】资金流数据仅覆盖最近约 120 个交易日，"
+                    f"{curr_date} 超出可得范围，{symbol} 本项不可用。"
+                )
+
             df_recent = chronological(take_latest(df, date_col, 5), date_col)
             if df_recent is None or df_recent.empty:
                 return f"{symbol} 近期主力资金流向数据日期不可解析。"
-            return f"{symbol} 近5日主力资金净流向：\n{df_recent.to_string(index=False)}"
+            latest_day = pd.to_datetime(df_recent[date_col], errors="coerce").max()
+            latest_str = latest_day.date().isoformat() if pd.notna(latest_day) else curr_date
+            return (
+                f"{symbol} 近5日主力资金净流向（截至于 {curr_date}，最新数据日 {latest_str}）：\n"
+                f"{df_recent.to_string(index=False)}"
+            )
         except Exception as exc:
             return f"个股资金流向数据获取失败：{type(exc).__name__}: {exc}"
 
@@ -1287,10 +1487,23 @@ class CnAkshareProvider(BaseMarketDataProvider):
             return res.to_prompt()
 
     def get_shareholder_count(self, symbol: str, curr_date: str = None) -> str:
-        """获取股东户数变动与筹码集中度。"""
+        """获取股东户数变动与筹码集中度。
+
+        curr_date 必填：缺参时若不过滤会直接 take_latest 最新 4 期，造成历史分析前视。
+        """
         source_name = "akshare.stock_zh_a_gdhs_detail_em"
         title = "股东户数与筹码集中度"
         try:
+            if not curr_date:
+                res = DataResult(
+                    ok=False,
+                    data=None,
+                    error="缺少 curr_date，拒绝返回未截断的最新股东户数（防止历史分析前视）",
+                    source=source_name,
+                    title=title,
+                )
+                return res.to_prompt()
+
             code = self._normalize_symbol(symbol)
             ak = self._ak()
 
@@ -1301,10 +1514,19 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 res = DataResult(ok=True, data=None, source=source_name, title=title)
                 return res.to_prompt()
 
-            # Truncate by curr_date if passed (datetime compare, not string)
+            # Truncate by curr_date (datetime compare, not string)
             date_col = "股东户数公告日期" if "股东户数公告日期" in df.columns else None
-            if curr_date and date_col:
+            if date_col:
                 cutoff = pd.to_datetime(curr_date, errors="coerce")
+                if pd.isna(cutoff):
+                    res = DataResult(
+                        ok=False,
+                        data=None,
+                        error=f"curr_date 无法解析：{curr_date!r}",
+                        source=source_name,
+                        title=title,
+                    )
+                    return res.to_prompt()
                 ann = pd.to_datetime(df[date_col], errors="coerce")
                 df = df[ann.notna() & (ann <= cutoff)]
 

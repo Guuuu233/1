@@ -45,7 +45,7 @@ def create_smart_money_analyst(llm, data_collector=None):
             
             # Parallelize fallback fetches
             results = await asyncio.gather(
-                _safe(get_individual_fund_flow, {"symbol": ticker}),
+                _safe(get_individual_fund_flow, {"symbol": ticker, "curr_date": current_date}),
                 _safe(get_lhb_detail, {"symbol": ticker, "date": current_date}),
                 _safe(get_indicators, {
                     "symbol": ticker, "indicator": "volume",

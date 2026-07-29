@@ -12,9 +12,10 @@ def get_board_fund_flow() -> str:
 @tool
 def get_individual_fund_flow(
     symbol: Annotated[str, "股票代码，格式如 600519.SH"],
+    curr_date: Annotated[str | None, "分析日期 YYYY-MM-DD，用于截断资金流历史"] = None,
 ) -> str:
     """获取个股近5日主力资金净流向，判断机构资金进出方向。symbol 格式如 600519.SH。"""
-    return route_to_vendor("get_individual_fund_flow", symbol)
+    return route_to_vendor("get_individual_fund_flow", symbol, curr_date)
 
 
 @tool
