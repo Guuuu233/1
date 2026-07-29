@@ -69,3 +69,40 @@ def test_check_llm_output_degraded_normal():
 def test_check_llm_output_degraded_empty():
     from tradingagents.agents.utils.agent_states import check_llm_output_degraded
     assert check_llm_output_degraded("", "TestAgent") is False
+
+
+def test_check_stream_chunk_degraded_triggers():
+    from tradingagents.agents.utils.agent_states import check_stream_chunk_degraded
+    # 2000+ whitespace-only tail → should trigger
+    buf = "正常内容开头" + " " * 2001
+    assert check_stream_chunk_degraded(buf, "TestAgent") is True
+
+def test_check_stream_chunk_degraded_short_buffer():
+    from tradingagents.agents.utils.agent_states import check_stream_chunk_degraded
+    # buffer shorter than window → should not trigger
+    buf = " " * 1999
+    assert check_stream_chunk_degraded(buf, "TestAgent") is False
+
+def test_check_stream_chunk_degraded_mixed_tail():
+    from tradingagents.agents.utils.agent_states import check_stream_chunk_degraded
+    # last 2000 chars contain some non-whitespace → should not trigger
+    buf = " " * 1990 + "结论：偏多" + " " * 5
+    assert check_stream_chunk_degraded(buf, "TestAgent") is False
+
+def test_stream_break_simulation():
+    """Simulate the astream loop: mock a stream that emits spaces after 50 chars,
+    assert the loop breaks before the full 5000-space sequence is consumed."""
+    from tradingagents.agents.utils.agent_states import check_stream_chunk_degraded
+
+    chunks = ["正常分析内容" * 5] + [" " * 100] * 100  # 50 real chars then 10000 spaces
+    full_content = ""
+    broke_at = None
+    for i, chunk in enumerate(chunks):
+        full_content += chunk
+        if check_stream_chunk_degraded(full_content, "MockAgent"):
+            broke_at = i
+            break
+
+    assert broke_at is not None, "loop should have broken"
+    # should break after 2000 spaces consumed (20 × 100-space chunks) + real prefix
+    assert len(full_content) < 5000, f"should break early, got {len(full_content)}"

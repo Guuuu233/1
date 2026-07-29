@@ -218,3 +218,25 @@ def check_llm_output_degraded(text: str, agent_name: str) -> bool:
         )
         return True
     return False
+
+
+_STREAM_DEGRADE_WINDOW = 2000
+
+
+def check_stream_chunk_degraded(buffer_tail: str, agent_name: str) -> bool:
+    """Return True if the last _STREAM_DEGRADE_WINDOW chars are all whitespace.
+
+    Call this inside the astream loop with the trailing slice of full_content.
+    When True, the caller should break the loop immediately.
+    """
+    n = len(buffer_tail)
+    if n < _STREAM_DEGRADE_WINDOW:
+        return False
+    tail = buffer_tail[-_STREAM_DEGRADE_WINDOW:]
+    if all(c in " \t\n\r" for c in tail):
+        _degrade_logger.warning(
+            "[%s] Stream degrade detected: last %d chars are all whitespace; aborting stream.",
+            agent_name, _STREAM_DEGRADE_WINDOW,
+        )
+        return True
+    return False

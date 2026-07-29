@@ -4,7 +4,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
 from tradingagents.graph.intent_parser import build_horizon_context
-from tradingagents.agents.utils.agent_states import current_tracker_var, extract_verdict, check_llm_output_degraded
+from tradingagents.agents.utils.agent_states import current_tracker_var, extract_verdict, check_llm_output_degraded, check_stream_chunk_degraded
 from api.database import log_llm_call
 
 
@@ -56,6 +56,8 @@ def create_volume_price_analyst(llm, data_collector=None):
             async for chunk in llm.astream(messages):
                 content = chunk.content if hasattr(chunk, "content") else str(chunk)
                 full_content += content
+                if check_stream_chunk_degraded(full_content, "Volume Price Analyst"):
+                    break
                 if tracker:
                     tracker._emit_token("Volume Price Analyst", "volume_price_report", content)
         except Exception as exc:
