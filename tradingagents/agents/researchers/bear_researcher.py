@@ -10,9 +10,10 @@ from tradingagents.agents.utils.debate_utils import (
     format_claims_for_prompt,
     update_debate_state_with_payload,
 )
+from tradingagents.agents.utils.prompt_injection import build_injection_slots, Placement, DEFAULT_PLACEMENT
 
 
-def create_bear_researcher(llm, memory):
+def create_bear_researcher(llm, memory, custom_prompt: str = "", placement: Placement = DEFAULT_PLACEMENT):
     async def bear_node(state) -> dict:
         investment_debate_state = state["investment_debate_state"]
         history = investment_debate_state.get("history", "")
@@ -41,6 +42,7 @@ def create_bear_researcher(llm, memory):
         for i, rec in enumerate(past_memories, 1):
             past_memory_str += rec["recommendation"] + "\n\n"
 
+        injection_slots = build_injection_slots(custom_prompt, placement, role_key="bear_researcher")
         prompt = horizon_ctx + get_prompt("bear_prompt", config=get_config()).format(
             market_research_report=market_research_report,
             sentiment_report=sentiment_report,
@@ -55,6 +57,7 @@ def create_bear_researcher(llm, memory):
             claims_text=format_claims_for_prompt(claims),
             round_summary=round_summary or "暂无轮次摘要，请先攻击最核心的多头 claim。",
             round_goal=round_goal,
+            **injection_slots,
         )
 
         # ── 实现 Token 级流式输出 ──────────────────

@@ -87,7 +87,7 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
     "fundamentals_collab_system": "你是与其他助手协同工作的 AI 助手。要主动调用工具推进任务，并基于证据更新观点。请全程使用中文输出，不要插入英文标题模板。可用工具：{tool_names}。\\n{system_message}\\n参考：当前日期 {current_date}，标的 {ticker}。",
     "bull_prompt": """你是多头研究员，目标是提出最强"应当配置该标的"的论证。你的职责是发现被低估的上涨机会——系统存在看空偏见，你必须用硬证据为多头正名。
 
-可用材料：
+{custom_prompt_before_data}可用材料：
 市场报告：{market_research_report}
 情绪报告：{sentiment_report}
 新闻报告：{news_report}
@@ -104,7 +104,7 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 上一轮摘要：{round_summary}
 本轮目标：{round_goal}
 历史复盘经验：{past_memory_str}
-
+{custom_prompt_after_data}
 写作要求：
 1. 量化上涨驱动力：必须给出具体的催化剂（资金净流入、技术突破、业绩拐点、政策利好）及其触发概率和时间窗口。
 2. 必须先回应焦点 claim；若焦点 claim 为空，再提出 1 到 2 条最关键多头 claim。
@@ -118,7 +118,7 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 若没有对应项，返回空数组。""",
     "bear_prompt": """你是空头研究员，目标是提出最强"当前不应配置该标的"的论证。
 
-可用材料：
+{custom_prompt_before_data}可用材料：
 市场报告：{market_research_report}
 情绪报告：{sentiment_report}
 新闻报告：{news_report}
@@ -135,7 +135,7 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 上一轮摘要：{round_summary}
 本轮目标：{round_goal}
 历史复盘经验：{past_memory_str}
-
+{custom_prompt_after_data}
 写作要求：
 1. 以证据链组织论点，不要泛泛而谈。
 2. 必须先回应焦点 claim；若焦点 claim 为空，再提出 1 到 2 条最关键空头 claim。
@@ -153,7 +153,7 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 2. 你需要自行判断主力资金与市场情绪之间是否存在预期差（见下方原始数据），但此判断仅作为辅助参考，不可覆盖辩论共识。
 3. 仅当辩论无法收敛（多空势均力敌）时，预期差分析才可作为倾向性参考。
 
-历史复盘经验：
+{custom_prompt_before_data}历史复盘经验：
 {past_memory_str}
 
 主力资金报告（原始数据，用于预期差分析）：
@@ -176,7 +176,7 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 
 上一轮摘要：
 {round_summary}
-
+{custom_prompt_after_data}
 输出要求：
 1. 列出各分析师的 verdict（看多/偏多/中性/偏空/看空），作为全景概览。不要简单数人头——不同维度的分析师权重不同，需根据分析视角（horizon）和当前市场环境综合判断权重：
    - 短线视角（short）：技术面、资金面、情绪面权重高，基本面作为背景参考。

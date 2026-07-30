@@ -62,6 +62,7 @@ def _get_real_ip(request: Request) -> Optional[str]:
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.graph.data_collector import DataCollector
+from tradingagents.agents.utils.prompt_injection import DEFAULT_PLACEMENT
 
 # 全局共享 DataCollector：同一 ticker+date 的数据只拉一次，所有 job 复用缓存
 _shared_data_collector = DataCollector()
@@ -1871,6 +1872,79 @@ async def _save_report_or_raise(
         raise RuntimeError(message) from exc
 
 
+_INJECT_ROLES = ("bull_researcher", "bear_researcher", "research_manager")
+
+
+def _attach_custom_prompt_snapshot(result: Dict[str, Any], prompt_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach a deep-copied custom_prompt_snapshot onto result_data before it is saved.
+
+    Both save paths (dual-horizon and single-path) must call this exact function so
+    the snapshot shape and isolation guarantee (deepcopy, not shared reference) stay
+    identical across paths — no per-path reimplementation.
+    """
+    result["custom_prompt_snapshot"] = deepcopy(prompt_snapshot)
+    return result
+
+
+def _build_custom_prompt_snapshot(
+    frozen_bundle: Dict[str, Dict[str, Any]],
+    injection_enabled: bool,
+) -> Dict[str, Any]:
+    """Build the persisted prompt snapshot from a frozen job bundle."""
+    return {
+        "enabled": injection_enabled,
+        "placement": DEFAULT_PLACEMENT,
+        "roles": deepcopy(frozen_bundle),
+    }
+
+
+def _resolve_and_freeze_custom_prompts(
+    db: Session,
+    user_id: Optional[str],
+) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+    """Resolve custom prompts from DB and freeze into an immutable bundle for a job.
+
+    Must happen after init_report, before any TradingAgentsGraph is constructed.
+    Only reads users.prompt_injection_enabled first; only calls resolve_all_roles_prompts
+    when the switch is on. Frozen value is immutable for this job's lifetime.
+
+    Returns:
+        (frozen_bundle, injection_enabled)
+    """
+    injection_enabled = custom_prompt_service.get_prompt_injection_enabled(db, user_id) if user_id else False
+    if injection_enabled:
+        resolved = custom_prompt_service.resolve_all_roles_prompts(db, user_id)
+        raw_bundle: Dict[str, Dict[str, Any]] = {}
+        for r in resolved:
+            rk = r["role_key"]
+            if rk not in _INJECT_ROLES:
+                continue
+            text = r["resolved_text"] or ""
+            if text and r["resolved_length"] > custom_prompt_service.RESOLVED_PROMPT_MAX_CHARS:
+                raise ValueError(
+                    f"[custom_prompt] {rk} resolved text "
+                    f"{r['resolved_length']} chars > "
+                    f"{custom_prompt_service.RESOLVED_PROMPT_MAX_CHARS} limit, "
+                    f"hash={r['resolved_hash']}"
+                )
+            raw_bundle[rk] = {
+                "resolved_text": text,
+                "resolved_hash": r["resolved_hash"],
+                "resolved_length": r["resolved_length"],
+                "injected": bool(text),
+            }
+        for rk in _INJECT_ROLES:
+            if rk not in raw_bundle:
+                raw_bundle[rk] = {"resolved_text": "", "resolved_hash": None, "resolved_length": 0, "injected": False}
+        return deepcopy(raw_bundle), True
+    else:
+        frozen_bundle = {
+            rk: {"resolved_text": "", "resolved_hash": None, "resolved_length": 0, "injected": False}
+            for rk in _INJECT_ROLES
+        }
+        return frozen_bundle, False
+
+
 async def _run_job_inner(
     job_id: str,
     request: AnalyzeRequest,
@@ -1899,9 +1973,20 @@ async def _run_job_inner(
                 db.commit()
             except Exception as e:
                 _log(f"CRITICAL: Failed to initialize report in DB: {e}")
-        return _build_runtime_config(request.config_overrides, user_id=user_id)
 
-    config = await asyncio.to_thread(_init_and_configure)
+            frozen_bundle, injection_enabled = _resolve_and_freeze_custom_prompts(db, user_id)
+
+        cfg = _build_runtime_config(request.config_overrides, user_id=user_id)
+        return cfg, frozen_bundle, injection_enabled
+
+    config, _frozen_bundle, _injection_enabled = await asyncio.to_thread(_init_and_configure)
+
+    # Build the snapshot dict written into result_data on both save paths.
+    # Keep this explicit at the job boundary; graph/factory defaults use the same constant.
+    _PROMPT_PLACEMENT = DEFAULT_PLACEMENT
+    _prompt_snapshot = _build_custom_prompt_snapshot(_frozen_bundle, _injection_enabled)
+    # Extract just the resolved texts for passing to TradingAgentsGraph
+    _custom_prompts_for_graph = {rk: v["resolved_text"] for rk, v in _frozen_bundle.items()}
 
     _set_job(
         job_id,
@@ -1961,6 +2046,8 @@ async def _run_job_inner(
             debug=False,
             config=config,
             data_collector=_shared_data_collector,
+            custom_prompts=_custom_prompts_for_graph,
+            custom_prompt_placement=_PROMPT_PLACEMENT,
         )
         final_state: Optional[Dict[str, Any]] = None
 
@@ -2032,6 +2119,8 @@ async def _run_job_inner(
                     debug=False,
                     config=config,
                     data_collector=graph.data_collector,
+                    custom_prompts=_custom_prompts_for_graph,
+                    custom_prompt_placement=_PROMPT_PLACEMENT,
                 )
 
                 horizon_label = "短线" if horizon == "short" else "中线"
@@ -2233,6 +2322,7 @@ async def _run_job_inner(
                 "target_price": resolved["target_price"],
                 "stop_loss_price": resolved["stop_loss_price"],
             })
+            _attach_custom_prompt_snapshot(result, _prompt_snapshot)
 
             # 自动保存报告到数据库
             if save_report:
@@ -2482,6 +2572,7 @@ async def _run_job_inner(
             "target_price": resolved["target_price"],
             "stop_loss_price": resolved["stop_loss_price"],
         })
+        _attach_custom_prompt_snapshot(result, _prompt_snapshot)
 
         # 自动保存/收口报告到数据库
         if save_report:

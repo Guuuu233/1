@@ -8,11 +8,12 @@ from tradingagents.agents.utils.debate_utils import (
     format_claim_subset_for_prompt,
     format_claims_for_prompt,
 )
+from tradingagents.agents.utils.prompt_injection import build_injection_slots, Placement, DEFAULT_PLACEMENT
 
 _logger = logging.getLogger(__name__)
 
 
-def create_research_manager(llm, memory):
+def create_research_manager(llm, memory, custom_prompt: str = "", placement: Placement = DEFAULT_PLACEMENT):
     async def research_manager_node(state) -> dict:
         history = state["investment_debate_state"].get("history", "")
         market_research_report = state["market_report"]
@@ -38,6 +39,7 @@ def create_research_manager(llm, memory):
         unresolved_claims_text = format_claim_subset_for_prompt(claims, unresolved_claim_ids)
         round_summary_text = round_summary or "暂无轮次摘要。"
 
+        injection_slots = build_injection_slots(custom_prompt, placement, role_key="research_manager")
         prompt = get_prompt("research_manager_prompt", config=get_config()).format(
             past_memory_str=past_memory_str,
             history=history,
@@ -47,6 +49,7 @@ def create_research_manager(llm, memory):
             claims_text=claims_text,
             unresolved_claims_text=unresolved_claims_text,
             round_summary=round_summary_text,
+            **injection_slots,
         )
 
         _logger.info(

@@ -22,6 +22,7 @@ from tradingagents.agents.utils.agent_states import (
     RiskDebateState,
 )
 from tradingagents.dataflows.config import set_config
+from tradingagents.agents.utils.prompt_injection import DEFAULT_PLACEMENT
 
 # Import the new abstract tool methods from agent_utils
 from tradingagents.agents.utils.agent_utils import (
@@ -61,11 +62,15 @@ class TradingAgentsGraph:
         config: Dict[str, Any] = None,
         callbacks: Optional[List] = None,
         data_collector: Optional["DataCollector"] = None,
+        custom_prompts: Optional[Dict[str, str]] = None,
+        custom_prompt_placement: str = DEFAULT_PLACEMENT,
     ):
         """Initialize the trading agents graph and components."""
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
+        self.custom_prompts: Dict[str, str] = custom_prompts if custom_prompts is not None else {}
+        self.custom_prompt_placement: str = custom_prompt_placement
 
         # Update the interface's config
         set_config(self.config)
@@ -178,6 +183,8 @@ class TradingAgentsGraph:
             self.conditional_logic,
             data_collector=self.data_collector,
             role_llms=self.role_llms,
+            custom_prompts=self.custom_prompts,
+            custom_prompt_placement=self.custom_prompt_placement,
         )
 
         self.propagator = Propagator(

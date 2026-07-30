@@ -6,6 +6,7 @@ from langgraph.graph import END, StateGraph, START
 from langgraph.prebuilt import ToolNode
 
 from tradingagents.agents.utils.agent_states import AgentState
+from tradingagents.agents.utils.prompt_injection import Placement, DEFAULT_PLACEMENT
 
 from .conditional_logic import ConditionalLogic
 
@@ -70,6 +71,8 @@ class GraphSetup:
         conditional_logic: ConditionalLogic,
         data_collector=None,
         role_llms: Optional[Dict[str, Any]] = None,
+        custom_prompts: Optional[Dict[str, str]] = None,
+        custom_prompt_placement: Optional[Placement] = None,
     ):
         """Initialize with required components."""
         self.quick_thinking_llm = quick_thinking_llm
@@ -83,6 +86,8 @@ class GraphSetup:
         self.conditional_logic = conditional_logic
         self.data_collector = data_collector
         self.role_llms = role_llms or {}
+        self.custom_prompts: Dict[str, str] = custom_prompts if custom_prompts is not None else {}
+        self.custom_prompt_placement: Placement = custom_prompt_placement if custom_prompt_placement is not None else DEFAULT_PLACEMENT
 
     def _get_role_llm(self, role_key: str, fallback_llm: Any) -> Any:
         if self.role_llms and role_key in self.role_llms:
@@ -163,13 +168,22 @@ class GraphSetup:
 
         # Create researcher and manager nodes
         bull_researcher_node = factories["create_bull_researcher"](
-            self._get_role_llm("bull_researcher", self.quick_thinking_llm), self.bull_memory
+            self._get_role_llm("bull_researcher", self.quick_thinking_llm),
+            self.bull_memory,
+            custom_prompt=self.custom_prompts.get("bull_researcher", ""),
+            placement=self.custom_prompt_placement,
         )
         bear_researcher_node = factories["create_bear_researcher"](
-            self._get_role_llm("bear_researcher", self.quick_thinking_llm), self.bear_memory
+            self._get_role_llm("bear_researcher", self.quick_thinking_llm),
+            self.bear_memory,
+            custom_prompt=self.custom_prompts.get("bear_researcher", ""),
+            placement=self.custom_prompt_placement,
         )
         research_manager_node = factories["create_research_manager"](
-            self._get_role_llm("research_manager", self.deep_thinking_llm), self.invest_judge_memory
+            self._get_role_llm("research_manager", self.deep_thinking_llm),
+            self.invest_judge_memory,
+            custom_prompt=self.custom_prompts.get("research_manager", ""),
+            placement=self.custom_prompt_placement,
         )
         trader_node = factories["create_trader"](
             self._get_role_llm("trader", self.quick_thinking_llm), self.trader_memory

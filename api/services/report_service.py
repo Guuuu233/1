@@ -103,6 +103,60 @@ class StructuredReport(BaseModel):
     def _coerce_not_applicable(cls, v):
         return False if v is None else v
 
+    @field_validator("probability", mode="before")
+    @classmethod
+    def _coerce_probability(cls, v):
+        if v is None:
+            return None
+        # bool is a subclass of int/float in Python; True/False are not probabilities.
+        if isinstance(v, bool):
+            logger.warning("[report_service] probability rejected: bool value %r is not a probability", v)
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            logger.warning("[report_service] probability rejected: cannot convert %r to float", v)
+            return None
+        if f != f:  # NaN
+            logger.warning("[report_service] probability rejected: NaN is not a valid probability")
+            return None
+        if f < 0.0 or f > 100.0:
+            logger.warning("[report_service] probability rejected: %s is out of [0, 100] range", f)
+            return None
+        # Model may return a percentage integer (e.g. 70 instead of 0.70). Reject it.
+        if 1.0 < f <= 100.0:
+            logger.warning(
+                "[report_service] probability rejected: %s looks like a percentage (expected 0.00–1.00)", f
+            )
+            return None
+        return f  # 0.0 <= f <= 1.0 at this point
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _coerce_confidence(cls, v):
+        if v is None:
+            return None
+        # bool is a subclass of int; True/False are not confidence scores.
+        if isinstance(v, bool):
+            logger.warning("[report_service] confidence rejected: bool value %r is not a confidence score", v)
+            return None
+        # Reject non-integer floats outright (e.g. 75.9) rather than silently truncating.
+        # 75.0 is accepted (already an integer value); 75.9 is a formatting error, not "75".
+        if isinstance(v, float) and not v.is_integer():
+            logger.warning(
+                "[report_service] confidence rejected: %s is a non-integer float", v
+            )
+            return None
+        try:
+            i = int(v)
+        except (TypeError, ValueError):
+            logger.warning("[report_service] confidence rejected: cannot convert %r to int", v)
+            return None
+        if not (0 <= i <= 100):
+            logger.warning("[report_service] confidence rejected: %d is out of [0, 100] range", i)
+            return None
+        return i
+
     @field_validator("target_price", "stop_loss_price", mode="before")
     @classmethod
     def _coerce_price(cls, v):
@@ -142,11 +196,15 @@ def extract_structured_data(
             f"【基本面报告摘要】\n{fundamentals_report[:1000]}\n\n"
             "提取要求（请确保输出为有效的 JSON 对象，不要包裹在 markdown 代码块中）：\n"
             "1. decision：决策方向关键词（BUY/SELL/HOLD 或 增持/减持/持有）\n"
-            "2. confidence：整体置信度（0-100整数），若文中未明确给出则根据语气判断\n"
+            "2. confidence：整体置信度（0-100 整数），若文中未明确给出则根据语气判断；"
+            "禁止把 confidence 换算为 probability 或代填 probability 字段\n"
             "3. target_price / stop_loss_price：纯数字，若未提及则为 null\n"
             "4. risks：最多5条主要风险，每条包含名称（15字内）、等级（high/medium/low）、一句话说明\n"
             "5. key_metrics：最多6条关键财务/估值指标，每条包含名称、值（含单位）、优劣（good/neutral/bad）\n"
-            "6. probability：报告明确给出的上涨概率；未明确给出则为 null，不要用 confidence 代填\n"
+            "6. probability：在报告对应的主分析周期内，期末价格高于分析基准价的概率；"
+            "必须是 0.00–1.00 之间的小数（不是百分比整数）；"
+            "报告未明确给出则为 null；禁止用 confidence 换算或代填；"
+            "双周期报告仅取主周期的 probability\n"
             "7. data_gaps：报告明确列出的数据缺口字符串数组；未提及则为 []\n"
             "8. falsification_conditions：报告明确列出的证伪条件字符串数组；未提及则为 []\n"
             "9. not_applicable：报告明确表示本分析框架不适用时为 true，否则为 false"
@@ -156,8 +214,6 @@ def extract_structured_data(
         raw = response.content if hasattr(response, "content") else str(response)
         parsed = json_repair.loads(raw)
         result = StructuredReport(**parsed)
-        if result.confidence is not None and not (0 <= result.confidence <= 100):
-            result.confidence = None
         return result
     except Exception as e:
         logger.warning(f"LLM structured extraction failed: {e}")
