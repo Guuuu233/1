@@ -791,3 +791,40 @@ export interface ResolvedRole {
     profile_display_name?: string | null
     provider_display_name?: string | null
 }
+
+// Custom analysis prompts (Phase B: persistence only, injection is Phase C).
+// target_type='global' always uses target_key=''. 'role' / 'group' are supported
+// by the schema and resolve order (role > group > global-only), but Phase B's
+// frontend only writes 'global' rows — there is no per-role/group UI yet.
+export interface CustomPromptItem {
+    target_type: 'global' | 'role' | 'group'
+    target_key: string
+    prompt_text: string
+    enabled?: boolean
+}
+
+export interface CustomPrompt {
+    id: string
+    target_type: 'global' | 'role' | 'group'
+    target_key: string
+    prompt_text: string
+    prompt_hash: string
+    char_count: number
+    enabled: boolean
+    created_at?: string | null
+    updated_at?: string | null
+}
+
+export interface ResolvedCustomPrompt {
+    role_key: string
+    global_text: string
+    override_text: string
+    override_source?: 'role' | 'group' | null
+    resolved_text: string
+    resolved_length: number
+    resolved_hash?: string | null
+}
+
+export interface PromptInjectionSwitch {
+    enabled: boolean
+}

@@ -140,6 +140,8 @@ def _ensure_user_schema() -> None:
                 conn.execute(text("ALTER TABLE users ADD COLUMN email_report_enabled BOOLEAN NOT NULL DEFAULT 1"))
             if "wecom_report_enabled" not in columns:
                 conn.execute(text("ALTER TABLE users ADD COLUMN wecom_report_enabled BOOLEAN NOT NULL DEFAULT 1"))
+            if "prompt_injection_enabled" not in columns:
+                conn.execute(text("ALTER TABLE users ADD COLUMN prompt_injection_enabled BOOLEAN NOT NULL DEFAULT 0"))
             llm_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(user_llm_configs)"))}
             if "wecom_webhook_encrypted" not in llm_columns:
                 conn.execute(text("ALTER TABLE user_llm_configs ADD COLUMN wecom_webhook_encrypted TEXT"))
@@ -394,6 +396,7 @@ class UserDB(Base):
     last_login_ip = Column(String(45), nullable=True)
     email_report_enabled = Column(Boolean, default=True, nullable=False, server_default="1")
     wecom_report_enabled = Column(Boolean, default=True, nullable=False, server_default="1")
+    prompt_injection_enabled = Column(Boolean, default=False, nullable=False, server_default="0")
 
 
 class EmailVerificationCodeDB(Base):
@@ -592,6 +595,31 @@ class RoleBindingDB(Base):
 
     __table_args__ = (
         UniqueConstraint('user_id', 'target_type', 'target_key', name='uq_role_binding_user_target'),
+    )
+
+
+class UserCustomPromptDB(Base):
+    """User custom analysis prompt: one 'global' row plus optional 'role'/'group' override rows.
+
+    Mirrors the RoleBindingDB shape (target_type + target_key + UniqueConstraint) so the same
+    resolve-by-priority pattern used for role-based model routing (role > group > default) can
+    be reused here (role override > group override > global). See
+    api/services/custom_prompt_service.py.
+    """
+    __tablename__ = "user_custom_prompts"
+
+    id = Column(String(36), primary_key=True, index=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    target_type = Column(String(20), nullable=False)  # 'global' | 'role' | 'group'
+    target_key = Column(String(50), nullable=False, default="")  # '' for 'global'; role_key or group_key otherwise
+    prompt_text = Column(Text, nullable=False)
+    prompt_hash = Column(String(12), nullable=False)  # sha256(prompt_text)[:12], recomputed on every write
+    enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'target_type', 'target_key', name='uq_custom_prompt_user_target'),
     )
 
 

@@ -1,4 +1,4 @@
-import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, Provider, ProviderCreatePayload, ProviderUpdatePayload, ModelProfile, ModelProfileCreatePayload, ModelProfileUpdatePayload, RoleBinding, RoleBindingItem, ResolvedRole } from '@/types'
+import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, Provider, ProviderCreatePayload, ProviderUpdatePayload, ModelProfile, ModelProfileCreatePayload, ModelProfileUpdatePayload, RoleBinding, RoleBindingItem, ResolvedRole, CustomPrompt, CustomPromptItem, ResolvedCustomPrompt, PromptInjectionSwitch } from '@/types'
 
 export function getBaseUrl(): string {
     const envUrl = (import.meta.env.VITE_API_URL as string) || ''
@@ -430,6 +430,40 @@ class ApiService {
 
     async getResolvedRoles(): Promise<Record<string, ResolvedRole>> {
         return this.request<Record<string, ResolvedRole>>('/v1/role-bindings/resolved')
+    }
+
+    // Custom Analysis Prompts API (Phase B: persistence only, no injection yet)
+    async getCustomPrompts(): Promise<CustomPrompt[]> {
+        return this.request<CustomPrompt[]>('/v1/custom-prompts')
+    }
+
+    async updateCustomPrompts(prompts: CustomPromptItem[]): Promise<CustomPrompt[]> {
+        return this.request<CustomPrompt[]>('/v1/custom-prompts', {
+            method: 'PATCH',
+            body: JSON.stringify({ prompts }),
+        })
+    }
+
+    async getResolvedCustomPrompts(): Promise<ResolvedCustomPrompt[]> {
+        return this.request<ResolvedCustomPrompt[]>('/v1/custom-prompts/resolved')
+    }
+
+    async migrateCustomPrompt(legacyText: string): Promise<CustomPrompt[]> {
+        return this.request<CustomPrompt[]>('/v1/custom-prompts/migrate', {
+            method: 'POST',
+            body: JSON.stringify({ legacy_text: legacyText }),
+        })
+    }
+
+    async getPromptInjectionSwitch(): Promise<PromptInjectionSwitch> {
+        return this.request<PromptInjectionSwitch>('/v1/custom-prompts/switch')
+    }
+
+    async updatePromptInjectionSwitch(enabled: boolean): Promise<PromptInjectionSwitch> {
+        return this.request<PromptInjectionSwitch>('/v1/custom-prompts/switch', {
+            method: 'PATCH',
+            body: JSON.stringify({ enabled }),
+        })
     }
 }
 

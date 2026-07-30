@@ -42,7 +42,7 @@ import pandas as pd
 
 from api.database import UserDB, UserLLMConfigDB, VersionStatsDB, ReportDB, ImportedPortfolioPositionDB, FeedbackDB, SponsorDB, ProviderDB, ModelProfileDB, RoleBindingDB, init_db, get_db, get_db_ctx
 from api.job_store import get_job_store as _new_job_store
-from api.services import auth_service, portfolio_import_service, report_service, token_service, watchlist_service, scheduled_service, tracking_board_service, feedback_service, sponsor_service, role_routing_service
+from api.services import auth_service, portfolio_import_service, report_service, token_service, watchlist_service, scheduled_service, tracking_board_service, feedback_service, sponsor_service, role_routing_service, custom_prompt_service
 
 def _get_real_ip(request: Request) -> Optional[str]:
     """Extract real client IP, preferring Cloudflare/proxy headers."""
@@ -1015,6 +1015,51 @@ class PresetApplyRequest(BaseModel):
     manager_profile_id: Optional[str] = None
     quick_profile_id: Optional[str] = None
     deep_profile_id: Optional[str] = None
+
+
+class CustomPromptItem(BaseModel):
+    target_type: str  # 'global' | 'role' | 'group'
+    target_key: str = ""  # '' for global; role_key or group_key otherwise
+    prompt_text: str
+    enabled: bool = True
+
+
+class CustomPromptsUpdateRequest(BaseModel):
+    prompts: List[CustomPromptItem]
+
+
+class CustomPromptResponse(BaseModel):
+    id: str
+    target_type: str
+    target_key: str
+    prompt_text: str
+    prompt_hash: str
+    char_count: int
+    enabled: bool
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class ResolvedCustomPromptResponse(BaseModel):
+    role_key: str
+    global_text: str
+    override_text: str
+    override_source: Optional[str] = None  # 'role' | 'group' | None
+    resolved_text: str
+    resolved_length: int
+    resolved_hash: Optional[str] = None
+
+
+class CustomPromptMigrateRequest(BaseModel):
+    legacy_text: str
+
+
+class PromptInjectionSwitchResponse(BaseModel):
+    enabled: bool
+
+
+class PromptInjectionSwitchUpdateRequest(BaseModel):
+    enabled: bool
 
 
 class PortfolioPositionItem(BaseModel):
@@ -4273,6 +4318,67 @@ def get_resolved_user_role_bindings(
 ):
     runtime_cfg = _config_response_for_user(current_user, db).model_dump()
     return role_routing_service.resolve_all_roles(db, current_user.id, runtime_cfg)
+
+
+# --- Custom Analysis Prompts Endpoints (Phase B: persistence only, no injection yet) ---
+
+@app.get("/v1/custom-prompts", response_model=List[CustomPromptResponse])
+def get_user_custom_prompts(
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    return custom_prompt_service.list_custom_prompts(db, current_user.id)
+
+
+@app.patch("/v1/custom-prompts", response_model=List[CustomPromptResponse])
+def update_user_custom_prompts(
+    body: CustomPromptsUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    raw_items = [item.model_dump() for item in body.prompts]
+    try:
+        return custom_prompt_service.replace_custom_prompts(db, current_user.id, raw_items)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/v1/custom-prompts/resolved", response_model=List[ResolvedCustomPromptResponse])
+def get_resolved_user_custom_prompts(
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    return custom_prompt_service.resolve_all_roles_prompts(db, current_user.id)
+
+
+@app.post("/v1/custom-prompts/migrate", response_model=List[CustomPromptResponse])
+def migrate_user_custom_prompt(
+    body: CustomPromptMigrateRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    try:
+        return custom_prompt_service.migrate_legacy_prompt(db, current_user.id, body.legacy_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/v1/custom-prompts/switch", response_model=PromptInjectionSwitchResponse)
+def get_user_prompt_injection_switch(
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    return {"enabled": custom_prompt_service.get_prompt_injection_enabled(db, current_user.id)}
+
+
+@app.patch("/v1/custom-prompts/switch", response_model=PromptInjectionSwitchResponse)
+def update_user_prompt_injection_switch(
+    body: PromptInjectionSwitchUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_web_user),
+):
+    enabled = custom_prompt_service.set_prompt_injection_enabled(db, current_user.id, body.enabled)
+    return {"enabled": enabled}
 
 
 @app.get("/v1/config", response_model=UserRuntimeConfigResponse)

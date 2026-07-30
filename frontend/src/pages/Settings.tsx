@@ -30,6 +30,9 @@ const PROVIDER_PRESETS: ProviderPreset[] = [
     { id: 'custom-openai', label: '自定义 OpenAI 兼容', provider: 'openai', baseUrl: '', protocol: 'OpenAI 兼容', editableBaseUrl: true },
 ]
 
+// Must match api/services/custom_prompt_service.py GLOBAL_PROMPT_MAX_CHARS.
+const CUSTOM_PROMPT_MAX_CHARS = 4000
+
 function inferPreset(llmProvider: string, backendUrl: string): string {
     const normalizedProvider = (llmProvider || '').toLowerCase()
     const normalizedUrl = (backendUrl || '').replace(/\/$/, '')
@@ -153,6 +156,43 @@ export default function Settings() {
         fetchTokens()
     }, [])
 
+    // Custom analysis prompt: backend (/v1/custom-prompts) is now the source of truth.
+    // localStorage stays as a display fallback / offline cache — see persistLocalSettings.
+    // On first load after this feature ships, a user's existing localStorage prompt is
+    // uploaded once (migrateCustomPrompt), and only if the backend has no 'global' row yet,
+    // so it can never clobber something already saved server-side.
+    useEffect(() => {
+        let cancelled = false
+        api.getCustomPrompts()
+            .then(async (rows) => {
+                if (cancelled) return
+                const globalRow = rows.find(r => r.target_type === 'global')
+                if (globalRow) {
+                    setCustomPrompt(globalRow.prompt_text)
+                    return
+                }
+                let legacyText = ''
+                try {
+                    legacyText = (localStorage.getItem('ta-custom-prompt') || '').trim()
+                } catch {}
+                if (!legacyText) return
+                try {
+                    const migrated = await api.migrateCustomPrompt(legacyText)
+                    const migratedGlobal = migrated.find(r => r.target_type === 'global')
+                    if (migratedGlobal && !cancelled) setCustomPrompt(migratedGlobal.prompt_text)
+                } catch (err) {
+                    console.warn('Failed to migrate legacy custom prompt to backend:', err)
+                    // Leave the localStorage-derived value (already set by the effect above) as-is —
+                    // nothing is lost, migration will simply retry on the next page load.
+                }
+            })
+            .catch((err) => {
+                console.warn('Failed to load custom prompts from backend:', err)
+                // Backend unreachable — keep whatever localStorage-derived value is already shown.
+            })
+        return () => { cancelled = true }
+    }, [])
+
     const fetchTokens = async () => {
         setTokensLoading(true)
         try {
@@ -202,7 +242,21 @@ export default function Settings() {
             defaultAnalysts,
             customPrompt,
         }))
+        // Kept in sync for ChatCopilotPanel, which still reads this key directly — the
+        // chat-side prompt splice is unrelated to Phase C's (not yet built) agent injection.
         localStorage.setItem('ta-custom-prompt', customPrompt)
+    }
+
+    // Persists the global custom prompt to the backend. Throws on failure (e.g. the
+    // 4000-char cap) so the caller's existing error handling (alert) surfaces it —
+    // localStorage already holds the in-progress text either way, so nothing is lost.
+    const syncCustomPromptToBackend = async () => {
+        const trimmed = customPrompt.trim()
+        if (trimmed) {
+            await api.updateCustomPrompts([{ target_type: 'global', target_key: '', prompt_text: trimmed }])
+        } else {
+            await api.updateCustomPrompts([])
+        }
     }
 
     const buildRuntimeConfigPayload = (options?: { includeEmail?: boolean; includeWecom?: boolean }) => ({
@@ -229,6 +283,7 @@ export default function Settings() {
 
     const submitConfig = async (options?: { forceWarmup?: boolean; successMessage?: string; includeEmail?: boolean; includeWecom?: boolean }) => {
         persistLocalSettings()
+        await syncCustomPromptToBackend()
         const { forceWarmup = false, successMessage = '设置已保存', includeEmail = true, includeWecom = false } = options || {}
         const response = await api.updateConfig({
             ...buildRuntimeConfigPayload({ includeEmail, includeWecom }),
@@ -712,7 +767,11 @@ export default function Settings() {
                         onChange={e => setCustomPrompt(e.target.value)}
                         className="input w-full min-h-[80px] resize-y"
                         placeholder="例如：更关注估值安全边际、政策催化与机构资金行为。"
+                        maxLength={CUSTOM_PROMPT_MAX_CHARS}
                     />
+                    <p className={`mt-1 text-xs ${customPrompt.length > CUSTOM_PROMPT_MAX_CHARS ? 'text-rose-500' : 'text-slate-400 dark:text-slate-500'}`}>
+                        {customPrompt.length} / {CUSTOM_PROMPT_MAX_CHARS} 字符（后端会拒绝超限内容；分角色覆盖将在后续版本开放）
+                    </p>
                 </div>
             </div>
 
