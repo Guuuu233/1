@@ -112,3 +112,42 @@ type disagreements.
 Implementation note: the 300-char cap is strict.  Evidence summaries must contain
 only verifiable facts (numbers, dates, named events), no interpretations.  The
 analyst's full report remains available in state for bull/bear to read.
+
+---
+
+## Custom prompt history is not retained — old versions are unrecoverable
+
+Status: **known gap, by design for Phase B. Must be closed in Phase C.**
+
+### Symptom
+
+`PATCH /v1/custom-prompts` replaces the user's whole prompt set (delete + insert in
+one transaction), mirroring `update_role_bindings`.  Each row carries a
+`prompt_hash` (sha256[:12]) that identifies *which version* a prompt was, but the
+previous row — and therefore the previous prompt **text** — is gone after any edit.
+
+### Why it matters
+
+This bites the project's end goal (statistical calibration of historical-date
+analyses), not just tidiness.
+
+In Phase E's A/B runs, each report can be tagged with the prompt hash that produced
+it.  Months later, when calibration is computed across a batch of reports, a report
+tagged `hash=abc123` cannot be traced back to any prompt text: we will know that two
+batches used *different* prompts, but not *what the older prompt said*.  Attributing
+a calibration shift to a specific prompt change — which is precisely the question the
+custom-prompt work exists to answer — becomes impossible.
+
+### Suggested fix (Phase C, when injection is implemented)
+
+Do **not** build a prompt-history table.  Instead, at injection time write the full
+**resolved prompt text itself** into the report snapshot, alongside its hash and
+length.  Attribution then becomes self-contained: no lookup against
+`user_custom_prompts` is ever needed, and later user edits cannot invalidate the
+record.  The resolved text is capped at 6000 chars
+(`custom_prompt_service.RESOLVED_PROMPT_MAX_CHARS`), which is negligible next to a
+report that is already hundreds of KB.
+
+Retrieve the text via `custom_prompt_service.resolve_role_prompt()` /
+`resolve_all_roles_prompts()` — do not re-concatenate global + override at the call
+site, or the two implementations will drift.
