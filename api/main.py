@@ -2724,7 +2724,19 @@ def _extract_chat_text(messages: List[ChatMessage]) -> str:
     return _extract_message_text(last.content)
 
 
+_ANALYSIS_REQUIREMENTS_BOUNDARY_RE = re.compile(
+    r"\r?\n\r?\n[ \t]*\[分析要求\][ \t]+"
+)
+
+
+def _original_question_for_extraction(text: str) -> str:
+    """Keep frontend-appended requirements out of symbol and date extraction."""
+    match = _ANALYSIS_REQUIREMENTS_BOUNDARY_RE.search(text)
+    return text[:match.start()].strip() if match else text
+
+
 def _extract_symbol_and_date(text: str) -> tuple[Optional[str], Optional[str]]:
+    text = _original_question_for_extraction(text)
     # Date extraction (flexible boundaries)
     date_match = re.search(r"\d{4}-\d{2}-\d{2}", text)
     date = date_match.group(0) if date_match else None
@@ -3269,7 +3281,8 @@ async def _ai_extract_symbol_and_date_streaming(
     today = datetime.now().strftime("%Y-%m-%d")
     # 兜底：先用 regex 直接从原文抽 symbol/date，LLM 失败 / 限流 / 返回 null 时
     # 至少不会把用户已经明确输入的代码也判为"无法识别"。
-    fast_symbol, fast_date = _extract_symbol_and_date(text)
+    extraction_text = _original_question_for_extraction(text)
+    fast_symbol, fast_date = _extract_symbol_and_date(extraction_text)
     llm_name: Optional[str] = None
     llm_date: Optional[str] = None
     llm_horizons: List[str] = ["short"]
@@ -3307,7 +3320,7 @@ async def _ai_extract_symbol_and_date_streaming(
 
 如果无法识别股票标的：{{"stock_name": null, "date": null, "horizons": ["short"], "focus_areas": [], "specific_questions": [], "user_context": {{}}}}
 
-用户消息："{text}"
+用户消息："{extraction_text}"
 """
         llm = client.get_llm()
         _log(f"[LLM Debug] Streaming StockExtract with model: {getattr(llm, 'model_name', 'unknown')}")
@@ -3343,7 +3356,7 @@ async def _ai_extract_symbol_and_date_streaming(
         # LLM 挂掉(限流/模型下线/网络)且原文没有代码时，拿原文在本地股票名单里
         # 搜一次：_search_cn_stock_by_name 支持"名称是输入子串"的匹配，
         # "分析一下 飞沃科技" 可以不经 LLM 直接命中 301232.SZ
-        local_code = await asyncio.to_thread(_search_cn_stock_by_name, text)
+        local_code = await asyncio.to_thread(_search_cn_stock_by_name, extraction_text)
         if local_code:
             _log(f"[StockExtract] LLM 失败，本地名单从原文兜底命中: {local_code}")
             return local_code, fast_date or today, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
@@ -3385,7 +3398,8 @@ def _ai_extract_symbol_and_date(
     today = datetime.now().strftime("%Y-%m-%d")
     # 兜底：先用 regex 直接从原文抽 symbol/date，LLM 失败 / 限流 / 返回 null 时
     # 至少不会把用户已经明确输入的代码也判为"无法识别"。
-    fast_symbol, fast_date = _extract_symbol_and_date(text)
+    extraction_text = _original_question_for_extraction(text)
+    fast_symbol, fast_date = _extract_symbol_and_date(extraction_text)
 
     llm_name: Optional[str] = None
     llm_date: Optional[str] = None
@@ -3423,7 +3437,7 @@ def _ai_extract_symbol_and_date(
 
 如果无法识别股票标的：{{"stock_name": null, "date": null, "horizons": ["short"], "focus_areas": [], "specific_questions": [], "user_context": {{}}}}
 
-用户消息："{text}"
+用户消息："{extraction_text}"
 """
         llm = client.get_llm()
         
@@ -3455,7 +3469,7 @@ def _ai_extract_symbol_and_date(
             _log(f"[StockExtract] LLM 未返回 stock_name，使用 regex 兜底: {fast_symbol}")
             return fast_symbol, fast_date or today, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
         # LLM 挂掉且原文没有代码时，拿原文在本地股票名单里搜一次（同流式版本）
-        local_code = _search_cn_stock_by_name(text)
+        local_code = _search_cn_stock_by_name(extraction_text)
         if local_code:
             _log(f"[StockExtract] LLM 失败，本地名单从原文兜底命中: {local_code}")
             return local_code, fast_date or today, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
