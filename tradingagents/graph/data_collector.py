@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import math
 from typing import Any, Dict, List, Optional
+import json
 import os
 import threading
 import time
@@ -33,6 +35,8 @@ from tradingagents.agents.utils.agent_utils import (
     get_margin_trading,
     get_northbound_flow,
 )
+from tradingagents.dataflows.interface import route_to_vendor
+from tradingagents.dataflows.trade_calendar import is_historical_analysis_date
 
 INDICATORS = [
     "close_50_sma", "close_200_sma", "close_10_ema",
@@ -257,7 +261,10 @@ def make_cache_key(ticker: str, trade_date: str) -> str:
 def _safe(tool, payload: dict) -> Any:
     start_t = time.time()
     try:
-        res = tool.invoke(payload)
+        if hasattr(tool, "invoke"):
+            res = tool.invoke(payload)
+        else:
+            res = tool(**payload)
         duration = time.time() - start_t
         # 仅在耗时较长时输出
         if duration > 0.5:
@@ -265,6 +272,123 @@ def _safe(tool, payload: dict) -> Any:
         return res
     except Exception as exc:
         return f"{getattr(tool, 'name', str(tool))} 调用失败：{type(exc).__name__}: {exc}"
+
+
+def _build_daily_context(df: Optional[pd.DataFrame], trade_date: str) -> Dict[str, Any]:
+    """Describe the latest complete daily bar available to the analysis."""
+    unavailable = {"as_of": None, "completeness": "unavailable"}
+    if df is None or df.empty or "date" not in df.columns:
+        return unavailable
+
+    end_dt = pd.to_datetime(trade_date, errors="coerce")
+    if pd.isna(end_dt):
+        return unavailable
+
+    dates = pd.to_datetime(df["date"], errors="coerce").dropna()
+    dates = dates[dates <= end_dt]
+    if dates.empty:
+        return unavailable
+
+    return {
+        "as_of": dates.max().strftime("%Y-%m-%d"),
+        "completeness": "completed",
+    }
+
+
+def _unavailable_realtime_context(retrieved_at: Optional[str], error: str) -> Dict[str, Any]:
+    return {
+        "status": "unavailable",
+        "source": None,
+        "quote_as_of": None,
+        "retrieved_at": retrieved_at,
+        "error": error,
+        "quote": None,
+    }
+
+
+def default_market_data_context() -> Dict[str, Any]:
+    """Return a safe context when collection did not provide one."""
+    return {
+        "daily": {"as_of": None, "completeness": "unavailable"},
+        "realtime": {
+            "status": "unavailable",
+            "source": None,
+            "quote_as_of": None,
+            "retrieved_at": None,
+            "error": "实时行情上下文不可用",
+            "quote": None,
+        },
+    }
+
+
+def _fetch_realtime_context(ticker: str, trade_date: str) -> Dict[str, Any]:
+    """Fetch a standalone quote snapshot without changing the daily series."""
+    if is_historical_analysis_date(trade_date):
+        return {
+            "status": "not_applicable",
+            "source": None,
+            "quote_as_of": None,
+            "retrieved_at": None,
+            "error": None,
+            "quote": None,
+        }
+
+    retrieved_at = datetime.now(timezone.utc).isoformat()
+    try:
+        raw = route_to_vendor("get_realtime_quotes", [ticker], curr_date=trade_date)
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(payload, dict):
+            return _unavailable_realtime_context(
+                retrieved_at, "实时行情源返回结构异常"
+            )
+
+        ticker_code = str(ticker).split(".", 1)[0].upper()
+        quote = payload.get(ticker) or payload.get(str(ticker).upper())
+        if quote is None:
+            for key, value in payload.items():
+                if str(key).split(".", 1)[0].upper() == ticker_code:
+                    quote = value
+                    break
+        if not isinstance(quote, dict):
+            return _unavailable_realtime_context(
+                retrieved_at, "实时行情源未返回目标标的快照"
+            )
+
+        source = quote.get("source")
+        if source not in {"sina", "eastmoney", "investoday"}:
+            return _unavailable_realtime_context(
+                retrieved_at, "实时行情源返回 source 字段结构异常"
+            )
+        price = quote.get("price")
+        try:
+            valid_price = (
+                not isinstance(price, bool)
+                and isinstance(price, (int, float))
+                and math.isfinite(float(price))
+            )
+        except (TypeError, ValueError, OverflowError):
+            valid_price = False
+        if not valid_price:
+            return _unavailable_realtime_context(
+                retrieved_at, "实时行情源返回 price 字段结构异常"
+            )
+        quote_as_of = quote.get("quote_time") or quote.get("quote_as_of")
+        if quote_as_of is not None and not isinstance(quote_as_of, str):
+            return _unavailable_realtime_context(
+                retrieved_at, "实时行情源返回 quote_time 字段结构异常"
+            )
+        return {
+            "status": "available",
+            "source": source,
+            "quote_as_of": quote_as_of if isinstance(quote_as_of, str) else None,
+            "retrieved_at": retrieved_at,
+            "error": None,
+            "quote": quote,
+        }
+    except Exception as exc:
+        return _unavailable_realtime_context(
+            retrieved_at, f"实时行情源不可用：{type(exc).__name__}"
+        )
 
 
 def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
@@ -281,6 +405,7 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
 
     tasks: Dict[str, tuple] = {
         "stock_data": (get_stock_data, {"symbol": ticker, "start_date": start_str, "end_date": trade_date}),
+        "realtime": (_fetch_realtime_context, {"ticker": ticker, "trade_date": trade_date}),
         "news": (get_news, {"ticker": ticker, "start_date": (end_dt - timedelta(days=lookback)).strftime("%Y-%m-%d"), "end_date": trade_date}),
         "global_news": (get_global_news, {"curr_date": trade_date, "look_back_days": lookback, "limit": 30}),
         "fund_flow_board": (get_board_fund_flow, {"curr_date": trade_date}),
@@ -325,6 +450,21 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
     # ── Parse CSV once, reuse for indicators and VPA ──────────────────
     raw_csv = results.get("stock_data", "")
     df = _parse_csv_to_dataframe(raw_csv)
+    daily_context = _build_daily_context(df, trade_date)
+    realtime_context = results.pop("realtime", None)
+    if not isinstance(realtime_context, dict) or realtime_context.get("status") not in {
+        "available",
+        "unavailable",
+        "not_applicable",
+    }:
+        realtime_context = _unavailable_realtime_context(
+            datetime.now(timezone.utc).isoformat(),
+            "实时行情抓取未完成",
+        )
+    results["market_data_context"] = {
+        "daily": daily_context,
+        "realtime": realtime_context,
+    }
 
     # ── 核心加速：本地计算所有技术指标 ──────────────────
     indicators_res = {}

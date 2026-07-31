@@ -1,4 +1,3 @@
-import os
 import logging
 import re
 import time
@@ -12,12 +11,10 @@ from stockstats import wrap
 from .base import BaseMarketDataProvider, DataResult
 from ..trade_calendar import (
     DateDataUnavailable,
-    TradeCalendarUnavailableError,
     cn_market_phase,
     cn_no_data_reason,
     cn_today_str,
     fetch_with_date_fallback,
-    is_cn_trading_day,
     is_historical_analysis_date,
     snapshot_historical_refusal,
 )
@@ -285,6 +282,26 @@ class CnAkshareProvider(BaseMarketDataProvider):
         out = out[(out["Date"] >= start_dt) & (out["Date"] <= end_dt)]
         return out.sort_values("Date").reset_index(drop=True)
 
+    def _drop_incomplete_today_bar(
+        self, hist_df: pd.DataFrame, end_date: str
+    ) -> pd.DataFrame:
+        """Keep incomplete intraday prices out of the completed daily series."""
+        if hist_df is None or hist_df.empty:
+            return hist_df
+
+        end_dt = pd.to_datetime(end_date, errors="coerce")
+        today = pd.to_datetime(cn_today_str(), errors="coerce")
+        if pd.isna(end_dt) or pd.isna(today) or end_dt.normalize() != today.normalize():
+            return hist_df
+
+        if cn_market_phase() not in ("pre_open", "in_session", "lunch_break"):
+            return hist_df
+
+        out = hist_df.copy()
+        dates = pd.to_datetime(out["Date"], errors="coerce")
+        out = out.loc[dates.dt.normalize() != today.normalize()]
+        return out.reset_index(drop=True)
+
     @staticmethod
     def _shrink_table(
         df: pd.DataFrame,
@@ -327,7 +344,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     out = self._normalize_hist_df(df)
                     out = self._slice_hist_df(out, start_date, end_date)
                     if not out.empty:
-                        return self._maybe_append_realtime_row(symbol, out, end_date, assume_locked=True)
+                        return self._drop_incomplete_today_bar(out, end_date)
                     etf_errors.append("fund_etf_hist_sina: empty after date filter")
                 except Exception as exc:
                     etf_errors.append(f"fund_etf_hist_sina: {type(exc).__name__}")
@@ -342,7 +359,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     )
                     out = self._normalize_hist_df(df)
                     if not out.empty:
-                        return self._maybe_append_realtime_row(symbol, out, end_date, assume_locked=True)
+                        return self._drop_incomplete_today_bar(out, end_date)
                     etf_errors.append("fund_etf_hist_em: empty dataframe")
                 except Exception as exc:
                     etf_errors.append(f"fund_etf_hist_em: {type(exc).__name__}")
@@ -359,7 +376,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                         adjust="qfq",
                     )
                     out = self._normalize_hist_df(df)
-                    return self._maybe_append_realtime_row(symbol, out, end_date, assume_locked=True)
+                    return self._drop_incomplete_today_bar(out, end_date)
                 except Exception as exc:
                     em_last_exc = exc
                     if i < 1:
@@ -374,7 +391,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     adjust="qfq",
                 )
                 out = self._normalize_hist_df(df)
-                return self._maybe_append_realtime_row(symbol, out, end_date, assume_locked=True)
+                return self._drop_incomplete_today_bar(out, end_date)
             except Exception:
                 pass
 
@@ -387,105 +404,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     adjust="qfq",
                 )
                 out = self._normalize_hist_df(df)
-                return self._maybe_append_realtime_row(symbol, out, end_date, assume_locked=True)
+                return self._drop_incomplete_today_bar(out, end_date)
             except Exception:
                 pass
 
             raise NotImplementedError(
                 f"cn_akshare is temporarily unavailable for price history (eastmoney/sina/tencent all failed): {em_last_exc}"
             ) from em_last_exc
-
-    def _fetch_realtime_row_unlocked(self, symbol: str) -> pd.DataFrame:
-        ak = self._ak()
-        xq_token = os.environ.get("XQ_A_TOKEN")
-        spot = ak.stock_individual_spot_xq(symbol=self._xq_symbol(symbol), token=xq_token)
-        if spot is None or spot.empty:
-            return pd.DataFrame()
-        if not {"item", "value"}.issubset(set(spot.columns)):
-            return pd.DataFrame()
-        kv = dict(zip(spot["item"].astype(str), spot["value"]))
-
-        raw_time = kv.get("时间")
-        date_val = pd.to_datetime(raw_time, errors="coerce")
-        if pd.isna(date_val):
-            # Never invent "today" for an unparseable vendor timestamp: that
-            # would stamp a mystery quote as the latest bar and poison TA.
-            _provider_logger.warning(
-                "refuse realtime bar for %s: unparseable spot time raw=%r",
-                symbol,
-                raw_time,
-            )
-            return pd.DataFrame()
-        row = {
-            "Date": pd.to_datetime(date_val).normalize(),
-            "Open": pd.to_numeric(kv.get("今开"), errors="coerce"),
-            "High": pd.to_numeric(kv.get("最高"), errors="coerce"),
-            "Low": pd.to_numeric(kv.get("最低"), errors="coerce"),
-            "Close": pd.to_numeric(kv.get("现价"), errors="coerce"),
-            "Volume": pd.to_numeric(kv.get("成交量"), errors="coerce"),
-        }
-        rt = pd.DataFrame([row]).dropna(subset=["Open", "High", "Low", "Close", "Volume"])
-        return rt
-
-    def _fetch_realtime_row(self, symbol: str) -> pd.DataFrame:
-        with AKSHARE_CALL_LOCK:
-            return self._fetch_realtime_row_unlocked(symbol)
-
-    def _maybe_append_realtime_row(
-        self,
-        symbol: str,
-        hist_df: pd.DataFrame,
-        end_date: str,
-        *,
-        assume_locked: bool = False,
-    ) -> pd.DataFrame:
-        if hist_df is None:
-            hist_df = pd.DataFrame()
-        try:
-            end_dt = pd.to_datetime(end_date, errors="coerce")
-            if pd.isna(end_dt):
-                return hist_df
-            today = pd.to_datetime(cn_today_str())
-            if end_dt.normalize() < today:
-                return hist_df
-            # Hard calendar only: on holiday/calendar outage do not invent a bar.
-            try:
-                if not is_cn_trading_day(
-                    today.strftime("%Y-%m-%d"), allow_weekday_fallback=False
-                ):
-                    return hist_df
-            except TradeCalendarUnavailableError as exc:
-                _provider_logger.warning(
-                    "refuse realtime bar for %s: trade calendar unavailable (%s)",
-                    symbol,
-                    exc,
-                )
-                return hist_df
-
-            has_today = False
-            if not hist_df.empty:
-                has_today = (pd.to_datetime(hist_df["Date"]).dt.normalize() == today).any()
-            if has_today:
-                return hist_df
-
-            phase = cn_market_phase()
-            if phase in ("pre_open", "closed"):
-                return hist_df
-
-            if assume_locked:
-                rt = self._fetch_realtime_row_unlocked(symbol)
-            else:
-                rt = self._fetch_realtime_row(symbol)
-            if rt.empty:
-                return hist_df
-            if pd.to_datetime(rt.iloc[0]["Date"]).normalize() != today:
-                return hist_df
-
-            merged = pd.concat([hist_df, rt], ignore_index=True)
-            merged = merged.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
-            return merged.reset_index(drop=True)
-        except Exception:
-            return hist_df
 
     def get_stock_data(self, symbol: str, start_date: str, end_date: str) -> str:
         df = self._fetch_hist_df(symbol, start_date, end_date)
@@ -1068,6 +993,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
         if not code_to_original:
             return json.dumps({})
 
+        last_error = None
+
         # Try Sina first (lightweight, rarely blocked)
         try:
             result = self._fetch_quotes_sina(code_to_original)
@@ -1075,9 +1002,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 return result
         except Exception as exc:
             logger.debug("[realtime-quotes] Sina failed, falling back to Eastmoney: %s", exc)
+            last_error = exc
 
         # Fallback: Eastmoney via akshare (cached)
         now = _time.time()
+        df = None
         if (
             CnAkshareProvider._spot_cache is not None
             and (now - CnAkshareProvider._spot_cache_ts) < CnAkshareProvider._SPOT_CACHE_TTL
@@ -1090,16 +1019,23 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     df = ak.stock_zh_a_spot_em()
             except TimeoutError as exc:
                 _lock_logger.warning("[realtime-quotes] Eastmoney slot timeout: %s", exc)
-                return json.dumps({})
+                last_error = exc
             except Exception as exc:
                 _lock_logger.warning("[realtime-quotes] Eastmoney fetch failed: %s", exc)
-                return json.dumps({})
-            CnAkshareProvider._spot_cache = df
-            CnAkshareProvider._spot_cache_ts = now
+                last_error = exc
+            else:
+                CnAkshareProvider._spot_cache = df
+                CnAkshareProvider._spot_cache_ts = now
 
         if df is not None and not df.empty:
-            return self._build_quotes_from_em(df, code_to_original)
-        return json.dumps({})
+            result = self._build_quotes_from_em(df, code_to_original)
+            if result != "{}":
+                return result
+            last_error = ValueError("Eastmoney returned no requested quotes")
+
+        raise NotImplementedError(
+            "cn_akshare realtime quote sources unavailable"
+        ) from last_error
 
     def _build_quotes_from_em(self, df: "pd.DataFrame", code_to_original: dict[str, str]) -> str:
         import json

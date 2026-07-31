@@ -1341,6 +1341,7 @@ def _build_result_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
         "direction": None,
         "instrument_context": final_state.get("instrument_context"),
         "market_context": final_state.get("market_context"),
+        "market_data_context": final_state.get("market_data_context"),
         "user_context": final_state.get("user_context"),
         "workflow_context": final_state.get("workflow_context"),
         "market_report": final_state.get("market_report"),
@@ -2094,7 +2095,17 @@ async def _run_job_inner(
             })
             _log(f"[DualHorizon] Collecting data for {ticker} {request.trade_date} (horizons={request.horizons})…")
             collect_start_t = time.time()
-            await asyncio.to_thread(graph.data_collector.collect, ticker, request.trade_date, horizons=request.horizons)
+            collected_pool = await asyncio.to_thread(
+                graph.data_collector.collect,
+                ticker,
+                request.trade_date,
+                horizons=request.horizons,
+            )
+            market_data_context = (
+                collected_pool.get("market_data_context")
+                if isinstance(collected_pool, dict)
+                else None
+            )
             _log(f"[Timer] Data Collection step in _run_job took {time.time() - collect_start_t:.2f}s")
 
             _emit_job_event(job_id, "agent.tool_call", {
@@ -2149,7 +2160,9 @@ async def _run_job_inner(
                     user_context=user_context_payload,
                     selected_analysts=horizon_analysts,
                     request_source=request_source,
-                    user_intent=user_intent, horizon=horizon,
+                    user_intent=user_intent,
+                    horizon=horizon,
+                    market_data_context=market_data_context,
                 )
                 last_report: Dict[str, str] = {}
                 seen: Dict[str, bool] = {}   # 追踪哪些字段已出现过，避免重复事件
@@ -2272,6 +2285,7 @@ async def _run_job_inner(
                 "mode": "dual_horizon",
                 "user_intent": user_intent,
                 "model_config_snapshot": model_snapshot,
+                "market_data_context": primary_r.get("market_data_context"),
                 "short_term": short_r,
                 "medium_term": medium_r,
                 "decision": decision,
@@ -2376,12 +2390,24 @@ async def _run_job_inner(
         # ── End dual-horizon path ─────────────────────────────────────────────
 
         if stream_events:
+            collected_pool = await asyncio.to_thread(
+                graph.data_collector.collect,
+                request.symbol,
+                request.trade_date,
+                horizons=request.horizons,
+            )
+            market_data_context = (
+                collected_pool.get("market_data_context")
+                if isinstance(collected_pool, dict)
+                else None
+            )
             init_state = graph.propagator.create_initial_state(
                 request.symbol,
                 request.trade_date,
                 user_context=user_context_payload,
                 selected_analysts=request.selected_analysts,
                 request_source=request_source,
+                market_data_context=market_data_context,
             )
             args = graph.propagator.get_graph_args()
             

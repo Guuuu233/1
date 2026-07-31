@@ -1,5 +1,6 @@
 from tradingagents.agents.utils.context_utils import get_cn_stock_name
 import asyncio
+import json
 from datetime import datetime, timedelta
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -23,6 +24,33 @@ MARKET_INDICATORS = [
     "atr",
     "vwma",
 ]
+
+
+def _default_market_data_context() -> dict:
+    return {
+        "daily": {"as_of": None, "completeness": "unavailable"},
+        "realtime": {
+            "status": "unavailable",
+            "source": None,
+            "quote_as_of": None,
+            "retrieved_at": None,
+            "error": "实时行情上下文不可用",
+            "quote": None,
+        },
+    }
+
+
+def _format_market_data_context(context: dict) -> str:
+    daily = context.get("daily") or {}
+    realtime = context.get("realtime") or {}
+    daily_as_of = daily.get("as_of") or "不可用"
+    daily_completeness = daily.get("completeness") or "unavailable"
+    return (
+        f"【完整日线】截至 {daily_as_of}，完整性：{daily_completeness}。"
+        "以下 K 线和指标不含盘中实时快照。\n"
+        "【实时快照】\n"
+        f"{json.dumps(realtime, ensure_ascii=False, sort_keys=True)}"
+    )
 
 
 def create_market_analyst(llm, data_collector=None):
@@ -49,10 +77,15 @@ def create_market_analyst(llm, data_collector=None):
                 stock_data = windowed.get("stock_data", "无数据")
                 indicators = windowed.get("indicators", {})
                 data_window = windowed.get("_data_window", "14天")
+                market_data_context = windowed.get(
+                    "market_data_context", _default_market_data_context()
+                )
             else:
                 stock_data, indicators, data_window = await _fetch_direct(ticker, current_date, horizon)
+                market_data_context = _default_market_data_context()
         else:
             stock_data, indicators, data_window = await _fetch_direct(ticker, current_date, horizon)
+            market_data_context = _default_market_data_context()
 
         indicator_blocks = [
             f"【{ind}】\n{indicators.get(ind, '无数据')}"
@@ -63,8 +96,9 @@ def create_market_analyst(llm, data_collector=None):
             SystemMessage(content=system_message + "\n\n请全程使用中文。"),
             HumanMessage(content=(
                 horizon_ctx + "\n"
-                f"以下是 {ticker_display} 在 {current_date} 的 K 线数据与指标（数据窗口：{data_window}）。\n\n"
-                f"【get_stock_data】\n{stock_data}\n\n"
+                f"以下是 {ticker_display} 在 {current_date} 的市场数据（数据窗口：{data_window}）。\n\n"
+                f"{_format_market_data_context(market_data_context)}\n\n"
+                f"【完整日线 OHLCV】\n{stock_data}\n\n"
                 + "\n\n".join(indicator_blocks)
             )),
         ]
@@ -153,6 +187,7 @@ def create_market_analyst(llm, data_collector=None):
 
         return {
             "market_report": full_content,
+            "market_data_context": market_data_context,
             "analyst_traces": [{
                 "agent": "market_analyst",
                 "horizon": horizon,

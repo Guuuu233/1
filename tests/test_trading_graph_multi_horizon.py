@@ -164,6 +164,34 @@ class TestPropagateAsync:
         collect_mock.assert_called_once_with("600519", "2024-01-15")
         evict_mock.assert_called_once_with("600519", "2024-01-15")
 
+    def test_collected_context_is_injected_before_async_graph_run(self):
+        context = {
+            "daily": {"as_of": "2024-01-12", "completeness": "completed"},
+            "realtime": {
+                "status": "available",
+                "source": "sina",
+                "quote_as_of": "2024-01-15 14:30:00",
+                "retrieved_at": "2024-01-15T06:30:00+00:00",
+                "error": None,
+                "quote": {"price": 10.5},
+            },
+        }
+        captured_state = {}
+
+        async def _capture_state(state, **_kwargs):
+            captured_state.update(state)
+            return self._fake_state(state["horizon"])
+
+        self.ta.graph.ainvoke = AsyncMock(side_effect=_capture_state)
+        self.ta.data_collector.collect = MagicMock(
+            return_value={"market_data_context": context}
+        )
+        self.ta.data_collector.evict = MagicMock()
+
+        asyncio.run(self.ta.propagate_async("600519", "2024-01-15"))
+
+        assert captured_state["market_data_context"] == context
+
     def test_query_parses_intent(self):
         self.ta.graph.ainvoke = AsyncMock(
             side_effect=lambda state, **kw: self._fake_state(state["horizon"])
@@ -184,6 +212,47 @@ class TestPropagateAsync:
             )
 
         assert result["user_intent"]["focus_areas"] == ["技术面"]
+
+
+def test_propagate_collects_data_before_non_query_graph_run():
+    ta = _make_mock_graph_class()
+    context = {
+        "daily": {"as_of": "2024-01-12", "completeness": "completed"},
+        "realtime": {
+            "status": "available",
+            "source": "sina",
+            "quote_as_of": "2024-01-15 14:30:00",
+            "retrieved_at": "2024-01-15T06:30:00+00:00",
+            "error": None,
+            "quote": {"price": 10.5},
+        },
+    }
+    ta.data_collector.collect = MagicMock(return_value={"market_data_context": context})
+    captured_state = {}
+
+    def _capture_state(state, **_kwargs):
+        captured_state.update(state)
+        return {
+            "company_of_interest": "600519",
+            "trade_date": "2024-01-15",
+            "final_trade_decision": "买入",
+            "market_report": "",
+            "sentiment_report": "",
+            "news_report": "",
+            "fundamentals_report": "",
+            "investment_debate_state": {},
+            "risk_debate_state": {},
+            "trader_investment_plan": "",
+        }
+
+    ta.graph.invoke = MagicMock(side_effect=_capture_state)
+    ta._log_state = MagicMock()
+    ta.process_signal = MagicMock(return_value="BUY")
+
+    ta.propagate("600519", "2024-01-15", selected_analysts=["news"])
+
+    ta.data_collector.collect.assert_called_once_with("600519", "2024-01-15")
+    assert captured_state["market_data_context"] == context
 
 
 class _FakeWorkflow:
