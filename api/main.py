@@ -583,6 +583,46 @@ def _get_horizon_analysts(horizon: str, available: List[str]) -> List[str]:
     return list(available)
 
 
+_SUPPORTED_ANALYSIS_HORIZONS = ("short", "medium")
+_DUAL_HORIZON_QUERY_RE = re.compile(
+    r"(?:短线|短期).{0,16}(?:中线|中期)|(?:中线|中期).{0,16}(?:短线|短期)"
+    r"|short(?:[- ]term)?.{0,24}medium(?:[- ]term)?"
+    r"|medium(?:[- ]term)?.{0,24}short(?:[- ]term)?",
+    re.IGNORECASE,
+)
+_MEDIUM_HORIZON_QUERY_RE = re.compile(
+    r"中线|中期|几个月|季度|长期|趋势投资|medium(?:[- ]term)?",
+    re.IGNORECASE,
+)
+
+
+def _normalize_analysis_horizons(
+    raw: Any,
+    *,
+    query: Optional[str] = None,
+) -> List[str]:
+    """Normalize API horizon intent without changing upstream analyst windows.
+
+    The API accepts only the two supported horizon names and treats an
+    explicit natural-language request for both horizons as authoritative.
+    Unknown or missing values retain the historical short-horizon default.
+    """
+    values = raw if isinstance(raw, (list, tuple)) else []
+    normalized = {
+        str(value).strip().lower()
+        for value in values
+        if str(value).strip().lower() in _SUPPORTED_ANALYSIS_HORIZONS
+    }
+    query_text = str(query or "")
+    if _DUAL_HORIZON_QUERY_RE.search(query_text):
+        normalized.update(_SUPPORTED_ANALYSIS_HORIZONS)
+    elif not normalized and _MEDIUM_HORIZON_QUERY_RE.search(query_text):
+        normalized.add("medium")
+    if not normalized:
+        normalized.add("short")
+    return [horizon for horizon in _SUPPORTED_ANALYSIS_HORIZONS if horizon in normalized]
+
+
 def _announcements_file() -> Path:
     return Path(__file__).resolve().parent / "announcements.json"
 
@@ -2052,14 +2092,10 @@ async def _run_job_inner(
         )
         final_state: Optional[Dict[str, Any]] = None
 
-        # 强制单周期：多个 horizon 时只取第一个，避免 dual-horizon 双倍开销
-        if not request.horizons:
-            request.horizons = ["short"]
-        elif len(request.horizons) > 1:
-            request.horizons = [request.horizons[0]]
+        request.horizons = _normalize_analysis_horizons(request.horizons, query=request.query)
 
         # ── Dual-horizon intent-driven path ──────────────────────────────────
-        if request.query:
+        if request.query or len(request.horizons) > 1:
             # 1. 组装用户意图
             intent_start_t = time.time()
             ticker = request.symbol or display_name
@@ -2070,10 +2106,31 @@ async def _run_job_inner(
                 user_intent["ticker"] = ticker
                 user_intent["horizons"] = request.horizons
             else:
-                # 直接 POST /v1/analyze 时的兜底（无预解析 intent）
-                user_intent = await asyncio.to_thread(_parse_intent, request.query, graph.quick_thinking_llm, fallback_ticker=ticker)
-                if not request.horizons:
-                    request.horizons = user_intent["horizons"]
+                if request.query:
+                    # 直接 POST /v1/analyze 时的兜底（无预解析 intent）
+                    user_intent = await asyncio.to_thread(
+                        _parse_intent,
+                        request.query,
+                        graph.quick_thinking_llm,
+                        fallback_ticker=ticker,
+                    )
+                    if not request.horizons:
+                        request.horizons = user_intent["horizons"]
+                    request.horizons = _normalize_analysis_horizons(
+                        request.horizons,
+                        query=request.query,
+                    )
+                else:
+                    # Explicit structured dual-horizon requests have no
+                    # natural-language parser input; keep the API contract
+                    # self-contained instead of calling the upstream parser.
+                    user_intent = {
+                        "raw_query": "",
+                        "ticker": ticker,
+                        "horizons": request.horizons,
+                        "focus_areas": [],
+                        "specific_questions": [],
+                    }
                 user_intent["horizons"] = request.horizons
             _log(f"[Timer] Intent Parsing took {time.time() - intent_start_t:.2f}s")
 
@@ -2168,7 +2225,10 @@ async def _run_job_inner(
                 seen: Dict[str, bool] = {}   # 追踪哪些字段已出现过，避免重复事件
                 horizon_final = None
 
-                # DB 更新使用短生命周期 session，避免长期占用连接池
+                # Preserve the historical incremental ReportDB updates for
+                # single-horizon query/chat jobs. Dual-horizon jobs defer
+                # persistence until aggregation so the two graphs cannot
+                # overwrite each other's flattened columns.
                 def _horizon_partial_update(updates: dict):
                     with get_db_ctx() as _hdb:
                         report_service.update_report_partial(_hdb, job_id, **updates)
@@ -2223,7 +2283,8 @@ async def _run_job_inner(
                                 h_tracker._set_status(ANALYST_AGENT_NAMES[r_key], "completed")
                         # ── end 并行感知 ────────────────────────────────────────────
 
-                        # 报告分片推送与数据库即时更新
+                        # 报告分片推送。双 horizon 的持久化只在最终聚合后写入，
+                        # 避免两个 graph 并发把不同 horizon 的字段相互覆盖。
                         db_updates = {}
                         for key in report_keys:
                             value = chunk.get(key)
@@ -2231,8 +2292,7 @@ async def _run_job_inner(
                                 last_report[key] = value
                                 db_updates[key] = str(value)
                                 h_tracker._emit_report_chunked(job_id, key, str(value))
-
-                        if db_updates:
+                        if db_updates and len(request.horizons) == 1:
                             await asyncio.to_thread(_horizon_partial_update, db_updates)
                 except Exception as e:
                     _log(
@@ -2254,14 +2314,220 @@ async def _run_job_inner(
                 *[_process_horizon(h) for h in request.horizons],
                 return_exceptions=True,
             )
-            horizon_errors = []
+            horizon_errors: Dict[str, Exception] = {}
             for i, r in enumerate(results):
                 if isinstance(r, Exception):
+                    horizon = request.horizons[i]
                     tb = "".join(traceback.format_exception(type(r), r, r.__traceback__))
-                    _log(f"Horizon '{request.horizons[i]}' failed: {r!r}\n{tb}")
-                    horizon_errors.append(f"{request.horizons[i]}: {r}")
-            if horizon_errors:
-                raise RuntimeError(f"Horizon analysis failed: {'; '.join(horizon_errors)}")
+                    _log(f"Horizon '{horizon}' failed: {r!r}\n{tb}")
+                    horizon_errors[horizon] = r
+                    _emit_job_event(
+                        job_id,
+                        "agent.horizon_failed",
+                        {
+                            "horizon": horizon,
+                            "status": "failed",
+                            "error": _humanize_analysis_error(str(r)),
+                            "impact": f"{horizon} horizon is unavailable; no decision is produced for this horizon.",
+                        },
+                    )
+            if horizon_errors and len(request.horizons) == 1:
+                raise RuntimeError(
+                    "Horizon analysis failed: "
+                    + "; ".join(f"{horizon}: {error}" for horizon, error in horizon_errors.items())
+                )
+            if len(horizon_errors) == len(request.horizons):
+                raise RuntimeError(
+                    "All requested horizons failed: "
+                    + "; ".join(f"{horizon}: {error}" for horizon, error in horizon_errors.items())
+                )
+
+            model_snapshot = {
+                role: {
+                    "provider_type": cfg.get("provider_type"),
+                    "model_name": cfg.get("model_name"),
+                    "base_url": cfg.get("base_url"),
+                    "resolved_via": cfg.get("resolved_via"),
+                    "fallback_used": cfg.get("fallback_used"),
+                    "profile_display_name": cfg.get("profile_display_name"),
+                    "provider_display_name": cfg.get("provider_display_name"),
+                }
+                for role, cfg in getattr(graph, "role_resolved_configs", {}).items()
+            }
+
+            if len(request.horizons) > 1:
+                # Each horizon owns its structured fields.  Keeping the
+                # values nested prevents a primary horizon from being
+                # accidentally presented as the result of the other graph.
+                horizon_results: Dict[str, Dict[str, Any]] = {}
+                for horizon in request.horizons:
+                    if horizon in horizon_errors:
+                        horizon_results[horizon] = {
+                            "horizon": horizon,
+                            "status": "failed",
+                            "error": _humanize_analysis_error(str(horizon_errors[horizon])),
+                            "not_applicable": None,
+                            "impact": (
+                                f"{horizon} horizon is unavailable; downstream consumers must use only the "
+                                "completed horizon and treat this result as partial."
+                            ),
+                        }
+                        continue
+
+                    horizon_result = graph._build_horizon_result(
+                        horizon,
+                        horizon_states.get(horizon) or {},
+                    )
+                    structured = None
+                    try:
+                        structured = await asyncio.to_thread(
+                            report_service.extract_structured_data,
+                            final_trade_decision=horizon_result.get("final_trade_decision", ""),
+                            fundamentals_report=horizon_result.get("fundamentals_report", ""),
+                            config=config,
+                        )
+                    except Exception as exc:
+                        _log(f"Structured extraction failed for {horizon} (non-fatal): {exc}")
+
+                    horizon_gaps = report_service.merge_data_gaps(
+                        result_data=horizon_result,
+                        llm_data_gaps=structured.data_gaps if structured else [],
+                    )
+                    resolved = await asyncio.to_thread(
+                        report_service.resolve_report_fields,
+                        result_data=horizon_result,
+                        confidence_override=structured.confidence if structured else None,
+                        target_price_override=structured.target_price if structured else None,
+                        stop_loss_override=structured.stop_loss_price if structured else None,
+                    )
+                    decision = (
+                        structured.decision
+                        if structured and structured.decision
+                        else graph.process_signal(horizon_result.get("final_trade_decision", ""))
+                    ) or "UNKNOWN"
+                    horizon_result.update(
+                        {
+                            "status": "completed",
+                            "decision": decision,
+                            "direction": resolved["direction"] or decision,
+                            "confidence": resolved["confidence"],
+                            "probability": structured.probability if structured else None,
+                            "data_gaps": horizon_gaps,
+                            "falsification_conditions": (
+                                structured.falsification_conditions if structured else []
+                            ),
+                            "not_applicable": structured.not_applicable if structured else False,
+                            "target_price": resolved["target_price"],
+                            "stop_loss_price": resolved["stop_loss_price"],
+                            "risk_items": (
+                                [item.model_dump() for item in structured.risks]
+                                if structured
+                                else []
+                            ),
+                            "key_metrics": (
+                                [item.model_dump() for item in structured.key_metrics]
+                                if structured
+                                else []
+                            ),
+                        }
+                    )
+                    horizon_results[horizon] = horizon_result
+
+                def _not_requested(horizon: str) -> Dict[str, Any]:
+                    return {"horizon": horizon, "status": "not_requested"}
+
+                short_r = horizon_results.get("short", _not_requested("short"))
+                medium_r = horizon_results.get("medium", _not_requested("medium"))
+                horizon_status = {
+                    horizon: horizon_results[horizon].get("status", "completed")
+                    for horizon in request.horizons
+                }
+                all_data_gaps: List[str] = []
+                seen_gaps: set[str] = set()
+                for horizon in request.horizons:
+                    for gap in horizon_results[horizon].get("data_gaps", []):
+                        if gap not in seen_gaps:
+                            seen_gaps.add(gap)
+                            all_data_gaps.append(gap)
+                result = {
+                    "symbol": ticker,
+                    "trade_date": request.trade_date,
+                    "mode": "dual_horizon",
+                    "status": "partial" if horizon_errors else "completed",
+                    "requested_horizons": list(request.horizons),
+                    "horizon_status": horizon_status,
+                    "failed_horizons": [horizon for horizon in request.horizons if horizon in horizon_errors],
+                    "user_intent": user_intent,
+                    "model_config_snapshot": model_snapshot,
+                    "market_data_context": {
+                        horizon: horizon_results[horizon].get("market_data_context")
+                        for horizon in request.horizons
+                        if horizon_results[horizon].get("status") == "completed"
+                    },
+                    "short_term": short_r,
+                    "medium_term": medium_r,
+                    "horizons": {"short": short_r, "medium": medium_r},
+                    "data_gaps": all_data_gaps,
+                    "analyst_traces": [
+                        trace
+                        for horizon in request.horizons
+                        for trace in horizon_results[horizon].get("analyst_traces", [])
+                    ],
+                }
+                _attach_custom_prompt_snapshot(result, _prompt_snapshot)
+
+                if save_report:
+                    def _save_dual_report_sync():
+                        with get_db_ctx() as save_db:
+                            report_service.create_report(
+                                db=save_db,
+                                symbol=request.symbol,
+                                trade_date=request.trade_date,
+                                decision=None,
+                                result_data=result,
+                                user_id=user_id,
+                                risk_items=None,
+                                key_metrics=None,
+                                probability=None,
+                                data_gaps=result["data_gaps"],
+                                falsification_conditions=[],
+                                not_applicable=False,
+                                confidence_override=None,
+                                target_price_override=None,
+                                stop_loss_override=None,
+                                report_id=job_id,
+                                analyst_traces=result.get("analyst_traces"),
+                            )
+                            save_db.commit()
+
+                    await _save_report_or_raise(job_id, _save_dual_report_sync, stage="save")
+
+                _set_job(
+                    job_id,
+                    status="completed",
+                    result=result,
+                    decision=None,
+                    error=None,
+                    overtime=False,
+                    overtime_at=None,
+                    finished_at=_utcnow_iso(),
+                )
+                _emit_job_event(
+                    job_id,
+                    "job.completed",
+                    {
+                        "job_id": job_id,
+                        "status": result["status"],
+                        "result": result,
+                        "mode": "dual_horizon",
+                        "data_gaps": result["data_gaps"],
+                        "horizon_status": result["horizon_status"],
+                        "failed_horizons": result["failed_horizons"],
+                    },
+                )
+                _log(f"Job completed successfully: {job_id}")
+                _log(f"[Timer] TOTAL Job execution (dual_horizon) took {time.time() - job_start_t:.2f}s")
+                return
 
             short_r = graph._build_horizon_result("short", horizon_states.get("short") or {})
             medium_r = graph._build_horizon_result("medium", horizon_states.get("medium") or {})
@@ -2407,6 +2673,7 @@ async def _run_job_inner(
                 user_context=user_context_payload,
                 selected_analysts=request.selected_analysts,
                 request_source=request_source,
+                horizon=request.horizons[0] if request.horizons else "short",
                 market_data_context=market_data_context,
             )
             args = graph.propagator.get_graph_args()
@@ -2543,15 +2810,50 @@ async def _run_job_inner(
             finally:
                 current_tracker_var.reset(_tracker_token)
         else:
-            final_state, _ = await asyncio.to_thread(
-                graph.propagate,
-                request.symbol,
-                request.trade_date,
-                user_context=user_context_payload,
-                selected_analysts=request.selected_analysts,
-                request_source=request_source,
-                thread_id=job_id,
-            )
+            single_horizon = request.horizons[0] if request.horizons else "short"
+            if single_horizon == "short":
+                final_state, _ = await asyncio.to_thread(
+                    graph.propagate,
+                    request.symbol,
+                    request.trade_date,
+                    user_context=user_context_payload,
+                    selected_analysts=request.selected_analysts,
+                    request_source=request_source,
+                    thread_id=job_id,
+                )
+            else:
+                # TradingAgentsGraph.propagate historically defaults the
+                # propagator state to short.  Keep the API-only medium path
+                # explicit without changing the upstream graph contract.
+                collected_pool = await asyncio.to_thread(
+                    graph.data_collector.collect,
+                    request.symbol,
+                    request.trade_date,
+                    horizons=request.horizons,
+                )
+                market_data_context = (
+                    collected_pool.get("market_data_context")
+                    if isinstance(collected_pool, dict)
+                    else None
+                )
+                init_state = graph.propagator.create_initial_state(
+                    request.symbol,
+                    request.trade_date,
+                    user_context=user_context_payload,
+                    selected_analysts=request.selected_analysts,
+                    request_source=request_source,
+                    horizon=single_horizon,
+                    market_data_context=market_data_context,
+                )
+                args = graph.propagator.get_graph_args()
+                if "config" not in args:
+                    args["config"] = {}
+                args["config"]["configurable"] = {"thread_id": job_id}
+                final_state = await asyncio.to_thread(
+                    graph.graph.invoke,
+                    init_state,
+                    **args,
+                )
 
         if not final_state:
             raise RuntimeError("graph returned empty final state")
@@ -3328,9 +3630,8 @@ async def _ai_extract_symbol_and_date_streaming(
 字段说明：
 - stock_name：用户提到的公司名称或股票代码原文（如"华盛天成"、"贵州茅台"、"600519"、"AAPL"）；美股直接填 ticker。
 - date：YYYY-MM-DD 格式。今天是 {today}，如未提及则填今天。
-- horizons：分析周期，只能选一个：
-  * 用户明确提到"中线/中期/几个月/季度/长期/趋势投资"→ ["medium"]
-  * 其他所有情况（含未提及）→ ["short"]
+- horizons：分析周期。默认只选短线；若用户明确同时提到"短线与中线/短期和中期"，或同时提到 short and medium，必须返回 ["short", "medium"]；
+  仅提到"中线/中期/几个月/季度/长期/趋势投资"→ ["medium"]；其他情况（含未提及）→ ["short"]。
 - focus_areas：用户关注的分析维度关键词列表，如 ["技术面", "资金面", "业绩"]，未提及则 []。
 - specific_questions：用户提出的具体问题列表，如 ["近期有无催化剂？", "主力是否出货？"]，未提及则 []。
 - user_context：从自然语言中提取的账户与约束对象。若未提及返回 {{}}。可包含：
@@ -3445,9 +3746,8 @@ def _ai_extract_symbol_and_date(
 字段说明：
 - stock_name：用户提到的公司名称或股票代码原文（如"华盛天成"、"贵州茅台"、"600519"、"AAPL"）；美股直接填 ticker。
 - date：YYYY-MM-DD 格式。今天是 {today}，如未提及则填今天。
-- horizons：分析周期，只能选一个：
-  * 用户明确提到"中线/中期/几个月/季度/长期/趋势投资"→ ["medium"]
-  * 其他所有情况（含未提及）→ ["short"]
+- horizons：分析周期。默认只选短线；若用户明确同时提到"短线与中线/短期和中期"，或同时提到 short and medium，必须返回 ["short", "medium"]；
+  仅提到"中线/中期/几个月/季度/长期/趋势投资"→ ["medium"]；其他情况（含未提及）→ ["short"]。
 - focus_areas：用户关注的分析维度关键词列表，如 ["技术面", "资金面", "业绩"]，未提及则 []。
 - specific_questions：用户提出的具体问题列表，如 ["近期有无催化剂？", "主力是否出货？"]，未提及则 []。
 - user_context：从自然语言中提取的账户与约束对象。若未提及返回 {{}}。可包含：
@@ -3550,6 +3850,7 @@ async def chat_completions(
             try:
                 symbol, trade_date, horizons, focus_areas, specific_questions, inferred_user_context = \
                     await _ai_extract_symbol_and_date_streaming(text, config, job_id)
+                horizons = _normalize_analysis_horizons(horizons, query=text)
 
                 if not symbol:
                     _emit_job_event(job_id, "job.failed", {
@@ -3633,6 +3934,7 @@ async def chat_completions(
     # ── 非流式模式：保持原有阻塞行为 ─────────────────────────────────────────────
     symbol, trade_date, horizons, focus_areas, specific_questions, inferred_user_context = \
         await asyncio.to_thread(_ai_extract_symbol_and_date, text, config)
+    horizons = _normalize_analysis_horizons(horizons, query=text)
 
     if not symbol:
         raise HTTPException(status_code=400, detail="抱歉，我没能从您的消息中识别出股票标的。请输入代码（如 600519.SH）或可识别的公司名称。")
