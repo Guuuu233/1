@@ -303,6 +303,12 @@ class TradingAgentsGraph:
         """Run the trading agents graph for a company on a specific date."""
 
         self.ticker = company_name
+        collected = self.data_collector.collect(company_name, trade_date)
+        market_data_context = (
+            collected.get("market_data_context")
+            if isinstance(collected, dict)
+            else None
+        )
 
         # Initialize state
         init_agent_state = self.propagator.create_initial_state(
@@ -311,6 +317,7 @@ class TradingAgentsGraph:
             user_context=user_context,
             selected_analysts=selected_analysts,
             request_source=request_source,
+            market_data_context=market_data_context,
         )
         args = self.propagator.get_graph_args()
 
@@ -378,12 +385,21 @@ class TradingAgentsGraph:
 
         # Pre-collect data once (always full data); analysts will read from cache
         print(f"[TradingAgentsGraph] Collecting data for {ticker} {trade_date}…")
-        self.data_collector.collect(ticker, trade_date)
+        collected = self.data_collector.collect(ticker, trade_date)
+        market_data_context = (
+            collected.get("market_data_context")
+            if isinstance(collected, dict)
+            else None
+        )
 
         graph_args = self.propagator.get_graph_args()
 
         state = self.propagator.create_initial_state(
-            ticker, trade_date, user_intent=user_intent, horizon="short"
+            ticker,
+            trade_date,
+            user_intent=user_intent,
+            horizon="short",
+            market_data_context=market_data_context,
         )
         final_state = await self.graph.ainvoke(state, **graph_args)
 
@@ -406,6 +422,7 @@ class TradingAgentsGraph:
             "horizon": horizon,
             "company_of_interest": final_state.get("company_of_interest", ""),
             "trade_date": final_state.get("trade_date", ""),
+            "market_data_context": final_state.get("market_data_context", {}),
             "final_trade_decision": final_state.get("final_trade_decision", ""),
             "investment_plan": final_state.get("investment_plan", ""),
             "trader_investment_plan": final_state.get("trader_investment_plan", ""),
@@ -457,6 +474,7 @@ class TradingAgentsGraph:
             "trade_date": final_state["trade_date"],
             "instrument_context": final_state.get("instrument_context", {}),
             "market_context": final_state.get("market_context", {}),
+            "market_data_context": final_state.get("market_data_context", {}),
             "user_context": final_state.get("user_context", {}),
             "workflow_context": final_state.get("workflow_context", {}),
             "market_report": final_state["market_report"],

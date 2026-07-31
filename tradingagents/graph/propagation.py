@@ -18,6 +18,7 @@ from tradingagents.agents.utils.debate_utils import (
     build_empty_risk_debate_state,
     default_round_goal,
 )
+from .data_collector import default_market_data_context
 
 
 class Propagator:
@@ -36,6 +37,7 @@ class Propagator:
         request_source: str = "api",
         user_intent: Optional[Dict[str, Any]] = None,
         horizon: str = "short",
+        market_data_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create the initial state for the agent graph."""
         instrument_context = infer_instrument_context(company_name)
@@ -53,6 +55,7 @@ class Propagator:
             "trade_date": str(trade_date),
             "instrument_context": instrument_context,
             "market_context": market_context,
+            "market_data_context": market_data_context or default_market_data_context(),
             "user_context": normalized_user_context,
             "workflow_context": {
                 "context_version": "v1",

@@ -37,6 +37,8 @@ def test_akshare_get_realtime_quotes_returns_structured_json():
     assert q["change_pct"] == pytest.approx(0.2786, abs=0.001)
     assert q["open"] == 1790.0
     assert q["volume"] == 50000
+    assert q["source"] == "eastmoney"
+    assert q.get("quote_time") is None
     assert "000001.SZ" in data
 
 
@@ -46,6 +48,17 @@ def test_akshare_get_realtime_quotes_empty_symbols():
     provider = CnAkshareProvider()
     result = provider.get_realtime_quotes([])
     assert json.loads(result) == {}
+
+
+def test_akshare_get_realtime_quotes_surfaces_source_failure_to_router():
+    from tradingagents.dataflows.providers.cn_akshare_provider import CnAkshareProvider
+
+    provider = CnAkshareProvider()
+    with patch.object(CnAkshareProvider, "_spot_cache", None), \
+         patch.object(provider, "_fetch_quotes_sina", return_value="{}"), \
+         patch.object(provider, "_ak", side_effect=RuntimeError("eastmoney down")):
+        with pytest.raises(NotImplementedError):
+            provider.get_realtime_quotes(["600519.SH"])
 
 
 def test_route_to_vendor_resolves_realtime_quotes():

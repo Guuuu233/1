@@ -151,6 +151,7 @@ class AgentState(MessagesState):
 
     instrument_context: Annotated[InstrumentContext, "Normalized instrument context"]
     market_context: Annotated[MarketContext, "Market session and timing context"]
+    market_data_context: Annotated[dict[str, Any], "Completed daily bars and independent realtime snapshot"]
     user_context: Annotated[UserContext, "User-specific holdings and constraints"]
     workflow_context: Annotated[WorkflowContext, "Workflow metadata for the current run"]
 
