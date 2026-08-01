@@ -542,6 +542,72 @@ def test_invalid_legacy_report_overrides_do_not_persist_canonical_values(
         db.close()
 
 
+def test_report_api_rejects_strict_boundary_bypasses_without_persisting_rows():
+    from fastapi.testclient import TestClient
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    import api.main as main
+    from api.database import Base, ReportDB
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db = session_factory()
+
+    def override_get_db():
+        yield db
+
+    current_user = SimpleNamespace(id="p5-api-user")
+    main.app.dependency_overrides[main.get_db] = override_get_db
+    main.app.dependency_overrides[main._require_api_user] = lambda: current_user
+    client = TestClient(main.app, raise_server_exceptions=False)
+
+    valid_payload = _valid_machine_payload()
+    invalid_responses = [
+        _machine_block("DEBATE_STATE", _valid_machine_payload(confidence=None)),
+        _machine_block("RISK_STATE", _valid_machine_payload(confidence="0.7")),
+        (
+            "固定正文\n"
+            f"<!-- DEBATE_STATE {json.dumps(valid_payload, ensure_ascii=False)} -->"
+        ),
+        _machine_block("RISK_STATE", valid_payload).removesuffix(" -->"),
+    ]
+    try:
+        for index, final_trade_decision in enumerate(invalid_responses):
+            response = client.post(
+                "/v1/reports",
+                json={
+                    "symbol": f"60051{index:02d}.SH",
+                    "trade_date": "2026-07-31",
+                    "result_data": {"final_trade_decision": final_trade_decision},
+                },
+            )
+            assert response.status_code == 422, response.text
+            assert db.query(ReportDB).count() == 0
+
+        valid_response = client.post(
+            "/v1/reports",
+            json={
+                "symbol": "600519.SH",
+                "trade_date": "2026-07-31",
+                "result_data": {"final_trade_decision": _machine_block("DEBATE_STATE", valid_payload)},
+            },
+        )
+        assert valid_response.status_code == 200, valid_response.text
+        assert db.query(ReportDB).count() == 1
+    finally:
+        main.app.dependency_overrides.pop(main.get_db, None)
+        main.app.dependency_overrides.pop(main._require_api_user, None)
+        db.close()
+        engine.dispose()
+
+
 def test_unknown_structured_fields_are_not_canonical_but_body_is_preserved(caplog):
     from api.services import report_service
 

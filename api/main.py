@@ -774,6 +774,8 @@ def _strict_report_probability(value: Any) -> Any:
 
 
 def _strict_claim_confidence(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, str, bytes, bytearray)):
+        raise ValueError("claim confidence must be a finite number in [0, 1]")
     return _strict_unit_interval(value, "claim confidence")
 
 
@@ -856,12 +858,15 @@ def _validate_report_machine_blocks(result_data: Optional[Dict[str, Any]]) -> No
         return
     for text in _iter_report_strings(result_data):
         for tag in _REPORT_MACHINE_BLOCK_TAGS:
-            openings = list(re.finditer(rf"<!--\s*{re.escape(tag)}\s*:", text))
+            openings = list(re.finditer(rf"<!--\s*{re.escape(tag)}\b", text))
             if not openings:
                 continue
             if len(openings) > 1:
                 raise ValueError(f"{tag} machine block must not be duplicated")
-            payload_text = text[openings[0].end():]
+            marker_suffix = text[openings[0].end():].lstrip()
+            if not marker_suffix.startswith(":"):
+                raise ValueError(f"{tag} machine block must use ':' after the marker")
+            payload_text = marker_suffix[1:]
             closing_index = payload_text.find("-->")
             if closing_index < 0:
                 raise ValueError(f"{tag} machine block is truncated")
