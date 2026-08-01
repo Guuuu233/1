@@ -15,7 +15,12 @@ from stockstats import wrap
 
 from .base import BaseMarketDataProvider
 from ..config import get_config
-from ..trade_calendar import cn_no_data_reason, snapshot_historical_refusal
+from ..trade_calendar import (
+    cn_no_data_reason,
+    dedupe_daily_bars,
+    drop_incomplete_today_bar,
+    snapshot_historical_refusal,
+)
 from ..utils import shrink_table
 
 logger = logging.getLogger(__name__)
@@ -188,7 +193,9 @@ class CnInvestodayProvider(BaseMarketDataProvider):
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna(subset=["Date", "Open", "High", "Low", "Close", "Volume"])
         df["Volume"] = df["Volume"].astype(float)
-        return df.sort_values("Date").reset_index(drop=True)
+        return dedupe_daily_bars(
+            df, "Date", ["Open", "High", "Low", "Close", "Volume"]
+        )
 
     @staticmethod
     def _slice_hist_df(df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
@@ -232,6 +239,12 @@ class CnInvestodayProvider(BaseMarketDataProvider):
             base_url,
         )
         return self._iv_adjusted_rows_to_df(rows)
+
+    def _drop_incomplete_today_bar(
+        self, hist_df: pd.DataFrame, end_date: str
+    ) -> pd.DataFrame:
+        """Keep incomplete intraday prices out of the completed daily series."""
+        return drop_incomplete_today_bar(hist_df, "Date", end_date)
 
     def _fetch_one_realtime(self, stock_code: str, api_key: str, base_url: str) -> dict[str, Any] | None:
         """单股实时日行情。"""
@@ -451,6 +464,7 @@ class CnInvestodayProvider(BaseMarketDataProvider):
         self._require_api_key()
         df = self._fetch_adjusted_hist_df(symbol, start_date, end_date)
         df = self._slice_hist_df(df, start_date, end_date)
+        df = self._drop_incomplete_today_bar(df, end_date)
         return self._format_hist_csv(df, symbol, start_date, end_date)
 
     def get_indicators(
@@ -469,6 +483,7 @@ class CnInvestodayProvider(BaseMarketDataProvider):
             symbol, start_dt.strftime("%Y-%m-%d"), curr_date
         )
         df = self._slice_hist_df(df, start_dt.strftime("%Y-%m-%d"), curr_date)
+        df = self._drop_incomplete_today_bar(df, curr_date)
         if df is None or df.empty:
             return f"No data found for {symbol} for indicator {indicator}"
 

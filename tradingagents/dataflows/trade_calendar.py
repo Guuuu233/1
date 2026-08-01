@@ -37,6 +37,15 @@ class DateDataUnavailable(Exception):
     """Raised by a date-scoped fetch when that specific day has no usable data yet."""
 
 
+class DuplicateBarConflictError(ValueError):
+    """Raised when a daily series has same-date rows with conflicting OHLCV/Volume.
+
+    Subclasses ``ValueError`` so provider-level callers that treat normalization
+    failure as a ``ValueError`` keep that contract, while the router can
+    distinguish this data-integrity refusal from generic runtime errors.
+    """
+
+
 def now_cn() -> datetime:
     return datetime.now(CN_TZ)
 
@@ -64,6 +73,79 @@ def is_historical_analysis_date(curr_date: str | None) -> bool:
     except Exception:
         return False
     return d < now_cn().date()
+
+
+def unavailable_analysis_date_reason(curr_date: str | None) -> str | None:
+    """Return an explicit refusal when the as-of date is missing/unparseable/future.
+
+    None means the date is usable as an analysis as-of. Callers must refuse
+    (never fall back to a live provider) when a reason is returned.
+    """
+    if curr_date is None or not str(curr_date).strip():
+        return "【数据获取失败】缺少分析日期（as-of），不得回退到 live 数据源，本项不可用。"
+    try:
+        d = _parse_date(str(curr_date))
+    except (TypeError, ValueError) as exc:
+        logger.warning("Unparseable analysis date %r: %s", curr_date, exc)
+        return f"【数据获取失败】分析日期无法解析：{curr_date!r}，本项不可用。"
+    if d > now_cn().date():
+        return f"【数据获取失败】分析日期 {_format_date(d)} 晚于当前日期，拒绝未来数据，本项不可用。"
+    return None
+
+
+def drop_incomplete_today_bar(
+    df: pd.DataFrame,
+    date_col: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """Remove today's intraday bar from a completed daily series.
+
+    Shared by AkShare / Investoday / BaoStock so the completed-bar rule is
+    consistent at the provider/router convergence. Only drops when ``end_date``
+    is today and the CN market has not closed yet.
+    """
+    if df is None or getattr(df, "empty", True) or date_col not in df.columns:
+        return df
+    end_dt = pd.to_datetime(end_date, errors="coerce")
+    today = pd.to_datetime(cn_today_str(), errors="coerce")
+    if pd.isna(end_dt) or pd.isna(today) or end_dt.normalize() != today.normalize():
+        return df
+    if cn_market_phase() not in ("pre_open", "in_session", "lunch_break"):
+        return df
+    out = df.copy()
+    dates = pd.to_datetime(out[date_col], errors="coerce")
+    return out.loc[dates.dt.normalize() != today.normalize()].reset_index(drop=True)
+
+
+def dedupe_daily_bars(
+    df: pd.DataFrame,
+    date_col: str,
+    value_cols: list[str],
+) -> pd.DataFrame:
+    """Deterministic duplicate policy for completed daily bars.
+
+    Identical duplicate rows (same date and same OHLCV values) are collapsed —
+    the choice is order-independent because the rows are identical. A date with
+    two rows whose values differ is rejected with ``ValueError``: without a
+    timestamp or quality basis there is no deterministic way to choose, so
+    callers must fail explicitly instead of silently picking vendor row order.
+    """
+    if df is None or getattr(df, "empty", True) or date_col not in df.columns:
+        return df
+    cols = [date_col, *value_cols]
+    out = df.copy()
+    out = out.sort_values(date_col, kind="stable").reset_index(drop=True)
+    out = out.drop_duplicates(subset=cols, keep="first").reset_index(drop=True)
+    conflicts = out[out.duplicated(subset=[date_col], keep=False)]
+    if not conflicts.empty:
+        dates = sorted(
+            {pd.Timestamp(d).strftime("%Y-%m-%d") for d in conflicts[date_col]}
+        )
+        raise DuplicateBarConflictError(
+            "duplicate daily bars with conflicting OHLCV, cannot choose "
+            f"deterministically for date(s): {', '.join(dates)}"
+        )
+    return out
 
 
 def snapshot_historical_refusal(
