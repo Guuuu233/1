@@ -3,6 +3,7 @@
 import json
 import json_repair
 import logging
+import math
 import re
 
 logger = logging.getLogger(__name__)
@@ -10,7 +11,7 @@ from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Iterable, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session, load_only
 
@@ -46,13 +47,120 @@ STALE_REPORT_ERROR_MESSAGE = "分析任务已中断，请重新发起分析"
 
 # ─── Structured extraction schemas ───────────────────────────────────────────
 
-from pydantic import field_validator
+_RISK_ITEM_FIELDS = frozenset(("name", "level", "description"))
+_KEY_METRIC_FIELDS = frozenset(("name", "value", "status"))
+_STRUCTURED_REPORT_FIELDS = frozenset(
+    (
+        "decision",
+        "confidence",
+        "probability",
+        "target_price",
+        "stop_loss_price",
+        "risks",
+        "key_metrics",
+        "data_gaps",
+        "falsification_conditions",
+        "not_applicable",
+    )
+)
+
+
+def _warn_unknown_fields(model_name: str, values: Any, allowed_fields: frozenset[str]) -> Any:
+    if not isinstance(values, dict):
+        return values
+    unknown_fields = sorted(str(key) for key in values if key not in allowed_fields)
+    if unknown_fields:
+        logger.warning(
+            "[report_service] unknown structured fields ignored for %s: %s",
+            model_name,
+            ", ".join(unknown_fields),
+        )
+    return values
+
+
+def _coerce_probability_value(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        logger.warning("[report_service] probability rejected: bool value %r is not a probability", value)
+        return None
+    try:
+        probability = float(value)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("[report_service] probability rejected: cannot convert %r to float", value)
+        return None
+    if not math.isfinite(probability):
+        logger.warning("[report_service] probability rejected: value must be finite, got %r", value)
+        return None
+    if not 0.0 <= probability <= 1.0:
+        logger.warning(
+            "[report_service] probability rejected: %s is outside the finite [0, 1] range",
+            probability,
+        )
+        return None
+    return probability
+
+
+def _coerce_confidence_value(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        logger.warning("[report_service] confidence rejected: bool value %r is not a confidence score", value)
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("[report_service] confidence rejected: cannot convert %r to int", value)
+        return None
+    if not math.isfinite(numeric):
+        logger.warning("[report_service] confidence rejected: value must be finite, got %r", value)
+        return None
+    if not numeric.is_integer():
+        logger.warning("[report_service] confidence rejected: %r is not an integer", value)
+        return None
+    confidence = int(numeric)
+    if not 0 <= confidence <= 100:
+        logger.warning(
+            "[report_service] confidence rejected: %d is out of [0, 100] range",
+            confidence,
+        )
+        return None
+    return confidence
+
+
+def _canonicalize_structured_items(items: Any, schema, field_name: str) -> Optional[List[dict]]:
+    if items is None:
+        return None
+    if not isinstance(items, list):
+        logger.warning("[report_service] %s rejected: structured field must be an array", field_name)
+        return []
+
+    canonical_items: list[dict] = []
+    for index, item in enumerate(items):
+        try:
+            model = item if isinstance(item, schema) else schema(**item)
+            canonical_items.append(model.model_dump())
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "[report_service] %s item %d rejected: %s",
+                field_name,
+                index,
+                exc,
+            )
+    return canonical_items
 
 
 class RiskItemSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     name: str = Field(..., description="风险名称，15字以内")
     level: str = Field("medium", description="风险等级")
     description: str = Field("", description="一句话说明，30字以内")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _warn_unknown_fields(cls, values):
+        return _warn_unknown_fields("risk item", values, _RISK_ITEM_FIELDS)
 
     @field_validator("level", mode="before")
     @classmethod
@@ -63,9 +171,16 @@ class RiskItemSchema(BaseModel):
 
 
 class KeyMetricSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     name: str = Field(..., description="指标名称，如 PE、ROE、营收增速")
     value: str = Field(..., description="指标值，包含单位，如 28.5x、15.2%")
     status: str = Field("neutral", description="优劣判断")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _warn_unknown_fields(cls, values):
+        return _warn_unknown_fields("key metric", values, _KEY_METRIC_FIELDS)
 
     @field_validator("value", mode="before")
     @classmethod
@@ -82,6 +197,8 @@ class KeyMetricSchema(BaseModel):
 
 
 class StructuredReport(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     decision: str = Field("HOLD", description="交易决策关键词：BUY/SELL/HOLD/增持/减持/持有")
     confidence: Optional[int] = Field(None, description="整体置信度 0-100")
     probability: Optional[float] = Field(None, description="报告明确给出的上涨概率")
@@ -92,6 +209,11 @@ class StructuredReport(BaseModel):
     data_gaps: List[str] = Field(default_factory=list, description="报告明确列出的数据缺口")
     falsification_conditions: List[str] = Field(default_factory=list, description="报告明确列出的证伪条件")
     not_applicable: bool = Field(False, description="本分析框架是否明确不适用")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _warn_unknown_fields(cls, values):
+        return _warn_unknown_fields("report", values, _STRUCTURED_REPORT_FIELDS)
 
     @field_validator("data_gaps", "falsification_conditions", mode="before")
     @classmethod
@@ -106,56 +228,12 @@ class StructuredReport(BaseModel):
     @field_validator("probability", mode="before")
     @classmethod
     def _coerce_probability(cls, v):
-        if v is None:
-            return None
-        # bool is a subclass of int/float in Python; True/False are not probabilities.
-        if isinstance(v, bool):
-            logger.warning("[report_service] probability rejected: bool value %r is not a probability", v)
-            return None
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            logger.warning("[report_service] probability rejected: cannot convert %r to float", v)
-            return None
-        if f != f:  # NaN
-            logger.warning("[report_service] probability rejected: NaN is not a valid probability")
-            return None
-        if f < 0.0 or f > 100.0:
-            logger.warning("[report_service] probability rejected: %s is out of [0, 100] range", f)
-            return None
-        # Model may return a percentage integer (e.g. 70 instead of 0.70). Reject it.
-        if 1.0 < f <= 100.0:
-            logger.warning(
-                "[report_service] probability rejected: %s looks like a percentage (expected 0.00–1.00)", f
-            )
-            return None
-        return f  # 0.0 <= f <= 1.0 at this point
+        return _coerce_probability_value(v)
 
     @field_validator("confidence", mode="before")
     @classmethod
     def _coerce_confidence(cls, v):
-        if v is None:
-            return None
-        # bool is a subclass of int; True/False are not confidence scores.
-        if isinstance(v, bool):
-            logger.warning("[report_service] confidence rejected: bool value %r is not a confidence score", v)
-            return None
-        # Reject non-integer floats outright (e.g. 75.9) rather than silently truncating.
-        # 75.0 is accepted (already an integer value); 75.9 is a formatting error, not "75".
-        if isinstance(v, float) and not v.is_integer():
-            logger.warning(
-                "[report_service] confidence rejected: %s is a non-integer float", v
-            )
-            return None
-        try:
-            i = int(v)
-        except (TypeError, ValueError):
-            logger.warning("[report_service] confidence rejected: cannot convert %r to int", v)
-            return None
-        if not (0 <= i <= 100):
-            logger.warning("[report_service] confidence rejected: %d is out of [0, 100] range", i)
-            return None
-        return i
+        return _coerce_confidence_value(v)
 
     @field_validator("target_price", "stop_loss_price", mode="before")
     @classmethod
@@ -164,6 +242,28 @@ class StructuredReport(BaseModel):
         if isinstance(v, list):
             return v[0] if v else None
         return v
+
+
+def _canonicalize_result_data(result_data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(result_data, dict) or "structured" not in result_data:
+        return result_data
+
+    canonical_data = dict(result_data)
+    structured = canonical_data.get("structured")
+    if isinstance(structured, StructuredReport):
+        canonical_data["structured"] = structured.model_dump()
+        return canonical_data
+    if not isinstance(structured, dict):
+        logger.warning("[report_service] structured report rejected: expected an object")
+        canonical_data.pop("structured", None)
+        return canonical_data
+
+    try:
+        canonical_data["structured"] = StructuredReport(**structured).model_dump()
+    except (TypeError, ValueError) as exc:
+        logger.warning("[report_service] structured report rejected before persistence: %s", exc)
+        canonical_data.pop("structured", None)
+    return canonical_data
 
 
 def extract_structured_data(
@@ -304,7 +404,10 @@ def resolve_report_fields(
     verdict = _extract_verdict(final_trade_decision)
     direction = verdict["direction"] if verdict else None
 
-    confidence = confidence_override if confidence_override is not None else _extract_confidence_regex(final_trade_decision)
+    if confidence_override is not None:
+        confidence = _coerce_confidence_value(confidence_override)
+    else:
+        confidence = _extract_confidence_regex(final_trade_decision)
 
     target_price = target_price_override if target_price_override is not None else _extract_price_regex(final_trade_decision, "target")
     if target_price is None:
@@ -374,6 +477,16 @@ def update_report_partial(
         db_report.status = status
     
     for key, value in fields.items():
+        if key == "confidence":
+            value = _coerce_confidence_value(value)
+        elif key == "probability":
+            value = _coerce_probability_value(value)
+        elif key == "result_data":
+            value = _canonicalize_result_data(value)
+        elif key == "risk_items":
+            value = _canonicalize_structured_items(value, RiskItemSchema, "risk_items")
+        elif key == "key_metrics":
+            value = _canonicalize_structured_items(value, KeyMetricSchema, "key_metrics")
         if hasattr(db_report, key):
             setattr(db_report, key, value)
     
@@ -467,8 +580,12 @@ def create_report(
     report_id: Optional[str] = None,  # If provided, update existing
 ) -> ReportDB:
     """Create or finalize a report."""
+    validated_probability = _coerce_probability_value(probability)
+    canonical_result_data = _canonicalize_result_data(result_data)
+    canonical_risk_items = _canonicalize_structured_items(risk_items, RiskItemSchema, "risk_items")
+    canonical_key_metrics = _canonicalize_structured_items(key_metrics, KeyMetricSchema, "key_metrics")
     resolved = resolve_report_fields(
-        result_data=result_data,
+        result_data=canonical_result_data,
         confidence_override=confidence_override,
         target_price_override=target_price_override,
         stop_loss_override=stop_loss_override,
@@ -490,12 +607,12 @@ def create_report(
         db_report.decision = decision
         db_report.direction = resolved["direction"]
         db_report.confidence = resolved["confidence"]
-        db_report.probability = probability
+        db_report.probability = validated_probability
         db_report.target_price = resolved["target_price"]
         db_report.stop_loss_price = resolved["stop_loss_price"]
-        db_report.result_data = result_data
-        db_report.risk_items = risk_items
-        db_report.key_metrics = key_metrics
+        db_report.result_data = canonical_result_data
+        db_report.risk_items = canonical_risk_items
+        db_report.key_metrics = canonical_key_metrics
         db_report.data_gaps = list(data_gaps or [])
         db_report.falsification_conditions = list(falsification_conditions or [])
         db_report.not_applicable = bool(not_applicable)
@@ -523,12 +640,12 @@ def create_report(
             decision=decision,
             direction=resolved["direction"],
             confidence=resolved["confidence"],
-            probability=probability,
+            probability=validated_probability,
             target_price=resolved["target_price"],
             stop_loss_price=resolved["stop_loss_price"],
-            result_data=result_data,
-            risk_items=risk_items,
-            key_metrics=key_metrics,
+            result_data=canonical_result_data,
+            risk_items=canonical_risk_items,
+            key_metrics=canonical_key_metrics,
             data_gaps=list(data_gaps or []),
             falsification_conditions=list(falsification_conditions or []),
             not_applicable=bool(not_applicable),
