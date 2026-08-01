@@ -11,9 +11,11 @@ from stockstats import wrap
 from .base import BaseMarketDataProvider, DataResult
 from ..trade_calendar import (
     DateDataUnavailable,
-    cn_market_phase,
+    DuplicateBarConflictError,
     cn_no_data_reason,
     cn_today_str,
+    dedupe_daily_bars,
+    drop_incomplete_today_bar,
     fetch_with_date_fallback,
     is_historical_analysis_date,
     snapshot_historical_refusal,
@@ -236,8 +238,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
             "成交量": "Volume",
             "volume": "Volume",
             "Volume": "Volume",
-            "amount": "Volume",
-            "Amount": "Volume",
+            "成交额": "Amount",
+            "amount": "Amount",
+            "Amount": "Amount",
         }
         df = raw_df.rename(columns=col_map).copy()
         required = ["Date", "Open", "High", "Low", "Close", "Volume"]
@@ -247,11 +250,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
 
         out = df[required].copy()
         out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-        out = out.dropna(subset=["Date"]).sort_values("Date")
-
+        out = out.dropna(subset=["Date"])
         for c in ["Open", "High", "Low", "Close", "Volume"]:
             out[c] = pd.to_numeric(out[c], errors="coerce")
         out = out.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+        out = dedupe_daily_bars(
+            out, "Date", ["Open", "High", "Low", "Close", "Volume"]
+        )
         out["Volume"] = out["Volume"].astype(float)
 
         return out
@@ -286,21 +291,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         self, hist_df: pd.DataFrame, end_date: str
     ) -> pd.DataFrame:
         """Keep incomplete intraday prices out of the completed daily series."""
-        if hist_df is None or hist_df.empty:
-            return hist_df
-
-        end_dt = pd.to_datetime(end_date, errors="coerce")
-        today = pd.to_datetime(cn_today_str(), errors="coerce")
-        if pd.isna(end_dt) or pd.isna(today) or end_dt.normalize() != today.normalize():
-            return hist_df
-
-        if cn_market_phase() not in ("pre_open", "in_session", "lunch_break"):
-            return hist_df
-
-        out = hist_df.copy()
-        dates = pd.to_datetime(out["Date"], errors="coerce")
-        out = out.loc[dates.dt.normalize() != today.normalize()]
-        return out.reset_index(drop=True)
+        return drop_incomplete_today_bar(hist_df, "Date", end_date)
 
     @staticmethod
     def _shrink_table(
@@ -346,6 +337,10 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     if not out.empty:
                         return self._drop_incomplete_today_bar(out, end_date)
                     etf_errors.append("fund_etf_hist_sina: empty after date filter")
+                except DuplicateBarConflictError:
+                    # Data-integrity refusal: do not silently switch to another
+                    # source whose row order is equally arbitrary.
+                    raise
                 except Exception as exc:
                     etf_errors.append(f"fund_etf_hist_sina: {type(exc).__name__}")
 
@@ -361,6 +356,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     if not out.empty:
                         return self._drop_incomplete_today_bar(out, end_date)
                     etf_errors.append("fund_etf_hist_em: empty dataframe")
+                except DuplicateBarConflictError:
+                    raise
                 except Exception as exc:
                     etf_errors.append(f"fund_etf_hist_em: {type(exc).__name__}")
 
@@ -376,7 +373,10 @@ class CnAkshareProvider(BaseMarketDataProvider):
                         adjust="qfq",
                     )
                     out = self._normalize_hist_df(df)
+                    out = self._slice_hist_df(out, start_date, end_date)
                     return self._drop_incomplete_today_bar(out, end_date)
+                except DuplicateBarConflictError:
+                    raise
                 except Exception as exc:
                     em_last_exc = exc
                     if i < 1:
@@ -391,7 +391,10 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     adjust="qfq",
                 )
                 out = self._normalize_hist_df(df)
+                out = self._slice_hist_df(out, start_date, end_date)
                 return self._drop_incomplete_today_bar(out, end_date)
+            except DuplicateBarConflictError:
+                raise
             except Exception:
                 pass
 
@@ -404,7 +407,10 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     adjust="qfq",
                 )
                 out = self._normalize_hist_df(df)
+                out = self._slice_hist_df(out, start_date, end_date)
                 return self._drop_incomplete_today_bar(out, end_date)
+            except DuplicateBarConflictError:
+                raise
             except Exception:
                 pass
 

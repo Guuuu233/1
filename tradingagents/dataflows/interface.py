@@ -3,7 +3,11 @@ import os
 from .alpha_vantage_common import AlphaVantageRateLimitError
 from .config import get_config
 from .providers import build_default_registry
-from .trade_calendar import is_historical_analysis_date
+from .trade_calendar import (
+    DuplicateBarConflictError,
+    is_historical_analysis_date,
+    unavailable_analysis_date_reason,
+)
 
 # Tools organized by category
 TOOLS_CATEGORIES = {
@@ -148,6 +152,88 @@ _HISTORICAL_NEAR_WINDOW_NEWS_METHODS = {
 }
 
 
+def _extract_as_of(method: str, args: tuple, kwargs: dict) -> str | None:
+    """Return the as-of/analysis date for a routed method call, if present."""
+    if "end_date" in kwargs:
+        val = kwargs["end_date"]
+        return None if val is None else str(val)
+    if "curr_date" in kwargs:
+        val = kwargs["curr_date"]
+        return None if val is None else str(val)
+    if "date" in kwargs:
+        val = kwargs["date"]
+        return None if val is None else str(val)
+
+    positional = {
+        "get_stock_data": 2,
+        "get_news": 2,
+        "get_indicators": 2,
+        "get_global_news": 0,
+        "get_board_fund_flow": 0,
+        "get_zt_pool": 0,
+        "get_hot_stocks_xq": 0,
+        "get_fundamentals": 1,
+        "get_insider_transactions": 1,
+        "get_restricted_release": 1,
+        "get_share_pledge": 1,
+        "get_earnings_forecast": 1,
+        "get_shareholder_count": 1,
+        "get_margin_trading": 1,
+        "get_northbound_flow": 1,
+        "get_individual_fund_flow": 1,
+        "get_lhb_detail": 1,
+        "get_balance_sheet": 2,
+        "get_cashflow": 2,
+        "get_income_statement": 2,
+    }
+    idx = positional.get(method)
+    if idx is not None and len(args) > idx:
+        val = args[idx]
+        return None if val is None else str(val)
+    return None
+
+
+_DATE_REQUIRED_METHODS = {
+    "get_stock_data",
+    "get_indicators",
+    "get_news",
+    "get_global_news",
+    "get_insider_transactions",
+    "get_restricted_release",
+    "get_share_pledge",
+    "get_earnings_forecast",
+    "get_shareholder_count",
+    "get_margin_trading",
+    "get_northbound_flow",
+    "get_board_fund_flow",
+    "get_individual_fund_flow",
+    "get_lhb_detail",
+    "get_zt_pool",
+    "get_hot_stocks_xq",
+    "get_fundamentals",
+    "get_balance_sheet",
+    "get_cashflow",
+    "get_income_statement",
+}
+
+
+def _as_of_refusal(method: str, args: tuple, kwargs: dict) -> str | None:
+    """Return a prompt-safe refusal for missing/invalid/future as-of dates."""
+    if method == "get_realtime_quotes":
+        # Signature: (symbols[, curr_date]); a missing/explicit-None curr_date
+        # keeps the live dashboard path, while empty/invalid/future is refused
+        # before any provider is contacted.
+        if "curr_date" in kwargs and kwargs["curr_date"] is not None:
+            return unavailable_analysis_date_reason(str(kwargs["curr_date"]))
+        if len(args) >= 2 and args[1] is not None:
+            return unavailable_analysis_date_reason(str(args[1]))
+        return None
+    if method not in _DATE_REQUIRED_METHODS:
+        return None
+    as_of = _extract_as_of(method, args, kwargs)
+    return unavailable_analysis_date_reason(as_of)
+
+
 def _analysis_date_for_method(method: str, args: tuple, kwargs: dict) -> str | None:
     """Extract the analysis/as-of date used for historical near-window refusal."""
     if method == "get_global_news":
@@ -191,6 +277,14 @@ def route_to_vendor(method: str, *args, **kwargs):
         f"configured='{vendor_config}' chain={fallback_vendors}"
     )
 
+    as_of_refusal = _as_of_refusal(method, args, kwargs)
+    if as_of_refusal is not None:
+        _trace(
+            f"method={method} {args_summary} status=as-of-refuse "
+            f"reason=missing-invalid-future providers_hit=0"
+        )
+        return as_of_refusal
+
     refusal = _historical_near_window_news_refusal(method, args, kwargs)
     if refusal is not None:
         _trace(
@@ -214,6 +308,16 @@ def route_to_vendor(method: str, *args, **kwargs):
             result = impl_func(*args, **kwargs)
             _trace(f"method={method} {args_summary} vendor={vendor} status=hit")
             return result
+        except DuplicateBarConflictError as exc:
+            # Data-integrity conflict (same date, different OHLCV/Volume): this is
+            # an explicit refusal, not a transient provider failure. Do not fall
+            # back to another vendor, which would silently mask the conflict by
+            # using a different source's row order.
+            _trace(
+                f"method={method} {args_summary} vendor={vendor} "
+                "status=unavailable reason=duplicate-bar-conflict"
+            )
+            return f"【数据获取失败】{exc}，本项不可用。"
         except (AlphaVantageRateLimitError, NotImplementedError) as exc:
             last_exc = exc
             # Try next provider for transient/routing issues or placeholder providers.
@@ -222,7 +326,7 @@ def route_to_vendor(method: str, *args, **kwargs):
                 f"reason={type(exc).__name__}: {exc}"
             )
             continue
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - router-level boundary, logged below
             # Provider-specific runtime/parsing errors (e.g., schema changes, KeyError)
             # should not terminate the full chain; fall through to next vendor.
             last_exc = exc

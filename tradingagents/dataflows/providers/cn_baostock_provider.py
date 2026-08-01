@@ -8,7 +8,11 @@ import pandas as pd
 from stockstats import wrap
 
 from .base import BaseMarketDataProvider
-from ..trade_calendar import cn_no_data_reason
+from ..trade_calendar import (
+    cn_no_data_reason,
+    dedupe_daily_bars,
+    drop_incomplete_today_bar,
+)
 
 
 class CnBaoStockProvider(BaseMarketDataProvider):
@@ -103,11 +107,16 @@ class CnBaoStockProvider(BaseMarketDataProvider):
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         df = df.dropna(subset=["Date", "Open", "High", "Low", "Close", "Volume"])
-        df = df.sort_values("Date").reset_index(drop=True)
-        return df
+        boundary = pd.to_datetime(end_date, errors="coerce")
+        if pd.notna(boundary):
+            df = df[df["Date"] <= boundary]
+        return dedupe_daily_bars(
+            df, "Date", ["Open", "High", "Low", "Close", "Volume"]
+        )
 
     def get_stock_data(self, symbol: str, start_date: str, end_date: str) -> str:
         df = self._fetch_hist_df(symbol, start_date, end_date)
+        df = drop_incomplete_today_bar(df, "Date", end_date)
         if df.empty:
             return f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
         out = df.copy()
@@ -130,6 +139,7 @@ class CnBaoStockProvider(BaseMarketDataProvider):
         curr_dt = datetime.strptime(curr_date, "%Y-%m-%d")
         start_dt = curr_dt - timedelta(days=max(look_back_days, 260))
         df = self._fetch_hist_df(symbol, start_dt.strftime("%Y-%m-%d"), curr_date)
+        df = drop_incomplete_today_bar(df, "Date", curr_date)
         if df.empty:
             return f"No data found for {symbol} for indicator {indicator}"
 

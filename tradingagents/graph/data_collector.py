@@ -36,7 +36,10 @@ from tradingagents.agents.utils.agent_utils import (
     get_northbound_flow,
 )
 from tradingagents.dataflows.interface import route_to_vendor
-from tradingagents.dataflows.trade_calendar import is_historical_analysis_date
+from tradingagents.dataflows.trade_calendar import (
+    dedupe_daily_bars,
+    is_historical_analysis_date,
+)
 
 INDICATORS = [
     "close_50_sma", "close_200_sma", "close_10_ema",
@@ -53,6 +56,55 @@ FETCH_ALL_TIMEOUT = int(os.getenv("TA_DATA_FETCH_TIMEOUT", "300"))
 import numpy as np
 
 _OHLCV_COLS = ["date", "open", "high", "low", "close", "volume"]
+
+
+def _normalize_daily_frame(df: Optional[pd.DataFrame], trade_date: str) -> Optional[pd.DataFrame]:
+    """Normalize an OHLCV frame to completed bars <= trade_date.
+
+    Column-name based parsing, invalid-date/bad-row removal, dedupe by date,
+    and ascending sort happen here so indicators/VPA/prompt never see a
+    look-ahead, unparseable, or duplicated bar.
+
+    Returns None when nothing usable remains (missing columns, all rows bad,
+    empty after the date filter, or conflicting duplicate dates) so callers can
+    surface an explicit unavailable instead of forwarding raw vendor CSV.
+    """
+    if df is None or df.empty:
+        return None
+    required = {"date", "open", "high", "low", "close", "volume"}
+    if not required.issubset({str(c).lower() for c in df.columns}):
+        return None
+    cols_map = {str(c).lower(): c for c in df.columns}
+    out = df.rename(columns={cols_map[t]: t for t in required}).copy()
+    out = out[list(required)].copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    for col in ("open", "high", "low", "close", "volume"):
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.dropna(subset=["date", "open", "high", "low", "close", "volume"])
+    end_dt = pd.to_datetime(trade_date, errors="coerce")
+    if pd.isna(end_dt):
+        return None
+    out = out[out["date"] <= end_dt]
+    out = out.sort_values("date")
+    try:
+        out = dedupe_daily_bars(
+            out, "date", ["open", "high", "low", "close", "volume"]
+        )
+    except ValueError:
+        # Conflicting same-date rows: no deterministic choice, refuse the field.
+        return None
+    return out if not out.empty else None
+
+
+def _csv_comment_lines(raw_csv: str) -> list[str]:
+    """Return the source-metadata comment lines a provider prepended to CSV."""
+    if not isinstance(raw_csv, str):
+        return []
+    return [
+        line.rstrip("\r\n")
+        for line in raw_csv.splitlines()
+        if line.startswith("#")
+    ]
 
 
 def _parse_csv_to_dataframe(raw_csv: str) -> Optional[pd.DataFrame]:
@@ -450,6 +502,19 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
     # ── Parse CSV once, reuse for indicators and VPA ──────────────────
     raw_csv = results.get("stock_data", "")
     df = _parse_csv_to_dataframe(raw_csv)
+    df = _normalize_daily_frame(df, trade_date)
+    if df is not None:
+        out = df.copy()
+        out["date"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
+        provenance = _csv_comment_lines(raw_csv)
+        provenance.append(f"# as-of: {trade_date}")
+        provenance.append("# normalized: sorted, deduped, date<=as-of, OHLCV columns")
+        results["stock_data"] = "\n".join(provenance) + "\n" + out.to_csv(index=False)
+    else:
+        results["stock_data"] = (
+            f"【数据获取失败】{ticker} 在 {trade_date} 无有效完整日线数据"
+            "（缺列/非法日期/全部行无效/重复冲突），本项不可用。"
+        )
     daily_context = _build_daily_context(df, trade_date)
     realtime_context = results.pop("realtime", None)
     if not isinstance(realtime_context, dict) or realtime_context.get("status") not in {
