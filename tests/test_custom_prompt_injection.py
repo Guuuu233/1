@@ -393,7 +393,9 @@ def test_T14_both_save_branches_call_attach_snapshot():
 
     source = inspect.getsource(main_module._run_job_inner)
     call = "_attach_custom_prompt_snapshot(result, _prompt_snapshot)"
-    assert source.count(call) == 2, "dual-horizon and single-path branches must both attach snapshots"
+    assert source.count(call) == 3, (
+        "dual-horizon, single-horizon, and regular graph paths must all attach snapshots"
+    )
 
     # Also verify helper isolation for the payload shape used by both branches.
     snapshot = {"enabled": False, "placement": "after_data", "roles": {}}
