@@ -2473,6 +2473,17 @@ async def _run_job_inner(
                         for horizon in request.horizons
                         for trace in horizon_results[horizon].get("analyst_traces", [])
                     ],
+                    "falsification_conditions": list(dict.fromkeys(
+                        cond
+                        for horizon in request.horizons
+                        if horizon_results[horizon].get("status") == "completed"
+                        for cond in horizon_results[horizon].get("falsification_conditions", [])
+                    )),
+                    "not_applicable": any(
+                        horizon_results[horizon].get("not_applicable")
+                        for horizon in request.horizons
+                        if horizon_results[horizon].get("status") == "completed"
+                    ),
                 }
                 _attach_custom_prompt_snapshot(result, _prompt_snapshot)
 
@@ -2490,8 +2501,8 @@ async def _run_job_inner(
                                 key_metrics=None,
                                 probability=None,
                                 data_gaps=result["data_gaps"],
-                                falsification_conditions=[],
-                                not_applicable=False,
+                                falsification_conditions=result.get("falsification_conditions", []),
+                                not_applicable=result.get("not_applicable", False),
                                 confidence_override=None,
                                 target_price_override=None,
                                 stop_loss_override=None,

@@ -201,7 +201,9 @@ def test_dual_job_keeps_horizon_scoped_fields_and_propagates_result_sse_and_repo
     assert saved_reports[0]["result_data"] == result
     assert saved_reports[0]["decision"] is None
     assert saved_reports[0]["data_gaps"] == result["data_gaps"]
-    assert saved_reports[0]["not_applicable"] is False
+    # DAV-8: the dual-horizon save path now aggregates not_applicable from
+    # completed horizons; the fixture marks medium not_applicable=True.
+    assert saved_reports[0]["not_applicable"] is True
     assert collector.collect.call_args.kwargs["horizons"] == ["short", "medium"]
     assert any('"mode": "dual_horizon"' in chunk for chunk in chunks)
     assert any('"data_gaps": ["short LLM gap", "medium LLM gap"]' in chunk for chunk in chunks)
