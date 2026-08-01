@@ -339,6 +339,30 @@ def test_bad_or_duplicate_machine_blocks_do_not_mutate_canonical_state(caplog, m
 
 
 @pytest.mark.parametrize("marker", ["DEBATE_STATE", "RISK_STATE"])
+def test_valid_and_malformed_duplicate_machine_blocks_are_rejected(caplog, marker):
+    payload = _valid_machine_payload(claim=f"{marker} canonical claim")
+    valid_block = _machine_block(marker, payload)
+    malformed_duplicate = (
+        f"固定正文\n<!-- {marker} {json.dumps(payload, ensure_ascii=False, allow_nan=True)} -->"
+    )
+    raw_response = f"{valid_block}\n{malformed_duplicate}"
+
+    state = _make_investment_debate_state() if marker == "DEBATE_STATE" else _make_risk_state()
+    before = _canonical_state_snapshot(state)
+    with caplog.at_level(logging.WARNING):
+        result = _apply_machine_block(state, raw_response, marker)
+
+    assert _canonical_state_snapshot(result) == before
+    assert result["claims"] == before["claims"]
+    warning_messages = [record.getMessage() for record in caplog.records]
+    assert any(marker in message for message in warning_messages)
+    assert any(
+        "duplicate" in message.lower() and "malformed" in message.lower()
+        for message in warning_messages
+    )
+
+
+@pytest.mark.parametrize("marker", ["DEBATE_STATE", "RISK_STATE"])
 def test_unknown_machine_fields_are_ignored_but_warned(caplog, marker):
     payload = _valid_machine_payload()
     payload["unexpected_root"] = "do not persist"

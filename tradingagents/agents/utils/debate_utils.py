@@ -29,7 +29,16 @@ def _tagged_openings(text: str, tag: str) -> list[re.Match[str]]:
     return list(re.finditer(pattern, text, flags=re.DOTALL))
 
 
+def _tagged_occurrences(text: str, tag: str) -> list[re.Match[str]]:
+    """Count same-tag machine block labels before validating their delimiter."""
+    if not isinstance(text, str):
+        return []
+    pattern = rf"<!--\s*{re.escape(tag)}\b"
+    return list(re.finditer(pattern, text, flags=re.DOTALL))
+
+
 def _parse_tagged_json(text: str, tag: str, *, warn: bool) -> dict[str, Any] | None:
+    occurrences = _tagged_occurrences(text, tag)
     openings = _tagged_openings(text, tag)
     if not openings:
         if warn:
@@ -37,12 +46,14 @@ def _parse_tagged_json(text: str, tag: str, *, warn: bool) -> dict[str, Any] | N
             category = "truncated" if re.search(tag_pattern, text or "", flags=re.DOTALL) else "missing"
             logger.warning("[debate_utils] %s parse warning (%s): machine block not accepted", tag, category)
         return None
-    if len(openings) > 1:
+    if len(occurrences) > 1:
         if warn:
+            category = "duplicate_malformed" if len(occurrences) != len(openings) else "duplicate"
             logger.warning(
-                "[debate_utils] %s parse warning (duplicate): %d machine blocks found; rejecting all",
+                "[debate_utils] %s parse warning (%s): %d same-tag machine block labels found; rejecting all",
                 tag,
-                len(openings),
+                category,
+                len(occurrences),
             )
         return None
 
