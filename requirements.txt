@@ -21,3 +21,6 @@ PyJWT
 cryptography
 json-repair
 markdown
+redis[hiredis]
+python-multipart
+python-dotenv

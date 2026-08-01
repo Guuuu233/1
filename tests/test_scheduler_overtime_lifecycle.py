@@ -29,7 +29,7 @@ def test_scheduled_slot_and_success_wait_for_analysis_terminal_outcome():
             call_order.append(f"start:{job_id}")
             if job_id == "job-first":
                 first_started.set()
-                await release_first.wait()
+                await asyncio.wait_for(release_first.wait(), timeout=5)
             else:
                 second_started.set()
             call_order.append(f"finish:{job_id}")
@@ -77,7 +77,7 @@ def test_scheduled_slot_and_success_wait_for_analysis_terminal_outcome():
                     mark_schedule_run=True,
                 )
             )
-            await first_started.wait()
+            await asyncio.wait_for(first_started.wait(), timeout=5)
 
             second = asyncio.create_task(
                 scheduler_main._run_scheduled_analysis_once(
