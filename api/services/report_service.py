@@ -666,3 +666,85 @@ def batch_delete_reports(db: Session, report_ids: Iterable[str], user_id: Option
         "deleted_ids": deleted_ids,
         "missing_ids": missing_ids,
     }
+
+
+_REPORT_GAP_FIELDS = (
+    "market_report",
+    "sentiment_report",
+    "news_report",
+    "fundamentals_report",
+    "macro_report",
+    "smart_money_report",
+    "volume_price_report",
+    "game_theory_report",
+    "investment_plan",
+    "trader_investment_plan",
+    "final_trade_decision",
+)
+_DATA_FAILURE_LINE_RE = re.compile(
+    r"^\s*(?:(?:[-*•]\s*)|(?:\d+[.)、]\s*))?(【数据获取失败】.*)\s*$"
+)
+
+
+def _normalize_gap_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _explicit_data_failure_lines(text: Any) -> Iterable[str]:
+    """Yield only machine-readable failure lines from a report body."""
+    if not isinstance(text, str):
+        return
+    for line in text.splitlines():
+        match = _DATA_FAILURE_LINE_RE.match(line)
+        if not match:
+            continue
+        normalized = _normalize_gap_text(match.group(1))
+        if normalized:
+            yield normalized
+
+
+def _iter_report_texts(result_data: Any) -> Iterable[str]:
+    if not isinstance(result_data, dict):
+        return
+
+    for field in _REPORT_GAP_FIELDS:
+        value = result_data.get(field)
+        if isinstance(value, str):
+            yield value
+
+    for nested_key in ("short_term", "medium_term", "result_data"):
+        nested = result_data.get(nested_key)
+        if isinstance(nested, dict):
+            yield from _iter_report_texts(nested)
+
+
+def merge_data_gaps(
+    result_data: Optional[Dict[str, Any]] = None,
+    llm_data_gaps: Optional[Iterable[Any]] = None,
+) -> List[str]:
+    """Merge explicit report failures with model-reported gaps deterministically."""
+    merged: List[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        normalized = _normalize_gap_text(value)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            merged.append(normalized)
+
+    for report_text in _iter_report_texts(result_data):
+        for gap in _explicit_data_failure_lines(report_text):
+            add(gap)
+
+    if isinstance(llm_data_gaps, str):
+        llm_data_gaps = [llm_data_gaps]
+    try:
+        llm_items = iter(llm_data_gaps or [])
+    except TypeError:
+        llm_items = iter(())
+    for gap in llm_items:
+        add(gap)
+
+    return merged
