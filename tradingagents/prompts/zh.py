@@ -105,8 +105,14 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 本轮目标：{round_goal}
 历史复盘经验：{past_memory_str}
 {custom_prompt_after_data}
+口径约束（不新增正文级 canonical 字段）：
+- 报告级 confidence（如需给出）只能是 0–100 的整数。
+- DEBATE_STATE 中每个 new_claims[].confidence 是 claim confidence，只能是有限的 0.00–1.00 数值，不得使用百分比。
+- probability 只表示在明确的主分析周期、明确的基准价下，周期结束时价格高于该基准价的上涨概率；缺少任一条件时写 null，不要猜测。
+- Bear 与 Bull 共同遵守同一 probability 口径：Bear 的 probability 不得改成下跌概率，不得反转，不做 1-p。
+- 只保留既有 DEBATE_STATE 边界和键名，不增加新的机读字段。
 写作要求：
-1. 量化上涨驱动力：必须给出具体的催化剂（资金净流入、技术突破、业绩拐点、政策利好）及其触发概率和时间窗口。
+1. 量化上涨驱动力：必须给出具体的催化剂（资金净流入、技术突破、业绩拐点、政策利好）及其触发条件和时间窗口。
 2. 必须先回应焦点 claim；若焦点 claim 为空，再提出 1 到 2 条最关键多头 claim。
 3. 用数据打穿空头论点：不允许只重复立场，必须用价格、量能、财务数据或事件逻辑反驳。
 4. 估算风险收益比：给出上涨目标（百分比）和下跌风险（百分比），论证赔率是否值得。
@@ -136,6 +142,12 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 本轮目标：{round_goal}
 历史复盘经验：{past_memory_str}
 {custom_prompt_after_data}
+口径约束（不新增正文级 canonical 字段）：
+- 报告级 confidence（如需给出）只能是 0–100 的整数。
+- DEBATE_STATE 中每个 new_claims[].confidence 是 claim confidence，只能是有限的 0.00–1.00 数值，不得使用百分比。
+- probability 只表示在明确的主分析周期、明确的基准价下，周期结束时价格高于该基准价的上涨概率；缺少任一条件时写 null，不要猜测。
+- Bear 与 Bull 共同遵守同一 probability 口径：Bear 的 probability 不得改成下跌概率，不得反转，不做 1-p。
+- 只保留既有 DEBATE_STATE 边界和键名，不增加新的机读字段。
 写作要求：
 1. 以证据链组织论点，不要泛泛而谈。
 2. 必须先回应焦点 claim；若焦点 claim 为空，再提出 1 到 2 条最关键空头 claim。
@@ -177,6 +189,11 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 上一轮摘要：
 {round_summary}
 {custom_prompt_after_data}
+口径约束（不新增正文级 canonical 字段）：
+- 报告级 confidence（如需给出）只能是 0–100 的整数；claim confidence 只能是有限的 0.00–1.00 数值，二者不得与 probability 混用。
+- probability 只表示在明确的主分析周期、明确的基准价下，周期结束时价格高于该基准价的上涨概率；缺少任一条件时写 null，不要猜测。
+- Bear 与 Bull 共同遵守同一 probability 口径：Bear 的 probability 不得改成下跌概率，不得反转，不做 1-p。
+- 只保留既有 VERDICT 边界和键名，不增加新的正文级 canonical 字段或机读字段。
 输出要求：
 1. 列出各分析师的 verdict（看多/偏多/中性/偏空/看空），作为全景概览。不要简单数人头——不同维度的分析师权重不同，需根据分析视角（horizon）和当前市场环境综合判断权重：
    - 短线视角（short）：技术面、资金面、情绪面权重高，基本面作为背景参考。
