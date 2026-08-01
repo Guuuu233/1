@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import socket
@@ -36,7 +37,7 @@ from fastapi import FastAPI, File, HTTPException, Depends, Query, Request, Uploa
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 from sqlalchemy.orm import Session
 import pandas as pd
 
@@ -743,6 +744,136 @@ class KlineResponse(BaseModel):
 
 
 # Report API Models
+_REPORT_MACHINE_BLOCK_TAGS = ("DEBATE_STATE", "RISK_STATE")
+_REPORT_MACHINE_LIST_FIELDS = (
+    "responded_claim_ids",
+    "new_claims",
+    "resolved_claim_ids",
+    "unresolved_claim_ids",
+    "next_focus_claim_ids",
+)
+_REPORT_MACHINE_TEXT_FIELDS = ("round_summary", "round_goal")
+
+
+def _strict_unit_interval(value: Any, field_name: str) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a finite number in [0, 1]")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} must be a finite number in [0, 1]") from exc
+    if not math.isfinite(numeric) or not 0.0 <= numeric <= 1.0:
+        raise ValueError(f"{field_name} must be a finite number in [0, 1]")
+    return value
+
+
+def _strict_report_probability(value: Any) -> Any:
+    return _strict_unit_interval(value, "probability")
+
+
+def _strict_claim_confidence(value: Any) -> Any:
+    return _strict_unit_interval(value, "claim confidence")
+
+
+def _strict_report_confidence(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("confidence must be a finite integer in [0, 100]")
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("confidence must be a finite integer in [0, 100]") from exc
+    if not math.isfinite(confidence) or not confidence.is_integer() or not 0.0 <= confidence <= 100.0:
+        raise ValueError("confidence must be a finite integer in [0, 100]")
+    return value
+
+
+def _iter_report_strings(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from _iter_report_strings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_report_strings(child)
+
+
+def _validate_report_machine_payload(payload: Dict[str, Any], tag: str) -> None:
+    unknown_fields = sorted(
+        str(key)
+        for key in payload
+        if key not in (*_REPORT_MACHINE_LIST_FIELDS, *_REPORT_MACHINE_TEXT_FIELDS)
+    )
+    if unknown_fields:
+        logger.warning(
+            "[report_api] unknown machine fields ignored for %s: %s",
+            tag,
+            ", ".join(unknown_fields),
+        )
+
+    for field_name in _REPORT_MACHINE_LIST_FIELDS:
+        value = payload.get(field_name)
+        if value is not None and not isinstance(value, list):
+            raise ValueError(f"{tag} machine field {field_name} must be an array")
+    for field_name in _REPORT_MACHINE_TEXT_FIELDS:
+        value = payload.get(field_name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{tag} machine field {field_name} must be a string")
+
+    claims = payload.get("new_claims") or []
+    for index, claim in enumerate(claims, start=1):
+        if not isinstance(claim, dict):
+            raise ValueError(f"{tag} claim {index} must be an object")
+        if not isinstance(claim.get("claim"), str) or not claim["claim"].strip():
+            raise ValueError(f"{tag} claim {index} must contain non-empty claim text")
+        evidence = claim.get("evidence")
+        if evidence is not None and not isinstance(evidence, list):
+            raise ValueError(f"{tag} claim {index} evidence must be an array")
+        target_claim_ids = claim.get("target_claim_ids")
+        if target_claim_ids is not None and not isinstance(target_claim_ids, list):
+            raise ValueError(f"{tag} claim {index} target_claim_ids must be an array")
+        _strict_claim_confidence(claim.get("confidence"))
+        if "confidence" not in claim:
+            raise ValueError(f"{tag} claim {index} confidence is required")
+        claim_unknown_fields = sorted(
+            str(key) for key in claim if key not in ("claim", "evidence", "confidence", "target_claim_ids")
+        )
+        if claim_unknown_fields:
+            logger.warning(
+                "[report_api] unknown machine claim fields ignored for %s claim %d: %s",
+                tag,
+                index,
+                ", ".join(claim_unknown_fields),
+            )
+
+
+def _validate_report_machine_blocks(result_data: Optional[Dict[str, Any]]) -> None:
+    if not result_data:
+        return
+    for text in _iter_report_strings(result_data):
+        for tag in _REPORT_MACHINE_BLOCK_TAGS:
+            openings = list(re.finditer(rf"<!--\s*{re.escape(tag)}\s*:", text))
+            if not openings:
+                continue
+            if len(openings) > 1:
+                raise ValueError(f"{tag} machine block must not be duplicated")
+            payload_text = text[openings[0].end():]
+            closing_index = payload_text.find("-->")
+            if closing_index < 0:
+                raise ValueError(f"{tag} machine block is truncated")
+            try:
+                payload = json.loads(payload_text[:closing_index].strip())
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise ValueError(f"{tag} machine block contains invalid JSON") from exc
+            if not isinstance(payload, dict):
+                raise ValueError(f"{tag} machine block must contain an object")
+            _validate_report_machine_payload(payload, tag)
+
+
 class ReportCreateRequest(BaseModel):
     symbol: str = Field(..., description="股票代码")
     trade_date: str = Field(..., description="交易日期 YYYY-MM-DD")
@@ -752,6 +883,24 @@ class ReportCreateRequest(BaseModel):
     data_gaps: List[str] = Field(default_factory=list)
     falsification_conditions: List[str] = Field(default_factory=list)
     not_applicable: bool = False
+
+    @field_validator("probability", mode="before")
+    @classmethod
+    def _validate_probability(cls, value: Any) -> Any:
+        return _strict_report_probability(value)
+
+    @model_validator(mode="after")
+    def _validate_structured_boundary(self):
+        structured = self.result_data.get("structured") if isinstance(self.result_data, dict) else None
+        if structured is not None:
+            if not isinstance(structured, dict):
+                raise ValueError("structured report must be an object")
+            if "confidence" in structured:
+                _strict_report_confidence(structured["confidence"])
+            if "probability" in structured:
+                _strict_report_probability(structured["probability"])
+        _validate_report_machine_blocks(self.result_data)
+        return self
 
 
 class ReportResponse(BaseModel):
