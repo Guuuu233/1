@@ -9,7 +9,7 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import patch
 
 import pandas as pd
@@ -278,7 +278,7 @@ def test_get_margin_trading_all_fail_lists_attempted_range():
     assert "已尝试 2026-07-29 至 2026-07-23 共 5 个交易日，均无数据" in text
 
 
-def test_get_zt_pool_rolls_back_and_labels_actual_date():
+def test_get_zt_pool_rolls_back_and_labels_actual_date(monkeypatch):
     _seed_calendar(
         [
             "2026-07-22",
@@ -289,6 +289,7 @@ def test_get_zt_pool_rolls_back_and_labels_actual_date():
             "2026-07-29",
         ]
     )
+    monkeypatch.setattr(tc, "now_cn", lambda: datetime(2026, 7, 29, 10, 0, 0))
     pool = pd.DataFrame({"代码": ["000001", "600000"], "连板数": [1, 2]})
     ak = _SeqAk(
         {
@@ -378,4 +379,3 @@ def test_normalize_allows_calendar_within_staleness_bound():
         ]
     )
     assert tc.normalize_to_trading_day("2026-07-29") == "2026-07-22"
-

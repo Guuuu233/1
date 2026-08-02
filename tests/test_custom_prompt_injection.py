@@ -429,7 +429,7 @@ def test_T15_bool_and_non_integer_float_rejected(caplog):
     messages = "\n".join(record.getMessage() for record in caplog.records)
     assert "probability rejected" in messages
     assert "confidence rejected" in messages
-    assert "cannot convert" in messages
+    assert "cannot convert" in messages or "value must be a real number" in messages
     assert "out of [0, 100] range" in messages
 
 

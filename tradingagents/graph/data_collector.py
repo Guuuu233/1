@@ -415,16 +415,24 @@ _DATA_FAILURE_SOURCE_ORDER = (
     "realtime",
 )
 _DATA_FAILURE_MARKERS = (
+    "【数据获取失败】",
+    "获取失败",
     "调用失败",
     "调用异常",
     "数据拉取超时",
     "拉取失败",
     "抓取失败",
+    "接口请求失败",
+    "请求失败",
     "数据源不可用",
     "接口不可用",
     "返回结构异常",
+    "返回格式异常",
     "服务不可用",
     "服务异常",
+    "数据暂不可用",
+    "暂时不可用",
+    "本项不可用",
     "访问被拒绝",
     "请求被拒绝",
     "连接失败",
@@ -447,6 +455,7 @@ def _compact_failure_reason(status: str) -> str:
 
 
 def _classify_failure_value(value: Any) -> Optional[str]:
+    """Classify only explicit failures; None/empty/not_applicable stay non-failure."""
     if isinstance(value, dict):
         status = str(value.get("status") or "").strip().lower()
         if status in {"available", "not_applicable", "ok", "completed"}:

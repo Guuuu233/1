@@ -5,6 +5,7 @@ import json_repair
 import logging
 import math
 import re
+from numbers import Real
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timezone
@@ -104,13 +105,19 @@ def _warn_unknown_fields(model_name: str, values: Any, allowed_fields: frozenset
 def _coerce_probability_value(value: Any) -> Optional[float]:
     if value is None:
         return None
-    if isinstance(value, bool):
-        logger.warning("[report_service] probability rejected: bool value %r is not a probability", value)
+    if isinstance(value, bool) or not isinstance(value, Real):
+        logger.warning(
+            "[report_service] probability rejected: value must be a real number, got %r",
+            value,
+        )
         return None
     try:
         probability = float(value)
-    except (TypeError, ValueError, OverflowError):
-        logger.warning("[report_service] probability rejected: cannot convert %r to float", value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        logger.warning(
+            "[report_service] probability rejected: cannot convert %r to float",
+            value,
+        )
         return None
     if not math.isfinite(probability):
         logger.warning("[report_service] probability rejected: value must be finite, got %r", value)
@@ -127,13 +134,19 @@ def _coerce_probability_value(value: Any) -> Optional[float]:
 def _coerce_confidence_value(value: Any) -> Optional[int]:
     if value is None:
         return None
-    if isinstance(value, bool):
-        logger.warning("[report_service] confidence rejected: bool value %r is not a confidence score", value)
+    if isinstance(value, bool) or not isinstance(value, Real):
+        logger.warning(
+            "[report_service] confidence rejected: value must be a real number, got %r",
+            value,
+        )
         return None
     try:
         numeric = float(value)
-    except (TypeError, ValueError, OverflowError):
-        logger.warning("[report_service] confidence rejected: cannot convert %r to int", value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        logger.warning(
+            "[report_service] confidence rejected: cannot convert %r to int",
+            value,
+        )
         return None
     if not math.isfinite(numeric):
         logger.warning("[report_service] confidence rejected: value must be finite, got %r", value)
@@ -275,14 +288,35 @@ class StructuredReport(BaseModel):
     @field_validator("target_price", "stop_loss_price", mode="before")
     @classmethod
     def _coerce_price(cls, v):
-        # LLM 可能返回数组 [34.0, 32.5] 而非单个数字，取第一个
-        if isinstance(v, list):
-            return v[0] if v else None
-        return v
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, Real):
+            logger.warning(
+                "[report_service] price rejected: value must be a real number, got %r",
+                v,
+            )
+            return None
+        try:
+            price = float(v)
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.warning(
+                "[report_service] price rejected: cannot convert %r to float",
+                v,
+            )
+            return None
+        if not math.isfinite(price):
+            logger.warning("[report_service] price rejected: value must be finite, got %r", v)
+            return None
+        if price < 0:
+            logger.warning("[report_service] price rejected: value must be non-negative, got %r", v)
+            return None
+        return price
 
 
 def _strict_unit_interval(value: Any, field_name: str) -> Any:
-    if value is None or isinstance(value, bool):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{field_name} must be a finite number in [0, 1]")
     try:
         numeric = float(value)

@@ -99,7 +99,7 @@ class TestDashboardTrackingApi:
             )
 
         monkeypatch.setattr("api.services.tracking_board_service.cn_today_str", lambda: "2026-03-31")
-        monkeypatch.setattr("api.services.tracking_board_service.previous_cn_trading_day", lambda _: "2026-03-30")
+        monkeypatch.setattr("api.services.tracking_board_service.previous_cn_trading_day", lambda _, **kwargs: "2026-03-30")
         monkeypatch.setattr(
             "api.services.tracking_board_service._fetch_live_quotes",
             lambda symbols, **kwargs: {
@@ -191,7 +191,7 @@ class TestDashboardTrackingApi:
             db.commit()
 
         monkeypatch.setattr("api.services.tracking_board_service.cn_today_str", lambda: "2026-03-31")
-        monkeypatch.setattr("api.services.tracking_board_service.previous_cn_trading_day", lambda _: "2026-03-30")
+        monkeypatch.setattr("api.services.tracking_board_service.previous_cn_trading_day", lambda _, **kwargs: "2026-03-30")
         monkeypatch.setattr("api.services.tracking_board_service._fetch_live_quotes", lambda symbols, **kwargs: {})
 
         response = client.get("/v1/dashboard/tracking-board", headers=headers)

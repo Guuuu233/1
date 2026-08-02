@@ -23,7 +23,7 @@ class _NewsFallbackProvider(CnAkshareProvider):
 def test_insider_transactions_fallback_uses_analysis_date_window():
     provider = _NewsFallbackProvider()
 
-    result = provider.get_insider_transactions("600519.SH", curr_date="2024-01-15")
+    result = provider.get_insider_transactions("600519.SH", curr_date="2026-08-03")
 
     assert "fallback news" in result
-    assert provider.news_calls == [("600519.SH", "2024-01-01", "2024-01-15")]
+    assert provider.news_calls == [("600519.SH", "2026-07-20", "2026-08-03")]

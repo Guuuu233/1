@@ -37,6 +37,50 @@ def _tagged_occurrences(text: str, tag: str) -> list[re.Match[str]]:
     return list(re.finditer(pattern, text, flags=re.DOTALL))
 
 
+def _find_machine_block_close(text: str, start: int) -> int:
+    """Return the first ``-->`` that is not inside a JSON string literal."""
+    in_string = False
+    escaped = False
+    index = start
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        else:
+            if char == '"':
+                in_string = True
+            elif text.startswith("-->", index):
+                return index
+        index += 1
+    return -1
+
+
+def _machine_block_spans(text: str, tag: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    if not isinstance(text, str):
+        return spans
+    for opening in _tagged_openings(text, tag):
+        close = _find_machine_block_close(text, opening.end())
+        if close >= 0:
+            spans.append((opening.start(), close + 3))
+    return spans
+
+
+def _looks_like_machine_block(text: str) -> bool:
+    return bool(
+        re.match(
+            r"<!--\s*[A-Za-z_][A-Za-z0-9_-]*\s*:",
+            text,
+            flags=re.DOTALL,
+        )
+    )
+
+
 def _parse_tagged_json(text: str, tag: str, *, warn: bool) -> dict[str, Any] | None:
     occurrences = _tagged_occurrences(text, tag)
     openings = _tagged_openings(text, tag)
@@ -57,35 +101,58 @@ def _parse_tagged_json(text: str, tag: str, *, warn: bool) -> dict[str, Any] | N
             )
         return None
 
-    payload_text = text[openings[0].end():]
-    closing_index = payload_text.find("-->")
-    if closing_index < 0:
-        if warn:
+    for opening in openings:
+        payload_start = opening.end()
+        closing_index = _find_machine_block_close(text, payload_start)
+        if closing_index < 0:
+            continue
+        payload_text = text[payload_start:closing_index].strip()
+        try:
+            payload = json.loads(payload_text)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        remainder = text[closing_index + 3:].lstrip()
+        if remainder and not _looks_like_machine_block(remainder):
+            continue
+        return payload
+
+    if warn:
+        if not any(_find_machine_block_close(text, opening.end()) >= 0 for opening in openings):
             logger.warning(
                 "[debate_utils] %s parse warning (truncated): closing marker is missing",
                 tag,
             )
-        return None
+        else:
+            logger.warning(
+                "[debate_utils] %s parse warning (invalid_or_trailing_prose): machine block not accepted",
+                tag,
+            )
+    return None
 
-    payload_text = payload_text[:closing_index].strip()
+
+def extract_tagged_json(text: str, tag: str) -> dict[str, Any]:
+    if tag in {"DEBATE_STATE", "RISK_STATE", "RISK_JUDGE"}:
+        return _parse_tagged_json(text, tag, warn=True) or {}
+    pattern = rf"<!--\s*{re.escape(tag)}:\s*(\{{.*?\}})\s*-->"
+    match = re.search(pattern, text, flags=re.DOTALL)
+    if not match:
+        return {}
     try:
-        payload = json.loads(payload_text)
-    except (json.JSONDecodeError, TypeError) as exc:
-        if warn:
-            logger.warning(
-                "[debate_utils] %s parse warning (invalid_json): %s",
-                tag,
-                exc,
-            )
-        return None
-    if not isinstance(payload, dict):
-        if warn:
-            logger.warning(
-                "[debate_utils] %s parse warning (invalid_schema): payload must be an object",
-                tag,
-            )
-        return None
-    return payload
+        return json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return {}
+
+
+def strip_tagged_json(text: str, tag: str) -> str:
+    if not isinstance(text, str):
+        return text
+    if _parse_tagged_json(text, tag, warn=False) is None:
+        return text.strip()
+    for start, end in reversed(_machine_block_spans(text, tag)):
+        text = text[:start] + text[end:]
+    return text.strip()
 
 
 def _warn_machine_validation(tag: str, category: str, detail: str) -> None:
@@ -209,24 +276,6 @@ def _sanitize_machine_payload(payload: Mapping[str, Any], tag: str) -> dict[str,
         )
     normalized["new_claims"] = claims
     return normalized
-
-
-def extract_tagged_json(text: str, tag: str) -> dict[str, Any]:
-    if tag in {"DEBATE_STATE", "RISK_STATE"}:
-        return _parse_tagged_json(text, tag, warn=True) or {}
-    pattern = rf"<!--\s*{re.escape(tag)}:\s*(\{{.*?\}})\s*-->"
-    match = re.search(pattern, text, flags=re.DOTALL)
-    if not match:
-        return {}
-    try:
-        return json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return {}
-
-
-def strip_tagged_json(text: str, tag: str) -> str:
-    pattern = rf"\n?<!--\s*{re.escape(tag)}:\s*\{{.*?\}}\s*-->\s*"
-    return re.sub(pattern, "", text, flags=re.DOTALL).strip()
 
 
 def safe_int(value: Any, default: int) -> int:

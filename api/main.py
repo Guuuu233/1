@@ -13,6 +13,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from numbers import Real
 from threading import Lock
 from fastapi import Body
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
@@ -747,7 +748,7 @@ class KlineResponse(BaseModel):
 def _strict_unit_interval(value: Any, field_name: str) -> Any:
     if value is None:
         return None
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{field_name} must be a finite number in [0, 1]")
     try:
         numeric = float(value)
@@ -755,7 +756,7 @@ def _strict_unit_interval(value: Any, field_name: str) -> Any:
         raise ValueError(f"{field_name} must be a finite number in [0, 1]") from exc
     if not math.isfinite(numeric) or not 0.0 <= numeric <= 1.0:
         raise ValueError(f"{field_name} must be a finite number in [0, 1]")
-    return value
+    return numeric
 
 
 def _strict_report_probability(value: Any) -> Any:
@@ -765,7 +766,7 @@ def _strict_report_probability(value: Any) -> Any:
 def _strict_report_confidence(value: Any) -> Any:
     if value is None:
         return None
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError("confidence must be a finite integer in [0, 100]")
     try:
         confidence = float(value)
@@ -773,7 +774,7 @@ def _strict_report_confidence(value: Any) -> Any:
         raise ValueError("confidence must be a finite integer in [0, 100]") from exc
     if not math.isfinite(confidence) or not confidence.is_integer() or not 0.0 <= confidence <= 100.0:
         raise ValueError("confidence must be a finite integer in [0, 100]")
-    return value
+    return int(confidence)
 
 
 class ReportCreateRequest(BaseModel):
@@ -1978,6 +1979,18 @@ def _attach_custom_prompt_snapshot(result: Dict[str, Any], prompt_snapshot: Dict
     return result
 
 
+def _merge_deduplicated_strings(existing: Any, incoming: Any) -> List[str]:
+    """Merge ordered string lists without clearing graph/ledger semantics."""
+    merged: List[str] = []
+    seen: set[str] = set()
+    for value in (existing or []) + (incoming or []):
+        normalized = report_service._normalize_gap_text(value)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            merged.append(normalized)
+    return merged
+
+
 def _apply_structured_report_fields(
     result: Dict[str, Any],
     *,
@@ -2000,9 +2013,18 @@ def _apply_structured_report_fields(
     existing_data_gaps = (
         result.get("data_gaps") if isinstance(result.get("data_gaps"), list) else []
     )
+    existing_falsification = (
+        result.get("falsification_conditions")
+        if isinstance(result.get("falsification_conditions"), list)
+        else []
+    )
     structured_not_applicable = bool(
         getattr(structured, "not_applicable", False) if structured else False
     )
+    if structured_not_applicable:
+        not_applicable = True
+    else:
+        not_applicable = bool(result.get("not_applicable"))
     result.update(
         {
             "decision": decision,
@@ -2013,8 +2035,11 @@ def _apply_structured_report_fields(
                 result_data=result,
                 llm_data_gaps=[*existing_data_gaps, *(structured_data_gaps or [])],
             ),
-            "falsification_conditions": list(structured_falsification or []),
-            "not_applicable": structured_not_applicable,
+            "falsification_conditions": _merge_deduplicated_strings(
+                existing_falsification,
+                structured_falsification,
+            ),
+            "not_applicable": not_applicable,
             "target_price": resolved.get("target_price"),
             "stop_loss_price": resolved.get("stop_loss_price"),
         }
