@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import pandas as pd
@@ -26,6 +26,29 @@ WALLCLOCK_MARKERS = (
 def _norm(s: str) -> str:
     y, m, d = s.split("-")
     return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
+
+
+def _offline_collected_pool(analysis: str) -> dict[str, object]:
+    """Deterministic _fetch_all-shaped pool with no wall-clock or future dates."""
+    analysis_day = datetime.strptime(analysis, "%Y-%m-%d").date()
+    previous = (analysis_day - timedelta(days=1)).isoformat()
+    week_ago = (analysis_day - timedelta(days=7)).isoformat()
+    return {
+        "stock_data": (
+            "# Stock data for 600519\n"
+            f"# as-of: {analysis}\n"
+            "date,open,high,low,close,volume\n"
+            f"{week_ago},1.0,1.1,0.9,1.1,100\n"
+            f"{previous},1.2,1.3,1.1,1.2,120\n"
+        ),
+        "market_data_context": {
+            "daily": {"as_of": analysis, "completeness": "completed"},
+            "realtime": {"status": "not_applicable"},
+        },
+        "indicators": {"close_50_sma": 10.5, "rsi": 55.2},
+        "news": f"Company news through {analysis}: stable operations.",
+        "global_news": f"Macro context through {analysis}: no wall-clock marker.",
+    }
 
 
 def test_akshare_hist_header_has_no_wallclock():
@@ -69,13 +92,15 @@ def test_yfinance_stock_header_has_no_wallclock():
     assert now_cn().date().isoformat() not in text
 
 
-@pytest.mark.integration
 def test_full_collect_no_date_after_analysis():
-    """Historical collect: no date string in any pool text after analysis day."""
-    from tradingagents.graph.data_collector import _fetch_all
+    """Collected pool fixture: no date string in any pool text after analysis day."""
+    from tradingagents.graph import data_collector as dc
 
     analysis = (now_cn().date() - timedelta(days=90)).isoformat()
-    pool = _fetch_all("600519", analysis)
+    pool = _offline_collected_pool(analysis)
+    with patch.object(dc, "_fetch_all", return_value=pool) as mock_fetch:
+        pool = dc._fetch_all("600519", analysis)
+    mock_fetch.assert_called_once_with("600519", analysis)
     violations = {}
     for key, val in pool.items():
         text = val if isinstance(val, str) else str(val)
