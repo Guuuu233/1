@@ -2596,7 +2596,10 @@ async def _run_job_inner(
                 "direction": resolved["direction"],
                 "confidence": resolved["confidence"],
                 "probability": structured.probability if structured else None,
-                "data_gaps": structured.data_gaps if structured else [],
+                "data_gaps": report_service.merge_data_gaps(
+                    result_data=result,
+                    llm_data_gaps=structured.data_gaps if structured else [],
+                ),
                 "falsification_conditions": structured.falsification_conditions if structured else [],
                 "not_applicable": structured.not_applicable if structured else False,
                 "target_price": resolved["target_price"],
@@ -2894,7 +2897,10 @@ async def _run_job_inner(
             "direction": resolved["direction"],
             "confidence": resolved["confidence"],
             "probability": structured.probability if structured else None,
-            "data_gaps": structured.data_gaps if structured else [],
+            "data_gaps": report_service.merge_data_gaps(
+                result_data=result,
+                llm_data_gaps=structured.data_gaps if structured else [],
+            ),
             "falsification_conditions": structured.falsification_conditions if structured else [],
             "not_applicable": structured.not_applicable if structured else False,
             "target_price": resolved["target_price"],
