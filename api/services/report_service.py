@@ -3,14 +3,16 @@
 import json
 import json_repair
 import logging
+import math
 import re
+from numbers import Real
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Iterable, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session, load_only
 
@@ -46,13 +48,155 @@ STALE_REPORT_ERROR_MESSAGE = "分析任务已中断，请重新发起分析"
 
 # ─── Structured extraction schemas ───────────────────────────────────────────
 
-from pydantic import field_validator
+_RISK_ITEM_FIELDS = frozenset(("name", "level", "description"))
+_KEY_METRIC_FIELDS = frozenset(("name", "value", "status"))
+_STRUCTURED_REPORT_FIELDS = frozenset(
+    (
+        "decision",
+        "confidence",
+        "probability",
+        "target_price",
+        "stop_loss_price",
+        "risks",
+        "key_metrics",
+        "data_gaps",
+        "falsification_conditions",
+        "not_applicable",
+    )
+)
+
+_REPORT_MACHINE_BLOCK_TAGS = ("DEBATE_STATE", "RISK_STATE")
+_REPORT_MACHINE_LIST_FIELDS = (
+    "responded_claim_ids",
+    "new_claims",
+    "resolved_claim_ids",
+    "unresolved_claim_ids",
+    "next_focus_claim_ids",
+)
+_REPORT_MACHINE_TEXT_FIELDS = ("round_summary", "round_goal")
+_LEGAL_DECISION_ALIASES = {
+    "BUY": "BUY",
+    "SELL": "SELL",
+    "HOLD": "HOLD",
+    "增持": "BUY",
+    "买入": "BUY",
+    "看多": "BUY",
+    "减持": "SELL",
+    "卖出": "SELL",
+    "看空": "SELL",
+    "持有": "HOLD",
+    "中性": "HOLD",
+}
+
+
+def _warn_unknown_fields(model_name: str, values: Any, allowed_fields: frozenset[str]) -> Any:
+    if not isinstance(values, dict):
+        return values
+    unknown_fields = sorted(str(key) for key in values if key not in allowed_fields)
+    if unknown_fields:
+        logger.warning(
+            "[report_service] unknown structured fields ignored for %s: %s",
+            model_name,
+            ", ".join(unknown_fields),
+        )
+    return values
+
+
+def _coerce_probability_value(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, Real):
+        logger.warning(
+            "[report_service] probability rejected: value must be a real number, got %r",
+            value,
+        )
+        return None
+    try:
+        probability = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        logger.warning(
+            "[report_service] probability rejected: cannot convert %r to float",
+            value,
+        )
+        return None
+    if not math.isfinite(probability):
+        logger.warning("[report_service] probability rejected: value must be finite, got %r", value)
+        return None
+    if not 0.0 <= probability <= 1.0:
+        logger.warning(
+            "[report_service] probability rejected: %s is outside the finite [0, 1] range",
+            probability,
+        )
+        return None
+    return probability
+
+
+def _coerce_confidence_value(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, Real):
+        logger.warning(
+            "[report_service] confidence rejected: value must be a real number, got %r",
+            value,
+        )
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        logger.warning(
+            "[report_service] confidence rejected: cannot convert %r to int",
+            value,
+        )
+        return None
+    if not math.isfinite(numeric):
+        logger.warning("[report_service] confidence rejected: value must be finite, got %r", value)
+        return None
+    if not numeric.is_integer():
+        logger.warning("[report_service] confidence rejected: %r is not an integer", value)
+        return None
+    confidence = int(numeric)
+    if not 0 <= confidence <= 100:
+        logger.warning(
+            "[report_service] confidence rejected: %d is out of [0, 100] range",
+            confidence,
+        )
+        return None
+    return confidence
+
+
+def _canonicalize_structured_items(items: Any, schema, field_name: str) -> Optional[List[dict]]:
+    if items is None:
+        return None
+    if not isinstance(items, list):
+        logger.warning("[report_service] %s rejected: structured field must be an array", field_name)
+        return []
+
+    canonical_items: list[dict] = []
+    for index, item in enumerate(items):
+        try:
+            model = item if isinstance(item, schema) else schema(**item)
+            canonical_items.append(model.model_dump())
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "[report_service] %s item %d rejected: %s",
+                field_name,
+                index,
+                exc,
+            )
+    return canonical_items
 
 
 class RiskItemSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     name: str = Field(..., description="风险名称，15字以内")
     level: str = Field("medium", description="风险等级")
     description: str = Field("", description="一句话说明，30字以内")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _warn_unknown_fields(cls, values):
+        return _warn_unknown_fields("risk item", values, _RISK_ITEM_FIELDS)
 
     @field_validator("level", mode="before")
     @classmethod
@@ -63,9 +207,16 @@ class RiskItemSchema(BaseModel):
 
 
 class KeyMetricSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     name: str = Field(..., description="指标名称，如 PE、ROE、营收增速")
     value: str = Field(..., description="指标值，包含单位，如 28.5x、15.2%")
     status: str = Field("neutral", description="优劣判断")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _warn_unknown_fields(cls, values):
+        return _warn_unknown_fields("key metric", values, _KEY_METRIC_FIELDS)
 
     @field_validator("value", mode="before")
     @classmethod
@@ -82,7 +233,9 @@ class KeyMetricSchema(BaseModel):
 
 
 class StructuredReport(BaseModel):
-    decision: str = Field("HOLD", description="交易决策关键词：BUY/SELL/HOLD/增持/减持/持有")
+    model_config = ConfigDict(extra="ignore")
+
+    decision: Optional[str] = Field(None, description="交易决策关键词：BUY/SELL/HOLD/增持/减持/持有")
     confidence: Optional[int] = Field(None, description="整体置信度 0-100")
     probability: Optional[float] = Field(None, description="报告明确给出的上涨概率")
     target_price: Optional[float] = Field(None, description="目标价（数字，无单位）")
@@ -93,10 +246,29 @@ class StructuredReport(BaseModel):
     falsification_conditions: List[str] = Field(default_factory=list, description="报告明确列出的证伪条件")
     not_applicable: bool = Field(False, description="本分析框架是否明确不适用")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _warn_unknown_fields(cls, values):
+        return _warn_unknown_fields("report", values, _STRUCTURED_REPORT_FIELDS)
+
     @field_validator("data_gaps", "falsification_conditions", mode="before")
     @classmethod
     def _coerce_string_list(cls, v):
         return [] if v is None else v
+
+    @field_validator("decision", mode="before")
+    @classmethod
+    def _coerce_decision(cls, value):
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        canonical = _LEGAL_DECISION_ALIASES.get(normalized)
+        if canonical is None:
+            canonical = _LEGAL_DECISION_ALIASES.get(normalized.upper())
+        if canonical is None:
+            logger.warning("[report_service] decision rejected: illegal structured value %r", value)
+            return None
+        return canonical
 
     @field_validator("not_applicable", mode="before")
     @classmethod
@@ -106,64 +278,180 @@ class StructuredReport(BaseModel):
     @field_validator("probability", mode="before")
     @classmethod
     def _coerce_probability(cls, v):
-        if v is None:
-            return None
-        # bool is a subclass of int/float in Python; True/False are not probabilities.
-        if isinstance(v, bool):
-            logger.warning("[report_service] probability rejected: bool value %r is not a probability", v)
-            return None
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            logger.warning("[report_service] probability rejected: cannot convert %r to float", v)
-            return None
-        if f != f:  # NaN
-            logger.warning("[report_service] probability rejected: NaN is not a valid probability")
-            return None
-        if f < 0.0 or f > 100.0:
-            logger.warning("[report_service] probability rejected: %s is out of [0, 100] range", f)
-            return None
-        # Model may return a percentage integer (e.g. 70 instead of 0.70). Reject it.
-        if 1.0 < f <= 100.0:
-            logger.warning(
-                "[report_service] probability rejected: %s looks like a percentage (expected 0.00–1.00)", f
-            )
-            return None
-        return f  # 0.0 <= f <= 1.0 at this point
+        return _coerce_probability_value(v)
 
     @field_validator("confidence", mode="before")
     @classmethod
     def _coerce_confidence(cls, v):
-        if v is None:
-            return None
-        # bool is a subclass of int; True/False are not confidence scores.
-        if isinstance(v, bool):
-            logger.warning("[report_service] confidence rejected: bool value %r is not a confidence score", v)
-            return None
-        # Reject non-integer floats outright (e.g. 75.9) rather than silently truncating.
-        # 75.0 is accepted (already an integer value); 75.9 is a formatting error, not "75".
-        if isinstance(v, float) and not v.is_integer():
-            logger.warning(
-                "[report_service] confidence rejected: %s is a non-integer float", v
-            )
-            return None
-        try:
-            i = int(v)
-        except (TypeError, ValueError):
-            logger.warning("[report_service] confidence rejected: cannot convert %r to int", v)
-            return None
-        if not (0 <= i <= 100):
-            logger.warning("[report_service] confidence rejected: %d is out of [0, 100] range", i)
-            return None
-        return i
+        return _coerce_confidence_value(v)
 
     @field_validator("target_price", "stop_loss_price", mode="before")
     @classmethod
     def _coerce_price(cls, v):
-        # LLM 可能返回数组 [34.0, 32.5] 而非单个数字，取第一个
-        if isinstance(v, list):
-            return v[0] if v else None
-        return v
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, Real):
+            logger.warning(
+                "[report_service] price rejected: value must be a real number, got %r",
+                v,
+            )
+            return None
+        try:
+            price = float(v)
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.warning(
+                "[report_service] price rejected: cannot convert %r to float",
+                v,
+            )
+            return None
+        if not math.isfinite(price):
+            logger.warning("[report_service] price rejected: value must be finite, got %r", v)
+            return None
+        if price < 0:
+            logger.warning("[report_service] price rejected: value must be non-negative, got %r", v)
+            return None
+        return price
+
+
+def _strict_unit_interval(value: Any, field_name: str) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{field_name} must be a finite number in [0, 1]")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} must be a finite number in [0, 1]") from exc
+    if not math.isfinite(numeric) or not 0.0 <= numeric <= 1.0:
+        raise ValueError(f"{field_name} must be a finite number in [0, 1]")
+    return numeric
+
+
+def _strict_claim_confidence(value: Any) -> float:
+    if value is None or isinstance(value, (bool, str, bytes, bytearray)):
+        raise ValueError("claim confidence must be a finite number in [0, 1]")
+    return _strict_unit_interval(value, "claim confidence")
+
+
+def _iter_report_strings(value: Any) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from _iter_report_strings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_report_strings(child)
+
+
+def _validate_report_machine_payload(payload: Dict[str, Any], tag: str) -> None:
+    allowed_fields = (*_REPORT_MACHINE_LIST_FIELDS, *_REPORT_MACHINE_TEXT_FIELDS)
+    unknown_fields = sorted(str(key) for key in payload if key not in allowed_fields)
+    if unknown_fields:
+        logger.warning(
+            "[report_service] unknown machine fields ignored for %s: %s",
+            tag,
+            ", ".join(unknown_fields),
+        )
+
+    for field_name in _REPORT_MACHINE_LIST_FIELDS:
+        value = payload.get(field_name)
+        if value is not None and not isinstance(value, list):
+            raise ValueError(f"{tag} machine field {field_name} must be an array")
+    for field_name in _REPORT_MACHINE_TEXT_FIELDS:
+        value = payload.get(field_name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{tag} machine field {field_name} must be a string")
+
+    claims = payload.get("new_claims") or []
+    for index, claim in enumerate(claims, start=1):
+        if not isinstance(claim, dict):
+            raise ValueError(f"{tag} claim {index} must be an object")
+        if not isinstance(claim.get("claim"), str) or not claim["claim"].strip():
+            raise ValueError(f"{tag} claim {index} must contain non-empty claim text")
+        evidence = claim.get("evidence")
+        if evidence is not None and not isinstance(evidence, list):
+            raise ValueError(f"{tag} claim {index} evidence must be an array")
+        target_claim_ids = claim.get("target_claim_ids")
+        if target_claim_ids is not None and not isinstance(target_claim_ids, list):
+            raise ValueError(f"{tag} claim {index} target_claim_ids must be an array")
+        if "confidence" not in claim:
+            raise ValueError(f"{tag} claim {index} confidence is required")
+        _strict_claim_confidence(claim.get("confidence"))
+        claim_unknown_fields = sorted(
+            str(key) for key in claim if key not in ("claim", "evidence", "confidence", "target_claim_ids")
+        )
+        if claim_unknown_fields:
+            logger.warning(
+                "[report_service] unknown machine claim fields ignored for %s claim %d: %s",
+                tag,
+                index,
+                ", ".join(claim_unknown_fields),
+            )
+
+
+def validate_report_machine_blocks(result_data: Optional[Dict[str, Any]]) -> None:
+    """Validate every embedded machine block before a report is persisted."""
+    if result_data is None:
+        return
+    if not isinstance(result_data, dict):
+        raise ValueError("result_data must be an object")
+
+    for text in _iter_report_strings(result_data):
+        for tag in _REPORT_MACHINE_BLOCK_TAGS:
+            openings = list(re.finditer(rf"<!--\s*{re.escape(tag)}\b", text))
+            if not openings:
+                continue
+            if len(openings) > 1:
+                raise ValueError(f"{tag} machine block must not be duplicated")
+            marker_suffix = text[openings[0].end():].lstrip()
+            if not marker_suffix.startswith(":"):
+                raise ValueError(f"{tag} machine block must use ':' after the marker")
+            payload_text = marker_suffix[1:]
+            closing_index = payload_text.find("-->")
+            if closing_index < 0:
+                raise ValueError(f"{tag} machine block is truncated")
+            try:
+                payload = json.loads(payload_text[:closing_index].strip())
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise ValueError(f"{tag} machine block contains invalid JSON") from exc
+            if not isinstance(payload, dict):
+                raise ValueError(f"{tag} machine block must contain an object")
+            _validate_report_machine_payload(payload, tag)
+
+
+def canonicalize_report_result_data(
+    result_data: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return the only result shape allowed at API and ReportDB boundaries.
+
+    This function deliberately raises for malformed report objects or machine
+    blocks.  Unknown structured fields are handled by ``StructuredReport``
+    with warnings and are omitted from the canonical nested value.
+    """
+    if result_data is None:
+        return None
+    if not isinstance(result_data, dict):
+        raise ValueError("result_data must be an object")
+
+    validate_report_machine_blocks(result_data)
+    canonical_data = dict(result_data)
+    if "structured" not in canonical_data:
+        return canonical_data
+
+    structured = canonical_data.get("structured")
+    if isinstance(structured, StructuredReport):
+        canonical_data["structured"] = structured.model_dump()
+        return canonical_data
+    if not isinstance(structured, dict):
+        raise ValueError("structured report must be an object")
+    canonical_data["structured"] = StructuredReport(**structured).model_dump()
+    return canonical_data
+
+
+def _canonicalize_result_data(result_data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Backward-compatible private alias for internal callers."""
+    return canonicalize_report_result_data(result_data)
 
 
 def extract_structured_data(
@@ -196,7 +484,7 @@ def extract_structured_data(
             f"【基本面报告摘要】\n{fundamentals_report[:1000]}\n\n"
             "提取要求（请确保输出为有效的 JSON 对象，不要包裹在 markdown 代码块中）：\n"
             "1. decision：决策方向关键词（BUY/SELL/HOLD 或 增持/减持/持有）\n"
-            "2. confidence：整体置信度（0-100 整数），若文中未明确给出则根据语气判断；"
+            "2. confidence：整体置信度（0-100 整数），若文中未明确给出则为 null；"
             "禁止把 confidence 换算为 probability 或代填 probability 字段\n"
             "3. target_price / stop_loss_price：纯数字，若未提及则为 null\n"
             "4. risks：最多5条主要风险，每条包含名称（15字内）、等级（high/medium/low）、一句话说明\n"
@@ -304,7 +592,10 @@ def resolve_report_fields(
     verdict = _extract_verdict(final_trade_decision)
     direction = verdict["direction"] if verdict else None
 
-    confidence = confidence_override if confidence_override is not None else _extract_confidence_regex(final_trade_decision)
+    if confidence_override is not None:
+        confidence = _coerce_confidence_value(confidence_override)
+    else:
+        confidence = _extract_confidence_regex(final_trade_decision)
 
     target_price = target_price_override if target_price_override is not None else _extract_price_regex(final_trade_decision, "target")
     if target_price is None:
@@ -354,8 +645,12 @@ def init_report(
         updated_at=now,
     )
     db.add(db_report)
-    db.commit()
-    db.refresh(db_report)
+    try:
+        db.commit()
+        db.refresh(db_report)
+    except Exception:
+        db.rollback()
+        raise
     return db_report
 
 
@@ -370,16 +665,37 @@ def update_report_partial(
     if not db_report:
         return None
     
+    canonical_fields: Dict[str, Any] = {}
+    try:
+        for key, value in fields.items():
+            if key == "confidence":
+                value = _coerce_confidence_value(value)
+            elif key == "probability":
+                value = _coerce_probability_value(value)
+            elif key == "result_data":
+                value = canonicalize_report_result_data(value)
+            elif key == "risk_items":
+                value = _canonicalize_structured_items(value, RiskItemSchema, "risk_items")
+            elif key == "key_metrics":
+                value = _canonicalize_structured_items(value, KeyMetricSchema, "key_metrics")
+            if hasattr(db_report, key):
+                canonical_fields[key] = value
+    except Exception:
+        db.rollback()
+        raise
+
     if status:
         db_report.status = status
-    
-    for key, value in fields.items():
-        if hasattr(db_report, key):
-            setattr(db_report, key, value)
-    
+    for key, value in canonical_fields.items():
+        setattr(db_report, key, value)
+
     db_report.updated_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(db_report)
+    try:
+        db.commit()
+        db.refresh(db_report)
+    except Exception:
+        db.rollback()
+        raise
     return db_report
 
 
@@ -467,8 +783,12 @@ def create_report(
     report_id: Optional[str] = None,  # If provided, update existing
 ) -> ReportDB:
     """Create or finalize a report."""
+    validated_probability = _coerce_probability_value(probability)
+    canonical_result_data = canonicalize_report_result_data(result_data)
+    canonical_risk_items = _canonicalize_structured_items(risk_items, RiskItemSchema, "risk_items")
+    canonical_key_metrics = _canonicalize_structured_items(key_metrics, KeyMetricSchema, "key_metrics")
     resolved = resolve_report_fields(
-        result_data=result_data,
+        result_data=canonical_result_data,
         confidence_override=confidence_override,
         target_price_override=target_price_override,
         stop_loss_override=stop_loss_override,
@@ -490,12 +810,12 @@ def create_report(
         db_report.decision = decision
         db_report.direction = resolved["direction"]
         db_report.confidence = resolved["confidence"]
-        db_report.probability = probability
+        db_report.probability = validated_probability
         db_report.target_price = resolved["target_price"]
         db_report.stop_loss_price = resolved["stop_loss_price"]
-        db_report.result_data = result_data
-        db_report.risk_items = risk_items
-        db_report.key_metrics = key_metrics
+        db_report.result_data = canonical_result_data
+        db_report.risk_items = canonical_risk_items
+        db_report.key_metrics = canonical_key_metrics
         db_report.data_gaps = list(data_gaps or [])
         db_report.falsification_conditions = list(falsification_conditions or [])
         db_report.not_applicable = bool(not_applicable)
@@ -523,12 +843,12 @@ def create_report(
             decision=decision,
             direction=resolved["direction"],
             confidence=resolved["confidence"],
-            probability=probability,
+            probability=validated_probability,
             target_price=resolved["target_price"],
             stop_loss_price=resolved["stop_loss_price"],
-            result_data=result_data,
-            risk_items=risk_items,
-            key_metrics=key_metrics,
+            result_data=canonical_result_data,
+            risk_items=canonical_risk_items,
+            key_metrics=canonical_key_metrics,
             data_gaps=list(data_gaps or []),
             falsification_conditions=list(falsification_conditions or []),
             not_applicable=bool(not_applicable),
@@ -549,8 +869,12 @@ def create_report(
         )
         db.add(db_report)
 
-    db.commit()
-    db.refresh(db_report)
+    try:
+        db.commit()
+        db.refresh(db_report)
+    except Exception:
+        db.rollback()
+        raise
     return db_report
 
 
@@ -665,4 +989,187 @@ def batch_delete_reports(db: Session, report_ids: Iterable[str], user_id: Option
     return {
         "deleted_ids": deleted_ids,
         "missing_ids": missing_ids,
+    }
+
+
+_REPORT_GAP_FIELDS = (
+    "market_report",
+    "sentiment_report",
+    "news_report",
+    "fundamentals_report",
+    "macro_report",
+    "smart_money_report",
+    "volume_price_report",
+    "game_theory_report",
+    "investment_plan",
+    "trader_investment_plan",
+    "final_trade_decision",
+)
+_DATA_FAILURE_LINE_RE = re.compile(
+    r"^\s*(?:(?:[-*•]\s*)|(?:\d+[.)、]\s*))?(【数据获取失败】.*)\s*$"
+)
+
+
+def _normalize_gap_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _explicit_data_failure_lines(text: Any) -> Iterable[str]:
+    """Yield only machine-readable failure lines from a report body."""
+    if not isinstance(text, str):
+        return
+    for line in text.splitlines():
+        match = _DATA_FAILURE_LINE_RE.match(line)
+        if not match:
+            continue
+        normalized = _normalize_gap_text(match.group(1))
+        if normalized:
+            yield normalized
+
+
+def _iter_report_texts(result_data: Any) -> Iterable[str]:
+    if not isinstance(result_data, dict):
+        return
+
+    for field in _REPORT_GAP_FIELDS:
+        value = result_data.get(field)
+        if isinstance(value, str):
+            yield value
+
+    for nested_key in ("short_term", "medium_term", "horizons", "result_data"):
+        nested = result_data.get(nested_key)
+        if isinstance(nested, dict):
+            if nested_key == "horizons":
+                for horizon_result in nested.values():
+                    if isinstance(horizon_result, dict):
+                        yield from _iter_report_texts(horizon_result)
+            else:
+                yield from _iter_report_texts(nested)
+
+
+def merge_data_gaps(
+    result_data: Optional[Dict[str, Any]] = None,
+    llm_data_gaps: Optional[Iterable[Any]] = None,
+) -> List[str]:
+    """Merge explicit report failures with model-reported gaps deterministically."""
+    merged: List[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        normalized = _normalize_gap_text(value)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            merged.append(normalized)
+
+    for ledger_entry in _iter_failure_ledger_entries(result_data):
+        source = _normalize_gap_text(ledger_entry.get("source"))
+        status = _normalize_gap_text(ledger_entry.get("status")).lower()
+        reason = _normalize_gap_text(ledger_entry.get("reason"))
+        if not source or status not in _FAILURE_LEDGER_STATUSES:
+            continue
+        explicit_gap = _normalize_gap_text(ledger_entry.get("gap"))
+        if explicit_gap.startswith("【数据获取失败】"):
+            add(explicit_gap)
+        elif reason:
+            add(f"【数据获取失败】{source}：{reason}")
+
+    for report_text in _iter_report_texts(result_data):
+        for gap in _explicit_data_failure_lines(report_text):
+            add(gap)
+
+    if isinstance(llm_data_gaps, str):
+        llm_data_gaps = [llm_data_gaps]
+    try:
+        llm_items = iter(llm_data_gaps or [])
+    except TypeError:
+        llm_items = iter(())
+    for gap in llm_items:
+        add(gap)
+
+    return merged
+
+
+_FAILURE_LEDGER_STATUSES = frozenset(("failed", "timeout", "unavailable", "refused", "error"))
+
+
+def _iter_failure_ledger_entries(result_data: Any) -> Iterable[Dict[str, Any]]:
+    """Yield only ledgers from the known market-data context locations."""
+    if not isinstance(result_data, dict):
+        return
+
+    market_data_context = result_data.get("market_data_context")
+    if isinstance(market_data_context, dict):
+        ledger = market_data_context.get("data_failure_ledger")
+        if isinstance(ledger, list):
+            for entry in ledger:
+                if isinstance(entry, dict):
+                    yield entry
+        # Dual reports keep one context per horizon at this location.
+        for nested_context in market_data_context.values():
+            if isinstance(nested_context, dict) and nested_context is not market_data_context:
+                nested_ledger = nested_context.get("data_failure_ledger")
+                if isinstance(nested_ledger, list):
+                    for entry in nested_ledger:
+                        if isinstance(entry, dict):
+                            yield entry
+
+    for nested_key in ("short_term", "medium_term", "horizons", "result_data"):
+        nested = result_data.get(nested_key)
+        if isinstance(nested, dict):
+            if nested_key == "horizons":
+                for horizon_result in nested.values():
+                    if isinstance(horizon_result, dict):
+                        yield from _iter_failure_ledger_entries(horizon_result)
+            else:
+                yield from _iter_failure_ledger_entries(nested)
+
+
+def aggregate_horizon_metadata(
+    horizon_results: Iterable[tuple[str, Dict[str, Any]]],
+    *,
+    requested_horizons: Iterable[str],
+) -> Dict[str, Any]:
+    """Aggregate horizon metadata without collapsing mixed states.
+
+    The flattened list is retained for the legacy ReportDB column, while the
+    keyed maps preserve which horizon supplied each value.
+    """
+    requested = [str(horizon) for horizon in requested_horizons]
+    by_horizon = {str(horizon): result for horizon, result in horizon_results}
+    not_applicable_by_horizon: Dict[str, Any] = {}
+    falsification_by_horizon: Dict[str, List[str]] = {}
+    flattened: List[str] = []
+    seen_conditions: set[str] = set()
+
+    all_completed = bool(requested)
+    all_not_applicable = bool(requested)
+    for horizon in requested:
+        result = by_horizon.get(horizon) or {}
+        completed = result.get("status") == "completed"
+        all_completed = all_completed and completed
+        value = result.get("not_applicable") if completed else None
+        not_applicable_by_horizon[horizon] = value
+        all_not_applicable = all_not_applicable and value is True
+
+        conditions = result.get("falsification_conditions") if completed else []
+        if not isinstance(conditions, list):
+            conditions = []
+        canonical_conditions: List[str] = []
+        for condition in conditions:
+            normalized = _normalize_gap_text(condition)
+            if not normalized or normalized in canonical_conditions:
+                continue
+            canonical_conditions.append(normalized)
+            if normalized not in seen_conditions:
+                seen_conditions.add(normalized)
+                flattened.append(normalized)
+        falsification_by_horizon[horizon] = canonical_conditions
+
+    return {
+        "falsification_conditions": flattened,
+        "falsification_conditions_by_horizon": falsification_by_horizon,
+        "not_applicable": bool(all_completed and all_not_applicable),
+        "not_applicable_by_horizon": not_applicable_by_horizon,
     }

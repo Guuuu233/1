@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import socket
@@ -12,6 +13,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from numbers import Real
 from threading import Lock
 from fastapi import Body
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
@@ -36,7 +38,7 @@ from fastapi import FastAPI, File, HTTPException, Depends, Query, Request, Uploa
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 from sqlalchemy.orm import Session
 import pandas as pd
 
@@ -743,6 +745,38 @@ class KlineResponse(BaseModel):
 
 
 # Report API Models
+def _strict_unit_interval(value: Any, field_name: str) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{field_name} must be a finite number in [0, 1]")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} must be a finite number in [0, 1]") from exc
+    if not math.isfinite(numeric) or not 0.0 <= numeric <= 1.0:
+        raise ValueError(f"{field_name} must be a finite number in [0, 1]")
+    return numeric
+
+
+def _strict_report_probability(value: Any) -> Any:
+    return _strict_unit_interval(value, "probability")
+
+
+def _strict_report_confidence(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError("confidence must be a finite integer in [0, 100]")
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("confidence must be a finite integer in [0, 100]") from exc
+    if not math.isfinite(confidence) or not confidence.is_integer() or not 0.0 <= confidence <= 100.0:
+        raise ValueError("confidence must be a finite integer in [0, 100]")
+    return int(confidence)
+
+
 class ReportCreateRequest(BaseModel):
     symbol: str = Field(..., description="股票代码")
     trade_date: str = Field(..., description="交易日期 YYYY-MM-DD")
@@ -752,6 +786,24 @@ class ReportCreateRequest(BaseModel):
     data_gaps: List[str] = Field(default_factory=list)
     falsification_conditions: List[str] = Field(default_factory=list)
     not_applicable: bool = False
+
+    @field_validator("probability", mode="before")
+    @classmethod
+    def _validate_probability(cls, value: Any) -> Any:
+        return _strict_report_probability(value)
+
+    @model_validator(mode="after")
+    def _validate_structured_boundary(self):
+        structured = self.result_data.get("structured") if isinstance(self.result_data, dict) else None
+        if structured is not None:
+            if not isinstance(structured, dict):
+                raise ValueError("structured report must be an object")
+            if "confidence" in structured:
+                _strict_report_confidence(structured["confidence"])
+            if "probability" in structured:
+                _strict_report_probability(structured["probability"])
+        self.result_data = report_service.canonicalize_report_result_data(self.result_data)
+        return self
 
 
 class ReportResponse(BaseModel):
@@ -1927,6 +1979,74 @@ def _attach_custom_prompt_snapshot(result: Dict[str, Any], prompt_snapshot: Dict
     return result
 
 
+def _merge_deduplicated_strings(existing: Any, incoming: Any) -> List[str]:
+    """Merge ordered string lists without clearing graph/ledger semantics."""
+    merged: List[str] = []
+    seen: set[str] = set()
+    for value in (existing or []) + (incoming or []):
+        normalized = report_service._normalize_gap_text(value)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            merged.append(normalized)
+    return merged
+
+
+def _apply_structured_report_fields(
+    result: Dict[str, Any],
+    *,
+    structured: Optional[Any],
+    graph_decision: Optional[str],
+    resolved: Dict[str, Any],
+) -> str:
+    """Apply one deterministic structured-report contract to every save path."""
+    legal_decisions = {"BUY", "SELL", "HOLD"}
+    structured_decision = getattr(structured, "decision", None) if structured else None
+    if structured_decision not in legal_decisions:
+        structured_decision = None
+    fallback_decision = graph_decision if graph_decision in legal_decisions else None
+    decision = structured_decision or fallback_decision or "UNKNOWN"
+    structured_probability = getattr(structured, "probability", None) if structured else None
+    structured_data_gaps = getattr(structured, "data_gaps", []) if structured else []
+    structured_falsification = (
+        getattr(structured, "falsification_conditions", []) if structured else []
+    )
+    existing_data_gaps = (
+        result.get("data_gaps") if isinstance(result.get("data_gaps"), list) else []
+    )
+    existing_falsification = (
+        result.get("falsification_conditions")
+        if isinstance(result.get("falsification_conditions"), list)
+        else []
+    )
+    structured_not_applicable = bool(
+        getattr(structured, "not_applicable", False) if structured else False
+    )
+    if structured_not_applicable:
+        not_applicable = True
+    else:
+        not_applicable = bool(result.get("not_applicable"))
+    result.update(
+        {
+            "decision": decision,
+            "direction": resolved.get("direction") or (decision if decision in legal_decisions else None),
+            "confidence": resolved.get("confidence"),
+            "probability": structured_probability,
+            "data_gaps": report_service.merge_data_gaps(
+                result_data=result,
+                llm_data_gaps=[*existing_data_gaps, *(structured_data_gaps or [])],
+            ),
+            "falsification_conditions": _merge_deduplicated_strings(
+                existing_falsification,
+                structured_falsification,
+            ),
+            "not_applicable": not_applicable,
+            "target_price": resolved.get("target_price"),
+            "stop_loss_price": resolved.get("stop_loss_price"),
+        }
+    )
+    return decision
+
+
 def _build_custom_prompt_snapshot(
     frozen_bundle: Dict[str, Dict[str, Any]],
     injection_enabled: bool,
@@ -2389,10 +2509,6 @@ async def _run_job_inner(
                     except Exception as exc:
                         _log(f"Structured extraction failed for {horizon} (non-fatal): {exc}")
 
-                    horizon_gaps = report_service.merge_data_gaps(
-                        result_data=horizon_result,
-                        llm_data_gaps=structured.data_gaps if structured else [],
-                    )
                     resolved = await asyncio.to_thread(
                         report_service.resolve_report_fields,
                         result_data=horizon_result,
@@ -2400,25 +2516,18 @@ async def _run_job_inner(
                         target_price_override=structured.target_price if structured else None,
                         stop_loss_override=structured.stop_loss_price if structured else None,
                     )
-                    decision = (
-                        structured.decision
-                        if structured and structured.decision
-                        else graph.process_signal(horizon_result.get("final_trade_decision", ""))
-                    ) or "UNKNOWN"
+                    graph_decision = graph.process_signal(
+                        horizon_result.get("final_trade_decision", "")
+                    )
+                    decision = _apply_structured_report_fields(
+                        horizon_result,
+                        structured=structured,
+                        graph_decision=graph_decision,
+                        resolved=resolved,
+                    )
                     horizon_result.update(
                         {
                             "status": "completed",
-                            "decision": decision,
-                            "direction": resolved["direction"] or decision,
-                            "confidence": resolved["confidence"],
-                            "probability": structured.probability if structured else None,
-                            "data_gaps": horizon_gaps,
-                            "falsification_conditions": (
-                                structured.falsification_conditions if structured else []
-                            ),
-                            "not_applicable": structured.not_applicable if structured else False,
-                            "target_price": resolved["target_price"],
-                            "stop_loss_price": resolved["stop_loss_price"],
                             "risk_items": (
                                 [item.model_dump() for item in structured.risks]
                                 if structured
@@ -2449,6 +2558,13 @@ async def _run_job_inner(
                         if gap not in seen_gaps:
                             seen_gaps.add(gap)
                             all_data_gaps.append(gap)
+                horizon_metadata = report_service.aggregate_horizon_metadata(
+                    (
+                        (horizon, horizon_results[horizon])
+                        for horizon in request.horizons
+                    ),
+                    requested_horizons=request.horizons,
+                )
                 result = {
                     "symbol": ticker,
                     "trade_date": request.trade_date,
@@ -2468,6 +2584,12 @@ async def _run_job_inner(
                     "medium_term": medium_r,
                     "horizons": {"short": short_r, "medium": medium_r},
                     "data_gaps": all_data_gaps,
+                    "falsification_conditions": horizon_metadata["falsification_conditions"],
+                    "falsification_conditions_by_horizon": (
+                        horizon_metadata["falsification_conditions_by_horizon"]
+                    ),
+                    "not_applicable": horizon_metadata["not_applicable"],
+                    "not_applicable_by_horizon": horizon_metadata["not_applicable_by_horizon"],
                     "analyst_traces": [
                         trace
                         for horizon in request.horizons
@@ -2490,8 +2612,8 @@ async def _run_job_inner(
                                 key_metrics=None,
                                 probability=None,
                                 data_gaps=result["data_gaps"],
-                                falsification_conditions=[],
-                                not_applicable=False,
+                                falsification_conditions=result["falsification_conditions"],
+                                not_applicable=result["not_applicable"],
                                 confidence_override=None,
                                 target_price_override=None,
                                 stop_loss_override=None,
@@ -2521,6 +2643,8 @@ async def _run_job_inner(
                         "result": result,
                         "mode": "dual_horizon",
                         "data_gaps": result["data_gaps"],
+                        "falsification_conditions": result["falsification_conditions"],
+                        "not_applicable": result["not_applicable"],
                         "horizon_status": result["horizon_status"],
                         "failed_horizons": result["failed_horizons"],
                     },
@@ -2532,7 +2656,7 @@ async def _run_job_inner(
             short_r = graph._build_horizon_result("short", horizon_states.get("short") or {})
             medium_r = graph._build_horizon_result("medium", horizon_states.get("medium") or {})
             primary_r = short_r if horizon_states.get("short") else medium_r
-            decision = graph.process_signal(primary_r.get("final_trade_decision", "")) or "UNKNOWN"
+            graph_decision = graph.process_signal(primary_r.get("final_trade_decision", ""))
             model_snapshot = {
                 role: {
                     "provider_type": cfg.get("provider_type"),
@@ -2554,7 +2678,7 @@ async def _run_job_inner(
                 "market_data_context": primary_r.get("market_data_context"),
                 "short_term": short_r,
                 "medium_term": medium_r,
-                "decision": decision,
+                "decision": graph_decision or "UNKNOWN",
                 # Hoist primary horizon's report fields to top level so that
                 # resolve_report_fields / create_report can find them directly.
                 "final_trade_decision": primary_r.get("final_trade_decision", ""),
@@ -2592,16 +2716,12 @@ async def _run_job_inner(
                 target_price_override=structured.target_price if structured else None,
                 stop_loss_override=structured.stop_loss_price if structured else None,
             )
-            result.update({
-                "direction": resolved["direction"],
-                "confidence": resolved["confidence"],
-                "probability": structured.probability if structured else None,
-                "data_gaps": structured.data_gaps if structured else [],
-                "falsification_conditions": structured.falsification_conditions if structured else [],
-                "not_applicable": structured.not_applicable if structured else False,
-                "target_price": resolved["target_price"],
-                "stop_loss_price": resolved["stop_loss_price"],
-            })
+            decision = _apply_structured_report_fields(
+                result,
+                structured=structured,
+                graph_decision=graph_decision,
+                resolved=resolved,
+            )
             _attach_custom_prompt_snapshot(result, _prompt_snapshot)
 
             # 自动保存报告到数据库
@@ -2858,9 +2978,9 @@ async def _run_job_inner(
         if not final_state:
             raise RuntimeError("graph returned empty final state")
 
-        decision = graph.process_signal(final_state["final_trade_decision"]) or "UNKNOWN"
+        graph_decision = graph.process_signal(final_state["final_trade_decision"])
         result = _build_result_payload(final_state)
-        result["decision"] = decision
+        result["decision"] = graph_decision or "UNKNOWN"
 
         # 全量收口为 completed/skipped
         for agent, status in tracker.status.items():
@@ -2890,16 +3010,12 @@ async def _run_job_inner(
         )
 
         # 注入结果字典以便通知和保存使用
-        result.update({
-            "direction": resolved["direction"],
-            "confidence": resolved["confidence"],
-            "probability": structured.probability if structured else None,
-            "data_gaps": structured.data_gaps if structured else [],
-            "falsification_conditions": structured.falsification_conditions if structured else [],
-            "not_applicable": structured.not_applicable if structured else False,
-            "target_price": resolved["target_price"],
-            "stop_loss_price": resolved["stop_loss_price"],
-        })
+        decision = _apply_structured_report_fields(
+            result,
+            structured=structured,
+            graph_decision=graph_decision,
+            resolved=resolved,
+        )
         _attach_custom_prompt_snapshot(result, _prompt_snapshot)
 
         # 自动保存/收口报告到数据库

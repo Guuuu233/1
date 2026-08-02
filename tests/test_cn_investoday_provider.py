@@ -308,7 +308,7 @@ def test_investoday_get_insider_exec_shrhld_markdown():
     provider = CnInvestodayProvider()
     with patch.object(provider, "_resolve_api_key", return_value="k"), \
          patch.object(provider, "_fetch_paged_list", return_value=rows):
-        out = provider.get_insider_transactions("600519.SH")
+        out = provider.get_insider_transactions("600519.SH", curr_date="2026-08-03")
 
     assert "高管持股变动" in out or "exec-shrhld-chg" in out
     assert "ZhangSan" in out

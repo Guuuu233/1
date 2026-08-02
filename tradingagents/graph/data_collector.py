@@ -370,6 +370,7 @@ def default_market_data_context() -> Dict[str, Any]:
             "error": "实时行情上下文不可用",
             "quote": None,
         },
+        "data_failure_ledger": [],
     }
 
 
@@ -443,6 +444,125 @@ def _fetch_realtime_context(ticker: str, trade_date: str) -> Dict[str, Any]:
         )
 
 
+_DATA_FAILURE_SOURCE_ORDER = (
+    "stock_data",
+    "news",
+    "global_news",
+    "fund_flow_board",
+    "fund_flow_individual",
+    "lhb",
+    "insider_transactions",
+    "zt_pool",
+    "hot_stocks",
+    "restricted_release",
+    "share_pledge",
+    "earnings_forecast",
+    "shareholder_count",
+    "margin_trading",
+    "northbound_flow",
+    "fundamentals",
+    "balance_sheet",
+    "cashflow",
+    "income_statement",
+    "realtime",
+)
+_DATA_FAILURE_MARKERS = (
+    "【数据获取失败】",
+    "获取失败",
+    "调用失败",
+    "调用异常",
+    "数据拉取超时",
+    "拉取失败",
+    "抓取失败",
+    "接口请求失败",
+    "请求失败",
+    "数据源不可用",
+    "接口不可用",
+    "返回结构异常",
+    "返回格式异常",
+    "服务不可用",
+    "服务异常",
+    "数据暂不可用",
+    "暂时不可用",
+    "本项不可用",
+    "访问被拒绝",
+    "请求被拒绝",
+    "连接失败",
+    "provider unavailable",
+    "provider timeout",
+)
+
+
+def _compact_failure_reason(status: str) -> str:
+    """Keep the ledger useful without persisting provider payloads or traces."""
+    if status == "timeout":
+        return "provider timeout"
+    if status == "unavailable":
+        return "data source unavailable"
+    if status == "refused":
+        return "data source refused"
+    if status == "failed":
+        return "provider call failed"
+    return "data source error"
+
+
+def _classify_failure_value(value: Any) -> Optional[str]:
+    """Classify only explicit failures; None/empty/not_applicable stay non-failure."""
+    if isinstance(value, dict):
+        status = str(value.get("status") or "").strip().lower()
+        if status in {"available", "not_applicable", "ok", "completed"}:
+            return None
+        if status in {"failed", "timeout", "unavailable", "refused", "error"}:
+            return status
+        return None
+    if not isinstance(value, str):
+        return None
+
+    normalized = value.strip()
+    lowered = normalized.lower()
+    if any(marker.lower() in lowered for marker in ("调用失败", "调用异常", "拉取失败", "抓取失败")):
+        return "failed"
+    if "数据拉取超时" in normalized or "timeout" in lowered or "超时" in normalized:
+        return "timeout"
+    if any(marker.lower() in lowered for marker in _DATA_FAILURE_MARKERS):
+        return "failed"
+    return None
+
+
+def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Build stable, serializable failure evidence for the report boundary."""
+    if not isinstance(results, dict):
+        return []
+
+    entries: list[tuple[int, str, Dict[str, str]]] = []
+    source_rank = {source: index for index, source in enumerate(_DATA_FAILURE_SOURCE_ORDER)}
+    for source, value in results.items():
+        source_name = str(source).strip()
+        if not source_name:
+            continue
+        classified = _classify_failure_value(value)
+        if classified is None:
+            continue
+        status = classified
+
+        reason = _compact_failure_reason(status)
+        entries.append(
+            (
+                source_rank.get(source_name, len(_DATA_FAILURE_SOURCE_ORDER)),
+                source_name,
+                {
+                    "source": source_name,
+                    "status": status,
+                    "reason": reason,
+                    "gap": f"【数据获取失败】{source_name}：{reason}",
+                },
+            )
+        )
+
+    entries.sort(key=lambda item: (item[0], item[1]))
+    return [entry for _rank, _source, entry in entries]
+
+
 def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
     """Fetch all data sources in parallel.
 
@@ -499,6 +619,8 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         # wait=False：卡死的抓取线程留给 socket 超时自行了断，绝不反过来堵住本线程
         executor.shutdown(wait=False, cancel_futures=True)
 
+    data_failure_ledger = _build_data_failure_ledger(results)
+
     # ── Parse CSV once, reuse for indicators and VPA ──────────────────
     raw_csv = results.get("stock_data", "")
     df = _parse_csv_to_dataframe(raw_csv)
@@ -529,6 +651,7 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
     results["market_data_context"] = {
         "daily": daily_context,
         "realtime": realtime_context,
+        "data_failure_ledger": data_failure_ledger,
     }
 
     # ── 核心加速：本地计算所有技术指标 ──────────────────

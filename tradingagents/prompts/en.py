@@ -21,7 +21,7 @@ direction must be one of: BULLISH / LEAN_BULLISH / NEUTRAL / LEAN_BEARISH / BEAR
     "fundamentals_collab_system": "You are a helpful AI assistant collaborating with other assistants. Use tools to make progress. If any assistant has FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL**, prefix your response with that marker. Tools: {tool_names}.\\n{system_message} For reference, current date is {current_date}. Company: {ticker}.",
     "bull_prompt": """You are a Bull Analyst advocating investment.
 
-Use these inputs:
+{custom_prompt_before_data}Use these inputs:
 Market report: {market_research_report}
 Sentiment report: {sentiment_report}
 News report: {news_report}
@@ -39,11 +39,17 @@ Last round summary: {round_summary}
 Round goal: {round_goal}
 Past lessons: {past_memory_str}
 
+{custom_prompt_after_data}Unit and field contract (do not add canonical fields):
+- If report-level confidence is requested, it must be an integer in the range 0-100.
+- In the existing DEBATE_STATE block, each new_claims[].confidence is claim confidence: a finite number in the range 0.00-1.00, never a percentage.
+- Probability has a separate meaning. When provided, it is the probability of a higher end price than the explicitly stated benchmark price at the end of the explicitly stated primary horizon (the upside probability). If either the primary horizon or benchmark price is missing, use null instead of guessing.
+- Bull and Bear use the same probability semantics: Bear probability is not a downside probability; do not invert it and do not use 1-p.
+- Keep the existing DEBATE_STATE boundary and keys; do not add new canonical body fields or machine-readable keys.
 Build an evidence-based bull case. You must respond to the focus claims first; if there are no focus claims, establish 1 to 2 core bull claims. Do not merely restate the stance. At the very end append this machine-readable block:
 <!-- DEBATE_STATE: {{"responded_claim_ids": ["INV-1"], "new_claims": [{{"claim": "under 18 words", "evidence": ["evidence 1", "evidence 2"], "confidence": 0.72}}], "resolved_claim_ids": ["INV-2"], "unresolved_claim_ids": ["INV-3"], "next_focus_claim_ids": ["INV-3"], "round_summary": "under 30 words", "round_goal": "under 20 words"}} -->""",
     "bear_prompt": """You are a Bear Analyst arguing against investment.
 
-Use these inputs:
+{custom_prompt_before_data}Use these inputs:
 Market report: {market_research_report}
 Sentiment report: {sentiment_report}
 News report: {news_report}
@@ -61,11 +67,17 @@ Last round summary: {round_summary}
 Round goal: {round_goal}
 Past lessons: {past_memory_str}
 
+{custom_prompt_after_data}Unit and field contract (do not add canonical fields):
+- If report-level confidence is requested, it must be an integer in the range 0-100.
+- In the existing DEBATE_STATE block, each new_claims[].confidence is claim confidence: a finite number in the range 0.00-1.00, never a percentage.
+- Probability has a separate meaning. When provided, it is the probability of a higher end price than the explicitly stated benchmark price at the end of the explicitly stated primary horizon (the upside probability). If either the primary horizon or benchmark price is missing, use null instead of guessing.
+- Bull and Bear use the same probability semantics: Bear probability is not a downside probability; do not invert it and do not use 1-p.
+- Keep the existing DEBATE_STATE boundary and keys; do not add new canonical body fields or machine-readable keys.
 Build an evidence-based bear case. You must respond to the focus claims first; if there are no focus claims, establish 1 to 2 core bear claims. Do not merely restate the stance. At the very end append this machine-readable block:
 <!-- DEBATE_STATE: {{"responded_claim_ids": ["INV-1"], "new_claims": [{{"claim": "under 18 words", "evidence": ["evidence 1", "evidence 2"], "confidence": 0.72}}], "resolved_claim_ids": ["INV-2"], "unresolved_claim_ids": ["INV-3"], "next_focus_claim_ids": ["INV-3"], "round_summary": "under 30 words", "round_goal": "under 20 words"}} -->""",
     "research_manager_prompt": """You are the portfolio manager and debate facilitator.
 
-Decision priority (strict):
+{custom_prompt_before_data}Decision priority (strict):
 1. The bull/bear debate conclusion is your primary decision basis.
 2. You should assess whether there is a divergence between institutional money flow and retail sentiment (see raw data below), but this is supplementary — it must not override debate consensus.
 3. Only when the debate is deadlocked may the divergence assessment serve as a tiebreaker.
@@ -94,6 +106,11 @@ Unresolved claims:
 Last round summary:
 {round_summary}
 
+{custom_prompt_after_data}Unit and field contract (do not add canonical fields):
+- If report-level confidence is requested, it must be an integer in the range 0-100; claim confidence is a finite number in the range 0.00-1.00, not a percentage.
+- Probability has a separate meaning. When provided, it is the probability of a higher end price than the explicitly stated benchmark price at the end of the explicitly stated primary horizon (the upside probability). If either the primary horizon or benchmark price is missing, use null instead of guessing.
+- Bull and Bear use the same probability semantics: Bear probability is not a downside probability; do not invert it and do not use 1-p.
+- Keep the existing VERDICT boundary and keys; do not add new canonical body fields or machine-readable keys.
 Output:
 1) Tally analyst verdicts and compute bull/bear ratio.
 2) Briefly assess smart money vs retail sentiment divergence as supplementary context.

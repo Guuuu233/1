@@ -102,11 +102,15 @@ def _run_dual_job(
     query=None,
     user_intent=None,
     stream_events=False,
+    collector_context=None,
+    structured_factory=None,
 ):
     job_id = f"dual-{uuid4().hex}"
     store = InMemoryJobStore()
     collector = MagicMock()
-    collector.collect.return_value = {"market_data_context": {"source": "fixture"}}
+    collector.collect.return_value = {
+        "market_data_context": collector_context or {"source": "fixture"}
+    }
     saved_reports = []
     db = MagicMock()
     _FakeTradingGraph.collector = collector
@@ -128,12 +132,15 @@ def _run_dual_job(
         saved_reports.append(kwargs)
 
     def structured_for(final_trade_decision, *_args, **_kwargs):
+        if structured_factory is not None:
+            return structured_factory(final_trade_decision)
         horizon = "short" if "short" in final_trade_decision else "medium"
         return report_service.StructuredReport(
             decision="BUY" if horizon == "short" else "SELL",
             confidence=80 if horizon == "short" else 60,
             probability=0.8 if horizon == "short" else 0.4,
             data_gaps=[f"{horizon} LLM gap"],
+            falsification_conditions=[f"{horizon} falsification condition"],
             not_applicable=horizon == "medium",
         )
 
@@ -182,6 +189,16 @@ def test_dual_job_keeps_horizon_scoped_fields_and_propagates_result_sse_and_repo
     assert result["medium_term"]["decision"] == "SELL"
     assert result["short_term"]["not_applicable"] is False
     assert result["medium_term"]["not_applicable"] is True
+    assert result["not_applicable"] is False
+    assert result["not_applicable_by_horizon"] == {"short": False, "medium": True}
+    assert result["falsification_conditions_by_horizon"] == {
+        "short": ["short falsification condition"],
+        "medium": ["medium falsification condition"],
+    }
+    assert result["falsification_conditions"] == [
+        "short falsification condition",
+        "medium falsification condition",
+    ]
     assert "direction" not in result
     assert "confidence" not in result
     assert "decision" not in result
@@ -201,10 +218,49 @@ def test_dual_job_keeps_horizon_scoped_fields_and_propagates_result_sse_and_repo
     assert saved_reports[0]["result_data"] == result
     assert saved_reports[0]["decision"] is None
     assert saved_reports[0]["data_gaps"] == result["data_gaps"]
+    assert saved_reports[0]["falsification_conditions"] == result["falsification_conditions"]
     assert saved_reports[0]["not_applicable"] is False
     assert collector.collect.call_args.kwargs["horizons"] == ["short", "medium"]
     assert any('"mode": "dual_horizon"' in chunk for chunk in chunks)
     assert any('"data_gaps": ["short LLM gap", "medium LLM gap"]' in chunk for chunk in chunks)
+
+
+def test_dual_job_uses_graph_signal_when_structured_report_is_empty():
+    job, saved_reports, chunks, _collector, _partial_updates = _run_dual_job(
+        structured_factory=lambda _decision: report_service.StructuredReport(),
+    )
+
+    result = job["result"]
+    assert job["status"] == "completed"
+    assert result["short_term"]["decision"] == "BUY"
+    assert result["medium_term"]["decision"] == "SELL"
+    assert result["short_term"]["confidence"] is None
+    assert result["medium_term"]["confidence"] is None
+    assert "HOLD" not in {result["short_term"]["decision"], result["medium_term"]["decision"]}
+    assert saved_reports[0]["result_data"] == result
+    assert any('"decision": "BUY"' in chunk for chunk in chunks)
+
+
+def test_dual_job_merges_collector_failure_ledger_into_result_sse_and_reportdb():
+    collector_context = {
+        "source": "fixture",
+        "data_failure_ledger": [
+            {"source": "news", "status": "timeout", "reason": "provider timeout"},
+        ],
+    }
+    job, saved_reports, chunks, _collector, _partial_updates = _run_dual_job(
+        collector_context=collector_context,
+    )
+
+    expected_gap = "【数据获取失败】news：provider timeout"
+    result = job["result"]
+    assert result["data_gaps"] == [
+        expected_gap,
+        "short LLM gap",
+        "medium LLM gap",
+    ]
+    assert saved_reports[0]["data_gaps"] == result["data_gaps"]
+    assert any(expected_gap in chunk for chunk in chunks)
 
 
 def test_dual_job_allows_partial_result_with_failed_horizon_status_and_impact():
