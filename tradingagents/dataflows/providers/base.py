@@ -2,6 +2,31 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Optional
 
+
+@dataclass(frozen=True)
+class ProviderResourcePolicy:
+    """每个 provider 独立的外部调用超时/重试/并发上限。"""
+
+    timeout_seconds: float
+    max_retries: int
+    max_concurrency: int
+
+    def __post_init__(self) -> None:
+        if self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if self.max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
+        if self.max_concurrency < 1:
+            raise ValueError("max_concurrency must be at least 1")
+
+
+DEFAULT_PROVIDER_RESOURCE_POLICY = ProviderResourcePolicy(
+    timeout_seconds=60.0,
+    max_retries=1,
+    max_concurrency=4,
+)
+
+
 @dataclass
 class DataResult:
     """所有数据接口的统一返回类型。"""

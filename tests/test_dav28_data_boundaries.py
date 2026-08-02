@@ -590,6 +590,7 @@ def test_route_generic_value_error_still_falls_back():
     the next vendor without conflating them with duplicate-bar conflicts.
     """
     from tradingagents.dataflows import interface as iface
+    from tradingagents.dataflows.providers.base import ProviderResourcePolicy
 
     broken = MagicMock()
     broken.is_placeholder = False
@@ -604,6 +605,12 @@ def test_route_generic_value_error_still_falls_back():
             "cn_akshare": broken,
             "cn_investoday": second,
         }[name]
+        # DAV-44: each vendor carries its own resource policy (retry budget).
+        # max_retries=0 keeps the original "generic error is not retried on the
+        # same vendor" expectation from the pre-DAV-44 router contract.
+        reg.resource_policy.return_value = ProviderResourcePolicy(
+            timeout_seconds=1.0, max_retries=0, max_concurrency=1
+        )
         out = iface.route_to_vendor(
             "get_stock_data", "600519", "2026-07-01", "2026-07-28"
         )

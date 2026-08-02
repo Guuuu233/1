@@ -1,8 +1,14 @@
+from concurrent.futures import ThreadPoolExecutor
 import os
+import threading
 
 from .alpha_vantage_common import AlphaVantageRateLimitError
 from .config import get_config
-from .providers import build_default_registry
+from .providers import (
+    DEFAULT_PROVIDER_RESOURCE_POLICY,
+    ProviderResourcePolicy,
+    build_default_registry,
+)
 from .trade_calendar import (
     DuplicateBarConflictError,
     is_historical_analysis_date,
@@ -66,6 +72,16 @@ TOOLS_CATEGORIES = {
 _registry = build_default_registry()
 
 VENDOR_LIST = _registry.list_names()
+
+PROVIDER_CALL_EXECUTOR_MAX_WORKERS = int(
+    os.getenv("TA_PROVIDER_MAX_WORKERS", "8")
+)
+_PROVIDER_CALL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=PROVIDER_CALL_EXECUTOR_MAX_WORKERS,
+    thread_name_prefix="provider-call",
+)
+_PROVIDER_SEMAPHORES: dict[tuple[str, int], threading.BoundedSemaphore] = {}
+_PROVIDER_SEMAPHORE_LOCK = threading.Lock()
 
 
 def _is_trace_enabled() -> bool:
@@ -265,6 +281,49 @@ def _historical_near_window_news_refusal(
     return f"【数据获取失败】{reason}"
 
 
+def _resource_policy_for(provider_name: str) -> ProviderResourcePolicy:
+    resolver = getattr(_registry, "resource_policy", None)
+    if callable(resolver):
+        candidate = resolver(provider_name)
+        if isinstance(candidate, ProviderResourcePolicy):
+            return candidate
+    return DEFAULT_PROVIDER_RESOURCE_POLICY
+
+
+def _provider_semaphore(
+    provider_name: str, max_concurrency: int
+) -> threading.BoundedSemaphore:
+    with _PROVIDER_SEMAPHORE_LOCK:
+        key = (provider_name, max_concurrency)
+        semaphore = _PROVIDER_SEMAPHORES.get(key)
+        if semaphore is None:
+            semaphore = threading.BoundedSemaphore(max_concurrency)
+            _PROVIDER_SEMAPHORES[key] = semaphore
+        return semaphore
+
+
+def _submit_provider_call(
+    provider_name: str,
+    policy: ProviderResourcePolicy,
+    impl_func,
+    args: tuple,
+    kwargs: dict,
+):
+    """Run one provider call under a hard per-provider concurrency bound."""
+    semaphore = _provider_semaphore(provider_name, policy.max_concurrency)
+    if not semaphore.acquire(timeout=policy.timeout_seconds):
+        raise TimeoutError(f"{provider_name} concurrency slot unavailable")
+    try:
+        future = _PROVIDER_CALL_EXECUTOR.submit(
+            lambda: impl_func(*args, **kwargs)
+        )
+    except BaseException:
+        semaphore.release()
+        raise
+    future.add_done_callback(lambda _: semaphore.release())
+    return future
+
+
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to provider implementations with fallback support."""
     category = get_category_for_method(method)
@@ -304,37 +363,64 @@ def route_to_vendor(method: str, *args, **kwargs):
             _trace(f"method={method} {args_summary} vendor={vendor} status=skip reason=not-implemented")
             continue
 
-        try:
-            result = impl_func(*args, **kwargs)
-            _trace(f"method={method} {args_summary} vendor={vendor} status=hit")
-            return result
-        except DuplicateBarConflictError as exc:
-            # Data-integrity conflict (same date, different OHLCV/Volume): this is
-            # an explicit refusal, not a transient provider failure. Do not fall
-            # back to another vendor, which would silently mask the conflict by
-            # using a different source's row order.
-            _trace(
-                f"method={method} {args_summary} vendor={vendor} "
-                "status=unavailable reason=duplicate-bar-conflict"
-            )
-            return f"【数据获取失败】{exc}，本项不可用。"
-        except (AlphaVantageRateLimitError, NotImplementedError) as exc:
-            last_exc = exc
-            # Try next provider for transient/routing issues or placeholder providers.
-            _trace(
-                f"method={method} {args_summary} vendor={vendor} status=fallback "
-                f"reason={type(exc).__name__}: {exc}"
-            )
-            continue
-        except Exception as exc:  # noqa: BLE001 - router-level boundary, logged below
-            # Provider-specific runtime/parsing errors (e.g., schema changes, KeyError)
-            # should not terminate the full chain; fall through to next vendor.
-            last_exc = exc
-            _trace(
-                f"method={method} {args_summary} vendor={vendor} status=fallback "
-                f"reason={type(exc).__name__}: {exc}"
-            )
-            continue
+        policy = _resource_policy_for(vendor)
+        for attempt in range(policy.max_retries + 1):
+            future = None
+            try:
+                future = _submit_provider_call(
+                    vendor, policy, impl_func, args, kwargs
+                )
+                result = future.result(timeout=policy.timeout_seconds)
+                _trace(f"method={method} {args_summary} vendor={vendor} status=hit")
+                return result
+            except (AlphaVantageRateLimitError, NotImplementedError) as exc:
+                last_exc = exc
+                # Try next provider for transient/routing issues or placeholder providers.
+                _trace(
+                    f"method={method} {args_summary} vendor={vendor} status=fallback "
+                    f"reason={type(exc).__name__}: {exc}"
+                )
+                break
+            except TimeoutError as exc:
+                last_exc = exc
+                if future is not None:
+                    future.cancel()
+                _trace(
+                    f"method={method} {args_summary} vendor={vendor} "
+                    f"status=provider-timeout attempt={attempt + 1}/"
+                    f"{policy.max_retries + 1} reason=TimeoutError"
+                )
+                if attempt < policy.max_retries:
+                    continue
+                _trace(
+                    f"method={method} {args_summary} vendor={vendor} "
+                    "status=fallback reason=TimeoutError"
+                )
+                break
+            except DuplicateBarConflictError as exc:
+                # Data-integrity conflict (same date, different OHLCV/Volume): this
+                # is an explicit refusal, not a transient provider failure. Do not
+                # retry or fall back to another vendor, which would silently mask
+                # the conflict by using a different source's row order.
+                _trace(
+                    f"method={method} {args_summary} vendor={vendor} "
+                    "status=unavailable reason=duplicate-bar-conflict"
+                )
+                return f"【数据获取失败】{exc}，本项不可用。"
+            except Exception as exc:
+                last_exc = exc
+                _trace(
+                    f"method={method} {args_summary} vendor={vendor} "
+                    f"status=provider-error attempt={attempt + 1}/"
+                    f"{policy.max_retries + 1} reason={type(exc).__name__}: {exc}"
+                )
+                if attempt < policy.max_retries:
+                    continue
+                _trace(
+                    f"method={method} {args_summary} vendor={vendor} "
+                    f"status=fallback reason={type(exc).__name__}: {exc}"
+                )
+                break
 
     _trace(f"method={method} {args_summary} status=failed reason=no-available-vendor")
     if last_exc is not None:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
+import copy
 from datetime import datetime, timedelta, timezone
 import math
 from typing import Any, Dict, List, Optional
@@ -52,6 +53,7 @@ LONG_DAYS = 90
 # 设硬上限，否则卡死线程会拿着 per-key 锁把后续同标的分析全部拖死，
 # 并逐渐占满 asyncio 默认线程池（生产事故：64/64 全部僵死 → 前端 524）。
 FETCH_ALL_TIMEOUT = int(os.getenv("TA_DATA_FETCH_TIMEOUT", "300"))
+FETCH_MAX_WORKERS = int(os.getenv("TA_DATA_FETCH_MAX_WORKERS", "10"))
 
 import numpy as np
 
@@ -485,7 +487,7 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
     fetch_start = time.time()
     # 减少并发池大小，避免被反爬
-    executor = ThreadPoolExecutor(max_workers=min(10, len(tasks)))
+    executor = ThreadPoolExecutor(max_workers=min(FETCH_MAX_WORKERS, len(tasks)))
     try:
         future_to_key = {executor.submit(_safe, tool, payload): key for key, (tool, payload) in tasks.items()}
         done, not_done = futures_wait(set(future_to_key), timeout=FETCH_ALL_TIMEOUT)
@@ -496,8 +498,9 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
             results[key] = f"{key} 数据拉取超时（>{FETCH_ALL_TIMEOUT}s），本次分析跳过该数据源"
             print(f"  [Warning] {key} fetch timed out after {FETCH_ALL_TIMEOUT}s, skipped")
     finally:
-        # wait=False：卡死的抓取线程留给 socket 超时自行了断，绝不反过来堵住本线程
-        executor.shutdown(wait=False, cancel_futures=True)
+        # Provider routing has bounded timeouts, so completing the executor here
+        # is finite and keeps stuck worker/socket threads from outliving the job.
+        executor.shutdown(wait=True, cancel_futures=True)
 
     # ── Parse CSV once, reuse for indicators and VPA ──────────────────
     raw_csv = results.get("stock_data", "")
@@ -613,13 +616,14 @@ class DataCollector:
         try:
             if key not in self._cache:
                 self._cache[key] = _fetch_all(ticker, trade_date)
-            return self._cache[key]
+            return copy.deepcopy(self._cache[key])
         finally:
             key_lock.release()
 
     def get(self, ticker: str, trade_date: str) -> Optional[Dict[str, Any]]:
         """Retrieve cached pool, or None if not collected yet."""
-        return self._cache.get(make_cache_key(ticker, trade_date))
+        cached = self._cache.get(make_cache_key(ticker, trade_date))
+        return None if cached is None else copy.deepcopy(cached)
 
     def get_window(
         self,
@@ -629,7 +633,7 @@ class DataCollector:
     ) -> Dict[str, Any]:
         """Return pool copy annotated with horizon window metadata."""
         days = SHORT_DAYS if horizon == "short" else LONG_DAYS
-        result = dict(pool)
+        result = copy.deepcopy(pool)
         result["_data_window"] = f"{days}天"
         result["_horizon"] = horizon
         return result
@@ -648,8 +652,6 @@ class DataCollector:
             if count <= 0:
                 self._cache.pop(key, None)
                 self._refcounts.pop(key, None)
-                # 不删除 _locks[key]：其他线程可能仍持有该锁的引用，
-                # 删除会导致新 collect() 创建新锁，破坏互斥。
-                # 锁对象很轻量，留着不影响内存。
+                self._locks.pop(key, None)
             else:
                 self._refcounts[key] = count
