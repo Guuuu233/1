@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Smoke test script for TradingAgents data providers.
 
-Offline by default: run provider *dispatch fixture checks* only and do not call
-real data sources. Set LIVE=1 to exercise real providers.
+Offline by default (CI): provider methods are stubbed with deterministic
+success values, then every probe is routed through route_to_vendor() so the
+configured provider chain, primary source, and fallback behavior are actually
+exercised without touching external data sources. Set LIVE=1 to opt in to real
+provider calls; CI never sets LIVE.
 
 Exit semantics: a data item passes only when every probe symbol passes; any
-failure (missing method, non-falsy/失败 response, or exception) makes the item
-fail, is reported with its symbol and error, and makes the script exit non-zero.
+failure (missing configured source, fallback failure, non-falsy/失败 response,
+or exception) makes the item fail, is reported with its symbol and error, and
+makes the script exit non-zero.
 """
 
 import os
@@ -18,7 +22,13 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from tradingagents.dataflows.interface import _registry, route_to_vendor
+from tradingagents.dataflows.interface import (
+    _registry,
+    _resolve_vendor_chain,
+    get_category_for_method,
+    get_vendor,
+    route_to_vendor,
+)
 
 TEST_SYMBOLS = ["600519", "000001", "300750"]
 METHODS = [
@@ -43,11 +53,71 @@ def _is_offline() -> bool:
     return os.environ.get("LIVE", "").strip().lower() not in ("1", "true", "yes")
 
 
-def _method_available(method_name: str) -> bool:
-    return any(
-        hasattr(_registry.get(name), method_name)
-        for name in _registry.list_names()
-    )
+def _offline_provider_result(provider_name: str, method_name: str):
+    def _result(*args, **kwargs):
+        return {
+            "ok": True,
+            "source": provider_name,
+            "method": method_name,
+        }
+
+    return _result
+
+
+def _install_offline_providers():
+    """Temporarily stub every probed method so route_to_vendor can run offline."""
+    saved = {}
+    try:
+        for provider_name in _registry.list_names():
+            provider = _registry.get(provider_name)
+            saved[provider_name] = {}
+            for _, method_name, _ in METHODS:
+                if hasattr(provider, method_name):
+                    saved[provider_name][method_name] = getattr(provider, method_name)
+                    setattr(
+                        provider,
+                        method_name,
+                        _offline_provider_result(provider_name, method_name),
+                    )
+    except Exception:
+        _restore_offline_providers(saved)
+        raise
+    return saved
+
+
+def _restore_offline_providers(saved):
+    for provider_name, methods in saved.items():
+        provider = _registry.get(provider_name)
+        if provider is None:
+            continue
+        for method_name, original in methods.items():
+            setattr(provider, method_name, original)
+
+
+def _offline_expected_source(method_name: str):
+    """Return the provider route_to_vendor should hit for an offline probe."""
+    category = get_category_for_method(method_name)
+    configured = get_vendor(category, method_name)
+    chain = _resolve_vendor_chain(method_name, configured)
+    for provider_name in chain:
+        provider = _registry.get(provider_name)
+        if provider is not None and hasattr(provider, method_name):
+            return provider_name, chain
+    return None, chain
+
+
+def _offline_source_error(result, expected_source, chain):
+    if expected_source is None:
+        return f"配置链 {chain} 无 provider 实现该方法"
+    if _is_failure_result(result):
+        return f"离线 route_to_vendor 返回失败结果 {str(result)[:120]!r}"
+    actual_source = result.get("source") if isinstance(result, dict) else None
+    if actual_source != expected_source:
+        return (
+            f"离线 route_to_vendor 未命中配置源 {expected_source}, "
+            f"实际 source={actual_source!r}, chain={chain}"
+        )
+    return None
 
 
 _FAILURE_MARKERS = (
@@ -100,44 +170,60 @@ def run_checks():
     today = datetime.now().strftime("%Y-%m-%d")
     offline = _is_offline()
     results = []
+    saved_offline = {}
+    if offline:
+        saved_offline = _install_offline_providers()
 
-    for label, method_name, arg_builder in METHODS:
-        passed = 0
-        failed = 0
-        total_time = 0.0
-        errors = []
+    try:
+        for label, method_name, arg_builder in METHODS:
+            passed = 0
+            failed = 0
+            total_time = 0.0
+            errors = []
 
-        for symbol in TEST_SYMBOLS:
-            args = arg_builder(symbol, today)
-            start_t = time.time()
-            try:
-                if offline:
-                    if _method_available(method_name):
-                        passed += 1
+            for symbol in TEST_SYMBOLS:
+                args = arg_builder(symbol, today)
+                start_t = time.time()
+                try:
+                    if offline:
+                        res = route_to_vendor(method_name, *args)
+                        expected_source, chain = _offline_expected_source(method_name)
+                        error = _offline_source_error(
+                            res, expected_source, chain
+                        )
+                        if error:
+                            failed += 1
+                            errors.append(f"{symbol}: {error}")
+                        else:
+                            passed += 1
                     else:
-                        failed += 1
-                        errors.append(f"{symbol}: registry 无 provider 实现该方法")
-                else:
-                    res = route_to_vendor(method_name, *args)
-                    elapsed = time.time() - start_t
-                    total_time += elapsed
-                    if _is_failure_result(res):
-                        failed += 1
-                        errors.append(f"{symbol}: 返回失败结果 {str(res)[:120]!r}")
-                    else:
-                        passed += 1
-            except Exception as e:
-                failed += 1
-                errors.append(f"{symbol}: {type(e).__name__}: {e}")
+                        res = route_to_vendor(method_name, *args)
+                        elapsed = time.time() - start_t
+                        total_time += elapsed
+                        if _is_failure_result(res):
+                            failed += 1
+                            errors.append(
+                                f"{symbol}: 返回失败结果 {str(res)[:120]!r}"
+                            )
+                        else:
+                            passed += 1
+                except Exception as e:
+                    failed += 1
+                    errors.append(f"{symbol}: {type(e).__name__}: {e}")
 
-        results.append({
-            "label": label,
-            "method_name": method_name,
-            "passed": passed,
-            "failed": failed,
-            "avg_time": (total_time / len(TEST_SYMBOLS)) if TEST_SYMBOLS else 0.0,
-            "errors": errors,
-        })
+            results.append({
+                "label": label,
+                "method_name": method_name,
+                "passed": passed,
+                "failed": failed,
+                "avg_time": (
+                    total_time / len(TEST_SYMBOLS) if TEST_SYMBOLS else 0.0
+                ),
+                "errors": errors,
+            })
+    finally:
+        if offline:
+            _restore_offline_providers(saved_offline)
 
     return results
 

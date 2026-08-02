@@ -27,7 +27,15 @@ class _Provider:
         self.name = name
         self.is_placeholder = False
         for method in methods:
-            setattr(self, method, lambda *a, **k: {"ok": True})
+            setattr(
+                self,
+                method,
+                lambda *a, _method=method, **k: {
+                    "ok": True,
+                    "source": self.name,
+                    "method": _method,
+                },
+            )
 
 
 class _FakeRegistry:
@@ -54,9 +62,16 @@ def smoke():
     stub_interface = types.ModuleType("tradingagents.dataflows.interface")
     stub_interface._registry = _FakeRegistry([])
     registry_holder["registry"] = stub_interface._registry
+    registry_holder["route_calls"] = 0
     stub_interface._registry_holder = registry_holder
+    stub_interface.get_category_for_method = lambda method: "stub"
+    stub_interface.get_vendor = lambda category, method=None: "stub"
+    stub_interface._resolve_vendor_chain = (
+        lambda method, configured: [configured] if configured else []
+    )
 
     def _route_to_vendor(method, *args, **kwargs):
+        registry_holder["route_calls"] += 1
         registry = registry_holder["registry"]
         for provider in registry.list_names():
             fn = getattr(registry.get(provider), method, None)
@@ -72,6 +87,8 @@ def smoke():
     try:
         spec.loader.exec_module(module)
         module._registry_holder = registry_holder
+        module._install_offline_providers = lambda: {}
+        module._restore_offline_providers = lambda saved: None
         yield module
     finally:
         for name in list(sys.modules):
@@ -134,6 +151,9 @@ def test_all_items_pass_in_offline_mode_exits_zero(smoke, offline_env):
     assert rc == 0
     assert output.count("✅ 正常") == len(smoke.METHODS)
     assert "smoke-result: PASS" in output
+    assert smoke._registry_holder["route_calls"] == (
+        len(smoke.METHODS) * len(smoke.TEST_SYMBOLS)
+    )
 
 
 def test_partial_failure_is_failure_and_exits_nonzero(smoke, offline_env):
@@ -148,9 +168,56 @@ def test_partial_failure_is_failure_and_exits_nonzero(smoke, offline_env):
     assert "smoke-result: FAIL" in output
     assert "❌ 失败" in output
     assert "新闻资讯/get_news" in output
-    assert "registry 无 provider 实现该方法" in output
+    assert "无 provider 实现该方法" in output
     # The pass count is still reported per item; the status must not say OK
     # merely because some symbols passed.
+    assert output.count("✅ 正常") == len(smoke.METHODS) - 1
+
+
+def test_offline_primary_missing_method_falls_back_to_configured_source(
+    smoke, offline_env
+):
+    # Offline mode must exercise the config chain: a missing primary should
+    # fall through to the configured fallback and still pass with the source
+    # that actually handled the probe.
+    smoke.get_vendor = lambda category, method=None: "primary"
+    smoke._resolve_vendor_chain = lambda method, configured: [
+        "primary",
+        "fallback",
+    ]
+    all_methods = [method_name for _, method_name, _ in smoke.METHODS]
+    missing = "get_news"
+    _registry_with(
+        smoke,
+        {
+            "primary": [m for m in all_methods if m != missing],
+            "fallback": all_methods,
+        },
+    )
+
+    rc, output = _captured_run(smoke)
+
+    assert rc == 0
+    assert "smoke-result: PASS" in output
+    assert smoke._registry_holder["route_calls"] == (
+        len(smoke.METHODS) * len(smoke.TEST_SYMBOLS)
+    )
+
+
+def test_offline_route_failure_is_failure_and_exits_nonzero(smoke, offline_env):
+    # Offline mode must treat a failed route_to_vendor result as a hard failure
+    # instead of only checking that a method exists in the registry.
+    all_methods = [method_name for _, method_name, _ in smoke.METHODS]
+    _registry_with(smoke, {"stub": all_methods})
+    smoke._registry.get("stub").get_news = lambda *a, **k: {"ok": False}
+
+    rc, output = _captured_run(smoke)
+
+    assert rc == 1
+    assert "smoke-result: FAIL" in output
+    assert "新闻资讯/get_news" in output
+    assert "返回失败结果" in output
+    assert output.count("❌ 失败") == 1
     assert output.count("✅ 正常") == len(smoke.METHODS) - 1
 
 

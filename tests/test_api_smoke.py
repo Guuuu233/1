@@ -699,7 +699,8 @@ class TestPortfolioOverviewEndpoint:
             )
             db.commit()
 
-        response = self.client.get("/v1/portfolio/overview", headers=self.headers)
+        with patch("api.main._get_reverse_stock_map", return_value=self.code_to_name):
+            response = self.client.get("/v1/portfolio/overview", headers=self.headers)
 
         assert response.status_code == 200
         body = response.json()
@@ -710,6 +711,34 @@ class TestPortfolioOverviewEndpoint:
         assert body["scheduled"][0]["has_imported_context"] is True
         assert [item["symbol"] for item in body["latest_reports"]] == ["600519.SH", "300750.SZ"]
         assert body["portfolio_import"]["summary"]["positions"] == 1
+
+    def test_overview_resolves_names_with_cold_stock_map(self):
+        from api import main as main_mod
+
+        self._add_watchlist("600519.SH")
+
+        # Use a fresh user's data and explicitly clear the module-level cache so
+        # this test cannot pass by reusing a warm cache from earlier tests.
+        main_mod._cn_stock_map = None
+        main_mod._cn_stock_reverse_map = None
+        main_mod._cn_stock_map_loaded_at = 0
+
+        def _load_offline_map():
+            main_mod._cn_stock_map = dict(self.name_to_code)
+            main_mod._cn_stock_reverse_map = dict(self.code_to_name)
+            main_mod._cn_stock_map_loaded_at = time.time()
+            return main_mod._cn_stock_map
+
+        with patch.object(
+            main_mod, "_load_cn_stock_map", side_effect=_load_offline_map
+        ) as load_map:
+            response = self.client.get("/v1/portfolio/overview", headers=self.headers)
+
+        assert response.status_code == 200
+        assert load_map.called
+        body = response.json()
+        assert body["watchlist"][0]["symbol"] == "600519.SH"
+        assert body["watchlist"][0]["name"] == "贵州茅台"
 
 
 class TestScheduledBatchEndpoints:
