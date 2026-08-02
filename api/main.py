@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
+import ipaddress
 import json
 import os
 import re
 import socket
 import traceback
+import urllib.parse
 from contextlib import asynccontextmanager
 from io import StringIO
 from pathlib import Path
@@ -4926,6 +4929,270 @@ def update_runtime_config(
 
 
 
+_MODELS_FETCH_ALLOWLIST_ENV = "TA_MODELS_FETCH_ALLOWLIST"
+_MODELS_FETCH_TIMEOUT_SECONDS = 8.0
+_MODELS_FETCH_DEFAULT_URL = "http://host.docker.internal:8317/v1"
+_MODELS_FETCH_GENERIC_ERROR = "无法获取模型列表"
+_MODELS_FETCH_METADATA_IPS = frozenset({"169.254.169.254", "fd00:ec2::254"})
+
+
+class _ModelsFetchError(Exception):
+    """Internal marker; API responses must expose only the generic message."""
+
+
+def _split_models_allowlist_entry(raw: str) -> tuple[str, Optional[int]]:
+    entry = raw.strip()
+    if not entry or any(ch in entry for ch in "/?#@"):
+        raise _ModelsFetchError("invalid allowlist entry")
+    if entry.startswith("["):
+        end = entry.find("]")
+        if end == -1:
+            raise _ModelsFetchError("invalid IPv6 allowlist entry")
+        host = entry[1:end].strip().casefold().rstrip(".")
+        suffix = entry[end + 1:].strip()
+        if not suffix:
+            return host, None
+        if not suffix.startswith(":"):
+            raise _ModelsFetchError("invalid allowlist port")
+        port_text = suffix[1:].strip()
+    else:
+        colon_count = entry.count(":")
+        if colon_count == 0:
+            host = entry.casefold().rstrip(".")
+            port_text = None
+        elif colon_count == 1:
+            host_text, port_text = entry.rsplit(":", 1)
+            host = host_text.strip().casefold().rstrip(".")
+        else:
+            host = entry.casefold().rstrip(".")
+            port_text = None
+    if not host:
+        raise _ModelsFetchError("empty allowlist host")
+    if port_text is not None:
+        if not port_text.isdigit():
+            raise _ModelsFetchError("invalid allowlist port")
+        port = int(port_text)
+        if not 1 <= port <= 65535:
+            raise _ModelsFetchError("allowlist port out of range")
+        return host, port
+    return host, None
+
+
+def _parse_models_fetch_allowlist(raw: Optional[str] = None) -> Optional[Dict[str, set[Optional[int]]]]:
+    raw_value = (raw if raw is not None else os.getenv(_MODELS_FETCH_ALLOWLIST_ENV, "")).strip()
+    if not raw_value:
+        return None
+    allow_by_host: Dict[str, set[Optional[int]]] = {}
+    for raw_entry in re.split(r"[,;]", raw_value):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        host, port = _split_models_allowlist_entry(entry)
+        allow_by_host.setdefault(host, set()).add(port)
+    return allow_by_host or None
+
+
+def _parse_models_fetch_url(base_url: str) -> urllib.parse.SplitResult:
+    url = (base_url or "").strip()
+    if not url:
+        raise _ModelsFetchError("empty base_url")
+    if any(ch in url for ch in ("\x00", "\r", "\n")):
+        raise _ModelsFetchError("invalid control characters")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        explicit_port = parsed.port
+    except ValueError as exc:
+        raise _ModelsFetchError("invalid base_url") from exc
+    if parsed.scheme not in ("http", "https"):
+        raise _ModelsFetchError("unsupported scheme")
+    host = parsed.hostname
+    if not host or any(ch.isspace() for ch in host):
+        raise _ModelsFetchError("missing or invalid host")
+    if parsed.username is not None or parsed.password is not None:
+        raise _ModelsFetchError("credentials not allowed")
+    if parsed.query or parsed.fragment:
+        raise _ModelsFetchError("query and fragment not allowed")
+    if explicit_port is not None and not 1 <= explicit_port <= 65535:
+        raise _ModelsFetchError("port out of range")
+    return parsed
+
+
+def _models_fetch_port(parsed: urllib.parse.SplitResult) -> int:
+    return parsed.port or (443 if parsed.scheme == "https" else 80)
+
+
+def _models_fetch_host_allowed(
+    host: str,
+    port: int,
+    allowlist: Dict[str, set[Optional[int]]],
+) -> bool:
+    allowed_ports = allowlist.get(host.casefold().rstrip("."))
+    if allowed_ports is None:
+        return False
+    return None in allowed_ports or port in allowed_ports
+
+
+def _is_models_fetch_ip_blocked(ip_text: str) -> bool:
+    if ip_text in _MODELS_FETCH_METADATA_IPS:
+        return True
+    try:
+        ip = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return True
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return _is_models_fetch_ip_blocked(str(ip.ipv4_mapped))
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_unspecified
+        or ip.is_multicast
+        or not ip.is_global
+    )
+
+
+def _resolve_models_fetch_target(host: str, port: int) -> str:
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise _ModelsFetchError("DNS resolution failed") from exc
+    safe_ip: Optional[str] = None
+    for address in addresses:
+        ip_text = address[4][0]
+        if _is_models_fetch_ip_blocked(ip_text):
+            raise _ModelsFetchError("resolved address is blocked")
+        if safe_ip is None:
+            safe_ip = ip_text
+    if safe_ip is None:
+        raise _ModelsFetchError("no addresses resolved")
+    return safe_ip
+
+
+class _SafeHTTPConnection(http.client.HTTPConnection):
+    def __init__(
+        self,
+        host: str,
+        port: Optional[int] = None,
+        timeout: Optional[float] = None,
+        source_address=None,
+        blocksize: int = 8192,
+        safe_ip: Optional[str] = None,
+    ) -> None:
+        super().__init__(host, port, timeout=timeout, source_address=source_address, blocksize=blocksize)
+        self._safe_ip = safe_ip or self.host
+        self._create_connection = self._safe_create_connection
+
+    def _safe_create_connection(self, address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+        return socket.create_connection((self._safe_ip, self.port), timeout, source_address)
+
+
+class _SafeHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(
+        self,
+        host: str,
+        port: Optional[int] = None,
+        *,
+        timeout: Optional[float] = None,
+        source_address=None,
+        context=None,
+        blocksize: int = 8192,
+        safe_ip: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            host,
+            port,
+            timeout=timeout,
+            source_address=source_address,
+            context=context,
+            blocksize=blocksize,
+        )
+        self._safe_ip = safe_ip or self.host
+        self._create_connection = self._safe_create_connection
+
+    def _safe_create_connection(self, address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+        return socket.create_connection((self._safe_ip, self.port), timeout, source_address)
+
+
+def _build_models_fetch_connection(
+    scheme: str,
+    host: str,
+    port: int,
+    safe_ip: str,
+    timeout: float,
+) -> http.client.HTTPConnection:
+    if scheme == "https":
+        return _SafeHTTPSConnection(host, port, timeout=timeout, safe_ip=safe_ip)
+    return _SafeHTTPConnection(host, port, timeout=timeout, safe_ip=safe_ip)
+
+
+def _models_fetch_path(parsed: urllib.parse.SplitResult) -> str:
+    path = (parsed.path or "").rstrip("/")
+    if path.endswith("/models"):
+        return path
+    if path.endswith("/v1"):
+        return f"{path}/models"
+    return f"{path}/v1/models" if path else "/v1/models"
+
+
+def _models_fetch_url(parsed: urllib.parse.SplitResult, path: str) -> str:
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _extract_models_from_payload(body: str) -> list[str]:
+    data = json.loads(body)
+    models: list[str] = []
+    if isinstance(data, dict) and isinstance(data.get("data"), list):
+        items = data["data"]
+    elif isinstance(data, list):
+        items = data
+    else:
+        return models
+    for item in items:
+        if isinstance(item, dict) and "id" in item:
+            models.append(str(item["id"]))
+        elif isinstance(item, str):
+            models.append(item)
+    return models
+
+
+def _fetch_available_models(base_url: str, api_key: str) -> tuple[list[str], str]:
+    allowlist = _parse_models_fetch_allowlist()
+    if allowlist is None:
+        raise _ModelsFetchError("models fetch allowlist is not configured")
+    parsed = _parse_models_fetch_url(base_url)
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    port = _models_fetch_port(parsed)
+    if not _models_fetch_host_allowed(host, port, allowlist):
+        raise _ModelsFetchError("host is not allowlisted")
+    safe_ip = _resolve_models_fetch_target(host, port)
+    path = _models_fetch_path(parsed)
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    conn: Optional[http.client.HTTPConnection] = None
+    try:
+        conn = _build_models_fetch_connection(
+            parsed.scheme,
+            host,
+            port,
+            safe_ip,
+            _MODELS_FETCH_TIMEOUT_SECONDS,
+        )
+        conn.request("GET", path, headers=headers)
+        response = conn.getresponse()
+        body = response.read().decode("utf-8")
+        if response.status < 200 or response.status >= 300:
+            raise _ModelsFetchError(f"HTTP status {response.status}")
+        models = _extract_models_from_payload(body)
+        return sorted(set(models)), _models_fetch_url(parsed, path)
+    except (_ModelsFetchError, OSError, http.client.HTTPException, UnicodeDecodeError, ValueError) as exc:
+        raise _ModelsFetchError("model fetch failed") from exc
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 class FetchModelsRequest(BaseModel):
     base_url: Optional[str] = None
     api_key: Optional[str] = None
@@ -4938,10 +5205,7 @@ def fetch_available_models(
     db: Session = Depends(get_db),
     current_user: UserDB = Depends(_require_api_user),
 ):
-    """
-    从指定 Base URL 或 LLM 代理服务器自动抓取可用模型列表。
-    运行在 Docker 容器内时，自动将 localhost / 127.0.0.1 映射为 host.docker.internal。
-    """
+    """从白名单允许的 Base URL 抓取可用模型列表。"""
     base_url = (payload.base_url or "").strip()
     api_key = (payload.api_key or "").strip()
 
@@ -4963,70 +5227,28 @@ def fetch_available_models(
                 api_key = auth_service.decrypt_secret(user_cfg.llm_api_key_ciphertext) or ""
 
     if not base_url:
-        base_url = "http://host.docker.internal:8317/v1"
-
-    target_url = base_url.rstrip("/")
-    if os.path.exists("/.dockerenv") or os.environ.get("DOCKER_CONTAINER"):
-        target_url = target_url.replace("localhost", "host.docker.internal").replace("127.0.0.1", "host.docker.internal")
-
-    if not target_url.endswith("/models"):
-        if target_url.endswith("/v1"):
-            target_url = f"{target_url}/models"
-        else:
-            target_url = f"{target_url}/v1/models"
-
-    headers = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
+        base_url = _MODELS_FETCH_DEFAULT_URL
     try:
-        import urllib.request
-        import json
-        req = urllib.request.Request(target_url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=8) as response:
-            body = response.read().decode("utf-8")
-            data = json.loads(body)
-            models_list = []
-            if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
-                for item in data["data"]:
-                    if isinstance(item, dict) and "id" in item:
-                        models_list.append(str(item["id"]))
-                    elif isinstance(item, str):
-                        models_list.append(item)
-            elif isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict) and "id" in item:
-                        models_list.append(str(item["id"]))
-                    elif isinstance(item, str):
-                        models_list.append(item)
-
-            models_sorted = sorted(list(set(models_list)))
-            if models_sorted and current_user:
-                try:
-                    role_routing_service.sync_model_profiles_from_names(db, current_user.id, models_sorted)
-                except Exception as sync_err:
-                    print(f"[fetch_available_models] warning: auto-sync failed: {sync_err}")
-            return {
-                "ok": True,
-                "models": models_sorted,
-                "count": len(models_sorted),
-                "url": target_url,
-            }
+        models_sorted, target_url = _fetch_available_models(base_url, api_key)
     except Exception as exc:
-        err_msg = str(exc)
-        if hasattr(exc, "read"):
-            try:
-                err_body = exc.read().decode("utf-8")
-                err_msg = f"{err_msg} ({err_body})"
-            except Exception:
-                pass
+        logger.warning("[fetch_available_models] rejected: %s", exc)
         return {
             "ok": False,
-            "error": f"无法从 {target_url} 获取模型列表: {err_msg}",
+            "error": _MODELS_FETCH_GENERIC_ERROR,
             "models": [],
             "count": 0,
-            "url": target_url,
         }
+    if models_sorted and current_user:
+        try:
+            role_routing_service.sync_model_profiles_from_names(db, current_user.id, models_sorted)
+        except Exception as sync_err:
+            logger.warning("[fetch_available_models] model profile sync failed: %s", sync_err)
+    return {
+        "ok": True,
+        "models": models_sorted,
+        "count": len(models_sorted),
+        "url": target_url,
+    }
 
 
 @app.post("/v1/config/warmup", response_model=UserRuntimeWarmupResponse)
