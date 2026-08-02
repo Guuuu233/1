@@ -298,7 +298,8 @@ def test_get_zt_pool_rolls_back_and_labels_actual_date(monkeypatch):
         }
     )
     # empty DataFrame is truthy-check empty -> raise
-    text = _FixtureProvider(ak).get_zt_pool("2026-07-29")
+    with patch.object(tc, "now_cn", return_value=datetime(2026, 7, 29, 12, 0, tzinfo=tc.CN_TZ)):
+        text = _FixtureProvider(ak).get_zt_pool("2026-07-29")
     assert "【数据日期】2026-07-28" in text
     assert "请求 2026-07-29" in text
     assert "涨停家数：2" in text

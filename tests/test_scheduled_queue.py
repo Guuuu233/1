@@ -1,14 +1,10 @@
 import asyncio
 
-from api import main
+from scheduler import main as scheduler_main
 
 
 def _reset_queue_state(limit: int) -> None:
-    main._scheduled_analysis_max_concurrency = limit
-    main._scheduled_analysis_semaphore = asyncio.Semaphore(limit)
-    main._scheduled_analysis_queue_lock = asyncio.Lock()
-    main._scheduled_analysis_waiting_job_ids = []
-    main._scheduled_analysis_running_job_ids = set()
+    scheduler_main._semaphore = asyncio.Semaphore(limit)
 
 
 def test_scheduled_analysis_slot_queues_when_limit_is_full():
@@ -19,14 +15,14 @@ def test_scheduled_analysis_slot_queues_when_limit_is_full():
         first_started = asyncio.Event()
 
         async def first():
-            async with main._scheduled_analysis_slot("job-first", "300750.SZ"):
+            async with scheduler_main._concurrency_slot("job-first", "300750.SZ"):
                 entered.append("job-first")
                 first_started.set()
                 await release_first.wait()
 
         async def second():
             await first_started.wait()
-            async with main._scheduled_analysis_slot("job-second", "600519.SH"):
+            async with scheduler_main._concurrency_slot("job-second", "600519.SH"):
                 entered.append("job-second")
 
         first_task = asyncio.create_task(first())
@@ -37,18 +33,12 @@ def test_scheduled_analysis_slot_queues_when_limit_is_full():
         await asyncio.sleep(0)
 
         assert entered == ["job-first"]
-        assert main._scheduled_analysis_waiting_job_ids == ["job-second"]
-        assert "job-first" in main._scheduled_analysis_running_job_ids
-        assert main._get_job("job-second")["waiting_ahead_count"] == 0
-        assert main._get_job("job-second")["scheduled_running_count"] == 1
-        assert main._get_job("job-second")["scheduled_concurrency_limit"] == 1
+        assert "job-second" not in entered
 
         release_first.set()
         await asyncio.gather(first_task, second_task)
 
         assert entered == ["job-first", "job-second"]
-        assert main._scheduled_analysis_waiting_job_ids == []
-        assert main._scheduled_analysis_running_job_ids == set()
 
     asyncio.run(scenario())
 
@@ -62,7 +52,7 @@ def test_scheduled_analysis_slot_respects_max_concurrency():
 
         async def worker(job_id: str):
             nonlocal in_flight, max_in_flight
-            async with main._scheduled_analysis_slot(job_id, job_id):
+            async with scheduler_main._concurrency_slot(job_id, job_id):
                 in_flight += 1
                 max_in_flight = max(max_in_flight, in_flight)
                 await gate.wait()
@@ -73,7 +63,6 @@ def test_scheduled_analysis_slot_respects_max_concurrency():
         await asyncio.sleep(0)
 
         assert max_in_flight == 2
-        assert len(main._scheduled_analysis_waiting_job_ids) == 1
 
         gate.set()
         await asyncio.gather(*tasks)

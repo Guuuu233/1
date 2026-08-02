@@ -1,17 +1,75 @@
-name: Lint and Test (Disabled)
+name: CI quick gates
 
 on:
   pull_request:
-    branches: [ "main" ]
   push:
     branches: [ "main" ]
+  workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  placeholder:
+  quick-gates:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - name: Skip
-        run: echo "Lint checks are currently disabled."
+      - uses: actions/checkout@v7
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt pytest
+      - name: Python dependency/compile/import gate
+        run: |
+          python -m compileall -q api scheduler tradingagents tests
+          python -m pytest --collect-only -q
+      - name: Core offline backend tests
+        run: |
+          python -m pytest -q \
+            tests/test_api_smoke.py \
+            tests/test_portfolio_import.py \
+            tests/test_scheduler_overtime_lifecycle.py \
+            tests/test_scheduled_queue.py \
+            tests/test_watchlist_scheduled.py \
+            tests/test_job_store.py \
+            tests/test_job_lifecycle.py \
+            tests/test_smoke_providers.py
+      - name: Offline smoke gates
+        run: |
+          python scripts/smoke_providers.py
+          python scripts/smoke_custom_prompts.py
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Frontend build/lint/test discovery gate
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+          npm run test
+      - name: Frontend lint (non-blocking)
+        if: always()
+        continue-on-error: true
+        run: |
+          cd frontend
+          npm run lint
+
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compose config syntax check
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          TA_APP_SECRET_KEY=ci-secret docker compose -f docker-compose.split.yml config --quiet
+      - name: Real docker build
+        run: docker build --progress=plain -t tradingagents-ashare:ci .

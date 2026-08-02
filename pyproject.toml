@@ -37,12 +37,11 @@ dependencies = [
 ]
 
 [project.scripts]
-tradingagents = "cli.main:app"
 tradingagents-api = "api.main:run"
 tradingagents-scheduler = "scheduler.main:sync_main"
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*", "cli*", "api*", "scheduler*"]
+include = ["tradingagents*", "api*", "scheduler*"]
 
 [dependency-groups]
 dev = [

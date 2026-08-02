@@ -1,5 +1,6 @@
 services:
   app:
+    build: .
     image: tradingagents-ashare:latest
     container_name: tradingagents-ashare
     restart: always
@@ -9,7 +10,6 @@ services:
       - ./data:/app/data
       - ./api:/app/api
       - ./tradingagents:/app/tradingagents
-      - ./frontend/dist:/app/frontend/dist
       - ./tests:/app/tests
       - ./scripts:/app/scripts
     extra_hosts:

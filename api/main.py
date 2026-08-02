@@ -5460,7 +5460,7 @@ def get_portfolio_overview(
     current_user: UserDB = Depends(_require_api_user),
     db: Session = Depends(get_db),
 ):
-    code_to_name = _get_reverse_stock_map_cached_only()
+    code_to_name = _get_reverse_stock_map()
 
     watchlist_items = watchlist_service.list_watchlist(db, current_user.id)
     _attach_stock_names(watchlist_items, code_to_name)

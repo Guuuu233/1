@@ -22,9 +22,8 @@ services:
       retries: 10
 
   api:
-    image: ghcr.io/kylinmountain/tradingagents-ashare:latest
-    # 从源码构建镜像时：注释掉上面的 image，改用下行
-    # build: .
+    build: .
+    # 发布公开镜像后如需固定使用远端镜像，这里可改回 image 并移走 build。
     container_name: tradingagents-api
     restart: always
     ports:
@@ -46,9 +45,8 @@ services:
       # MAIL_HOST: "smtp.gmail.com"
 
   scheduler:
-    image: ghcr.io/kylinmountain/tradingagents-ashare:latest
-    # 从源码构建镜像时：注释掉上面的 image，改用下行
-    # build: .
+    build: .
+    # 发布公开镜像后如需固定使用远端镜像，这里可改回 image 并移走 build。
     container_name: tradingagents-scheduler
     restart: always
     volumes:

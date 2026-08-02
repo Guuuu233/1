@@ -387,7 +387,7 @@ def test_T13_attach_snapshot_is_deepcopy():
 # ---------------------------------------------------------------------------
 
 def test_T14_both_save_branches_call_attach_snapshot():
-    """The two result branches in _run_job_inner must both call the production helper."""
+    """All result branches in _run_job_inner must call the production helper."""
     import inspect
     import api.main as main_module
 

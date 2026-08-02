@@ -1,3 +1,10 @@
+FROM node:22-bookworm-slim AS frontend-build
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
 FROM ghcr.io/astral-sh/uv:python3.10-bookworm-slim AS runtime
 WORKDIR /app
 
@@ -21,8 +28,8 @@ COPY docker-entrypoint.py ./docker-entrypoint.py
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
-# 拷贝前端产物
-COPY frontend/dist ./frontend/dist
+# 从前端构建阶段拷贝产物（clean checkout 无需预生成 frontend/dist）
+COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
 # 暴露端口
 EXPOSE 8000
