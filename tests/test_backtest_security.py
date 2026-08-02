@@ -74,6 +74,10 @@ def reset_backtest_state():
     with bt._lock:
         bt._backtest_jobs.clear()
         bt._job_queue.queue.clear()
+        # Reset the worker registry too so one test cannot hand a real
+        # daemon thread to another test.
+        bt._workers_started = False
+        bt._workers = []
     yield
 
 
@@ -102,6 +106,21 @@ class TestOwnerScoping:
 
 
 class TestResourceLimits:
+    def test_prune_does_not_delete_when_store_is_under_cap(self, monkeypatch):
+        monkeypatch.setattr(bt, "MAX_RETAINED_BACKTEST_JOBS", 100)
+        for index in range(98):
+            _create(
+                f"term-{index}",
+                user_id="u1",
+                status="completed",
+                created_at=f"2024-01-{index + 1:02d}T00:00:00+00:00",
+            )
+        _create("running-1", user_id="u1", status="running", created_at="2024-03-01T00:00:00+00:00")
+
+        bt._prune_old_jobs()
+
+        assert len(bt._backtest_jobs) == 99
+
     def test_submit_rejects_when_queue_is_full(self, monkeypatch):
         monkeypatch.setattr(bt, "_job_queue", queue.Queue(maxsize=1))
         monkeypatch.setattr(bt, "_ensure_workers", lambda: None)
@@ -113,6 +132,17 @@ class TestResourceLimits:
         assert set(bt._backtest_jobs) == {first}
 
     def test_worker_pool_size_is_bounded(self, monkeypatch):
+        class FakeThread:
+            def __init__(self, *, target=None, name="", daemon=None):
+                self.target = target
+                self.name = name
+                self.daemon = daemon
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+        monkeypatch.setattr(bt.threading, "Thread", FakeThread)
         monkeypatch.setattr(bt, "MAX_BACKTEST_WORKERS", 3)
         monkeypatch.setattr(bt, "_workers_started", False)
         monkeypatch.setattr(bt, "_workers", [])
@@ -121,6 +151,7 @@ class TestResourceLimits:
 
         assert len(bt._workers) == 3
         assert all(worker.daemon for worker in bt._workers)
+        assert all(worker.started for worker in bt._workers)
         assert bt._workers_started is True
 
     def test_terminal_history_is_pruned(self, monkeypatch):
@@ -192,7 +223,10 @@ class TestApiWiring:
     def test_submit_records_api_user_as_owner(self, client):
         user_id, token = _user_token()
         headers = {"Authorization": f"Bearer {token}"}
-        with patch.object(bt, "_run_backtest", lambda *args, **kwargs: None):
+        with (
+            patch.object(bt, "_run_backtest", lambda *args, **kwargs: None),
+            patch.object(bt, "_ensure_workers", lambda: None),
+        ):
             response = client.post(
                 "/v1/backtest",
                 headers=headers,
@@ -211,7 +245,7 @@ class TestApiWiring:
         assert job["user_id"] == user_id
         assert job["status"] == "pending"
 
-    @pytest.mark.parametrize("bad", [0, -1, 366])
+    @pytest.mark.parametrize("bad", [0, -1, 366, True, "5", 1.5])
     def test_submit_rejects_invalid_sample_interval_via_api(self, client, bad):
         _, token = _user_token()
         headers = {"Authorization": f"Bearer {token}"}

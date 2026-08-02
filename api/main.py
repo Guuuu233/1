@@ -4205,7 +4205,9 @@ class BacktestRequest(BaseModel):
     end_date: str
     selected_analysts: List[str] = ["market", "news", "fundamentals", "sentiment"]
     hold_days: int = 5
-    sample_interval: int = 7
+    # Keep the raw value until service validation so FastAPI/Pydantic cannot
+    # coerce bool or numeric strings into an int before the strict check.
+    sample_interval: Any = 7
     config_overrides: Optional[Dict[str, Any]] = None
 
 

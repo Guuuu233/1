@@ -116,7 +116,9 @@ def _prune_old_jobs(keep_job_id: Optional[str] = None) -> None:
             ),
             key=lambda job: job.get("created_at") or "",
         )
-        excess = len(_backtest_jobs) - MAX_RETAINED_BACKTEST_JOBS
+        # Never treat a negative excess as a Python negative slice; doing so
+        # would delete the oldest terminal jobs even when the store is under cap.
+        excess = max(0, len(_backtest_jobs) - MAX_RETAINED_BACKTEST_JOBS)
         for job in terminal[:excess]:
             _backtest_jobs.pop(job["job_id"], None)
 
