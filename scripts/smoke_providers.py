@@ -16,7 +16,6 @@ makes the script exit non-zero.
 import os
 import sys
 import time
-from datetime import datetime
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -29,6 +28,7 @@ from tradingagents.dataflows.interface import (
     get_vendor,
     route_to_vendor,
 )
+from tradingagents.dataflows.trade_calendar import cn_today_str
 
 TEST_SYMBOLS = ["600519", "000001", "300750"]
 METHODS = [
@@ -167,7 +167,7 @@ def run_checks():
     Each dict: label, method_name, passed, failed, avg_time, errors.
     An item passes only when passed == len(TEST_SYMBOLS) and failed == 0.
     """
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = cn_today_str()
     offline = _is_offline()
     results = []
     saved_offline = {}
@@ -253,7 +253,7 @@ def format_summary(results) -> str:
 
 
 def run_smoke():
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = cn_today_str()
     print(f"=== Starting Provider Smoke Test ({today}) ===")
     print(f"mode={'offline-fixture' if _is_offline() else 'live'}")
 
