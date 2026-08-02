@@ -4205,7 +4205,9 @@ class BacktestRequest(BaseModel):
     end_date: str
     selected_analysts: List[str] = ["market", "news", "fundamentals", "sentiment"]
     hold_days: int = 5
-    sample_interval: int = 7
+    # Keep the raw value until service validation so FastAPI/Pydantic cannot
+    # coerce bool or numeric strings into an int before the strict check.
+    sample_interval: Any = 7
     config_overrides: Optional[Dict[str, Any]] = None
 
 
@@ -4217,38 +4219,48 @@ def submit_backtest(
 ) -> Dict:
     """提交历史回测任务，返回 job_id."""
     config = _build_runtime_config(request.config_overrides or {}, user_id=current_user.id, db=db)
-    job_id = _bt.submit(
-        symbol=request.symbol,
-        start_date=request.start_date,
-        end_date=request.end_date,
-        selected_analysts=request.selected_analysts,
-        hold_days=request.hold_days,
-        sample_interval=request.sample_interval,
-        config=config,
-    )
+    try:
+        job_id = _bt.submit(
+            user_id=current_user.id,
+            symbol=request.symbol,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            selected_analysts=request.selected_analysts,
+            hold_days=request.hold_days,
+            sample_interval=request.sample_interval,
+            config=config,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except _bt.BacktestQueueFullError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
     return {"job_id": job_id, "status": "pending"}
 
 
 @app.get("/v1/backtest")
-def list_backtests() -> Dict:
+def list_backtests(current_user: UserDB = Depends(_require_api_user)) -> Dict:
     """列出所有回测任务."""
-    jobs = _bt.list_jobs()
+    jobs = _bt.list_jobs(user_id=current_user.id)
     return {"jobs": jobs, "total": len(jobs)}
 
 
-@app.get("/v1/backtest/{job_id}")
-def get_backtest(job_id: str) -> Dict:
-    """获取回测任务状态和结果."""
-    job = _bt.get_job(job_id)
+def _require_backtest_owner(job_id: str, current_user: UserDB) -> Dict[str, Any]:
+    job = _bt.get_job(job_id, user_id=current_user.id)
     if not job:
         raise HTTPException(status_code=404, detail="回测任务不存在")
     return job
 
 
+@app.get("/v1/backtest/{job_id}")
+def get_backtest(job_id: str, current_user: UserDB = Depends(_require_api_user)) -> Dict:
+    """获取回测任务状态和结果."""
+    return _require_backtest_owner(job_id, current_user)
+
+
 @app.delete("/v1/backtest/{job_id}")
-def delete_backtest(job_id: str) -> Dict:
+def delete_backtest(job_id: str, current_user: UserDB = Depends(_require_api_user)) -> Dict:
     """删除回测任务."""
-    if not _bt.delete_job(job_id):
+    if not _bt.delete_job(job_id, user_id=current_user.id):
         raise HTTPException(status_code=404, detail="回测任务不存在")
     return {"message": "已删除"}
 
