@@ -3,7 +3,7 @@ name: CI quick gates
 on:
   pull_request:
   push:
-    branches: [ "main" ]
+    branches: [ "codex/dav-4-p2a-trunk" ]
   workflow_dispatch:
 
 env:
