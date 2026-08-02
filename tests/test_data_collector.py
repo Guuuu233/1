@@ -105,7 +105,7 @@ def test_get_window_does_not_mutate_source_pool():
     assert sliced is not pool
 
 
-def test_evict_removes_lock_and_refcount_then_refetches():
+def test_evict_clears_cache_and_refcount_but_retains_lock_then_refetches():
     collector = DataCollector()
     key = make_cache_key("600519", "2026-03-12")
     collector._cache[key] = {"stock_data": "old"}
@@ -115,7 +115,9 @@ def test_evict_removes_lock_and_refcount_then_refetches():
     collector.evict("600519", "2026-03-12")
 
     assert key not in collector._cache
-    assert key not in collector._locks
+    # 锁对象必须保留：其他线程可能仍持有该锁的引用，删除会导致新 collect()
+    # 创建新锁、破坏 per-key 互斥。
+    assert key in collector._locks
     assert key not in collector._refcounts
 
     with patch(
