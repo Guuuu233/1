@@ -8,16 +8,53 @@ without touching any existing code.
 from __future__ import annotations
 
 import json
+import logging
+import os
+import queue
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+logger = logging.getLogger(__name__)
+
+# Backtest jobs are intentionally in-memory only: a process restart drops all
+# queued, running, and completed jobs. No DB schema or recovery path is added;
+# terminal history is bounded below so the in-memory store cannot grow without
+# limit.
 # ──────────────────────────────────────────────────────────────────────────────
 # In-memory store (no additional DB table — results stored as JSON in the job)
 # ──────────────────────────────────────────────────────────────────────────────
 _backtest_jobs: Dict[str, Dict[str, Any]] = {}
 _lock = threading.Lock()
+
+MAX_BACKTEST_WORKERS = max(1, int(os.getenv("BACKTEST_MAX_WORKERS", "2")))
+MAX_BACKTEST_QUEUE = max(1, int(os.getenv("BACKTEST_MAX_QUEUE", "20")))
+MAX_RETAINED_BACKTEST_JOBS = max(1, int(os.getenv("BACKTEST_MAX_RETAINED_JOBS", "100")))
+MIN_SAMPLE_INTERVAL = 1
+MAX_SAMPLE_INTERVAL = 365
+
+
+class BacktestQueueFullError(RuntimeError):
+    """Raised when the bounded backtest submission queue is full."""
+
+
+@dataclass(frozen=True)
+class _BacktestTask:
+    job_id: str
+    symbol: str
+    start_date: str
+    end_date: str
+    selected_analysts: List[str]
+    hold_days: int
+    sample_interval: int
+    config: Dict[str, Any]
+
+
+_job_queue: "queue.Queue[_BacktestTask]" = queue.Queue(maxsize=MAX_BACKTEST_QUEUE)
+_workers: List[threading.Thread] = []
+_workers_started = False
 
 
 def _utcnow_iso() -> str:
@@ -26,26 +63,73 @@ def _utcnow_iso() -> str:
 
 def _set(job_id: str, **kwargs: Any) -> None:
     with _lock:
-        if job_id not in _backtest_jobs:
-            _backtest_jobs[job_id] = {}
-        _backtest_jobs[job_id].update(kwargs)
+        job = _backtest_jobs.get(job_id)
+        if job is None:
+            # A deleted job must not be resurrected by a queued worker.
+            return
+        job.update(kwargs)
 
 
-def get_job(job_id: str) -> Optional[Dict[str, Any]]:
-    return _backtest_jobs.get(job_id)
-
-
-def list_jobs() -> List[Dict[str, Any]]:
+def _create_job(job_id: str, **kwargs: Any) -> None:
+    payload = dict(kwargs)
+    payload["job_id"] = job_id
     with _lock:
-        return sorted(_backtest_jobs.values(), key=lambda j: j.get("created_at", ""), reverse=True)
+        _backtest_jobs[job_id] = payload
 
 
-def delete_job(job_id: str) -> bool:
+def get_job(job_id: str, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     with _lock:
-        if job_id in _backtest_jobs:
-            del _backtest_jobs[job_id]
-            return True
-        return False
+        job = _backtest_jobs.get(job_id)
+        if job is None or (user_id is not None and job.get("user_id") != user_id):
+            return None
+        return dict(job)
+
+
+def list_jobs(user_id: str) -> List[Dict[str, Any]]:
+    with _lock:
+        jobs = [
+            dict(job)
+            for job in _backtest_jobs.values()
+            if job.get("user_id") == user_id
+        ]
+        return sorted(jobs, key=lambda j: j.get("created_at", ""), reverse=True)
+
+
+def delete_job(job_id: str, user_id: str) -> bool:
+    with _lock:
+        job = _backtest_jobs.get(job_id)
+        if job is None or job.get("user_id") != user_id:
+            return False
+        del _backtest_jobs[job_id]
+        return True
+
+
+def _prune_old_jobs(keep_job_id: Optional[str] = None) -> None:
+    """Drop oldest terminal jobs once the in-memory store exceeds its cap."""
+    with _lock:
+        terminal = sorted(
+            (
+                job
+                for job in _backtest_jobs.values()
+                if job.get("status") in ("completed", "failed")
+                and job.get("job_id") != keep_job_id
+            ),
+            key=lambda job: job.get("created_at") or "",
+        )
+        excess = len(_backtest_jobs) - MAX_RETAINED_BACKTEST_JOBS
+        for job in terminal[:excess]:
+            _backtest_jobs.pop(job["job_id"], None)
+
+
+def validate_sample_interval(sample_interval: int) -> int:
+    """Validate an integer sampling interval and return it unchanged."""
+    if isinstance(sample_interval, bool) or not isinstance(sample_interval, int):
+        raise ValueError("sample_interval must be an integer")
+    if sample_interval < MIN_SAMPLE_INTERVAL or sample_interval > MAX_SAMPLE_INTERVAL:
+        raise ValueError(
+            f"sample_interval must be between {MIN_SAMPLE_INTERVAL} and {MAX_SAMPLE_INTERVAL}"
+        )
+    return sample_interval
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -54,6 +138,8 @@ def delete_job(job_id: str) -> bool:
 
 def _get_trading_dates(start: str, end: str, interval_days: int) -> List[str]:
     """Return a list of weekday dates between start and end, sampled every interval_days."""
+    if interval_days < MIN_SAMPLE_INTERVAL:
+        raise ValueError("interval_days must be >= 1")
     fmt = "%Y-%m-%d"
     cur = datetime.strptime(start, fmt)
     end_dt = datetime.strptime(end, fmt)
@@ -186,44 +272,104 @@ def _run_backtest(job_id: str, symbol: str, start_date: str, end_date: str,
                   config: Dict[str, Any]) -> None:
     """Background thread: run backtest and store results."""
     _set(job_id, status="running", started_at=_utcnow_iso())
+    try:
+        dates = _get_trading_dates(start_date, end_date, sample_interval)
+        total = len(dates)
+        _set(job_id, total_dates=total, completed_dates=0, records=[], error=None)
 
-    dates = _get_trading_dates(start_date, end_date, sample_interval)
-    total = len(dates)
-    _set(job_id, total_dates=total, completed_dates=0, records=[], error=None)
+        records: List[Dict[str, Any]] = []
 
-    records: List[Dict[str, Any]] = []
+        for i, trade_date in enumerate(dates):
+            record: Dict[str, Any] = {
+                "date": trade_date,
+                "action": "HOLD",
+                "return_pct": None,
+                "error": None,
+            }
+            try:
+                analysis = _run_single_analysis(symbol, trade_date, selected_analysts, config)
+                action = _classify_decision(analysis["decision"])
+                record["action"] = action
+                record["decision_summary"] = analysis["final_trade_decision"][:200] if analysis.get("final_trade_decision") else ""
 
-    for i, trade_date in enumerate(dates):
-        record: Dict[str, Any] = {"date": trade_date, "action": "HOLD", "return_pct": None, "error": None}
+                if action in ("BUY", "SELL"):
+                    entry_price = _get_price_on(symbol, trade_date)
+                    exit_price = _get_price_after(symbol, trade_date, hold_days)
+                    if entry_price and exit_price and entry_price > 0:
+                        raw_return = (exit_price - entry_price) / entry_price * 100
+                        record["entry_price"] = round(entry_price, 2)
+                        record["exit_price"] = round(exit_price, 2)
+                        record["return_pct"] = round(raw_return if action == "BUY" else -raw_return, 2)
+            except Exception as exc:
+                record["error"] = str(exc)[:200]
+
+            records.append(record)
+            _set(job_id, completed_dates=i + 1, records=list(records))
+
+        stats = _compute_stats(records)
+        _set(job_id,
+             status="completed",
+             finished_at=_utcnow_iso(),
+             records=records,
+             stats=stats)
+    except Exception as exc:
+        logger.exception("Backtest job %s failed", job_id)
+        _set(job_id,
+             status="failed",
+             finished_at=_utcnow_iso(),
+             records=[],
+             stats=None,
+             error=str(exc)[:500])
+    finally:
+        _prune_old_jobs(job_id)
+
+
+def _worker_loop() -> None:
+    """Consume queued backtest tasks from a fixed worker pool."""
+    while True:
+        task = _job_queue.get()
         try:
-            analysis = _run_single_analysis(symbol, trade_date, selected_analysts, config)
-            action = _classify_decision(analysis["decision"])
-            record["action"] = action
-            record["decision_summary"] = analysis["final_trade_decision"][:200] if analysis.get("final_trade_decision") else ""
-
-            if action in ("BUY", "SELL"):
-                entry_price = _get_price_on(symbol, trade_date)
-                exit_price = _get_price_after(symbol, trade_date, hold_days)
-                if entry_price and exit_price and entry_price > 0:
-                    raw_return = (exit_price - entry_price) / entry_price * 100
-                    record["entry_price"] = round(entry_price, 2)
-                    record["exit_price"] = round(exit_price, 2)
-                    record["return_pct"] = round(raw_return if action == "BUY" else -raw_return, 2)
+            _run_backtest(
+                task.job_id,
+                task.symbol,
+                task.start_date,
+                task.end_date,
+                task.selected_analysts,
+                task.hold_days,
+                task.sample_interval,
+                task.config,
+            )
         except Exception as exc:
-            record["error"] = str(exc)[:200]
+            logger.exception("Backtest worker task %s failed", task.job_id)
+            _set(task.job_id,
+                 status="failed",
+                 finished_at=_utcnow_iso(),
+                 records=[],
+                 stats=None,
+                 error=str(exc)[:500])
+            _prune_old_jobs(task.job_id)
+        finally:
+            _job_queue.task_done()
 
-        records.append(record)
-        _set(job_id, completed_dates=i + 1, records=list(records))
 
-    stats = _compute_stats(records)
-    _set(job_id,
-         status="completed",
-         finished_at=_utcnow_iso(),
-         records=records,
-         stats=stats)
+def _ensure_workers() -> None:
+    global _workers_started
+    with _lock:
+        if _workers_started:
+            return
+        for index in range(MAX_BACKTEST_WORKERS):
+            worker = threading.Thread(
+                target=_worker_loop,
+                name=f"backtest-worker-{index + 1}",
+                daemon=True,
+            )
+            worker.start()
+            _workers.append(worker)
+        _workers_started = True
 
 
 def submit(
+    user_id: str,
     symbol: str,
     start_date: str,
     end_date: str,
@@ -233,27 +379,40 @@ def submit(
     config: Dict[str, Any],
 ) -> str:
     """Submit a backtest job. Returns job_id."""
+    validate_sample_interval(sample_interval)
     job_id = uuid4().hex
-    _set(job_id,
-         job_id=job_id,
-         symbol=symbol,
-         start_date=start_date,
-         end_date=end_date,
-         selected_analysts=selected_analysts,
-         hold_days=hold_days,
-         sample_interval=sample_interval,
-         status="pending",
-         created_at=_utcnow_iso(),
-         total_dates=0,
-         completed_dates=0,
-         records=[],
-         stats=None,
-         error=None)
-
-    thread = threading.Thread(
-        target=_run_backtest,
-        args=(job_id, symbol, start_date, end_date, selected_analysts, hold_days, sample_interval, config),
-        daemon=True,
+    _create_job(
+        job_id=job_id,
+        user_id=user_id,
+        symbol=symbol,
+        start_date=start_date,
+        end_date=end_date,
+        selected_analysts=selected_analysts,
+        hold_days=hold_days,
+        sample_interval=sample_interval,
+        status="pending",
+        created_at=_utcnow_iso(),
+        total_dates=0,
+        completed_dates=0,
+        records=[],
+        stats=None,
+        error=None,
     )
-    thread.start()
+    _prune_old_jobs()
+    task = _BacktestTask(
+        job_id=job_id,
+        symbol=symbol,
+        start_date=start_date,
+        end_date=end_date,
+        selected_analysts=selected_analysts,
+        hold_days=hold_days,
+        sample_interval=sample_interval,
+        config=config,
+    )
+    try:
+        _job_queue.put_nowait(task)
+    except queue.Full as exc:
+        delete_job(job_id, user_id)
+        raise BacktestQueueFullError("backtest queue is full; retry later") from exc
+    _ensure_workers()
     return job_id
