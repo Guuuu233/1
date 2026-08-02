@@ -1,5 +1,6 @@
 from unittest.mock import patch
 import threading
+import time
 
 from tradingagents.graph.data_collector import (
     DataCollector,
@@ -136,3 +137,26 @@ def test_fetch_all_completes_executor_with_fast_tools():
 
     assert "stock_data" in result
     assert "market_data_context" in result
+
+
+def test_fetch_all_returns_bounded_when_sources_hang():
+    release = threading.Event()
+    started = time.monotonic()
+
+    def hang(*args, **kwargs):
+        release.wait(timeout=5)
+        return "late"
+
+    try:
+        with patch("tradingagents.graph.data_collector._safe", side_effect=hang), \
+             patch("tradingagents.graph.data_collector.FETCH_ALL_TIMEOUT", 0.05), \
+             patch("tradingagents.graph.data_collector.FETCH_MAX_WORKERS", 2), \
+             patch("tradingagents.graph.data_collector.FETCH_ALL_SHUTDOWN_GRACE_SECONDS", 0.01):
+            result = _fetch_all("600519", "2025-01-02")
+
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert elapsed < 1.0
+    assert "数据拉取超时" in result["news"]

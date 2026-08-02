@@ -54,6 +54,10 @@ LONG_DAYS = 90
 # 并逐渐占满 asyncio 默认线程池（生产事故：64/64 全部僵死 → 前端 524）。
 FETCH_ALL_TIMEOUT = int(os.getenv("TA_DATA_FETCH_TIMEOUT", "300"))
 FETCH_MAX_WORKERS = int(os.getenv("TA_DATA_FETCH_MAX_WORKERS", "10"))
+# 超时后只再等一个很短的有界窗口，避免 shutdown(wait=True) 被卡死 worker 拖到无界。
+FETCH_ALL_SHUTDOWN_GRACE_SECONDS = float(
+    os.getenv("TA_DATA_FETCH_SHUTDOWN_GRACE_SECONDS", "1")
+)
 
 import numpy as np
 
@@ -611,6 +615,12 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
     try:
         future_to_key = {executor.submit(_safe, tool, payload): key for key, (tool, payload) in tasks.items()}
         done, not_done = futures_wait(set(future_to_key), timeout=FETCH_ALL_TIMEOUT)
+        if not_done:
+            # cancel_futures 只能移除排队任务，无法中断已运行的 worker；
+            # 这里给 shutdown 前的收尾等待一个显式上界，保证 _fetch_all 有界返回。
+            _, not_done = futures_wait(
+                not_done, timeout=FETCH_ALL_SHUTDOWN_GRACE_SECONDS
+            )
         for future in done:
             results[future_to_key[future]] = future.result()
         for future in not_done:
@@ -618,9 +628,9 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
             results[key] = f"{key} 数据拉取超时（>{FETCH_ALL_TIMEOUT}s），本次分析跳过该数据源"
             print(f"  [Warning] {key} fetch timed out after {FETCH_ALL_TIMEOUT}s, skipped")
     finally:
-        # Provider routing has bounded timeouts, so completing the executor here
-        # is finite and keeps stuck worker/socket threads from outliving the job.
-        executor.shutdown(wait=True, cancel_futures=True)
+        # 已超时 future 不再等待：wait=False 是这里唯一的硬上界，卡死线程
+        # 无法被 Python 线程池强杀，但不能继续占用本次 fetch 的锁等待预算。
+        executor.shutdown(wait=False, cancel_futures=True)
 
     data_failure_ledger = _build_data_failure_ledger(results)
 

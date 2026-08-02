@@ -1,3 +1,4 @@
+import atexit
 from concurrent.futures import ThreadPoolExecutor
 import os
 import threading
@@ -82,6 +83,14 @@ _PROVIDER_CALL_EXECUTOR = ThreadPoolExecutor(
 )
 _PROVIDER_SEMAPHORES: dict[tuple[str, int], threading.BoundedSemaphore] = {}
 _PROVIDER_SEMAPHORE_LOCK = threading.Lock()
+
+
+def _shutdown_provider_call_executor() -> None:
+    """Best-effort module-level executor cleanup at interpreter exit."""
+    _PROVIDER_CALL_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+
+
+atexit.register(_shutdown_provider_call_executor)
 
 
 def _is_trace_enabled() -> bool:
