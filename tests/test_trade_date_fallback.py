@@ -9,7 +9,7 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import patch
 
 import pandas as pd
@@ -297,7 +297,8 @@ def test_get_zt_pool_rolls_back_and_labels_actual_date():
         }
     )
     # empty DataFrame is truthy-check empty -> raise
-    text = _FixtureProvider(ak).get_zt_pool("2026-07-29")
+    with patch.object(tc, "now_cn", return_value=datetime(2026, 7, 29, 12, 0, tzinfo=tc.CN_TZ)):
+        text = _FixtureProvider(ak).get_zt_pool("2026-07-29")
     assert "【数据日期】2026-07-28" in text
     assert "请求 2026-07-29" in text
     assert "涨停家数：2" in text
@@ -378,4 +379,3 @@ def test_normalize_allows_calendar_within_staleness_bound():
         ]
     )
     assert tc.normalize_to_trading_day("2026-07-29") == "2026-07-22"
-

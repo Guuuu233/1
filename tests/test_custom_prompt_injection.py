@@ -387,13 +387,13 @@ def test_T13_attach_snapshot_is_deepcopy():
 # ---------------------------------------------------------------------------
 
 def test_T14_both_save_branches_call_attach_snapshot():
-    """The two result branches in _run_job_inner must both call the production helper."""
+    """All result branches in _run_job_inner must call the production helper."""
     import inspect
     import api.main as main_module
 
     source = inspect.getsource(main_module._run_job_inner)
     call = "_attach_custom_prompt_snapshot(result, _prompt_snapshot)"
-    assert source.count(call) == 2, "dual-horizon and single-path branches must both attach snapshots"
+    assert source.count(call) == 3, "dual-horizon and single-path branches must all attach snapshots"
 
     # Also verify helper isolation for the payload shape used by both branches.
     snapshot = {"enabled": False, "placement": "after_data", "roles": {}}

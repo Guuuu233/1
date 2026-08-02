@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from tradingagents.dataflows.providers.cn_akshare_provider import CnAkshareProvider
+from tradingagents.dataflows.trade_calendar import cn_today_str
 
 
 class _PledgeAk:
@@ -59,7 +60,7 @@ def test_share_pledge_missing_ratio_is_unassessed_not_safe():
             "所属行业": ["白酒"],
         }
     )
-    out = _PledgeProvider(df).get_share_pledge("600519", curr_date="2026-07-29")
+    out = _PledgeProvider(df).get_share_pledge("600519", curr_date=cn_today_str())
     assert "未排查" in out
     assert "安全" not in out
     assert "质押比例" in out
@@ -74,7 +75,7 @@ def test_share_pledge_blank_ratio_is_unassessed():
             "所属行业": ["白酒"],
         }
     )
-    out = _PledgeProvider(df).get_share_pledge("600519", curr_date="2026-07-29")
+    out = _PledgeProvider(df).get_share_pledge("600519", curr_date=cn_today_str())
     assert "未排查" in out
     assert "安全" not in out
 
@@ -88,7 +89,7 @@ def test_share_pledge_present_ratio_still_thresholds():
             "所属行业": ["白酒"],
         }
     )
-    out = _PledgeProvider(df).get_share_pledge("600519", curr_date="2026-07-29")
+    out = _PledgeProvider(df).get_share_pledge("600519", curr_date=cn_today_str())
     assert "整体质押比例：12.5%" in out
     assert "未排查" not in out
 

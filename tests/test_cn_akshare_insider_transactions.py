@@ -1,6 +1,9 @@
+from datetime import timedelta
+
 import pandas as pd
 
 from tradingagents.dataflows.providers.cn_akshare_provider import CnAkshareProvider
+from tradingagents.dataflows.trade_calendar import cn_today_str, now_cn
 
 
 class _EmptyAkshareClient:
@@ -23,7 +26,9 @@ class _NewsFallbackProvider(CnAkshareProvider):
 def test_insider_transactions_fallback_uses_analysis_date_window():
     provider = _NewsFallbackProvider()
 
-    result = provider.get_insider_transactions("600519.SH", curr_date="2024-01-15")
+    end_date = cn_today_str()
+    start_date = (now_cn().date() - timedelta(days=14)).isoformat()
+    result = provider.get_insider_transactions("600519.SH", curr_date=end_date)
 
     assert "fallback news" in result
-    assert provider.news_calls == [("600519.SH", "2024-01-01", "2024-01-15")]
+    assert provider.news_calls == [("600519.SH", start_date, end_date)]

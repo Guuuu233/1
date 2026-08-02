@@ -699,8 +699,7 @@ class TestPortfolioOverviewEndpoint:
             )
             db.commit()
 
-        with patch("api.main._get_reverse_stock_map", return_value=self.code_to_name):
-            response = self.client.get("/v1/portfolio/overview", headers=self.headers)
+        response = self.client.get("/v1/portfolio/overview", headers=self.headers)
 
         assert response.status_code == 200
         body = response.json()

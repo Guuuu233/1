@@ -222,6 +222,22 @@ def extract_structured_data(
         return None
 
 
+def merge_data_gaps(
+    result_data: Optional[Dict[str, Any]] = None,
+    llm_data_gaps: Optional[List[str]] = None,
+) -> List[str]:
+    """Merge graph and LLM data gaps without duplicates or empty strings."""
+    existing = result_data.get("data_gaps") if isinstance(result_data, dict) else None
+    merged: List[str] = []
+    seen: set[str] = set()
+    for value in list(existing or []) + list(llm_data_gaps or []):
+        text = str(value).strip()
+        if text and text not in seen:
+            seen.add(text)
+            merged.append(text)
+    return merged
+
+
 # ─── Fallback regex extraction (used when LLM extraction unavailable) ─────────
 
 def _extract_confidence_regex(text: Optional[str]) -> Optional[int]:
