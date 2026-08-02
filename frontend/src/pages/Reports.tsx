@@ -6,6 +6,7 @@ import { api } from '@/services/api'
 import type { Report, ReportDetail } from '@/types'
 import DecisionCard from '@/components/DecisionCard'
 import ReportViewer from '@/components/ReportViewer'
+import DualHorizonReportSection from '@/components/DualHorizonReportSection'
 import RiskRadar from '@/components/RiskRadar'
 import KeyMetrics from '@/components/KeyMetrics'
 import { useAuthStore } from '@/stores/authStore'
@@ -517,6 +518,8 @@ export default function Reports() {
                     <RiskRadar items={selectedReport.risk_items ?? undefined} />
                     <KeyMetrics items={selectedReport.key_metrics ?? undefined} />
                 </div>
+
+                <DualHorizonReportSection reportData={selectedReport} />
 
                 <div className="card">
                     <ReportViewer reportData={selectedReport} />

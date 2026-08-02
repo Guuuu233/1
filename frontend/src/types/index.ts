@@ -249,6 +249,25 @@ export interface AnalysisReport {
     trade_date: string
     decision?: string
     direction?: string
+    mode?: 'single_horizon' | 'dual_horizon' | string
+    status?: string
+    requested_horizons?: AnalysisHorizon[]
+    horizon_status?: Partial<Record<AnalysisHorizon, string>>
+    failed_horizons?: AnalysisHorizon[]
+    short_term?: AnalysisHorizonResult
+    medium_term?: AnalysisHorizonResult
+    horizons?: Partial<Record<AnalysisHorizon, AnalysisHorizonResult>>
+    data_gaps?: string[]
+    falsification_conditions?: string[]
+    falsification_conditions_by_horizon?: Partial<Record<AnalysisHorizon, string[]>>
+    not_applicable?: boolean
+    not_applicable_by_horizon?: Partial<Record<AnalysisHorizon, boolean | null>>
+    probability?: number | null
+    target_price?: number | null
+    stop_loss_price?: number | null
+    risk_items?: RiskItem[]
+    key_metrics?: KeyMetric[]
+    analyst_traces?: Array<Record<string, unknown>>
     instrument_context?: InstrumentContext
     market_context?: MarketContext
     user_context?: UserContext
@@ -318,6 +337,39 @@ export interface KeyMetric {
     status: 'good' | 'neutral' | 'bad'
 }
 
+export type AnalysisHorizon = 'short' | 'medium'
+
+export interface AnalysisHorizonResult {
+    horizon?: string
+    status?: string
+    error?: string
+    impact?: string
+    decision?: string
+    direction?: string
+    confidence?: number | null
+    probability?: number | null
+    target_price?: number | null
+    stop_loss_price?: number | null
+    data_gaps?: string[]
+    falsification_conditions?: string[]
+    not_applicable?: boolean | null
+    risk_items?: RiskItem[]
+    key_metrics?: KeyMetric[]
+    market_data_context?: unknown
+    analyst_traces?: Array<Record<string, unknown>>
+    market_report?: string
+    sentiment_report?: string
+    news_report?: string
+    fundamentals_report?: string
+    macro_report?: string
+    smart_money_report?: string
+    volume_price_report?: string
+    game_theory_report?: string
+    investment_plan?: string
+    trader_investment_plan?: string
+    final_trade_decision?: string
+}
+
 // Report Types (from database)
 export interface Report {
     id: string
@@ -330,10 +382,15 @@ export interface Report {
     decision?: string
     direction?: string
     confidence?: number
+    probability?: number | null
     target_price?: number
     stop_loss_price?: number
     risk_items?: RiskItem[]
     key_metrics?: KeyMetric[]
+    data_gaps?: string[]
+    falsification_conditions?: string[]
+    not_applicable?: boolean
+    analyst_traces?: Array<Record<string, unknown>>
     created_at?: string
     updated_at?: string
     waiting_ahead_count?: number | null
