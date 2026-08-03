@@ -1,5 +1,32 @@
 # Known Issues
 
+## Legacy report English direction leaks on secondary surfaces
+
+**Status:** Open (minor, display-layer only)  
+**Discovered:** 2026-08-04 during M5 wrap-up
+
+### Symptom
+
+Pre-Chinese-localization reports store their direction in English (`BULLISH` /
+`LEAN_BEARISH` / `NEUTRAL` / …). The main report surfaces now handle this — the
+report list and detail view show a「旧版报告」badge, and the DecisionCard maps
+English directions to Chinese via `DIRECTION_ALIAS` (`localizeDirection` in
+`frontend/src/utils/reportText.ts`). Secondary surfaces that render a report's
+raw `direction` field are not mapped yet:
+
+- `TrackingBoardPanel`（跟踪看板）— renders `analysis.direction` directly
+- `Portfolio`（持仓页）— renders `report.direction` in the latest-report line
+
+So a legacy report can still display「方向：BULLISH」in those spots.
+
+### Suggested fix
+
+Apply the same display-layer mapping the DecisionCard uses
+(`localizeDirection`) to the tracking board and portfolio list. Low risk; no
+data migration involved.
+
+---
+
 ## Vendor chain collapses three outcomes into two behaviors
 
 **Status:** Open (documented; not fixed in 3b-hotfix)  

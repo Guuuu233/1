@@ -3,7 +3,7 @@ import { TrendingUp, TrendingDown, Target, Shield, ChevronDown, ChevronUp, Info 
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { AnalysisReport } from '@/types'
-import { sanitizeReportMarkdown } from '@/utils/reportText'
+import { sanitizeReportMarkdown, localizeDirection } from '@/utils/reportText'
 
 interface DecisionCardProps {
     symbol: string
@@ -80,7 +80,7 @@ export default function DecisionCard({
                         <h3 className="font-semibold text-slate-900 dark:text-slate-100">{name}</h3>
                         <p className="text-sm text-slate-500">{symbol}</p>
                         {direction && (
-                            <p className="text-xs text-slate-400 mt-0.5">方向：{direction}</p>
+                            <p className="text-xs text-slate-400 mt-0.5">方向：{localizeDirection(direction)}</p>
                         )}
                     </div>
                 </div>
