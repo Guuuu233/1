@@ -38,6 +38,7 @@ jobs:
             tests/test_watchlist_scheduled.py \
             tests/test_job_store.py \
             tests/test_job_lifecycle.py \
+            tests/test_models_fetch_ssrf.py \
             tests/test_smoke_providers.py
       - name: Offline smoke gates
         run: |
