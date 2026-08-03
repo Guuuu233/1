@@ -53,7 +53,10 @@ High risk (multi-provider chain + mixed date semantics):
 
 ## Adjudicators have no first-hand access to analyst reports
 
-**Status:** Open (documented; not fixing this round)  
+**Status:** Partially resolved in DAV-68 M2 (`research_manager` now receives
+first-hand evidence summaries for market/news/fundamentals/macro; `trader` and
+`risk_manager` custom-prompt injection landed; trader/risk_manager analyst-report
+access remains a follow-up)  
 **Discovered:** 2026-07-29 during 1.58MB output investigation
 
 ### Symptom
@@ -66,6 +69,9 @@ the string is never injected into the prompt template.
 
 ### Prompt template coverage map (from `tradingagents/prompts/zh.py`)
 
+`✓(摘要)` = the report is passed as a bounded first-hand **evidence summary**
+(`build_evidence_summary`, ≤300 chars) rather than the full report.
+
 | Agent | market | sentiment | news | fundamentals | smart_money | volume_price | macro |
 |---|---|---|---|---|---|---|---|
 | bull_researcher | ✓ | ✓ | ✓ | ✓ | — | ✓ | — |
@@ -73,15 +79,16 @@ the string is never injected into the prompt template.
 | aggressive_debator | ✓ | ✓ | ✓ | ✓ | — | ✓ | — |
 | conservative_debator | ✓ | ✓ | ✓ | ✓ | — | ✓ | — |
 | neutral_debator | ✓ | ✓ | ✓ | ✓ | — | ✓ | — |
-| **research_manager** | — | ✓ (smart_money only) | — | **✗** | ✓ | ✓ | — |
-| **trader** | — | — | — | **✗** | — | — | — |
-| **risk_manager** | — | — | — | **✗** | — | — | — |
+| **research_manager** | ✓(摘要) | ✓ | ✓(摘要) | ✓(摘要) | ✓ | ✓ | ✓(摘要) |
+| **trader** | — | — | — | — | — | — | — |
+| **risk_manager** | — | — | — | — | — | — | — |
 
 `research_manager` receives `smart_money_report`, `volume_price_report`, and
-`sentiment_report` as raw data for its "expected-value gap analysis", but none of
-market/news/fundamentals/macro.  `trader` and `risk_manager` receive only
-structured summaries built by `build_agent_context_view` — no analyst reports at
-all.
+`sentiment_report` as raw data for its "expected-value gap analysis", plus
+bounded evidence summaries of market/news/fundamentals/macro for evidence-level
+cross-checks.  The macro analyst's report — previously consumed by nobody — is now
+wired in.  `trader` and `risk_manager` receive only structured summaries built by
+`build_agent_context_view` — no analyst reports at all.
 
 ### Why it matters
 
@@ -95,23 +102,25 @@ This is an inherent structural constraint, not a bug per se, but it creates a
 situation where strong rhetoric can outweigh weak evidence at the adjudication
 layer.
 
-### Suggested fix (future; do not implement until custom-prompt injection is live)
+### Fix (implemented in DAV-68 M2)
 
-Do **not** pass full analyst reports to adjudicators — that would blow up context.
-Instead, add a second output slot to each analyst:
+Adjudicators do **not** receive full analyst reports — that would blow up context.
+`tradingagents/agents/utils/evidence_summary.py::build_evidence_summary` builds a
+deterministic, bounded (≤300 chars) summary per report that keeps verifiable facts
+(numbers, dates, named events), drops argumentation, strips machine-readable
+blocks, and prefixes the analyst's own `VERDICT` direction as a labeled fact so the
+manager can still tally verdicts.  `research_manager` receives these summaries for
+market/news/fundamentals/macro.
 
-```python
-"fundamentals_evidence_summary": "<≤300字，仅包含A级事实和数字，无论断>"
-```
+The analyst's full report remains available in state for bull/bear to read.
 
-Adjudicators receive the evidence summaries (not full reports) and can perform
-evidence-level cross-checks rather than pure rhetoric comparison.  This also
-enables `research_manager` to call out "多头方引用的基本面结论与原始数据不符"
-type disagreements.
+### Remaining gap (follow-up)
 
-Implementation note: the 300-char cap is strict.  Evidence summaries must contain
-only verifiable facts (numbers, dates, named events), no interpretations.  The
-analyst's full report remains available in state for bull/bear to read.
+`trader` and `risk_manager` still do not receive analyst reports (only
+`build_agent_context_view` summaries).  They DO now receive the 3000-char
+custom-prompt injection (confidence-ceiling / falsification constraints), so the
+adjudication-affecting constraints reach them, but first-hand analyst-evidence
+access for those two roles is a candidate next step.
 
 ---
 

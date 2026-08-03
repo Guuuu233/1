@@ -1968,7 +1968,7 @@ async def _save_report_or_raise(
         raise RuntimeError(message) from exc
 
 
-_INJECT_ROLES = ("bull_researcher", "bear_researcher", "research_manager")
+_INJECT_ROLES = ("bull_researcher", "bear_researcher", "research_manager", "trader", "risk_manager")
 
 
 def _attach_custom_prompt_snapshot(result: Dict[str, Any], prompt_snapshot: Dict[str, Any]) -> Dict[str, Any]:
