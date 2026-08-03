@@ -1164,7 +1164,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
     def get_board_fund_flow(self, curr_date: str = None) -> str:
         """获取行业板块资金流向排名（即时快照）。
 
-        注意：此接口依赖 akshare，可能因东方财富 API 变化而暂时不可用。
+        东财 ``stock_fund_flow_industry`` 对当前 IP 间歇不可达
+        （RemoteDisconnected），失败时回退到同花顺
+        ``stock_board_industry_summary_ths``（新浪无板块资金流接口）。
         历史日期分析直接拒绝：接口无历史截面。
         """
         refusal = snapshot_historical_refusal(
@@ -1172,74 +1174,180 @@ class CnAkshareProvider(BaseMarketDataProvider):
         )
         if refusal:
             return refusal
+
+        errors: list[str] = []
+
+        # Source 1: 东方财富（板块资金流）
         try:
             ak = self._ak()
-            # 使用正确的方法名 stock_fund_flow_industry
             with AKSHARE_CALL_LOCK:
                 df = ak.stock_fund_flow_industry(symbol="即时")
-            if df is None or df.empty:
-                return "今日板块资金流向数据暂不可用。"
-            sort_col = "今日主力净流入-净额"
-            if sort_col in df.columns:
-                df_sorted = df.sort_values(sort_col, ascending=False).reset_index(drop=True)
-            else:
-                df_sorted = df.reset_index(drop=True)
-            df_sorted.insert(0, "排名", range(1, len(df_sorted) + 1))
-            total = len(df_sorted)
-            result = df_sorted.head(10).to_string(index=False)
-            return f"板块资金流向排名（共{total}个板块，前10名）：\n{result}"
+            if df is not None and not df.empty:
+                return self._format_board_fund_flow(df)
+            errors.append("stock_fund_flow_industry: empty dataframe")
         except Exception as exc:
-            return f"板块资金流向数据暂时不可用（akshare 接口问题）：{type(exc).__name__}"
+            errors.append(f"stock_fund_flow_industry: {type(exc).__name__}")
+
+        # Source 2: 同花顺（板块净流入快照）
+        try:
+            ak = self._ak()
+            with AKSHARE_CALL_LOCK:
+                df = ak.stock_board_industry_summary_ths()
+            if df is not None and not df.empty:
+                return self._format_board_fund_flow(
+                    df, source_label="同花顺", net_col="净流入"
+                )
+            errors.append("stock_board_industry_summary_ths: empty dataframe")
+        except Exception as exc:
+            errors.append(f"stock_board_industry_summary_ths: {type(exc).__name__}")
+
+        return (
+            f"板块资金流向数据暂时不可用（东财/同花顺均失败："
+            f"{'；'.join(errors)}）"
+        )
+
+    @staticmethod
+    def _format_board_fund_flow(
+        df: "pd.DataFrame",
+        source_label: str = "东方财富",
+        net_col: str | None = None,
+    ) -> str:
+        """Format an industry-board fund-flow frame, ranked by net inflow desc."""
+        work = df.copy()
+        if net_col is None:
+            for cand in ("今日主力净流入-净额", "净额", "主力净流入-净额"):
+                if cand in work.columns:
+                    net_col = cand
+                    break
+        if net_col in work.columns:
+            work = work.sort_values(net_col, ascending=False).reset_index(drop=True)
+        else:
+            work = work.reset_index(drop=True)
+        work.insert(0, "排名", range(1, len(work) + 1))
+        total = len(work)
+        result = work.head(10).to_string(index=False)
+        if source_label and source_label != "东方财富":
+            return (
+                f"【备用数据源：{source_label}】板块资金流向排名"
+                f"（共{total}个板块，前10名）：\n{result}"
+            )
+        return f"板块资金流向排名（共{total}个板块，前10名）：\n{result}"
 
     def get_individual_fund_flow(self, symbol: str, curr_date: str = None) -> str:
         """获取个股近期主力资金净流向，并按 curr_date 截断。
 
-        东财个股资金流仅覆盖约最近 120 个交易日；过滤后为空时返回明确失败，
-        不返回空表。
+        东财 ``stock_individual_fund_flow`` 对当前 IP 间歇不可达
+        （RemoteDisconnected），失败时回退到新浪全市场即时截面
+        ``stock_fund_flow_individual``。新浪仅提供当日快照（无历史序列），
+        因此只在非历史分析日作为备用源。
         """
-        try:
-            if not curr_date:
-                return (
-                    f"【数据获取失败】个股资金流向缺少 curr_date，无法做日期截断，"
-                    f"{symbol} 本项不可用。"
-                )
-            cutoff = parse_yyyymmdd(curr_date)
-            if cutoff is None:
-                return f"【数据获取失败】个股资金流向 curr_date 无法解析：{curr_date!r}"
+        if not curr_date:
+            return (
+                f"【数据获取失败】个股资金流向缺少 curr_date，无法做日期截断，"
+                f"{symbol} 本项不可用。"
+            )
+        cutoff = parse_yyyymmdd(curr_date)
+        if cutoff is None:
+            return f"【数据获取失败】个股资金流向 curr_date 无法解析：{curr_date!r}"
 
-            ak = self._ak()
-            code = self._normalize_symbol(symbol)
+        ak = self._ak()
+        code = self._normalize_symbol(symbol)
+        errors: list[str] = []
+
+        # Source 1: 东财（近 120 交易日逐日序列，可按 curr_date 截断）
+        try:
             # 沪市：以 5、6、9 开头；其余为深市
             market = "sh" if code[:1] in ("5", "6", "9") else "sz"
             with AKSHARE_CALL_LOCK:
                 df = ak.stock_individual_fund_flow(stock=code, market=market)
             if df is None or df.empty:
-                return f"{symbol} 近期主力资金流向数据暂不可用。"
-            date_col = "日期" if "日期" in df.columns else None
-            if date_col is None:
-                return f"{symbol} 近期主力资金流向数据缺少日期列，无法判定最新记录。"
-
-            dates = pd.to_datetime(df[date_col], errors="coerce")
-            df = df.loc[dates.notna()].copy()
-            df[date_col] = dates[dates.notna()]
-            df = df[df[date_col] <= pd.Timestamp(cutoff)]
-            if df.empty:
-                return (
-                    f"【数据获取失败】资金流数据仅覆盖最近约 120 个交易日，"
-                    f"{curr_date} 超出可得范围，{symbol} 本项不可用。"
+                errors.append("stock_individual_fund_flow: empty dataframe")
+            else:
+                em_result = self._format_individual_fund_flow_em(
+                    df, symbol, curr_date, cutoff
                 )
+                if em_result is not None:
+                    return em_result
+                errors.append(
+                    "stock_individual_fund_flow: 无可用记录（超出可得范围或日期不可解析）"
+                )
+        except Exception as exc:
+            errors.append(f"stock_individual_fund_flow: {type(exc).__name__}")
 
-            df_recent = chronological(take_latest(df, date_col, 5), date_col)
-            if df_recent is None or df_recent.empty:
-                return f"{symbol} 近期主力资金流向数据日期不可解析。"
-            latest_day = pd.to_datetime(df_recent[date_col], errors="coerce").max()
-            latest_str = latest_day.date().isoformat() if pd.notna(latest_day) else curr_date
+        # Source 2: 新浪即时截面（当日快照，无历史序列）
+        if is_historical_analysis_date(curr_date):
             return (
-                f"{symbol} 近5日主力资金净流向（截至于 {curr_date}，最新数据日 {latest_str}）：\n"
-                f"{df_recent.to_string(index=False)}"
+                f"【数据获取失败】个股资金流向东财接口失败且新浪备用源为当日快照，"
+                f"历史日期 {curr_date} 下无法截断，{symbol} 本项不可用。"
+                f"（{'；'.join(errors)}）"
+            )
+        try:
+            with AKSHARE_CALL_LOCK:
+                df = ak.stock_fund_flow_individual(symbol="即时")
+            if df is None or df.empty:
+                raise ValueError("empty dataframe")
+            stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
+            if stock_df.empty:
+                return (
+                    f"【备用数据源：新浪】{symbol} 当日资金流向快照无记录"
+                    f"（{'；'.join(errors)}）"
+                )
+            row = stock_df.iloc[0]
+
+            def _v(col: str) -> str:
+                if col not in stock_df.columns:
+                    return ""
+                val = row[col]
+                return "" if pd.isna(val) else str(val)
+
+            return (
+                f"【备用数据源：新浪】{symbol} 当日主力资金净流向快照"
+                f"（{curr_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
+                f"净额: {_v('净额')} | 流入资金: {_v('流入资金')} | "
+                f"流出资金: {_v('流出资金')} | 换手率: {_v('换手率')}"
             )
         except Exception as exc:
-            return f"个股资金流向数据获取失败：{type(exc).__name__}: {exc}"
+            errors.append(f"stock_fund_flow_individual: {type(exc).__name__}")
+
+        return f"个股资金流向数据获取失败（东财/新浪均失败：{'；'.join(errors)}）"
+
+    def _format_individual_fund_flow_em(
+        self,
+        df: "pd.DataFrame",
+        symbol: str,
+        curr_date: str,
+        cutoff,
+    ) -> str | None:
+        """Format the Eastmoney per-day fund-flow series truncated to curr_date.
+
+        Returns None only when no usable record remains (out of the ~120 trading
+        day window or unparseable dates), in which case the caller tries the Sina
+        snapshot backup.  Out-of-range is still surfaced to the caller here as an
+        explicit refusal rather than an empty table.
+        """
+        date_col = "日期" if "日期" in df.columns else None
+        if date_col is None:
+            return f"{symbol} 近期主力资金流向数据缺少日期列，无法判定最新记录。"
+
+        dates = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.loc[dates.notna()].copy()
+        df[date_col] = dates[dates.notna()]
+        df = df[df[date_col] <= pd.Timestamp(cutoff)]
+        if df.empty:
+            return (
+                f"【数据获取失败】资金流数据仅覆盖最近约 120 个交易日，"
+                f"{curr_date} 超出可得范围，{symbol} 本项不可用。"
+            )
+
+        df_recent = chronological(take_latest(df, date_col, 5), date_col)
+        if df_recent is None or df_recent.empty:
+            return f"{symbol} 近期主力资金流向数据日期不可解析。"
+        latest_day = pd.to_datetime(df_recent[date_col], errors="coerce").max()
+        latest_str = latest_day.date().isoformat() if pd.notna(latest_day) else curr_date
+        return (
+            f"{symbol} 近5日主力资金净流向（截至于 {curr_date}，最新数据日 {latest_str}）：\n"
+            f"{df_recent.to_string(index=False)}"
+        )
 
     def get_lhb_detail(self, symbol: str, date: str) -> str:
         """获取龙虎榜数据，非异动日返回空提示（属正常）。
@@ -1288,15 +1396,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             _fetch_one, request_date, max_back=5, start_offset=0
         )
         if not result.ok:
-            res = DataResult(
-                ok=False,
-                data=None,
-                error=f"龙虎榜数据获取失败：{result.error}",
-                source=source_name,
-                title=title,
-                as_of=None,
-            )
-            return res.to_prompt()
+            return self._lhb_sina_fallback(symbol, code, request_date, result.error)
 
         body = str(result.data)
         header = result.date_header()
@@ -1309,6 +1409,54 @@ class CnAkshareProvider(BaseMarketDataProvider):
             as_of=result.as_of,
         )
         return res.to_prompt()
+
+    def _lhb_sina_fallback(self, symbol: str, code: str, request_date: str, em_error: str) -> str:
+        """东财龙虎榜失败时的新浪备用源（``stock_lhb_detail_daily_sina``）。"""
+        source_name = "akshare.stock_lhb_detail_daily_sina"
+        title = "龙虎榜明细"
+        try:
+            ak = self._ak()
+            date_fmt = request_date.replace("-", "")
+            with AKSHARE_CALL_LOCK:
+                df = ak.stock_lhb_detail_daily_sina(date=date_fmt)
+            if df is None or df.empty:
+                raise DateDataUnavailable(f"{request_date} 新浪龙虎榜无数据")
+            if "股票代码" in df.columns:
+                stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
+            else:
+                stock_df = df
+            if stock_df is None or stock_df.empty:
+                res = DataResult(
+                    ok=True,
+                    data=f"{symbol} 在 {request_date} 无龙虎榜数据（非异动日属正常）。",
+                    source=source_name,
+                    title=title,
+                    as_of=request_date,
+                )
+                return res.to_prompt()
+            res = DataResult(
+                ok=True,
+                data=(
+                    f"{symbol} 龙虎榜明细（{request_date}，新浪备用源）：\n"
+                    f"{stock_df.head(20).to_string(index=False)}"
+                ),
+                source=source_name,
+                title=title,
+                as_of=request_date,
+            )
+            return res.to_prompt()
+        except Exception as exc:
+            res = DataResult(
+                ok=False,
+                data=None,
+                error=(
+                    f"龙虎榜数据获取失败：{em_error}；"
+                    f"新浪备用源失败：{type(exc).__name__}: {exc}"
+                ),
+                source=source_name,
+                title=title,
+            )
+            return res.to_prompt()
 
     def get_zt_pool(self, date: str) -> str:
         """获取涨停板情绪池，反映市场整体情绪温度。
