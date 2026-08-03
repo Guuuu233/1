@@ -383,6 +383,12 @@ async def _startup():
     """Initialize DB, pre-load caches, recover stale tasks, then run the loop."""
     global _semaphore, _executor
 
+    # Security startup guard (DAV-66): refuse to run the scheduler without a
+    # TA_APP_SECRET_KEY (unless explicitly opted into the insecure default for
+    # local dev). The scheduler decrypts webhook URLs and reads user secrets, so
+    # it must fail fast alongside the API server instead of using the default key.
+    auth_service.ensure_secure_secret_configured()
+
     # Each scheduled `_run_job` fans out many `asyncio.to_thread` calls (DB
     # writes, akshare data collection, LLM extraction). The CPython default
     # of `min(32, cpu_count + 4)` is too small to absorb concurrent jobs +

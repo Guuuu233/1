@@ -151,7 +151,7 @@ docker run -d -p 8000:8000 \
 
 访问 `http://localhost:8000` 即可使用。
 
-> **`TA_APP_SECRET_KEY`**：用于加密用户 LLM API Key 和签发登录 JWT。不设置时使用内置默认密钥（仅适合本地开发）。生产环境务必设置，且不可更改。
+> **`TA_APP_SECRET_KEY`**：用于加密用户 LLM API Key 和签发登录 JWT。**未设置时服务（API 与调度器）会拒绝启动**；请先设置再启动，且生产环境设置后不可更改。仅限本地开发：如确需放行内置默认密钥，可显式设置 `TA_ALLOW_DEFAULT_SECRET=1`（不安全，禁止用于生产）。
 
 > **LLM 配置**：启动后在前端"设置"页面配置模型厂商、API Key 和模型名称即可，无需环境变量预设。
 
@@ -177,7 +177,7 @@ npm run build
 cd ..
 ```
 
-复制 `.env.example` 到 `.env` 并按需修改，然后：
+复制 `.env.example` 到 `.env` 并按需修改。**注意：`TA_APP_SECRET_KEY` 未设置时后端会拒绝启动**，请先取消注释并填入（生成方式：`openssl rand -base64 32`），或仅限本地开发时设置 `TA_ALLOW_DEFAULT_SECRET=1` 放行内置默认密钥。然后：
 
 ```bash
 # 启动后端

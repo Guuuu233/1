@@ -35,9 +35,46 @@ def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
 
 _DEFAULT_SECRET = "tradingagents-ashare-dev-secret"
 
+# Local-development escape hatch: when TA_APP_SECRET_KEY is unset, startup is
+# refused unless this is explicitly set to a truthy value. The built-in default
+# key is insecure (well-known, deterministic) and must never be used outside a
+# single-user local dev environment.
+ALLOW_DEFAULT_SECRET_ENV = "TA_ALLOW_DEFAULT_SECRET"
+_TRUTHY = {"1", "true", "yes", "on"}
+
 
 def _secret_key() -> str:
     return os.getenv("TA_APP_SECRET_KEY") or _DEFAULT_SECRET
+
+
+def allow_default_secret() -> bool:
+    """Whether the operator explicitly opted into the insecure built-in default key."""
+    return os.getenv(ALLOW_DEFAULT_SECRET_ENV, "").strip().lower() in _TRUTHY
+
+
+def ensure_secure_secret_configured() -> None:
+    """Refuse startup when TA_APP_SECRET_KEY is unset (startup guard, DAV-66).
+
+    Without a custom key, user LLM API keys are encrypted and login JWTs are
+    signed with a well-known hardcoded secret, so a production deployment
+    accidentally running without ``TA_APP_SECRET_KEY`` would be trivially
+    compromised. Fail fast instead of silently booting insecure.
+
+    Local development can explicitly opt out of the guard with
+    ``TA_ALLOW_DEFAULT_SECRET=1`` — see the README before doing that.
+    """
+    if is_custom_secret_configured():
+        return
+    if allow_default_secret():
+        return
+    raise RuntimeError(
+        "Refusing to start: TA_APP_SECRET_KEY is not set. This key encrypts "
+        "user LLM API keys and signs login JWTs; without it the insecure "
+        "hardcoded default key would be used. Generate one with "
+        "`openssl rand -base64 32` and export it, or for LOCAL DEVELOPMENT "
+        "ONLY set TA_ALLOW_DEFAULT_SECRET=1 to opt into the built-in default "
+        "key (never do this in production)."
+    )
 
 
 def _fernet_from_key(key: str) -> Fernet:

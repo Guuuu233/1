@@ -18,6 +18,12 @@ _ORIGINAL_DATABASE_URL = os.environ.get("DATABASE_URL")
 _DB_DIR = tempfile.mkdtemp(prefix="ta-pytest-")
 os.environ["DATABASE_URL"] = "sqlite:///" + _DB_DIR + "/pytest.db"
 
+# The offline test suite runs without a TA_APP_SECRET_KEY and explicitly opts
+# into the insecure built-in default key (DAV-66 startup guard). Production
+# deployments must set TA_APP_SECRET_KEY or both the API and the scheduler
+# refuse to start. setdefault keeps an externally provided value winning.
+os.environ.setdefault("TA_ALLOW_DEFAULT_SECRET", "1")
+
 _OFFLINE_STOCK_MAP = {
     "贵州茅台": "600519.SH",
     "宁德时代": "300750.SZ",
