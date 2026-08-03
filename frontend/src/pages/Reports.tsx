@@ -1,8 +1,8 @@
-import { FileText, Download, Trash2, Search, ChevronLeft, ChevronRight, Loader2, History, Clock3 } from 'lucide-react'
+import { FileText, Download, Trash2, Search, ChevronLeft, ChevronRight, Loader2, History, Clock3, X } from 'lucide-react'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import TaskProgressBanner from '@/components/TaskProgressBanner'
-import { api } from '@/services/api'
+import { api, isNotFoundError } from '@/services/api'
 import type { Report, ReportDetail } from '@/types'
 import DecisionCard from '@/components/DecisionCard'
 import ReportViewer from '@/components/ReportViewer'
@@ -11,6 +11,7 @@ import RiskRadar from '@/components/RiskRadar'
 import KeyMetrics from '@/components/KeyMetrics'
 import { useAuthStore } from '@/stores/authStore'
 import { advanceProgress, getReportRunProgress } from '@/utils/progressFeedback'
+import { isLegacyEnglishReport } from '@/utils/reportText'
 
 type ProgressState = {
     status: 'idle' | 'loading' | 'success' | 'error'
@@ -196,6 +197,7 @@ export default function Reports() {
     const [symbolHistory, setSymbolHistory] = useState<Report[]>([])
     const [listProgress, setListProgress] = useState<ProgressState>(IDLE_PROGRESS)
     const [detailProgress, setDetailProgress] = useState<ProgressState>(IDLE_PROGRESS)
+    const [deadReportNotice, setDeadReportNotice] = useState<string | null>(null)
 
     const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
 
@@ -325,6 +327,22 @@ export default function Reports() {
             }
         } catch (err) {
             const message = err instanceof Error ? err.message : '获取报告详情失败'
+            if (isNotFoundError(err)) {
+                // The report no longer exists (deleted, or its in-memory job was
+                // lost across a restart before the row was persisted). Stop the
+                // dead-task polling loop and return the user to the list.
+                setDeadReportNotice(message)
+                setSelectedReport(null)
+                if (!silent) {
+                    setDetailProgress({
+                        status: 'error',
+                        progress: 100,
+                        detail: message,
+                    })
+                    setSearchParamsRef.current({})
+                }
+                throw err
+            }
             if (!silent) {
                 setDetailProgress({
                     status: 'error',
@@ -383,7 +401,7 @@ export default function Reports() {
         const timer = window.setInterval(() => {
             const current = selectedReportRef.current
             if (!current || (current.status !== 'pending' && current.status !== 'running')) return
-            void loadReportDetail(current.id, { silent: true, preserveHistory: true })
+            loadReportDetail(current.id, { silent: true, preserveHistory: true }).catch(() => {})
         }, 4000)
 
         return () => window.clearInterval(timer)
@@ -540,6 +558,25 @@ export default function Reports() {
                 </div>
             </div>
 
+            {/* 死任务提示：报告已不存在，轮询已停止 */}
+            {deadReportNotice && (
+                <div className="card border-amber-200/80 bg-amber-50/80 dark:border-amber-500/20 dark:bg-amber-500/10">
+                    <div className="flex items-start justify-between gap-3 px-4 py-3">
+                        <div className="flex items-start gap-2 text-sm text-amber-800 dark:text-amber-200">
+                            <Clock3 className="w-4 h-4 mt-0.5 shrink-0" />
+                            <span>{deadReportNotice}</span>
+                        </div>
+                        <button
+                            onClick={() => setDeadReportNotice(null)}
+                            className="text-amber-600 dark:text-amber-300 hover:text-amber-800 dark:hover:text-amber-100 transition-colors"
+                            aria-label="关闭提示"
+                        >
+                            <X className="w-4 h-4" />
+                        </button>
+                    </div>
+                </div>
+            )}
+
             {/* 搜索 */}
             <div className="card">
                 <div className="flex flex-col gap-4">
@@ -608,7 +645,17 @@ export default function Reports() {
                                                         <FileText className="w-4 h-4 text-blue-600 dark:text-blue-400" />
                                                     </div>
                                                     <div>
-                                                        <p className="font-medium text-slate-900 dark:text-slate-100">{report.name || report.symbol}</p>
+                                                        <div className="flex items-center gap-1.5">
+                                                            <p className="font-medium text-slate-900 dark:text-slate-100">{report.name || report.symbol}</p>
+                                                            {isLegacyEnglishReport(report) && (
+                                                                <span
+                                                                    className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium leading-none text-amber-700 dark:bg-amber-500/15 dark:text-amber-300"
+                                                                    title="该报告由旧版引擎生成，正文可能为英文"
+                                                                >
+                                                                    旧版报告
+                                                                </span>
+                                                            )}
+                                                        </div>
                                                         {report.name && report.name !== report.symbol && (
                                                             <p className="text-xs text-slate-400 dark:text-slate-500">{report.symbol}</p>
                                                         )}

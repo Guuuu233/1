@@ -4,7 +4,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAnalysisStore } from '@/stores/analysisStore'
 import type { ReportDetail } from '@/types'
-import { sanitizeReportMarkdown } from '@/utils/reportText'
+import { isLegacyEnglishReport, sanitizeReportMarkdown } from '@/utils/reportText'
 
 const REPORT_SECTIONS = [
     { key: 'market_report', title: '市场分析报告', team: '分析团队' },
@@ -122,12 +122,25 @@ export default function ReportViewer({ reportData, activeSection }: ReportViewer
                     <div className="flex items-center gap-2">
                         <FileText className="w-5 h-5 text-blue-500" />
                         <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">分析报告</h2>
+                        {isLegacyEnglishReport(reportData) && (
+                            <span
+                                className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium leading-none text-amber-700 dark:bg-amber-500/15 dark:text-amber-300"
+                                title="该报告由旧版引擎生成，正文可能为英文"
+                            >
+                                旧版报告
+                            </span>
+                        )}
                     </div>
                     <button onClick={handleExport} className="btn-secondary flex items-center gap-2 text-sm py-1.5 px-3">
                         <Download className="w-4 h-4" />
                         导出
                     </button>
                 </div>
+                {isLegacyEnglishReport(reportData) && (
+                    <div className="rounded-2xl border border-amber-200/80 bg-amber-50/80 px-4 py-2.5 text-xs leading-5 text-amber-800 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-200">
+                        该报告由旧版引擎生成，正文可能包含英文内容。
+                    </div>
+                )}
                 <div className="space-y-3">
                     {REPORT_SECTIONS.map((section) => {
                         const content = getSectionContent(section.key)

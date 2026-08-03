@@ -7,13 +7,14 @@ import {
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { api } from '@/services/api'
+import { api, isNotFoundError } from '@/services/api'
 import { useAnalysisStore } from '@/stores/analysisStore'
 import {
     classifyRecoveredJobStatus,
     DEFAULT_OVERTIME_NOTICE,
     getJobLifecycleUpdate,
     hasRecoveryPollingReachedLimit,
+    JOB_NOT_FOUND_MESSAGE,
     RECOVERY_POLL_TIMEOUT_MESSAGE,
 } from '@/utils/jobLifecycle'
 import type {
@@ -288,6 +289,16 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
                 }
             } catch (error) {
                 if (signal.aborted) return false
+                // Job no longer exists (e.g. server restarted and dropped the
+                // in-memory job store). Stop polling instead of retrying a
+                // resource that can never come back.
+                if (isNotFoundError(error)) {
+                    pushAssistant(JOB_NOT_FOUND_MESSAGE)
+                    setCurrentHorizon(null)
+                    setIsAnalyzing(false)
+                    setAnalysisRunState('failed', JOB_NOT_FOUND_MESSAGE)
+                    return true
+                }
                 console.warn('任务状态回查失败，将继续重试:', error)
             }
 
