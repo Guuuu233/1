@@ -14,6 +14,13 @@ from .trade_calendar import (
     is_historical_analysis_date,
     unavailable_analysis_date_reason,
 )
+from .vendor_result import (
+    VendorEmpty,
+    VendorFail,
+    VendorOk,
+    VendorRefuse,
+    result_to_prompt,
+)
 
 # Tools organized by category
 TOOLS_CATEGORIES = {
@@ -325,12 +332,24 @@ def _submit_provider_call(
 
 
 def route_to_vendor(method: str, *args, **kwargs):
-    """Route method calls to provider implementations with fallback support."""
+    """Route method calls to provider implementations with fallback support.
+
+    Provider returns are interpreted with typed vendor semantics
+    (KNOWN_ISSUES #1):
+
+    - plain value / ``VendorOk``  -> successful hit, chain stops
+    - ``VendorRefuse``            -> this source cannot serve; chain stops
+      (unless ``allow_peers`` names same-semantics peers to continue through)
+    - ``VendorEmpty``             -> confirmed empty; chain stops
+    - ``VendorFail`` / exception  -> transient failure; chain falls through
+    """
     category = get_category_for_method(method)
     vendor_config = get_vendor(category, method)
     fallback_vendors = _resolve_vendor_chain(method, vendor_config)
     args_summary = _summarize_args(args, kwargs)
     last_exc = None
+    refusal_reason = None
+    peer_allowlist: set[str] | None = None
     _trace(
         f"method={method} {args_summary} category={category} "
         f"configured='{vendor_config}' chain={fallback_vendors}"
@@ -353,6 +372,12 @@ def route_to_vendor(method: str, *args, **kwargs):
         return refusal
 
     for vendor in fallback_vendors:
+        if peer_allowlist is not None and vendor not in peer_allowlist:
+            _trace(
+                f"method={method} {args_summary} vendor={vendor} "
+                "status=skip reason=refuse-peer-allowlist"
+            )
+            continue
         provider = _registry.get(vendor)
         if provider is None:
             _trace(f"method={method} {args_summary} vendor={vendor} status=skip reason=not-registered")
@@ -371,8 +396,6 @@ def route_to_vendor(method: str, *args, **kwargs):
                     vendor, policy, impl_func, args, kwargs
                 )
                 result = future.result(timeout=policy.timeout_seconds)
-                _trace(f"method={method} {args_summary} vendor={vendor} status=hit")
-                return result
             except (AlphaVantageRateLimitError, NotImplementedError) as exc:
                 last_exc = exc
                 # Try next provider for transient/routing issues or placeholder providers.
@@ -421,7 +444,45 @@ def route_to_vendor(method: str, *args, **kwargs):
                     f"status=fallback reason={type(exc).__name__}: {exc}"
                 )
                 break
+            else:
+                # Provider returned normally — interpret typed vendor semantics.
+                if isinstance(result, VendorRefuse):
+                    if result.allow_peers:
+                        refusal_reason = result.to_prompt()
+                        peer_allowlist = set(result.allow_peers)
+                        _trace(
+                            f"method={method} {args_summary} vendor={vendor} "
+                            f"status=refuse reason=refuse-with-peers "
+                            f"allow_peers={sorted(peer_allowlist)}"
+                        )
+                        break
+                    _trace(
+                        f"method={method} {args_summary} vendor={vendor} "
+                        "status=refuse reason=vendor-refuse"
+                    )
+                    return result.to_prompt()
+                if isinstance(result, VendorEmpty):
+                    _trace(
+                        f"method={method} {args_summary} vendor={vendor} "
+                        "status=confirmed-empty reason=vendor-empty"
+                    )
+                    return result.to_prompt()
+                if isinstance(result, VendorFail):
+                    last_exc = RuntimeError(result.error)
+                    _trace(
+                        f"method={method} {args_summary} vendor={vendor} "
+                        f"status=fallback reason=VendorFail: {result.error}"
+                    )
+                    break
+                if isinstance(result, VendorOk):
+                    _trace(f"method={method} {args_summary} vendor={vendor} status=hit")
+                    return result.to_prompt()
+                _trace(f"method={method} {args_summary} vendor={vendor} status=hit")
+                return result
 
+    if refusal_reason is not None:
+        _trace(f"method={method} {args_summary} status=refuse-sticky reason=no-peer-hit")
+        return refusal_reason
     _trace(f"method={method} {args_summary} status=failed reason=no-available-vendor")
     if last_exc is not None:
         raise RuntimeError(

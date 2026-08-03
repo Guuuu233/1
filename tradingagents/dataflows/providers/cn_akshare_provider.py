@@ -21,6 +21,12 @@ from ..trade_calendar import (
     snapshot_historical_refusal,
 )
 from ..utils import chronological, shrink_table, take_latest
+from ..vendor_result import (
+    VendorEmpty,
+    VendorFail,
+    VendorRefuse,
+    result_to_prompt,
+)
 from ..financial_announce import (
     build_effective_announce_map,
     filter_abstract_period_columns,
@@ -811,7 +817,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             try:
                 df = ak.stock_news_em(symbol=code)
                 if df is None or df.empty:
-                    return f"No news found for {ticker}"
+                    return VendorEmpty(f"No news found for {ticker}")
 
                 date_col = "发布时间" if "发布时间" in df.columns else None
                 if date_col is not None:
@@ -821,7 +827,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     df = df[(df[date_col] >= start_dt) & (df[date_col] < end_dt)]
 
                 if df.empty:
-                    return f"No news found for {ticker} between {start_date} and {end_date}"
+                    return VendorEmpty(
+                        f"No news found for {ticker} between {start_date} and {end_date}"
+                    )
 
                 if date_col is not None:
                     df = chronological(take_latest(df, date_col, 20), date_col)
@@ -847,12 +855,19 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     f"cn_akshare is temporarily unavailable for news: {exc}"
                 ) from exc
 
-    def get_global_news(self, curr_date: str) -> str:
+    def get_global_news(
+        self, curr_date: str, look_back_days: int = 7, limit: int = 50
+    ) -> str:
         result = self.get_sina_global_news(page="1", page_size="100", tag_id="1,4,7")
         # get_sina_global_news 异常时返回 "新浪财经快讯获取失败：..." 字符串（truthy），需显式检查
         if result and result.startswith("## "):
             return result
-        return f"{curr_date} 未获取到全球市场新闻"
+        if result and result.startswith("新浪财经快讯获取失败"):
+            # 源失败（网络/接口异常）：这是 VendorFail，链路应换到下一个 vendor
+            # （如 yfinance），而不是当作“确认无新闻”停止。
+            return VendorFail(result)
+        # 新浪接口成功返回但无快讯条目：确认空，停止链路并如实上报。
+        return VendorEmpty(f"{curr_date} 未获取到全球市场新闻")
 
     def get_insider_transactions(self, symbol: str, curr_date: str = None) -> str:
         """股东持股/内部人相关（主路径为当前截面，非历史增减持序列）。
@@ -891,7 +906,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
             end_date = end_dt.strftime("%Y-%m-%d")
             start_date = (end_dt - timedelta(days=14)).strftime("%Y-%m-%d")
-            news = self.get_news(symbol, start_date, end_date)
+            news = result_to_prompt(self.get_news(symbol, start_date, end_date))
             return (
                 f"## Insider Transactions for {symbol}\n\n"
                 f"未获取到股东交易明细，降级返回近两周公司相关新闻：\n\n{news}"
