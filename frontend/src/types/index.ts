@@ -444,6 +444,7 @@ export interface CalibrationResponse {
     brier_score: number | null
     sample_size: number
     skipped_no_outcome: number
+    truncated_before_filter: boolean
     buckets: CalibrationBucket[]
     filters: CalibrationFilters
 }

@@ -138,6 +138,18 @@ def client():
     return TestClient(app, raise_server_exceptions=False)
 
 
+@pytest.fixture(autouse=True)
+def _reset_calibration_state(monkeypatch):
+    """Isolate the module-level cache, concurrency counter and per-IP rate limiter."""
+    from api import main as main_mod
+
+    cal._calibration_cache.clear()
+    cal._active_calibrations = 0
+    main_mod._calibration_rate_hits.clear()
+    monkeypatch.setattr(main_mod, "_CALIBRATION_RATE_MAX", 10000)
+    yield
+
+
 class TestReliabilityCurveBucketing:
     def test_buckets_and_rise_rate_are_computed_correctly(self):
         user_id, _ = _user_token()
@@ -279,6 +291,20 @@ class TestFilters:
             )
         assert result["sample_size"] == 1
 
+    def test_symbol_filter_is_normalized_case_insensitively(self):
+        user_id, _ = _user_token()
+        _seed_report(symbol="600519.SH", trade_date="2024-01-02", probability=0.6, user_id=user_id)
+
+        with get_db_ctx() as db:
+            result = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                symbol="600519.sh",  # lowercase suffix must still match 600519.SH
+                outcome_resolver=lambda r: True,
+            )
+        assert result["sample_size"] == 1
+        assert result["filters"]["symbol"] == "600519.sh"
+
     def test_prompt_version_filter_matches_snapshot_hash(self):
         user_id, _ = _user_token()
         _seed_report(
@@ -342,20 +368,147 @@ class TestFilters:
         assert result["sample_size"] == 1
 
 
+class TestFilterBeforeLimit:
+    def test_snapshot_filter_applies_before_limit_when_scan_covers_matches(self, monkeypatch):
+        user_id, _ = _user_token()
+        monkeypatch.setattr(cal, "MAX_CALIBRATION_FILTER_SCAN", 20)
+        # 10 recent non-matching reports + 3 older matching reports
+        for index in range(10):
+            _seed_report(
+                symbol="600519.SH",
+                trade_date=f"2024-04-{index + 1:02d}",
+                probability=0.6,
+                user_id=user_id,
+                prompt_versions=("hash-aaaa",),
+            )
+        for index in range(3):
+            _seed_report(
+                symbol="600519.SH",
+                trade_date=f"2024-03-{index + 1:02d}",
+                probability=0.6,
+                user_id=user_id,
+                prompt_versions=("hash-bbbb",),
+            )
+
+        with get_db_ctx() as db:
+            result = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                prompt_version="hash-bbbb",
+                limit=3,
+                outcome_resolver=lambda r: True,
+            )
+        assert result["sample_size"] == 3
+        assert result["truncated_before_filter"] is False
+
+    def test_scan_cap_reports_truncated_before_filter(self, monkeypatch):
+        user_id, _ = _user_token()
+        monkeypatch.setattr(cal, "MAX_CALIBRATION_FILTER_SCAN", 5)
+        # Older matching reports would exist but fall beyond the scan cap (seeded
+        # first, so they are older in created_at).
+        for index in range(3):
+            _seed_report(
+                symbol="600519.SH",
+                trade_date=f"2024-03-{index + 1:02d}",
+                probability=0.6,
+                user_id=user_id,
+                prompt_versions=("hash-bbbb",),
+            )
+        # 5 recent non-matching reports occupy the whole scan window (seeded last).
+        for index in range(5):
+            _seed_report(
+                symbol="600519.SH",
+                trade_date=f"2024-04-{index + 1:02d}",
+                probability=0.6,
+                user_id=user_id,
+                prompt_versions=("hash-aaaa",),
+            )
+
+        with get_db_ctx() as db:
+            result = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                prompt_version="hash-bbbb",
+                limit=3,
+                outcome_resolver=lambda r: True,
+            )
+        assert result["sample_size"] == 0
+        assert result["truncated_before_filter"] is True
+
+    def test_no_snapshot_filter_never_truncates_before_filter(self):
+        user_id, _ = _user_token()
+        _seed_report(symbol="600519.SH", trade_date="2024-01-02", probability=0.6, user_id=user_id)
+        with get_db_ctx() as db:
+            result = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                limit=1,
+                outcome_resolver=lambda r: True,
+            )
+        assert result["truncated_before_filter"] is False
+
+
 class TestDefaultPriceOutcome:
-    def test_default_resolver_uses_price_after(self):
+    def test_default_resolver_uses_strict_price_after(self):
         user_id, _ = _user_token()
         _seed_report(symbol="600519.SH", trade_date="2024-01-02", probability=0.8, user_id=user_id)
 
         with (
             patch.object(cal, "_get_price_on", side_effect=_fake_price_on(100.0)),
-            patch.object(cal, "_get_price_after", side_effect=_fake_price_after(110.0)),
+            patch.object(cal, "_get_price_after_strict", side_effect=_fake_price_after(110.0)),
         ):
             with get_db_ctx() as db:
                 result = cal.compute_calibration(db, user_id=user_id)
         assert result["sample_size"] == 1
         assert result["buckets"][-1]["rise_count"] == 1
         assert result["buckets"][-1]["rise_rate"] == 100.0
+
+
+class TestHoldWindowIntegrity:
+    def _report(self, trade_date: str):
+        from types import SimpleNamespace
+
+        # A detached/expired ORM row can't be read outside a session, so the
+        # direct `_resolve_outcome` unit tests use a lightweight stand-in.
+        return SimpleNamespace(id="r-1", symbol="600519.SH", trade_date=trade_date)
+
+    def test_hold_window_incomplete_is_skipped_before_price_fetch(self):
+        report = self._report("2026-07-30")
+        with (
+            patch.object(cal, "_today", return_value=datetime(2026, 8, 1).date()),
+            patch.object(cal, "_get_price_on", side_effect=_fake_price_on(100.0)),
+            patch.object(cal, "_get_price_after_strict", side_effect=_fake_price_after(110.0)),
+        ):
+            # Even though the patched prices would say "rise", the hold window is
+            # not yet complete, so no premature conclusion is drawn.
+            assert cal._resolve_outcome(report, 5) is None
+
+    def test_hold_window_complete_after_elapsed(self):
+        report = self._report("2026-06-01")
+        with (
+            patch.object(cal, "_today", return_value=datetime(2026, 8, 1).date()),
+            patch.object(cal, "_get_price_on", side_effect=_fake_price_on(100.0)),
+            patch.object(cal, "_get_price_after_strict", side_effect=_fake_price_after(110.0)),
+        ):
+            assert cal._resolve_outcome(report, 5) is True
+
+    def test_exit_non_positive_price_is_skipped(self):
+        report = self._report("2024-01-02")
+        with (
+            patch.object(cal, "_get_price_on", side_effect=_fake_price_on(100.0)),
+            patch.object(cal, "_get_price_after_strict", side_effect=_fake_price_after(0.0)),
+        ):
+            assert cal._resolve_outcome(report, 5) is None
+
+    def test_strict_price_after_refuses_short_series(self):
+        short_csv = "date,close\n2024-01-02,100\n2024-01-03,101\n2024-01-04,102\n"
+        long_csv = "date,close\n" + "\n".join(
+            f"2024-01-{day:02d},{100 + day}" for day in range(2, 12)
+        ) + "\n"
+        with patch("tradingagents.dataflows.interface.route_to_vendor", return_value=short_csv):
+            assert cal._get_price_after_strict("600519.SH", "2024-01-01", 5) is None
+        with patch("tradingagents.dataflows.interface.route_to_vendor", return_value=long_csv):
+            assert cal._get_price_after_strict("600519.SH", "2024-01-01", 5) == 106.0
 
 
 class TestApiWiring:
@@ -372,7 +525,7 @@ class TestApiWiring:
 
         with (
             patch.object(cal, "_get_price_on", side_effect=_fake_price_on(100.0)),
-            patch.object(cal, "_get_price_after", side_effect=_fake_price_after(110.0)),
+            patch.object(cal, "_get_price_after_strict", side_effect=_fake_price_after(110.0)),
         ):
             response = client.get(
                 "/v1/calibration",
@@ -394,7 +547,7 @@ class TestApiWiring:
 
         with (
             patch.object(cal, "_get_price_on", side_effect=_fake_price_on(100.0)),
-            patch.object(cal, "_get_price_after", side_effect=_fake_price_after(110.0)),
+            patch.object(cal, "_get_price_after_strict", side_effect=_fake_price_after(110.0)),
         ):
             response = client.get(
                 "/v1/calibration",
@@ -411,3 +564,93 @@ class TestApiWiring:
         assert payload["sample_size"] == 1
         assert payload["filters"]["hold_days"] == 3
         assert payload["filters"]["symbol"] == "600519.SH"
+
+
+class TestApiParamsAndResourceGuard:
+    def test_calibration_endpoint_prompt_version_and_model_params(self, client):
+        user_id, token = _user_token()
+        _seed_report(
+            symbol="600519.SH", trade_date="2024-01-02", probability=0.6,
+            user_id=user_id, prompt_versions=("hash-aaaa",), model_names=("gpt-4o-mini",),
+        )
+        _seed_report(
+            symbol="600519.SH", trade_date="2024-01-03", probability=0.6,
+            user_id=user_id, prompt_versions=("hash-bbbb",), model_names=("deepseek-v3",),
+        )
+
+        with (
+            patch.object(cal, "_get_price_on", side_effect=_fake_price_on(100.0)),
+            patch.object(cal, "_get_price_after_strict", side_effect=_fake_price_after(110.0)),
+        ):
+            response = client.get(
+                "/v1/calibration",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"prompt_version": "hash-aaaa", "model": "gpt-4o-mini", "limit": 10},
+            )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["sample_size"] == 1
+        assert payload["filters"]["prompt_version"] == "hash-aaaa"
+        assert payload["filters"]["model"] == "gpt-4o-mini"
+
+    def test_calibration_endpoint_limit_param(self, client):
+        user_id, token = _user_token()
+        for index in range(5):
+            _seed_report(symbol="600519.SH", trade_date=f"2024-01-{index + 1:02d}", probability=0.6, user_id=user_id)
+
+        with (
+            patch.object(cal, "_get_price_on", side_effect=_fake_price_on(100.0)),
+            patch.object(cal, "_get_price_after_strict", side_effect=_fake_price_after(110.0)),
+        ):
+            response = client.get(
+                "/v1/calibration",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"limit": 2},
+            )
+        assert response.status_code == 200
+        assert response.json()["sample_size"] == 2
+
+    @pytest.mark.parametrize("params", [
+        {"hold_days": 61},
+        {"hold_days": 0},
+        {"limit": 201},
+        {"limit": 0},
+    ])
+    def test_calibration_rejects_invalid_params(self, client, params):
+        _, token = _user_token()
+        response = client.get(
+            "/v1/calibration",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+        )
+        assert response.status_code == 422
+
+    def test_calibration_busy_returns_429(self, client, monkeypatch):
+        _, token = _user_token()
+
+        def _block(*args, **kwargs):
+            raise cal.CalibrationBusyError("校准度计算繁忙，请稍后重试")
+
+        monkeypatch.setattr(cal, "compute_calibration", _block)
+        response = client.get(
+            "/v1/calibration",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 429
+        assert "繁忙" in response.json()["detail"]
+
+    def test_calibration_uses_cache_for_repeated_identical_requests(self, client):
+        user_id, token = _user_token()
+        _seed_report(symbol="600519.SH", trade_date="2024-01-02", probability=0.6, user_id=user_id)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        with (
+            patch.object(cal, "_get_price_on", side_effect=_fake_price_on(100.0)),
+            patch.object(cal, "_get_price_after_strict", side_effect=_fake_price_after(110.0)),
+        ):
+            first = client.get("/v1/calibration", headers=headers)
+            second = client.get("/v1/calibration", headers=headers)
+        assert first.status_code == 200 and second.status_code == 200
+        assert first.json() == second.json()
+        # The cache key is stored — the second identical request did not recompute.
+        assert len(cal._calibration_cache) == 1

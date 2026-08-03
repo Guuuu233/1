@@ -27,10 +27,14 @@ type ChartDatum = {
 
 function toChartData(buckets: CalibrationBucket[]): ChartDatum[] {
     return buckets.map(bucket => {
-        const midpoint = bucket.probability_min + (bucket.probability_max - bucket.probability_min) / 2
+        // Empty buckets have no observed prediction; leave predicted null so the
+        // chart never draws a bar for a bucket with zero samples.
+        const predicted = bucket.avg_probability != null
+            ? Number((bucket.avg_probability * 100).toFixed(1))
+            : null
         return {
             bucket: bucket.bucket,
-            predicted: bucket.avg_probability != null ? Number((bucket.avg_probability * 100).toFixed(1)) : midpoint * 100,
+            predicted,
             actual: bucket.rise_rate,
             count: bucket.count,
         }
@@ -56,40 +60,28 @@ export default function CalibrationPanel({ compact = false }: CalibrationPanelPr
     const [endDate, setEndDate] = useState('')
     const [holdDays, setHoldDays] = useState(5)
     const [symbol, setSymbol] = useState('')
+    const [promptVersion, setPromptVersion] = useState('')
     const [model, setModel] = useState('')
 
-    const load = useCallback(async (showSpinner = true) => {
-        if (showSpinner) setLoading(true)
-        setError(null)
-        try {
-            const res = await api.getCalibration({
-                start_date: startDate || undefined,
-                end_date: endDate || undefined,
-                symbol: symbol.trim() || undefined,
-                model: model.trim() || undefined,
-                hold_days: holdDays,
-            })
-            setData(res)
-        } catch (err) {
-            setError(err instanceof Error ? err.message : '加载校准度数据失败')
-        } finally {
-            if (showSpinner) setLoading(false)
-        }
-    }, [endDate, holdDays, model, startDate, symbol])
-
-    const refresh = useCallback(() => {
-        void load()
-    }, [load])
-
-    useEffect(() => {
-        let cancelled = false
-        api.getCalibration({
+    // Single fetch source shared by the mount effect and the refresh button; it
+    // returns a promise and never calls setState itself, so the effect applies
+    // results in async callbacks (matching the codebase fetch pattern) and there
+    // is no competing double-fetch path.
+    const fetchCalibration = useCallback(
+        () => api.getCalibration({
             start_date: startDate || undefined,
             end_date: endDate || undefined,
             symbol: symbol.trim() || undefined,
+            prompt_version: promptVersion.trim() || undefined,
             model: model.trim() || undefined,
             hold_days: holdDays,
-        })
+        }),
+        [endDate, holdDays, model, promptVersion, startDate, symbol],
+    )
+
+    useEffect(() => {
+        let cancelled = false
+        fetchCalibration()
             .then(res => {
                 if (cancelled) return
                 setError(null)
@@ -102,7 +94,20 @@ export default function CalibrationPanel({ compact = false }: CalibrationPanelPr
         return () => {
             cancelled = true
         }
-    }, [endDate, holdDays, model, startDate, symbol])
+    }, [fetchCalibration])
+
+    const handleRefresh = useCallback(() => {
+        setLoading(true)
+        fetchCalibration()
+            .then(res => {
+                setError(null)
+                setData(res)
+            })
+            .catch(err => {
+                setError(err instanceof Error ? err.message : '加载校准度数据失败')
+            })
+            .finally(() => setLoading(false))
+    }, [fetchCalibration])
 
     const chartData = data ? toChartData(data.buckets) : []
     const evaluated = data?.sample_size ?? 0
@@ -125,7 +130,7 @@ export default function CalibrationPanel({ compact = false }: CalibrationPanelPr
                 </div>
                 <button
                     type="button"
-                    onClick={refresh}
+                    onClick={handleRefresh}
                     disabled={loading}
                     className="btn-secondary inline-flex items-center gap-1.5 px-3 py-1.5 text-sm disabled:opacity-50"
                 >
@@ -135,7 +140,7 @@ export default function CalibrationPanel({ compact = false }: CalibrationPanelPr
             </div>
 
             {/* Filters */}
-            <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-6">
                 <label className="block">
                     <span className="mb-1 block text-xs text-slate-400">起始日期</span>
                     <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} className="input w-full" />
@@ -151,6 +156,16 @@ export default function CalibrationPanel({ compact = false }: CalibrationPanelPr
                         value={symbol}
                         onChange={e => setSymbol(e.target.value)}
                         placeholder="600519.SH"
+                        className="input w-full"
+                    />
+                </label>
+                <label className="block">
+                    <span className="mb-1 block text-xs text-slate-400">提示词版本</span>
+                    <input
+                        type="text"
+                        value={promptVersion}
+                        onChange={e => setPromptVersion(e.target.value)}
+                        placeholder="resolved_hash"
                         className="input w-full"
                     />
                 </label>
@@ -184,7 +199,13 @@ export default function CalibrationPanel({ compact = false }: CalibrationPanelPr
                 </div>
             )}
 
-            {!data && !error && loading && (
+            {data?.truncated_before_filter && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300">
+                    提示：快照过滤的候选扫描达到上限，当前结果可能未覆盖所有历史报告（有偏采样）。
+                </div>
+            )}
+
+            {!data && !error && (
                 <div className="flex items-center justify-center py-10">
                     <Loader2 className="h-6 w-6 animate-spin text-indigo-500" />
                 </div>
