@@ -18,6 +18,25 @@ function getAuthToken(): string | null {
     }
 }
 
+/**
+ * Error thrown by ApiService for non-2xx responses. Carries the HTTP status so
+ * callers can distinguish a missing resource (404) from a transient failure,
+ * e.g. to stop polling a job/report that no longer exists after a restart.
+ */
+export class ApiError extends Error {
+    readonly status: number
+
+    constructor(message: string, status: number) {
+        super(message)
+        this.name = 'ApiError'
+        this.status = status
+    }
+}
+
+export function isNotFoundError(error: unknown): boolean {
+    return error instanceof ApiError && error.status === 404
+}
+
 class ApiService {
     private async request<T>(endpoint: string, options?: RequestInit): Promise<T> {
         const url = `${getBaseUrl()}${endpoint}`
@@ -32,14 +51,15 @@ class ApiService {
         })
 
         if (!response.ok) {
+            const status = response.status
             const contentType = response.headers.get('content-type') || ''
             if (contentType.includes('application/json')) {
                 const data = await response.json().catch(() => null)
                 const detail = data?.detail || data?.message
-                throw new Error(detail || `HTTP error! status: ${response.status}`)
+                throw new ApiError(detail || `HTTP error! status: ${status}`, status)
             }
             const error = await response.text()
-            throw new Error(error || `HTTP error! status: ${response.status}`)
+            throw new ApiError(error || `HTTP error! status: ${status}`, status)
         }
 
         if (response.status === 204 || response.status === 205) {
@@ -101,7 +121,7 @@ class ApiService {
         })
 
         if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`)
+            throw new ApiError(`HTTP error! status: ${response.status}`, response.status)
         }
 
         return response
