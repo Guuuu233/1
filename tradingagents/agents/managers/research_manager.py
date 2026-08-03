@@ -8,6 +8,7 @@ from tradingagents.agents.utils.debate_utils import (
     format_claim_subset_for_prompt,
     format_claims_for_prompt,
 )
+from tradingagents.agents.utils.evidence_summary import build_evidence_summary
 from tradingagents.agents.utils.prompt_injection import build_injection_slots, Placement, DEFAULT_PLACEMENT
 
 _logger = logging.getLogger(__name__)
@@ -39,6 +40,16 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
         unresolved_claims_text = format_claim_subset_for_prompt(claims, unresolved_claim_ids)
         round_summary_text = round_summary or "暂无轮次摘要。"
 
+        # First-hand evidence access (KNOWN_ISSUES #2): adjudicators get compact
+        # fact-dense excerpts of the reports they currently only use for memory
+        # retrieval, so the verdict can be anchored to evidence strength. The
+        # macro analyst's report was previously consumed by nobody (git log shows
+        # it was added with the other analysts but never wired into a template).
+        market_evidence_summary = build_evidence_summary(market_research_report)
+        news_evidence_summary = build_evidence_summary(news_report)
+        fundamentals_evidence_summary = build_evidence_summary(fundamentals_report)
+        macro_evidence_summary = build_evidence_summary(state.get("macro_report", ""))
+
         injection_slots = build_injection_slots(custom_prompt, placement, role_key="research_manager")
         prompt = get_prompt("research_manager_prompt", config=get_config()).format(
             past_memory_str=past_memory_str,
@@ -46,6 +57,10 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             smart_money_report=smart_money_report,
             volume_price_report=volume_price_report,
             sentiment_report=sentiment_report,
+            market_evidence_summary=market_evidence_summary,
+            news_evidence_summary=news_evidence_summary,
+            fundamentals_evidence_summary=fundamentals_evidence_summary,
+            macro_evidence_summary=macro_evidence_summary,
             claims_text=claims_text,
             unresolved_claims_text=unresolved_claims_text,
             round_summary=round_summary_text,
@@ -55,12 +70,17 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
         _logger.info(
             "[research_manager] prompt size: total=%d chars | "
             "history=%d, smart_money=%d, volume_price=%d, sentiment=%d, "
+            "evidence(market/news/fund/macro)=%d/%d/%d/%d, "
             "memory=%d, claims=%d, unresolved=%d, round_summary=%d",
             len(prompt),
             len(history or ""),
             len(smart_money_report or ""),
             len(volume_price_report or ""),
             len(sentiment_report or ""),
+            len(market_evidence_summary),
+            len(news_evidence_summary),
+            len(fundamentals_evidence_summary),
+            len(macro_evidence_summary),
             len(past_memory_str or ""),
             len(claims_text or ""),
             len(unresolved_claims_text or ""),

@@ -10,9 +10,10 @@ from tradingagents.agents.utils.debate_utils import (
     format_claims_for_prompt,
     safe_int,
 )
+from tradingagents.agents.utils.prompt_injection import build_injection_slots, Placement, DEFAULT_PLACEMENT
 
 
-def create_risk_manager(llm, memory):
+def create_risk_manager(llm, memory, custom_prompt: str = "", placement: Placement = DEFAULT_PLACEMENT):
     async def risk_manager_node(state) -> dict:
 
         company_name = state["company_of_interest"]
@@ -36,6 +37,10 @@ def create_risk_manager(llm, memory):
         context_view = build_agent_context_view(state, "risk")
         claims = risk_debate_state.get("claims", [])
         unresolved_claim_ids = risk_debate_state.get("unresolved_claim_ids", [])
+
+        # Custom-prompt injection (3000-char constraints e.g. confidence ceiling /
+        # falsification conditions) must reach the risk adjudicator too.
+        injection_slots = build_injection_slots(custom_prompt, placement, role_key="risk_manager")
         prompt = get_prompt("risk_manager_prompt", config=get_config()).format(
             trader_plan=trader_plan,
             past_memory_str=past_memory_str,
@@ -45,6 +50,7 @@ def create_risk_manager(llm, memory):
             claims_text=format_claims_for_prompt(claims, empty_message="当前没有已登记风控 claim。"),
             unresolved_claims_text=format_claim_subset_for_prompt(claims, unresolved_claim_ids),
             round_summary=risk_debate_state.get("round_summary", "暂无风险轮次摘要。"),
+            **injection_slots,
         )
 
         # ── 流式输出 ──
