@@ -11,6 +11,7 @@ import RiskRadar from '@/components/RiskRadar'
 import KeyMetrics from '@/components/KeyMetrics'
 import { useAuthStore } from '@/stores/authStore'
 import { advanceProgress, getReportRunProgress } from '@/utils/progressFeedback'
+import { isLegacyEnglishReport } from '@/utils/reportText'
 
 type ProgressState = {
     status: 'idle' | 'loading' | 'success' | 'error'
@@ -644,7 +645,17 @@ export default function Reports() {
                                                         <FileText className="w-4 h-4 text-blue-600 dark:text-blue-400" />
                                                     </div>
                                                     <div>
-                                                        <p className="font-medium text-slate-900 dark:text-slate-100">{report.name || report.symbol}</p>
+                                                        <div className="flex items-center gap-1.5">
+                                                            <p className="font-medium text-slate-900 dark:text-slate-100">{report.name || report.symbol}</p>
+                                                            {isLegacyEnglishReport(report) && (
+                                                                <span
+                                                                    className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium leading-none text-amber-700 dark:bg-amber-500/15 dark:text-amber-300"
+                                                                    title="该报告由旧版引擎生成，正文可能为英文"
+                                                                >
+                                                                    旧版报告
+                                                                </span>
+                                                            )}
+                                                        </div>
                                                         {report.name && report.name !== report.symbol && (
                                                             <p className="text-xs text-slate-400 dark:text-slate-500">{report.symbol}</p>
                                                         )}
