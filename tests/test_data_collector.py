@@ -160,3 +160,33 @@ def test_fetch_all_returns_bounded_when_sources_hang():
 
     assert elapsed < 1.0
     assert "数据拉取超时" in result["news"]
+
+
+def test_fetch_all_preserves_source_completed_during_grace_window():
+    release = threading.Event()
+    realtime_payload = {
+        "status": "available",
+        "source": "sina",
+        "quote_as_of": "2026-07-29T15:00:00",
+        "retrieved_at": "2026-07-29T15:00:00",
+        "error": None,
+        "quote": {"price": 1.0},
+    }
+
+    def delayed_realtime(tool, payload):
+        if getattr(tool, "__name__", "") == "_fetch_realtime_context":
+            time.sleep(0.15)
+            return realtime_payload
+        release.wait(timeout=5)
+        return "late"
+
+    try:
+        with patch("tradingagents.graph.data_collector._safe", side_effect=delayed_realtime), \
+             patch("tradingagents.graph.data_collector.FETCH_ALL_TIMEOUT", 0.05), \
+             patch("tradingagents.graph.data_collector.FETCH_MAX_WORKERS", 2), \
+             patch("tradingagents.graph.data_collector.FETCH_ALL_SHUTDOWN_GRACE_SECONDS", 1.0):
+            result = _fetch_all("600519", "2025-01-02")
+    finally:
+        release.set()
+
+    assert result["market_data_context"]["realtime"] == realtime_payload

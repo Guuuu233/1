@@ -618,9 +618,12 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         if not_done:
             # cancel_futures 只能移除排队任务，无法中断已运行的 worker；
             # 这里给 shutdown 前的收尾等待一个显式上界，保证 _fetch_all 有界返回。
-            _, not_done = futures_wait(
+            extra_done, not_done = futures_wait(
                 not_done, timeout=FETCH_ALL_SHUTDOWN_GRACE_SECONDS
             )
+            # 宽限期内完成的数据源也是有效结果，必须并入 done 取 result()，
+            # 否则该 key 会从 results 中整体消失且不会进入失败台账。
+            done = done.union(extra_done)
         for future in done:
             results[future_to_key[future]] = future.result()
         for future in not_done:
