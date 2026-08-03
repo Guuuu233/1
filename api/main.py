@@ -4391,6 +4391,77 @@ def delete_backtest(job_id: str, current_user: UserDB = Depends(_require_api_use
     return {"message": "已删除"}
 
 
+# ─── Calibration Endpoints ────────────────────────────────────────────────────
+
+from api.services import calibration_service as _calibration  # noqa: E402
+
+# /v1/calibration is a synchronous, I/O-heavy endpoint (it resolves a price
+# window per evaluated report).  Beyond the service-level concurrency guard and
+# per-filter-key cache, we rate-limit it per source IP so a burst cannot occupy
+# worker threads or exhaust the shared data-provider quota.
+_CALIBRATION_RATE_WINDOW_SECONDS = 60
+_CALIBRATION_RATE_MAX = int(os.getenv("CALIBRATION_RATE_MAX", "5"))
+_calibration_rate_hits: Dict[str, List[float]] = {}
+_calibration_rate_lock = Lock()
+
+
+def _enforce_calibration_rate_limit(request: Request) -> None:
+    remote_ip = _get_real_ip(request)
+    now = time.time()
+    with _calibration_rate_lock:
+        hits = _calibration_rate_hits.setdefault(remote_ip, [])
+        hits[:] = [t for t in hits if now - t < _CALIBRATION_RATE_WINDOW_SECONDS]
+        if len(hits) >= _CALIBRATION_RATE_MAX:
+            raise HTTPException(status_code=429, detail="校准度接口请求过于频繁，请稍后重试")
+        hits.append(now)
+        # Periodic cleanup: once the table grows past a threshold, drop buckets
+        # whose entries have all expired so memory cannot grow unbounded with
+        # the number of distinct source IPs.
+        if len(_calibration_rate_hits) > 1024:
+            empty_buckets = [
+                ip for ip, timestamps in _calibration_rate_hits.items() if not timestamps
+            ]
+            for ip in empty_buckets:
+                _calibration_rate_hits.pop(ip, None)
+
+
+@app.get("/v1/calibration")
+def get_calibration(
+    request: Request,
+    start_date: Optional[str] = Query(None, description="起始分析日期 (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="结束分析日期 (YYYY-MM-DD)"),
+    symbol: Optional[str] = Query(None, description="股票代码"),
+    prompt_version: Optional[str] = Query(None, description="提示词版本（resolved_hash 子串）"),
+    model: Optional[str] = Query(None, description="模型名称（子串匹配 model_config_snapshot）"),
+    hold_days: int = Query(_calibration.DEFAULT_HOLD_DAYS, ge=1, le=60),
+    limit: Optional[int] = Query(None, ge=1, le=_calibration.MAX_CALIBRATION_LIMIT),
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_api_user),
+) -> Dict:
+    """返回历史报告的校准度统计：可靠性曲线 + Brier score.
+
+    按报告的 probability（0–1）分桶 0-50 / 50-60 / 60-70 / 70-80 / 80+，
+    统计各桶实际上涨率；支持按日期段 / 提示词版本 / 模型过滤。
+    结果可归因到每份报告冻结的 custom_prompt_snapshot / model_config_snapshot。
+    结果按过滤器键缓存；并发计算受限，命中上限返回 429。
+    """
+    _enforce_calibration_rate_limit(request)
+    try:
+        return _calibration.compute_calibration(
+            db,
+            user_id=current_user.id,
+            start_date=start_date,
+            end_date=end_date,
+            symbol=symbol,
+            prompt_version=prompt_version,
+            model=model,
+            hold_days=hold_days,
+            limit=limit,
+        )
+    except _calibration.CalibrationBusyError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+
 # ─── Runtime Config Endpoints ────────────────────────────────────────────────
 
 _CONFIG_ALLOWED_KEYS = {
