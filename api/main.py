@@ -212,6 +212,11 @@ async def _run_manual_trigger(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize resources on startup and cleanup on shutdown."""
+    # Security startup guard (DAV-66): refuse to boot without a TA_APP_SECRET_KEY
+    # unless the operator explicitly opted into the insecure default for local
+    # development (TA_ALLOW_DEFAULT_SECRET=1). Must run before init_db() so no
+    # data is ever written using the well-known default key.
+    auth_service.ensure_secure_secret_configured()
     # 全局 socket 默认超时：akshare 等库内部的 requests 调用不传 timeout，
     # 网络丢包时 TLS 握手/读会永久阻塞，僵尸线程逐渐占满线程池（见 healthz 探针）。
     # uvicorn/asyncio 的服务端 socket 显式 setblocking(False)，不受此影响；
@@ -258,12 +263,14 @@ async def lifespan(app: FastAPI):
     store.clear()
     _background_tasks.clear()
 
-    # Security: warn loudly if using default secret key
-    if not os.getenv("TA_APP_SECRET_KEY"):
+    # Security: reaching this point without a custom key means the operator
+    # explicitly opted into the insecure built-in default (TA_ALLOW_DEFAULT_SECRET=1)
+    # for local development. Warn loudly so it cannot be confused with a secure boot.
+    if not auth_service.is_custom_secret_configured():
         _log("=" * 70)
-        _log("WARNING: TA_APP_SECRET_KEY is not set!")
+        _log("WARNING: TA_APP_SECRET_KEY is not set and TA_ALLOW_DEFAULT_SECRET=1.")
         _log("Using hardcoded default key. ALL encryption and JWT signing")
-        _log("is INSECURE. Set TA_APP_SECRET_KEY env var before production use.")
+        _log("is INSECURE. Set TA_APP_SECRET_KEY for any non-local deployment.")
         _log("=" * 70)
 
     _report_version_stats()
