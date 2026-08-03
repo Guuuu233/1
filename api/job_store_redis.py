@@ -97,6 +97,27 @@ class RedisJobStore:
             return {}
         return {k: _deserialize_value(v) for k, v in raw.items()}
 
+    def running_jobs(self) -> Dict[str, Dict[str, Any]]:
+        """Return ``{job_id: fields}`` for all jobs currently in 'running' status.
+
+        Uses SCAN to avoid blocking the Redis server with KEYS.  Job state
+        survives process restarts in Redis, so this lets the scheduler's startup
+        recovery enumerate in-flight jobs from the shared store.
+        """
+        running: Dict[str, Dict[str, Any]] = {}
+        prefix_len = len(self._prefix + "job:")
+        cursor = 0
+        while True:
+            cursor, keys = self._r.scan(cursor=cursor, match=f"{self._prefix}job:*", count=200)
+            for key in keys:
+                job_id = key[prefix_len:]
+                fields = self.get_job(job_id)
+                if fields.get("status") == "running":
+                    running[job_id] = fields
+            if cursor == 0:
+                break
+        return running
+
     def delete_job(self, job_id: str) -> None:
         """Remove job state hash. Deleting a non-existent key is a no-op."""
         self._r.delete(self._job_key(job_id))

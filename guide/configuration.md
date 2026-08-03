@@ -56,6 +56,8 @@
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `SCHEDULER_CONCURRENCY` | `3` | 定时分析并发数（scheduler 进程内的信号量） |
+| `SCHEDULER_GRACEFUL_SHUTDOWN_SECONDS` | `900` | 收到 SIGTERM/SIGINT 后等待进行中任务完成的最大秒数；超时取消剩余任务。被取消的任务保持 `running` 落库，下次启动自动重新入队（不丢失当日分析） |
+| `SCHEDULER_HEARTBEAT_SECONDS` | `30` | 运行中任务心跳落库间隔（秒），启动恢复时用于区分"分析中崩溃"与"已放弃" |
 
 ## 容器角色（Docker 入口）
 

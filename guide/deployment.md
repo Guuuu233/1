@@ -35,7 +35,7 @@ docker run -d -p 8000:8000 \
 访问 `http://localhost:8000` 即可使用。容器入口的行为：
 
 - 任一进程退出时停止另一进程并以其退出码结束，配合 `--restart always` 整体自愈；
-- `SIGTERM`/`SIGINT` 会转发给两个进程，优雅停机；
+- `SIGTERM`/`SIGINT` 会转发给两个进程，优雅停机：调度器停止领取新任务，等待进行中任务完成（最长 `SCHEDULER_GRACEFUL_SHUTDOWN_SECONDS`，默认 900 秒）后再退出；超时被取消的任务保持 `running` 落库，下次启动自动重新入队，不丢失当日分析。若希望完整等待而非被 `stop_grace_period` 强杀，请把 compose 的 `stop_grace_period` 调大到不小于该值；
 - 如需只跑单进程，可覆盖容器命令，如 `... <镜像> uv run --no-sync tradingagents-api`。
 
 ## 拓扑 B：分开部署（API 与调度器各跑一个容器）
