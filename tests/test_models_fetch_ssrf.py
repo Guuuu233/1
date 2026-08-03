@@ -77,7 +77,7 @@ def _endpoint_client():
 
 def test_allowlisted_public_host_fetches_and_sorts_models(monkeypatch):
     monkeypatch.setenv(api_main._MODELS_FETCH_ALLOWLIST_ENV, "models.example.com:8080")
-    monkeypatch.setattr(api_main, "_resolve_models_fetch_target", lambda host, port: "93.184.216.34")
+    monkeypatch.setattr(api_main, "_resolve_models_fetch_target", lambda host, port, **kwargs: "93.184.216.34")
     fake_conn = _FakeConnection(
         response=_FakeResponse(
             body=json.dumps({"data": [{"id": "z"}, {"id": "a"}, {"id": "a"}]}).encode("utf-8")
@@ -196,7 +196,7 @@ def test_private_ip_literal_rejected(monkeypatch, allow_entry, url):
 
 def test_redirect_response_is_rejected(monkeypatch):
     monkeypatch.setenv(api_main._MODELS_FETCH_ALLOWLIST_ENV, "models.example.com")
-    monkeypatch.setattr(api_main, "_resolve_models_fetch_target", lambda host, port: "93.184.216.34")
+    monkeypatch.setattr(api_main, "_resolve_models_fetch_target", lambda host, port, **kwargs: "93.184.216.34")
     fake_conn = _FakeConnection(
         response=_FakeResponse(
             status=302,
@@ -222,7 +222,7 @@ def test_redirect_response_is_rejected(monkeypatch):
 )
 def test_connection_failure_is_wrapped_generically(monkeypatch, request_error):
     monkeypatch.setenv(api_main._MODELS_FETCH_ALLOWLIST_ENV, "models.example.com")
-    monkeypatch.setattr(api_main, "_resolve_models_fetch_target", lambda host, port: "93.184.216.34")
+    monkeypatch.setattr(api_main, "_resolve_models_fetch_target", lambda host, port, **kwargs: "93.184.216.34")
     fake_conn = _FakeConnection(request_error=request_error)
     monkeypatch.setattr(api_main, "_build_models_fetch_connection", lambda *args, **kwargs: fake_conn)
 
@@ -323,3 +323,132 @@ def test_endpoint_success_shape_is_preserved(monkeypatch):
         "count": 2,
         "url": "http://allowed.example.com/v1/models",
     }
+
+
+# --- 受信本地默认（host.docker.internal / 回环）+ 白名单 + 钉端口 ---
+
+def test_trusted_local_host_docker_gateway_allowed_with_pinned_port(monkeypatch):
+    """host.docker.internal 在白名单中且钉死端口时，放行解析出的私网 IP。"""
+    monkeypatch.setenv(api_main._MODELS_FETCH_ALLOWLIST_ENV, "host.docker.internal:8317")
+    monkeypatch.setattr(api_main.socket, "getaddrinfo", _getaddrinfo_for("172.17.0.1"))
+    fake_conn = _FakeConnection(
+        response=_FakeResponse(body=json.dumps({"data": [{"id": "a"}]}).encode("utf-8"))
+    )
+    monkeypatch.setattr(api_main, "_build_models_fetch_connection", lambda *args, **kwargs: fake_conn)
+
+    models, url = api_main._fetch_available_models("http://host.docker.internal:8317/v1", "")
+
+    assert models == ["a"]
+
+
+def test_trusted_local_host_loopback_allowed_with_pinned_port(monkeypatch):
+    """裸机场景：127.0.0.1:8317 白名单放行回环。"""
+    monkeypatch.setenv(api_main._MODELS_FETCH_ALLOWLIST_ENV, "127.0.0.1:8317")
+    monkeypatch.setattr(api_main.socket, "getaddrinfo", _getaddrinfo_for("127.0.0.1"))
+    fake_conn = _FakeConnection(
+        response=_FakeResponse(body=json.dumps({"data": [{"id": "b"}]}).encode("utf-8"))
+    )
+    monkeypatch.setattr(api_main, "_build_models_fetch_connection", lambda *args, **kwargs: fake_conn)
+
+    models, url = api_main._fetch_available_models("http://127.0.0.1:8317/v1", "")
+
+    assert models == ["b"]
+
+
+def test_trusted_local_host_bare_hostname_still_rejected(monkeypatch):
+    """受信本地主机必须钉死端口：裸 host 形式即使在白名单也拒绝。"""
+    monkeypatch.setenv(api_main._MODELS_FETCH_ALLOWLIST_ENV, "host.docker.internal")
+    monkeypatch.setattr(api_main.socket, "getaddrinfo", _getaddrinfo_for("172.17.0.1"))
+    monkeypatch.setattr(api_main, "_build_models_fetch_connection", _unexpected)
+
+    with pytest.raises(api_main._ModelsFetchError):
+        api_main._fetch_available_models("http://host.docker.internal:8317/v1", "")
+
+
+def test_trusted_local_host_wrong_port_rejected(monkeypatch):
+    """白名单端口与实际端口不匹配时拒绝。"""
+    monkeypatch.setenv(api_main._MODELS_FETCH_ALLOWLIST_ENV, "127.0.0.1:8317")
+    monkeypatch.setattr(api_main.socket, "getaddrinfo", _getaddrinfo_for("127.0.0.1"))
+    monkeypatch.setattr(api_main, "_build_models_fetch_connection", _unexpected)
+
+    with pytest.raises(api_main._ModelsFetchError):
+        api_main._fetch_available_models("http://127.0.0.1:9999/v1", "")
+
+
+def test_trusted_local_host_metadata_ip_never_allowed(monkeypatch):
+    """即便受信本地主机 + 白名单，云元数据地址仍无条件拦截。"""
+    monkeypatch.setenv(api_main._MODELS_FETCH_ALLOWLIST_ENV, "host.docker.internal:8317")
+    monkeypatch.setattr(api_main.socket, "getaddrinfo", _getaddrinfo_for("169.254.169.254"))
+    monkeypatch.setattr(api_main, "_build_models_fetch_connection", _unexpected)
+
+    with pytest.raises(api_main._ModelsFetchError):
+        api_main._fetch_available_models("http://host.docker.internal:8317/v1", "")
+
+
+def test_non_trusted_host_private_ip_still_rejected(monkeypatch):
+    """非受信主机解析到私网地址仍被拦（fail-closed 回归）。"""
+    monkeypatch.setenv(api_main._MODELS_FETCH_ALLOWLIST_ENV, "public.example.com:8080")
+    monkeypatch.setattr(api_main.socket, "getaddrinfo", _getaddrinfo_for("10.0.0.5"))
+    monkeypatch.setattr(api_main, "_build_models_fetch_connection", _unexpected)
+
+    with pytest.raises(api_main._ModelsFetchError):
+        api_main._fetch_available_models("http://public.example.com:8080/v1", "")
+
+
+# --- B：匿名回退仅限回环来源 ---
+
+def _default_local_user():
+    user = MagicMock()
+    user.id = api_main._DEFAULT_LOCAL_USER_ID
+    return user
+
+
+@contextmanager
+def _endpoint_client_with_user(user, client_addr=("testclient", 50000)):
+    app = api_main.app
+
+    def override_user():
+        return user
+
+    def override_db():
+        yield MagicMock()
+
+    app.dependency_overrides[api_main._require_api_user] = override_user
+    app.dependency_overrides[api_main.get_db] = override_db
+    try:
+        yield TestClient(app, raise_server_exceptions=False, client=client_addr)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_anonymous_fetch_from_non_loopback_rejected():
+    """默认本地账号从非回环来源调用 fetch → 401。"""
+    with _endpoint_client_with_user(
+        _default_local_user(), client_addr=("192.168.1.5", 50000)
+    ) as client:
+        resp = client.post("/v1/models/fetch", json={"base_url": "http://public.example.com/v1"})
+
+    assert resp.status_code == 401
+
+
+def test_anonymous_fetch_from_loopback_allowed():
+    """默认本地账号从回环来源调用 fetch → 继续（白名单未配置 → 通用错误）。"""
+    with _endpoint_client_with_user(
+        _default_local_user(), client_addr=("127.0.0.1", 50000)
+    ) as client:
+        resp = client.post("/v1/models/fetch", json={"base_url": "http://public.example.com/v1"})
+
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is False
+    assert resp.json()["error"] == api_main._MODELS_FETCH_GENERIC_ERROR
+
+
+def test_authenticated_fetch_from_non_loopback_allowed():
+    """非默认本地账号从非回环来源调用 → 不受匿名回退限制。"""
+    user = MagicMock()
+    user.id = "real-user-1"
+    with _endpoint_client_with_user(user, client_addr=("192.168.1.5", 50000)) as client:
+        resp = client.post("/v1/models/fetch", json={"base_url": "http://public.example.com/v1"})
+
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is False  # 白名单未配置 → 通用错误

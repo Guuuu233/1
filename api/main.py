@@ -5062,6 +5062,17 @@ _MODELS_FETCH_TIMEOUT_SECONDS = 8.0
 _MODELS_FETCH_DEFAULT_URL = "http://host.docker.internal:8317/v1"
 _MODELS_FETCH_GENERIC_ERROR = "无法获取模型列表"
 _MODELS_FETCH_METADATA_IPS = frozenset({"169.254.169.254", "fd00:ec2::254"})
+# 受信本地默认主机：Docker host-gateway + 裸机回环。仅当这些主机显式写入
+# TA_MODELS_FETCH_ALLOWLIST（且必须钉死端口）时才放行解析出的私网/回环 IP，
+# 其余主机一律保持 fail-closed。
+_MODELS_FETCH_TRUSTED_LOCAL_HOSTS = frozenset({
+    "host.docker.internal",
+    "localhost",
+    "127.0.0.1",
+    "::1",
+})
+# auth_service.get_or_create_default_user 创建的默认本地账号 id。
+_DEFAULT_LOCAL_USER_ID = "local-default-user"
 
 
 class _ModelsFetchError(Exception):
@@ -5153,10 +5164,15 @@ def _models_fetch_host_allowed(
     host: str,
     port: int,
     allowlist: Dict[str, set[Optional[int]]],
+    *,
+    require_explicit_port: bool = False,
 ) -> bool:
     allowed_ports = allowlist.get(host.casefold().rstrip("."))
     if allowed_ports is None:
         return False
+    if require_explicit_port:
+        # 受信本地主机必须钉死端口；裸 host 形式（任意端口）不满足。
+        return port in allowed_ports
     return None in allowed_ports or port in allowed_ports
 
 
@@ -5180,7 +5196,18 @@ def _is_models_fetch_ip_blocked(ip_text: str) -> bool:
     )
 
 
-def _resolve_models_fetch_target(host: str, port: int) -> str:
+def _is_models_fetch_local_ip(ip_text: str) -> bool:
+    """回环或私网地址——受信本地主机解析目标的放行范围。"""
+    try:
+        ip = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return _is_models_fetch_local_ip(str(ip.ipv4_mapped))
+    return ip.is_loopback or ip.is_private
+
+
+def _resolve_models_fetch_target(host: str, port: int, *, trust_local: bool = False) -> str:
     try:
         addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
@@ -5188,8 +5215,14 @@ def _resolve_models_fetch_target(host: str, port: int) -> str:
     safe_ip: Optional[str] = None
     for address in addresses:
         ip_text = address[4][0]
-        if _is_models_fetch_ip_blocked(ip_text):
+        # 云元数据地址无条件拦截，受信本地放行也不覆盖。
+        if ip_text in _MODELS_FETCH_METADATA_IPS:
             raise _ModelsFetchError("resolved address is blocked")
+        if _is_models_fetch_ip_blocked(ip_text):
+            # 仅受信本地主机（host.docker.internal / 回环）在已通过白名单时，
+            # 放行其解析出的回环/私网地址；其余主机一律 fail-closed。
+            if not (trust_local and _is_models_fetch_local_ip(ip_text)):
+                raise _ModelsFetchError("resolved address is blocked")
         if safe_ip is None:
             safe_ip = ip_text
     if safe_ip is None:
@@ -5291,9 +5324,11 @@ def _fetch_available_models(base_url: str, api_key: str) -> tuple[list[str], str
     parsed = _parse_models_fetch_url(base_url)
     host = (parsed.hostname or "").casefold().rstrip(".")
     port = _models_fetch_port(parsed)
-    if not _models_fetch_host_allowed(host, port, allowlist):
+    trust_local = host in _MODELS_FETCH_TRUSTED_LOCAL_HOSTS
+    # 受信本地主机必须钉死端口（require_explicit_port），防止裸 host 变任意端口可探。
+    if not _models_fetch_host_allowed(host, port, allowlist, require_explicit_port=trust_local):
         raise _ModelsFetchError("host is not allowlisted")
-    safe_ip = _resolve_models_fetch_target(host, port)
+    safe_ip = _resolve_models_fetch_target(host, port, trust_local=trust_local)
     path = _models_fetch_path(parsed)
     headers = {}
     if api_key:
@@ -5321,6 +5356,23 @@ def _fetch_available_models(base_url: str, api_key: str) -> tuple[list[str], str
             conn.close()
 
 
+def _is_loopback_client(client_host: Optional[str]) -> bool:
+    """直接 TCP 对端是否为回环来源（用于匿名回退的收窄）。
+
+    必须使用 request.client 的真实对端，而不是 X-Forwarded-For /
+    CF-Connecting-IP——那些头可被客户端伪造。
+    """
+    if not client_host:
+        return False
+    try:
+        ip = ipaddress.ip_address(client_host)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return _is_loopback_client(str(ip.ipv4_mapped))
+    return ip.is_loopback
+
+
 class FetchModelsRequest(BaseModel):
     base_url: Optional[str] = None
     api_key: Optional[str] = None
@@ -5330,10 +5382,18 @@ class FetchModelsRequest(BaseModel):
 @app.post("/v1/models/fetch")
 def fetch_available_models(
     payload: FetchModelsRequest,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: UserDB = Depends(_require_api_user),
 ):
     """从白名单允许的 Base URL 抓取可用模型列表。"""
+    # 匿名回退收窄：默认本地账号(local@tradingagents.local)仅在回环来源下可用。
+    # 非回环来源（局域网/暴露端口）必须提供登录或 API Token，否则拒绝匿名调用。
+    # 判定用 request.client 真实对端，不信任可伪造的代理头。
+    if current_user.id == _DEFAULT_LOCAL_USER_ID and not _is_loopback_client(
+        request.client.host if request.client else None
+    ):
+        raise HTTPException(status_code=401, detail="authentication required")
     base_url = (payload.base_url or "").strip()
     api_key = (payload.api_key or "").strip()
 

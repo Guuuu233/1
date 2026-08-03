@@ -48,8 +48,8 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       DATABASE_URL: sqlite:///./data/tradingagents.db
-      TA_APP_SECRET_KEY: g48dSK9v1pXZmQ3L8eR2tB7yN0uW5c6A8x9Z1v2W3e4R5t6Y
-      TA_API_KEY: sk-Kmd9ysjg9plNpXE98
+      TA_APP_SECRET_KEY: ${TA_APP_SECRET_KEY:?请先设置 TA_APP_SECRET_KEY}
+      TA_API_KEY: ${TA_API_KEY}
       TA_BASE_URL: http://host.docker.internal:8317/v1
       TA_LLM_PROVIDER: openai
       TA_LLM_QUICK: gemini-2.5-flash
@@ -88,11 +88,30 @@ docker ps -a | grep tradingagents-ashare
 
 1. **接口兼容模式**: OpenAI 兼容 (Custom Endpoint / `openai`)
 2. **容器内 Base URL**: `http://host.docker.internal:8317/v1`
-3. **API Key**: `sk-Kmd9ysjg9plNpXE98` (通过 `http://localhost:8317/v1/models` 验证)
+3. **API Key**: `${TA_API_KEY}` (通过 `http://localhost:8317/v1/models` 验证，用自己的密钥)
 4. **推荐模型**:
    - `gemini-2.5-flash` (速度快、响应稳定)
    - `gemini-3.5-flash`
    - `claude-sonnet-4-6`
+
+---
+
+## 模型列表抓取白名单（`TA_MODELS_FETCH_ALLOWLIST`）
+
+Web 界面「设置」里点"获取模型列表"时，后端会从 Base URL 拉取可用模型。出于 SSRF 防护，后端只允许抓取显式白名单里的主机，且**默认 fail-closed**（未配置一律返回「无法获取模型列表」）。
+
+按部署形态配置：
+
+- **Docker（容器内访问宿主机代理）**：设置 `TA_MODELS_FETCH_ALLOWLIST=host.docker.internal:8317`
+- **裸机（本机直接跑，代理在本机）**：设置 `TA_MODELS_FETCH_ALLOWLIST=127.0.0.1:8317`
+- **远程/公网代理**：设置 `TA_MODELS_FETCH_ALLOWLIST=<远程域名>:<端口>`
+
+注意事项：
+
+1. **必须写端口**。受信本地主机（`host.docker.internal` / `localhost` / `127.0.0.1` / `::1`）不写端口视为无效，防止"任意端口可探"。
+2. **云元数据地址永远拦截**（`169.254.169.254` 等），任何白名单配置都不放行。
+3. 白名单支持多个条目，用英文逗号分隔，例如 `TA_MODELS_FETCH_ALLOWLIST=host.docker.internal:8317,api.openai.com:443`。
+4. 该接口的匿名访问只允许来自本机回环（`127.0.0.1`）。**Docker 场景通过映射端口从浏览器访问时，需要先登录（或使用 API Token）**，否则返回 401；裸机本机访问不受影响。
 
 ---
 
