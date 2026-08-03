@@ -256,16 +256,23 @@ def _query_reports(
     prompt_version: Optional[str],
     model: Optional[str],
     limit: int,
-) -> Tuple[List[ReportDB], bool]:
+    hold_days: int,
+) -> Tuple[List[ReportDB], bool, int]:
     """Load completed reports that carry a probability, applying filters.
 
-    Date/symbol/user filters run in SQL.  Prompt-version and model filters run
-    in Python because they inspect the snapshot JSON nested in ``result_data``
-    (SQLite JSON queries are unreliable across backends); to avoid the sampling
-    bias of filtering after a tight SQL limit, snapshot filtering happens on a
-    wide candidate scan BEFORE the final ``limit`` truncation.  The second
-    return value reports whether that candidate scan hit its cap, i.e. whether
-    the filter result may be a biased sample.
+    Date/symbol/user filters run in SQL.  Hold-window completeness also runs in
+    SQL, BEFORE the ``limit`` truncation, so the newest reports (whose hold
+    window has not yet elapsed) are excluded from selection rather than being
+    silently skipped after truncation; they are counted separately and reported
+    as ``skipped_no_outcome`` so the UI can distinguish "hold window not over"
+    from "no report".  Prompt-version and model filters run in Python because
+    they inspect the snapshot JSON nested in ``result_data`` (SQLite JSON
+    queries are unreliable across backends); they are applied on a wide
+    candidate scan BEFORE the final ``limit`` truncation.
+
+    Returns ``(rows, truncated_before_filter, skipped_incomplete_window)``.
+    ``truncated_before_filter`` is True only when the pre-filter candidate scan
+    actually hit its cap (checked by fetching one extra row).
     """
     query = db.query(ReportDB).filter(
         ReportDB.status == "completed",
@@ -280,11 +287,21 @@ def _query_reports(
     if end_date:
         query = query.filter(ReportDB.trade_date <= end_date)
 
+    # Hold-window completeness before truncation: only reports whose window has
+    # elapsed are eligible; count the too-recent ones so callers know the view
+    # was non-empty but unevaluable yet.
+    skipped_incomplete = 0
+    cutoff = _hold_window_cutoff(hold_days)
+    if cutoff:
+        skipped_incomplete = query.filter(ReportDB.trade_date > cutoff).count()
+        query = query.filter(ReportDB.trade_date <= cutoff)
+
     has_snapshot_filters = bool(prompt_version or model)
     if has_snapshot_filters:
         scan_cap = max(limit, MAX_CALIBRATION_FILTER_SCAN)
-        rows = query.order_by(ReportDB.created_at.desc()).limit(scan_cap).all()
-        truncated_before_filter = len(rows) >= scan_cap
+        rows = query.order_by(ReportDB.created_at.desc()).limit(scan_cap + 1).all()
+        truncated_before_filter = len(rows) > scan_cap
+        rows = rows[:scan_cap]
         rows = [
             row
             for row in rows
@@ -295,7 +312,7 @@ def _query_reports(
     else:
         rows = query.order_by(ReportDB.created_at.desc()).limit(limit).all()
         truncated_before_filter = False
-    return rows, truncated_before_filter
+    return rows, truncated_before_filter, skipped_incomplete
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -323,6 +340,18 @@ def _hold_window_complete(trade_date: Optional[str], hold_days: int) -> bool:
         return False
     days_since = (_today() - report_day).days
     return days_since >= max(0, int(hold_days * HOLD_CALENDAR_FACTOR))
+
+
+def _hold_window_cutoff(hold_days: int) -> Optional[str]:
+    """Earliest ``trade_date`` eligible for evaluation (inclusive).
+
+    Mirrors ``_hold_window_complete`` so the report-selection stage can exclude
+    too-recent reports BEFORE the ``limit`` truncation — otherwise an active
+    account's newest ``limit`` reports would all be skipped as incomplete and the
+    default view would come back empty.
+    """
+    required_days = max(0, int(hold_days * HOLD_CALENDAR_FACTOR))
+    return (_today() - timedelta(days=required_days)).strftime("%Y-%m-%d")
 
 
 def _get_price_after_strict(symbol: str, base_date: str, hold_days: int) -> Optional[float]:
@@ -422,7 +451,7 @@ def _compute_calibration_unlocked(
     window).  Reports whose outcome cannot be resolved are counted separately
     and excluded from the curve and Brier score.
     """
-    reports, truncated_before_filter = _query_reports(
+    reports, truncated_before_filter, skipped_incomplete = _query_reports(
         db,
         user_id=user_id,
         start_date=start_date,
@@ -431,10 +460,13 @@ def _compute_calibration_unlocked(
         prompt_version=prompt_version,
         model=model,
         limit=limit,
+        hold_days=hold_days,
     )
 
     samples: List[Tuple[float, bool]] = []
-    skipped_no_outcome = 0
+    # Too-recent reports (hold window not yet elapsed) are excluded at selection
+    # time; they count as skipped alongside reports whose price is unavailable.
+    skipped_no_outcome = skipped_incomplete
     resolve = outcome_resolver or (lambda row: _resolve_outcome(row, hold_days))
 
     for report in reports:

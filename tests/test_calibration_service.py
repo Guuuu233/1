@@ -448,6 +448,48 @@ class TestFilterBeforeLimit:
         assert result["truncated_before_filter"] is False
 
 
+class TestHoldWindowSelection:
+    def test_recent_reports_all_skipped_by_hold_window(self, monkeypatch):
+        user_id, _ = _user_token()
+        # Today fixed to 2026-08-01; hold_days=5 requires 8 calendar days,
+        # so any report dated after 2026-07-24 is not yet evaluable.
+        today = datetime(2026, 8, 1).date()
+        monkeypatch.setattr(cal, "_today", lambda: today)
+        _seed_report(symbol="600519.SH", trade_date="2026-07-28", probability=0.6, user_id=user_id)
+        _seed_report(symbol="600519.SH", trade_date="2026-07-30", probability=0.6, user_id=user_id)
+
+        with get_db_ctx() as db:
+            result = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                hold_days=5,
+                outcome_resolver=lambda r: True,
+            )
+
+        assert result["sample_size"] == 0
+        assert result["skipped_no_outcome"] == 2
+
+    def test_recent_reports_excluded_but_older_evaluable_selected(self, monkeypatch):
+        user_id, _ = _user_token()
+        today = datetime(2026, 8, 1).date()
+        monkeypatch.setattr(cal, "_today", lambda: today)
+        _seed_report(symbol="600519.SH", trade_date="2026-07-28", probability=0.6, user_id=user_id)
+        _seed_report(symbol="600519.SH", trade_date="2026-06-01", probability=0.6, user_id=user_id)
+
+        with get_db_ctx() as db:
+            result = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                hold_days=5,
+                outcome_resolver=lambda r: True,
+            )
+
+        # The older evaluable report is selected even though a newer one exists;
+        # the too-recent one is reported as skipped, not silently dropped.
+        assert result["sample_size"] == 1
+        assert result["skipped_no_outcome"] == 1
+
+
 class TestDefaultPriceOutcome:
     def test_default_resolver_uses_strict_price_after(self):
         user_id, _ = _user_token()

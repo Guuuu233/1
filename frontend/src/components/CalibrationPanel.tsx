@@ -225,7 +225,7 @@ export default function CalibrationPanel({ compact = false }: CalibrationPanelPr
                             icon={BarChart3}
                             label="已评估样本"
                             value={String(evaluated)}
-                            hint={`跳过 ${skipped} 份无价格数据报告`}
+                            hint={`跳过 ${skipped} 份持有期未到/无价格数据报告`}
                         />
                         <StatTile
                             icon={Activity}
@@ -296,7 +296,9 @@ export default function CalibrationPanel({ compact = false }: CalibrationPanelPr
 
             {data && data.sample_size === 0 && !error && (
                 <p className="py-4 text-center text-sm text-slate-400">
-                    当前筛选条件下暂无带概率的历史报告，调整日期范围或过滤条件后重试。
+                    {data.skipped_no_outcome > 0
+                        ? '最近报告持有期尚未结束，或缺少价格数据，暂无可评估样本。'
+                        : '当前筛选条件下暂无带概率的历史报告，调整日期范围或过滤条件后重试。'}
                 </p>
             )}
         </div>

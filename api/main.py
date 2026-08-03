@@ -4407,6 +4407,15 @@ def _enforce_calibration_rate_limit(request: Request) -> None:
         if len(hits) >= _CALIBRATION_RATE_MAX:
             raise HTTPException(status_code=429, detail="校准度接口请求过于频繁，请稍后重试")
         hits.append(now)
+        # Periodic cleanup: once the table grows past a threshold, drop buckets
+        # whose entries have all expired so memory cannot grow unbounded with
+        # the number of distinct source IPs.
+        if len(_calibration_rate_hits) > 1024:
+            empty_buckets = [
+                ip for ip, timestamps in _calibration_rate_hits.items() if not timestamps
+            ]
+            for ip in empty_buckets:
+                _calibration_rate_hits.pop(ip, None)
 
 
 @app.get("/v1/calibration")
