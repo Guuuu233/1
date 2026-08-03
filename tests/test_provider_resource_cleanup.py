@@ -204,3 +204,24 @@ def test_route_enforces_per_provider_concurrency_bound():
 
     assert results == ["ok"] * 8
     assert 0 < max_active <= 2
+
+
+def test_provider_call_executor_registers_atexit_shutdown():
+    import atexit
+    import importlib
+
+    # Reload in a controlled way so we can observe the registration call while
+    # avoiding private atexit internals. The old executor is shut down first so
+    # it cannot leave idle worker threads behind.
+    old_executor = iface._PROVIDER_CALL_EXECUTOR
+    old_executor.shutdown(wait=True, cancel_futures=True)
+    with patch("atexit.register") as register:
+        reloaded = importlib.reload(iface)
+        registered = register.call_args.args[0]
+
+    assert registered.__name__ == "_shutdown_provider_call_executor"
+    assert register.call_args.kwargs == {}
+    assert reloaded._PROVIDER_CALL_EXECUTOR is not old_executor
+    # The reload above ran under a mocked atexit, so register the replacement
+    # executor for real as well; otherwise later tests would leave it unmanaged.
+    atexit.register(reloaded._shutdown_provider_call_executor)
