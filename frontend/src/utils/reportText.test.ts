@@ -4,6 +4,7 @@ import {
     detectLegacyEnglishContent,
     isLegacyEnglishDirection,
     isLegacyEnglishReport,
+    localizeDirection,
     sanitizeReportMarkdown,
 } from '@/utils/reportText'
 
@@ -21,6 +22,22 @@ describe('isLegacyEnglishDirection', () => {
         expect(isLegacyEnglishDirection(null)).toBe(false)
         expect(isLegacyEnglishDirection(undefined)).toBe(false)
         expect(isLegacyEnglishDirection('')).toBe(false)
+    })
+})
+
+describe('localizeDirection', () => {
+    it('maps legacy English directions to Chinese display labels', () => {
+        expect(localizeDirection('BULLISH')).toBe('看多')
+        expect(localizeDirection('lean_bearish')).toBe('偏空')
+        expect(localizeDirection('NEUTRAL')).toBe('中性')
+        expect(localizeDirection('CAUTIOUS')).toBe('谨慎')
+    })
+
+    it('passes through Chinese directions and empty values unchanged', () => {
+        expect(localizeDirection('看多')).toBe('看多')
+        expect(localizeDirection('')).toBe(null)
+        expect(localizeDirection(null)).toBe(null)
+        expect(localizeDirection(undefined)).toBe(null)
     })
 })
 
