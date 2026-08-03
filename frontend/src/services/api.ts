@@ -1,4 +1,4 @@
-import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, Provider, ProviderCreatePayload, ProviderUpdatePayload, ModelProfile, ModelProfileCreatePayload, ModelProfileUpdatePayload, RoleBinding, RoleBindingItem, ResolvedRole, CustomPrompt, CustomPromptItem, ResolvedCustomPrompt, PromptInjectionSwitch } from '@/types'
+import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, CalibrationResponse, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, Provider, ProviderCreatePayload, ProviderUpdatePayload, ModelProfile, ModelProfileCreatePayload, ModelProfileUpdatePayload, RoleBinding, RoleBindingItem, ResolvedRole, CustomPrompt, CustomPromptItem, ResolvedCustomPrompt, PromptInjectionSwitch } from '@/types'
 
 export function getBaseUrl(): string {
     const envUrl = (import.meta.env.VITE_API_URL as string) || ''
@@ -254,6 +254,28 @@ class ApiService {
 
     async getDashboardTrackingBoard(): Promise<TrackingBoardResponse> {
         return this.request<TrackingBoardResponse>('/v1/dashboard/tracking-board')
+    }
+
+    // Calibration API (校准度统计)
+    async getCalibration(params?: {
+        start_date?: string
+        end_date?: string
+        symbol?: string
+        prompt_version?: string
+        model?: string
+        hold_days?: number
+        limit?: number
+    }): Promise<CalibrationResponse> {
+        const search = new URLSearchParams()
+        if (params?.start_date) search.append('start_date', params.start_date)
+        if (params?.end_date) search.append('end_date', params.end_date)
+        if (params?.symbol) search.append('symbol', params.symbol)
+        if (params?.prompt_version) search.append('prompt_version', params.prompt_version)
+        if (params?.model) search.append('model', params.model)
+        if (params?.hold_days != null) search.append('hold_days', String(params.hold_days))
+        if (params?.limit != null) search.append('limit', String(params.limit))
+        const qs = search.toString()
+        return this.request<CalibrationResponse>(`/v1/calibration${qs ? `?${qs}` : ''}`)
     }
 
     // Stock Search

@@ -6,6 +6,7 @@ import { api } from '@/services/api'
 import { useAnalysisStore } from '@/stores/analysisStore'
 import { useAuthStore } from '@/stores/authStore'
 import type { Report, TrackingBoardResponse } from '@/types'
+import CalibrationPanel from '@/components/CalibrationPanel'
 import PromoBanner from '@/components/PromoBanner'
 
 export default function Dashboard() {
@@ -106,6 +107,8 @@ export default function Dashboard() {
                 trackingBoard={trackingBoard}
                 onOpen={() => navigate('/tracking-board')}
             />
+
+            <CalibrationPanel compact />
 
             <div className="card">
                 <h2 className="mb-4 text-lg font-semibold text-slate-900 dark:text-slate-100">快速开始</h2>

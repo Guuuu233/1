@@ -418,6 +418,36 @@ export interface ReportListResponse {
     reports: Report[]
 }
 
+// ─── Calibration (校准度统计) ───────────────────────────────────────────────
+
+export interface CalibrationBucket {
+    bucket: string
+    probability_min: number
+    probability_max: number
+    count: number
+    rise_count: number
+    rise_rate: number | null
+    avg_probability: number | null
+}
+
+export interface CalibrationFilters {
+    start_date?: string | null
+    end_date?: string | null
+    symbol?: string | null
+    prompt_version?: string | null
+    model?: string | null
+    hold_days: number
+    limit: number
+}
+
+export interface CalibrationResponse {
+    brier_score: number | null
+    sample_size: number
+    skipped_no_outcome: number
+    buckets: CalibrationBucket[]
+    filters: CalibrationFilters
+}
+
 export interface AnnouncementItem {
     title: string
     detail: string

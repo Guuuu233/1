@@ -4,6 +4,7 @@ import { useSearchParams } from 'react-router-dom'
 import TaskProgressBanner from '@/components/TaskProgressBanner'
 import { api } from '@/services/api'
 import type { Report, ReportDetail } from '@/types'
+import CalibrationPanel from '@/components/CalibrationPanel'
 import DecisionCard from '@/components/DecisionCard'
 import ReportViewer from '@/components/ReportViewer'
 import DualHorizonReportSection from '@/components/DualHorizonReportSection'
@@ -556,6 +557,8 @@ export default function Reports() {
 
                 </div>
             </div>
+
+            <CalibrationPanel />
 
             {/* 加载中 */}
             {loading && (

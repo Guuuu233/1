@@ -4384,6 +4384,42 @@ def delete_backtest(job_id: str, current_user: UserDB = Depends(_require_api_use
     return {"message": "已删除"}
 
 
+# ─── Calibration Endpoints ────────────────────────────────────────────────────
+
+from api.services import calibration_service as _calibration  # noqa: E402
+
+
+@app.get("/v1/calibration")
+def get_calibration(
+    start_date: Optional[str] = Query(None, description="起始分析日期 (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="结束分析日期 (YYYY-MM-DD)"),
+    symbol: Optional[str] = Query(None, description="股票代码"),
+    prompt_version: Optional[str] = Query(None, description="提示词版本（resolved_hash 子串）"),
+    model: Optional[str] = Query(None, description="模型名称（子串匹配 model_config_snapshot）"),
+    hold_days: int = Query(_calibration.DEFAULT_HOLD_DAYS, ge=1, le=60),
+    limit: Optional[int] = Query(None, ge=1, le=1000),
+    db: Session = Depends(get_db),
+    current_user: UserDB = Depends(_require_api_user),
+) -> Dict:
+    """返回历史报告的校准度统计：可靠性曲线 + Brier score.
+
+    按报告的 probability（0–1）分桶 0-50 / 50-60 / 60-70 / 70-80 / 80+，
+    统计各桶实际上涨率；支持按日期段 / 提示词版本 / 模型过滤。
+    结果可归因到每份报告冻结的 custom_prompt_snapshot / model_config_snapshot。
+    """
+    return _calibration.compute_calibration(
+        db,
+        user_id=current_user.id,
+        start_date=start_date,
+        end_date=end_date,
+        symbol=symbol,
+        prompt_version=prompt_version,
+        model=model,
+        hold_days=hold_days,
+        limit=limit,
+    )
+
+
 # ─── Runtime Config Endpoints ────────────────────────────────────────────────
 
 _CONFIG_ALLOWED_KEYS = {
