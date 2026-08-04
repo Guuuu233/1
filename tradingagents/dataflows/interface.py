@@ -19,7 +19,6 @@ from .vendor_result import (
     VendorFail,
     VendorOk,
     VendorRefuse,
-    result_to_prompt,
 )
 
 # Tools organized by category

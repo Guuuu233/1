@@ -2,7 +2,6 @@ from typing import Annotated
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import yfinance as yf
-import os
 from .stockstats_utils import StockstatsUtils
 from .trade_calendar import cn_no_data_reason, is_cn_symbol
 
@@ -221,8 +220,7 @@ def _get_stock_stats_bulk(
     else:
         # Online data fetching with caching
         today_date = pd.Timestamp.today()
-        curr_date_dt = pd.to_datetime(curr_date)
-        
+
         end_date = today_date + pd.DateOffset(days=1)
         start_date = today_date - pd.DateOffset(years=15)
         start_date_str = start_date.strftime("%Y-%m-%d")
