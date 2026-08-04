@@ -1,6 +1,6 @@
 # TradingAgents/graph/setup.py
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph, START
 from langgraph.prebuilt import ToolNode
