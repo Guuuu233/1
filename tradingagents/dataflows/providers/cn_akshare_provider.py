@@ -191,10 +191,6 @@ class CnAkshareProvider(BaseMarketDataProvider):
             ) from exc
         return ak
 
-    def _locked(self, func, *args, **kwargs):
-        with AKSHARE_CALL_LOCK:
-            return func(*args, **kwargs)
-
     def _normalize_symbol(self, symbol: str) -> str:
         s = symbol.strip().lower()
         m = re.search(r"(\d{6})", s)
