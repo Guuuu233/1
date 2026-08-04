@@ -4434,19 +4434,6 @@ def _warmup_model_names(config: Dict[str, Any]) -> List[str]:
     return models
 
 
-def _warmup_model_targets(config: Dict[str, Any]) -> List[Tuple[str, List[str]]]:
-    targets: Dict[str, List[str]] = {}
-    for key in ("quick_think_llm", "deep_think_llm"):
-        model = str(config.get(key) or "").strip()
-        if not model:
-            continue
-        labels = targets.setdefault(model, [])
-        label = _CONFIG_MODEL_LABELS.get(key, key)
-        if label not in labels:
-            labels.append(label)
-    return [(model, labels) for model, labels in targets.items()]
-
-
 def _should_trigger_config_warmup(
     before_cfg: UserRuntimeConfigResponse,
     after_cfg: UserRuntimeConfigResponse,
