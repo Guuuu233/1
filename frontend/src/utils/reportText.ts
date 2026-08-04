@@ -23,23 +23,6 @@ export function sanitizeReportMarkdown(text?: string | null): string {
         .replace(/SELL with Conditional Trigger/gi, '卖出（条件触发）')
 }
 
-export function buildAgentSummary(text?: string | null): string {
-    const cleaned = sanitizeReportMarkdown(text)
-        .replace(/^#+\s*/gm, '')
-        .replace(/\*\*/g, '')
-        .replace(/\|/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim()
-    const decision = detectDecisionLabel(cleaned)
-    if (decision) return decision
-    if (/偏多|看多|上涨|突破/.test(cleaned)) return '偏多'
-    if (/偏空|看空|下跌|回撤/.test(cleaned)) return '偏空'
-    if (/中性|震荡/.test(cleaned)) return '中性'
-    if (cleaned.includes('风险')) return '风控结论'
-    if (cleaned.includes('计划')) return '计划已生成'
-    return cleaned.slice(0, 18) || '报告已生成'
-}
-
 export interface Verdict {
     direction: string
     reason: string
