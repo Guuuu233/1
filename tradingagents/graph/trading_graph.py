@@ -212,11 +212,6 @@ class TradingAgentsGraph:
         # Set up the graph with checkpointer
         self.graph = self.graph_setup.setup_graph(selected_analysts, checkpointer=self.checkpointer)
 
-    def get_state(self, thread_id: str):
-        """Retrieve the current state for a given thread_id."""
-        config = {"configurable": {"thread_id": thread_id}}
-        return self.graph.get_state(config)
-
     def _get_provider_kwargs(self) -> Dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
         kwargs = {}
