@@ -21,7 +21,7 @@ from ..trade_calendar import (
     drop_incomplete_today_bar,
     snapshot_historical_refusal,
 )
-from ..utils import shrink_table
+from ..utils import format_hist_csv, safe_float, shrink_table, slice_hist_df
 
 logger = logging.getLogger(__name__)
 
@@ -104,13 +104,7 @@ class CnInvestodayProvider(BaseMarketDataProvider):
     @staticmethod
     def _safe_float(val: Any) -> float | None:
         """将接口返回值安全转为 float，失败或空为 None。"""
-        if val is None:
-            return None
-        try:
-            f = float(val)
-            return f
-        except (ValueError, TypeError):
-            return None
+        return safe_float(val)
 
     def _request_investoday(
         self,
@@ -199,29 +193,13 @@ class CnInvestodayProvider(BaseMarketDataProvider):
 
     @staticmethod
     def _slice_hist_df(df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
-        if df is None or df.empty:
-            return pd.DataFrame()
-        start_dt = pd.to_datetime(start_date, errors="coerce")
-        end_dt = pd.to_datetime(end_date, errors="coerce")
-        if pd.isna(start_dt) or pd.isna(end_dt):
-            return df
-        out = df.copy()
-        out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-        out = out.dropna(subset=["Date"])
-        out = out[(out["Date"] >= start_dt) & (out["Date"] <= end_dt)]
-        return out.sort_values("Date").reset_index(drop=True)
+        return slice_hist_df(df, start_date, end_date)
 
     def _format_hist_csv(self, df: pd.DataFrame, symbol: str, start: str, end: str) -> str:
         """与 AkShare  provider 一致的 CSV 头 + OHLCV 输出。"""
         if df is None or df.empty:
             return f"No data found for symbol '{symbol}' between {start} and {end}"
-        out = df.copy()
-        out["Dividends"] = 0.0
-        out["Stock Splits"] = 0.0
-        out["Date"] = pd.to_datetime(out["Date"]).dt.strftime("%Y-%m-%d")
-        header = f"# Stock data for {symbol} from {start} to {end}\n"
-        header += f"# Total records: {len(out)}\n\n"
-        return header + out.to_csv(index=False)
+        return format_hist_csv(df, symbol, start, end)
 
     def _fetch_adjusted_hist_df(
         self, symbol: str, start_date: str, end_date: str

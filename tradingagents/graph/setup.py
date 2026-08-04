@@ -1,6 +1,6 @@
 # TradingAgents/graph/setup.py
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph, START
 from langgraph.prebuilt import ToolNode
@@ -237,7 +237,7 @@ class GraphSetup:
             # Add conditional edges for current analyst
             workflow.add_conditional_edges(
                 current_analyst,
-                getattr(self.conditional_logic, f"should_continue_{analyst_type}"),
+                self.conditional_logic.should_continue_analyst,
                 {
                     "continue": current_tools,
                     "done": current_done,

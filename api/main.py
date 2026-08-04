@@ -37,15 +37,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, File, HTTPException, Depends, Query, Request, UploadFile, status, BackgroundTasks
+from fastapi import FastAPI, File, HTTPException, Depends, Query, Request, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 from sqlalchemy.orm import Session
 import pandas as pd
+import requests
 
-from api.database import UserDB, UserLLMConfigDB, VersionStatsDB, ReportDB, ImportedPortfolioPositionDB, FeedbackDB, SponsorDB, ProviderDB, ModelProfileDB, RoleBindingDB, init_db, get_db, get_db_ctx
+from api.database import UserDB, VersionStatsDB, FeedbackDB, SponsorDB, ProviderDB, init_db, get_db, get_db_ctx
 from api.job_store import get_job_store as _new_job_store
 from api.services import auth_service, portfolio_import_service, report_service, token_service, watchlist_service, scheduled_service, tracking_board_service, feedback_service, sponsor_service, role_routing_service, custom_prompt_service
 
@@ -110,8 +111,8 @@ def _report_version_stats() -> None:
                 json={"v": APP_VERSION, "nonce": uuid.uuid4().hex},
                 timeout=30,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("version-stats report failed: %s", exc)
 
     threading.Thread(target=_send, daemon=True).start()
 
@@ -417,6 +418,14 @@ def _serialize_datetime_utc(value: Optional[datetime]) -> Optional[str]:
     else:
         value = value.astimezone(timezone.utc)
     return value.isoformat()
+
+
+class _TokenDatetimeFieldsMixin:
+    """Shared JSON serializer for token ``created_at``/``last_used_at`` (audit P2-6)."""
+
+    @field_serializer("created_at", "last_used_at", when_used="json")
+    def serialize_token_datetimes(self, value: Optional[datetime]) -> Optional[str]:
+        return _serialize_datetime_utc(value)
 
 
 _cn_stock_map_loaded_at: float = 0  # timestamp of last load
@@ -755,22 +764,12 @@ class KlineResponse(BaseModel):
 
 
 # Report API Models
-def _strict_unit_interval(value: Any, field_name: str) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise ValueError(f"{field_name} must be a finite number in [0, 1]")
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{field_name} must be a finite number in [0, 1]") from exc
-    if not math.isfinite(numeric) or not 0.0 <= numeric <= 1.0:
-        raise ValueError(f"{field_name} must be a finite number in [0, 1]")
-    return numeric
+# Re-export for backward compat: single implementation lives in report_service (audit P2-7).
+_strict_unit_interval = report_service._strict_unit_interval
 
 
 def _strict_report_probability(value: Any) -> Any:
-    return _strict_unit_interval(value, "probability")
+    return report_service._strict_unit_interval(value, "probability")
 
 
 def _strict_report_confidence(value: Any) -> Any:
@@ -1181,7 +1180,7 @@ class PortfolioImportSyncRequest(BaseModel):
     auto_apply_scheduled: bool = Field(True, description="是否自动将持仓股票加入定时任务")
 
 
-class UserTokenResponse(BaseModel):
+class UserTokenResponse(_TokenDatetimeFieldsMixin, BaseModel):
     id: str
     name: str
     token: str
@@ -1191,12 +1190,8 @@ class UserTokenResponse(BaseModel):
 
     model_config = {"from_attributes": True}
 
-    @field_serializer("created_at", "last_used_at", when_used="json")
-    def serialize_token_datetimes(self, value: Optional[datetime]) -> Optional[str]:
-        return _serialize_datetime_utc(value)
 
-
-class UserTokenListItem(BaseModel):
+class UserTokenListItem(_TokenDatetimeFieldsMixin, BaseModel):
     """Token info for list endpoint — never exposes the full token."""
     id: str
     name: str
@@ -1205,10 +1200,6 @@ class UserTokenListItem(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
-
-    @field_serializer("created_at", "last_used_at", when_used="json")
-    def serialize_token_datetimes(self, value: Optional[datetime]) -> Optional[str]:
-        return _serialize_datetime_utc(value)
 
 
 class UserTokenCreateRequest(BaseModel):
@@ -1331,25 +1322,6 @@ class RequireUser:
 # 快捷依赖定义
 _require_api_user = RequireUser(allow_api_token=True)    # 允许 API Token
 _require_web_user = RequireUser(allow_api_token=False)   # 仅限网页登录
-
-
-def _optional_user(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_auth_scheme),
-) -> Optional[UserDB]:
-    if not credentials:
-        return None
-    try:
-        payload = auth_service.decode_access_token(credentials.credentials)
-    except Exception:
-        return None
-    user_id = str(payload.get("sub") or "")
-    if not user_id:
-        return None
-    with get_db_ctx() as db:
-        user = auth_service.get_user_by_id(db, user_id)
-        if user:
-            db.expunge(user)
-        return user
 
 
 def _set_job(job_key: str, **kwargs) -> None:
@@ -1713,71 +1685,6 @@ class AgentProgressTracker:
             logging.getLogger(__name__).warning(
                 "Failed to emit debate message for %s in %s", agent, debate, exc_info=True,
             )
-
-    def apply_chunk(self, chunk: Dict[str, Any]) -> None:
-        # 分析师阶段状态推进
-        found_active = False
-        for analyst_key in ANALYST_ORDER:
-            if analyst_key not in self.selected_analysts:
-                continue
-
-            agent_name = ANALYST_AGENT_NAMES[analyst_key]
-            report_key = ANALYST_REPORT_MAP[analyst_key]
-            has_report = bool(chunk.get(report_key))
-
-            if has_report:
-                if self.status.get(agent_name) != "completed":
-                    self._set_status(agent_name, "completed")
-                    self.report_sections[report_key] = chunk.get(report_key)
-            elif not found_active:
-                # 只在状态从 pending 变为 in_progress 时发送 writing 状态
-                prev_status = self.status.get(agent_name)
-                if prev_status != "in_progress":
-                    self._set_status(agent_name, "in_progress")
-                    # 发送正在分析的状态（只发送一次）
-                    self._emit_writing_status(agent_name, report_key)
-                found_active = True
-            else:
-                self._set_status(agent_name, "pending")
-
-        # 分析师全部完成后，启动 Bull Researcher
-        if not found_active and self.selected_analysts:
-            if self.status.get("Bull Researcher") == "pending":
-                self._set_status("Bull Researcher", "in_progress")
-
-        # 研究团队状态更新
-        debate_state = chunk.get("investment_debate_state") or {}
-        bull_hist = str(debate_state.get("bull_history", "")).strip()
-        bear_hist = str(debate_state.get("bear_history", "")).strip()
-        judge = str(debate_state.get("judge_decision", "")).strip()
-        if bull_hist or bear_hist:
-            self._update_research_team_status("in_progress")
-        if judge:
-            self._update_research_team_status("completed")
-            if self.status.get("Trader") != "in_progress":
-                self._set_status("Trader", "in_progress")
-                self._emit_writing_status("Trader", "trader_investment_plan")
-
-        # 交易团队
-        if chunk.get("trader_investment_plan"):
-            if self.status.get("Trader") != "completed":
-                self._set_status("Trader", "completed")
-                self._set_status("Aggressive Analyst", "in_progress")
-
-        # 风控与组合团队（发送最终决策）
-        risk_state = chunk.get("risk_debate_state") or {}
-        risk_judge = str(risk_state.get("judge_decision", "")).strip()
-
-        if risk_judge:
-            if self.status.get("Portfolio Manager") != "completed":
-                self._set_status("Portfolio Manager", "in_progress")
-                self._set_status("Aggressive Analyst", "completed")
-                self._set_status("Conservative Analyst", "completed")
-                self._set_status("Neutral Analyst", "completed")
-                self._set_status("Portfolio Manager", "completed")
-                final_summary = self._generate_stage_summary("final_decision", chunk)
-                self._emit_milestone("final_decision", final_summary)
-
 
 def _extract_message_text(content: Any) -> str:
     if isinstance(content, str):
@@ -4515,19 +4422,6 @@ def _warmup_model_names(config: Dict[str, Any]) -> List[str]:
         seen.add(value)
         models.append(value)
     return models
-
-
-def _warmup_model_targets(config: Dict[str, Any]) -> List[Tuple[str, List[str]]]:
-    targets: Dict[str, List[str]] = {}
-    for key in ("quick_think_llm", "deep_think_llm"):
-        model = str(config.get(key) or "").strip()
-        if not model:
-            continue
-        labels = targets.setdefault(model, [])
-        label = _CONFIG_MODEL_LABELS.get(key, key)
-        if label not in labels:
-            labels.append(label)
-    return [(model, labels) for model, labels in targets.items()]
 
 
 def _should_trigger_config_warmup(

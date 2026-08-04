@@ -12,56 +12,8 @@ class ConditionalLogic:
         self.max_debate_rounds = max_debate_rounds
         self.max_risk_discuss_rounds = max_risk_discuss_rounds
 
-    def should_continue_market(self, state: AgentState):
-        """Determine if market analysis should continue."""
-        messages = state["messages"]
-        last_message = messages[-1]
-        if getattr(last_message, "tool_calls", None):
-            return "continue"
-        return "done"
-
-    def should_continue_social(self, state: AgentState):
-        """Determine if social media analysis should continue."""
-        messages = state["messages"]
-        last_message = messages[-1]
-        if getattr(last_message, "tool_calls", None):
-            return "continue"
-        return "done"
-
-    def should_continue_news(self, state: AgentState):
-        """Determine if news analysis should continue."""
-        messages = state["messages"]
-        last_message = messages[-1]
-        if getattr(last_message, "tool_calls", None):
-            return "continue"
-        return "done"
-
-    def should_continue_fundamentals(self, state: AgentState):
-        """Determine if fundamentals analysis should continue."""
-        messages = state["messages"]
-        last_message = messages[-1]
-        if getattr(last_message, "tool_calls", None):
-            return "continue"
-        return "done"
-
-    def should_continue_macro(self, state: AgentState):
-        """Determine if macro analysis should continue."""
-        messages = state["messages"]
-        last_message = messages[-1]
-        if getattr(last_message, "tool_calls", None):
-            return "continue"
-        return "done"
-
-    def should_continue_smart_money(self, state: AgentState):
-        """Determine if smart money analysis should continue."""
-        messages = state["messages"]
-        last_message = messages[-1]
-        if getattr(last_message, "tool_calls", None):
-            return "continue"
-        return "done"
-
-    def should_continue_volume_price(self, state: AgentState):
-        """Determine if volume price analysis should continue."""
+    def should_continue_analyst(self, state: AgentState):
+        """Determine if an analyst node should continue (shared by all analyst types)."""
         messages = state["messages"]
         last_message = messages[-1]
         if getattr(last_message, "tool_calls", None):

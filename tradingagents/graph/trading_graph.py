@@ -1,13 +1,10 @@
 # TradingAgents/graph/trading_graph.py
 
-import asyncio
 import os
 import re
 from pathlib import Path
 import json
-from datetime import date
-from typing import Dict, Any, Tuple, List, Optional
-import sqlite3
+from typing import Dict, Any, List, Optional
 
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
@@ -16,11 +13,6 @@ from tradingagents.llm_clients import create_llm_client
 
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.agents.utils.memory import FinancialSituationMemory
-from tradingagents.agents.utils.agent_states import (
-    AgentState,
-    InvestDebateState,
-    RiskDebateState,
-)
 from tradingagents.dataflows.config import set_config
 from tradingagents.agents.utils.prompt_injection import DEFAULT_PLACEMENT
 
@@ -47,6 +39,17 @@ from .setup import GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
 from .signal_processing import SignalProcessor
+
+
+def _state_logging_enabled() -> bool:
+    """Whether full-state eval_results logging is enabled.
+
+    Disabled by default; opt in via TA_TRACE=1 (or true/yes/on). When enabled,
+    logs are written under TA_RESULTS_DIR (default ./results) instead of a
+    hardcoded eval_results/ directory.
+    """
+    raw = os.getenv("TA_TRACE")
+    return raw is not None and raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 class TradingAgentsGraph:
@@ -200,11 +203,6 @@ class TradingAgentsGraph:
 
         # Set up the graph with checkpointer
         self.graph = self.graph_setup.setup_graph(selected_analysts, checkpointer=self.checkpointer)
-
-    def get_state(self, thread_id: str):
-        """Retrieve the current state for a given thread_id."""
-        config = {"configurable": {"thread_id": thread_id}}
-        return self.graph.get_state(config)
 
     def _get_provider_kwargs(self) -> Dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
@@ -459,12 +457,15 @@ class TradingAgentsGraph:
         }
         self.log_states_dict[str(trade_date)] = entry
 
-        directory = Path(f"eval_results/{ticker}/TradingAgentsStrategy_logs/")
+        if not _state_logging_enabled():
+            return
+        directory = (
+            Path(os.getenv("TA_RESULTS_DIR", "./results"))
+            / ticker
+            / "TradingAgentsStrategy_logs"
+        )
         directory.mkdir(parents=True, exist_ok=True)
-        with open(
-            f"eval_results/{ticker}/TradingAgentsStrategy_logs/dual_horizon_{trade_date}.json",
-            "w",
-        ) as f:
+        with open(directory / f"dual_horizon_{trade_date}.json", "w") as f:
             json.dump(entry, f, indent=4, ensure_ascii=False)
 
     def _log_state(self, trade_date, final_state):
@@ -523,34 +524,20 @@ class TradingAgentsGraph:
             "final_trade_decision": final_state["final_trade_decision"],
         }
 
-        # Save to file
+        # Save to file — only when state logging is explicitly enabled; writes
+        # land under TA_RESULTS_DIR instead of a hardcoded eval_results/ dir.
+        if not _state_logging_enabled():
+            return
         safe_ticker = self._safe_ticker(self.ticker or "unknown")
-        directory = Path(f"eval_results/{safe_ticker}/TradingAgentsStrategy_logs/")
+        directory = (
+            Path(os.getenv("TA_RESULTS_DIR", "./results"))
+            / safe_ticker
+            / "TradingAgentsStrategy_logs"
+        )
         directory.mkdir(parents=True, exist_ok=True)
 
-        with open(
-            f"eval_results/{safe_ticker}/TradingAgentsStrategy_logs/full_states_log_{trade_date}.json",
-            "w",
-        ) as f:
+        with open(directory / f"full_states_log_{trade_date}.json", "w") as f:
             json.dump(self.log_states_dict, f, indent=4)
-
-    def reflect_and_remember(self, returns_losses):
-        """Reflect on decisions and update memory based on returns."""
-        self.reflector.reflect_bull_researcher(
-            self.curr_state, returns_losses, self.bull_memory
-        )
-        self.reflector.reflect_bear_researcher(
-            self.curr_state, returns_losses, self.bear_memory
-        )
-        self.reflector.reflect_trader(
-            self.curr_state, returns_losses, self.trader_memory
-        )
-        self.reflector.reflect_invest_judge(
-            self.curr_state, returns_losses, self.invest_judge_memory
-        )
-        self.reflector.reflect_risk_manager(
-            self.curr_state, returns_losses, self.risk_manager_memory
-        )
 
     def process_signal(self, full_signal):
         """Process a signal to extract the core decision."""

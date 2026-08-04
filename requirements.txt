@@ -1,7 +1,6 @@
 typing-extensions
 langchain-core
 langchain-openai
-langchain-experimental
 langchain-anthropic
 langchain-google-genai
 langgraph

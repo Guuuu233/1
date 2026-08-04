@@ -23,13 +23,6 @@ if DATABASE_URL.startswith("sqlite"):
         pool_recycle=3600,
     )
 
-    def _can_use_wal() -> bool:
-        """Check if WAL mode is safe: db's parent dir must be writable for -shm/-wal files."""
-        import pathlib
-        db_path = DATABASE_URL.replace("sqlite:///", "").replace("sqlite://", "")
-        parent = pathlib.Path(db_path).resolve().parent
-        return os.access(parent, os.W_OK)
-
     _use_wal = os.getenv("SQLITE_USE_WAL", "false").lower() == "true"
 
     @event.listens_for(engine, "connect")
@@ -81,7 +74,7 @@ class get_db_ctx:
         self.db = SessionLocal()
         return self.db
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, exc_type, _exc_val, _exc_tb) -> None:
         if self.db is not None:
             if exc_type is not None:
                 self.db.rollback()

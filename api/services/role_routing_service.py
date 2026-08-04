@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from uuid import uuid4
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 from sqlalchemy.orm import Session
 from api.database import UserLLMConfigDB, ProviderDB, ModelProfileDB, RoleBindingDB

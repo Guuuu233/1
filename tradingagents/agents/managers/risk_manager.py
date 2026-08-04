@@ -1,5 +1,3 @@
-import time
-import json
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
 from tradingagents.agents.utils.agent_states import current_tracker_var

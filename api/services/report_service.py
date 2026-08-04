@@ -9,7 +9,7 @@ from numbers import Real
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Iterable, Literal
+from typing import List, Optional, Dict, Any, Iterable
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -447,11 +447,6 @@ def canonicalize_report_result_data(
         raise ValueError("structured report must be an object")
     canonical_data["structured"] = StructuredReport(**structured).model_dump()
     return canonical_data
-
-
-def _canonicalize_result_data(result_data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Backward-compatible private alias for internal callers."""
-    return canonicalize_report_result_data(result_data)
 
 
 def extract_structured_data(

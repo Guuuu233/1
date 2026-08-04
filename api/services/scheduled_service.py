@@ -54,29 +54,6 @@ def get_scheduled(db: Session, user_id: str, item_id: str) -> Optional[dict]:
     return _to_dict(item)
 
 
-def get_scheduled_batch(db: Session, user_id: str, item_ids: Iterable[str]) -> List[dict]:
-    """Get multiple scheduled analysis tasks in the requested order."""
-
-    normalized_ids = _normalize_item_ids(item_ids)
-    if not normalized_ids:
-        raise ValueError("请至少选择一个定时任务")
-
-    items = (
-        db.query(ScheduledAnalysisDB)
-        .filter(
-            ScheduledAnalysisDB.user_id == user_id,
-            ScheduledAnalysisDB.id.in_(normalized_ids),
-        )
-        .all()
-    )
-    item_map = {item.id: item for item in items}
-    missing_ids = [item_id for item_id in normalized_ids if item_id not in item_map]
-    if missing_ids:
-        raise ValueError("部分定时任务不存在或已失效，请刷新后重试")
-
-    return [_to_dict(item_map[item_id]) for item_id in normalized_ids]
-
-
 def _normalize_item_ids(item_ids: Iterable[str]) -> list[str]:
     normalized: list[str] = []
     seen: set[str] = set()

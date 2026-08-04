@@ -282,7 +282,7 @@ def test_graph_setup_wires_market_analyst_without_name_errors():
     deep_llm = object()
     tool_nodes = {"market": object()}
     conditional_logic = SimpleNamespace(
-        should_continue_market=lambda *_args, **_kwargs: "done",
+        should_continue_analyst=lambda *_args, **_kwargs: "done",
         should_continue_debate=lambda *_args, **_kwargs: "Research Manager",
         should_continue_risk_analysis=lambda *_args, **_kwargs: "Risk Judge",
         should_revise_after_risk_judge=lambda *_args, **_kwargs: "END",

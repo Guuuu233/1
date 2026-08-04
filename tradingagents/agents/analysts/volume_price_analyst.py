@@ -1,3 +1,6 @@
+import logging
+import asyncio
+
 from tradingagents.agents.utils.context_utils import get_cn_stock_name
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -6,6 +9,8 @@ from tradingagents.prompts import get_prompt
 from tradingagents.graph.intent_parser import build_horizon_context
 from tradingagents.agents.utils.agent_states import current_tracker_var, extract_verdict, check_llm_output_degraded, check_stream_chunk_degraded
 from api.database import log_llm_call
+
+logger = logging.getLogger(__name__)
 
 
 def create_volume_price_analyst(llm, data_collector=None):
@@ -61,10 +66,10 @@ def create_volume_price_analyst(llm, data_collector=None):
                 if tracker:
                     tracker._emit_token("Volume Price Analyst", "volume_price_report", content)
         except Exception as exc:
-            print(f"[Volume Price Analyst] Stream error: {exc}")
+            logger.debug("[Volume Price Analyst] Stream error: %s", exc)
 
         if not full_content.strip():
-            print("[Volume Price Analyst] Stream yielded empty text, attempting invoke fallback...")
+            logger.debug("[Volume Price Analyst] Stream yielded empty text, attempting invoke fallback...")
             try:
                 res = await asyncio.to_thread(llm.invoke, messages)
                 full_content = res.content if hasattr(res, "content") else str(res)

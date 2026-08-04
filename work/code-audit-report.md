@@ -80,7 +80,7 @@
 | P1-13 | `tradingagents/dataflows/providers/cn_akshare_provider.py:194` | `_locked` | 从未调用；代码统一用 `with AKSHARE_CALL_LOCK:`（20+ 处） |
 | P1-14 | `tradingagents/graph/trading_graph.py:537` | `reflect_and_remember` | 全仓零调用（其内部调用的 `self.reflector.reflect_*` 仍有用） |
 | P1-15 | `tradingagents/graph/trading_graph.py:204` | `TradingAgentsGraph.get_state(thread_id)` | 全仓唯一出现是 def；`self.graph.get_state`（:207）是底层 langgraph，非本方法 |
-| P1-16 | `api/services/custom_prompt_service.py:157` | `resolve_role_prompt` | **生产死**（仅测试 `test_custom_prompts.py`/`test_custom_prompt_injection.py` 使用）。注意 `docs/KNOWN_ISSUES.md:211` 仍建议未来 Phase C 用它——保留与否需团队决策 |
+| P1-16 | `api/services/custom_prompt_service.py:157` | `resolve_role_prompt` | **生产死**（仅测试 `test_custom_prompts.py`/`test_custom_prompt_injection.py` 使用）。注意 `docs/KNOWN_ISSUES.md:211` 仍建议未来 Phase C 用它。**H3 决策：保留**——`resolve_role_prompt` 不删除，标注供 Phase C 接回调用点 |
 
 > 注：`api/database.py:372 to_dict`、`trade_calendar.py:177 clear_cn_trade_date_cache`、`trading_graph.py:355 propagate_async`、`registry.py:81 list_resource_policies` 等经查**仅测试/工具使用**，非生产调用点，属「生产死/测试活」，不单独列为 P1（在 P2-观察项列出）。
 

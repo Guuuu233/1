@@ -1,42 +1,59 @@
-import os
-import json
+from typing import Any, Optional
+
 import pandas as pd
-from datetime import date, timedelta, datetime
-from typing import Annotated
-
-SavePathType = Annotated[str, "File path to save data. If None, data is not saved."]
-
-def save_output(data: pd.DataFrame, tag: str, save_path: SavePathType = None) -> None:
-    if save_path:
-        data.to_csv(save_path)
-        print(f"{tag} saved to {save_path}")
 
 
-def get_current_date():
-    return date.today().strftime("%Y-%m-%d")
+def safe_float(value: Any, round_to: Optional[int] = None) -> Optional[float]:
+    """Convert ``value`` to float, returning None for empty/invalid/NaN input.
+
+    Mirrors the legacy per-module ``_to_float``/``_safe_float`` helpers
+    (audit P2-5): ``None`` and non-numeric values become None, NaN becomes
+    None, and ``round_to`` preserves call sites that rounded to 4 decimals.
+    """
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (ValueError, TypeError):
+        return None
+    if f != f:  # NaN
+        return None
+    if round_to is not None:
+        f = round(f, round_to)
+    return f
 
 
-def decorate_all_methods(decorator):
-    def class_decorator(cls):
-        for attr_name, attr_value in cls.__dict__.items():
-            if callable(attr_value):
-                setattr(cls, attr_name, decorator(attr_value))
-        return cls
+def slice_hist_df(df: "pd.DataFrame", start_date: str, end_date: str) -> "pd.DataFrame":
+    """Slice a OHLCV frame by ``Date`` into ``[start_date, end_date]``.
 
-    return class_decorator
+    Shared by cn_akshare and cn_investoday providers (audit P2-1).
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    start_dt = pd.to_datetime(start_date, errors="coerce")
+    end_dt = pd.to_datetime(end_date, errors="coerce")
+    if pd.isna(start_dt) or pd.isna(end_dt):
+        return df
+    out = df.copy()
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    out = out.dropna(subset=["Date"])
+    out = out[(out["Date"] >= start_dt) & (out["Date"] <= end_dt)]
+    return out.sort_values("Date").reset_index(drop=True)
 
 
-def get_next_weekday(date):
+def format_hist_csv(out: "pd.DataFrame", symbol: str, start: str, end: str) -> str:
+    """Render an OHLCV frame in the canonical AkShare-style CSV header format.
 
-    if not isinstance(date, datetime):
-        date = datetime.strptime(date, "%Y-%m-%d")
-
-    if date.weekday() >= 5:
-        days_to_add = 7 - date.weekday()
-        next_weekday = date + timedelta(days=days_to_add)
-        return next_weekday
-    else:
-        return date
+    Shared by cn_akshare ``_format_ak_hist`` and cn_investoday ``_format_hist_csv``
+    (audit P2-3).
+    """
+    out = out.copy()
+    out["Dividends"] = 0.0
+    out["Stock Splits"] = 0.0
+    out["Date"] = pd.to_datetime(out["Date"]).dt.strftime("%Y-%m-%d")
+    header = f"# Stock data for {symbol} from {start} to {end}\n"
+    header += f"# Total records: {len(out)}\n\n"
+    return header + out.to_csv(index=False)
 
 
 def take_latest(df: "pd.DataFrame", date_col: str, n: int = 1) -> "pd.DataFrame":
@@ -49,7 +66,6 @@ def take_latest(df: "pd.DataFrame", date_col: str, n: int = 1) -> "pd.DataFrame"
     Selection order is newest-first. For LLM-facing text, pass the result through
     :func:`chronological` so "later rows = later events".
     """
-    import pandas as pd
 
     if df is None or getattr(df, "empty", True):
         return df
@@ -73,7 +89,6 @@ def take_latest(df: "pd.DataFrame", date_col: str, n: int = 1) -> "pd.DataFrame"
 
 def chronological(df: "pd.DataFrame", date_col: str) -> "pd.DataFrame":
     """Sort rows ascending by ``date_col`` for prompt/display (later = more recent)."""
-    import pandas as pd
 
     if df is None or getattr(df, "empty", True):
         return df
@@ -189,7 +204,6 @@ _NULL_RATIO_DROP = 0.80
 
 
 def _is_nullish(value) -> bool:
-    import pandas as pd
 
     if value is None:
         return True
@@ -267,7 +281,6 @@ def _drop_sparse_columns(
     null_ratio_drop: float = _NULL_RATIO_DROP,
     protect_cols: list | None = None,
 ):
-    import pandas as pd
 
     if df is None or getattr(df, "empty", True):
         return df
@@ -293,7 +306,6 @@ def _drop_sparse_columns(
 
 
 def _replace_nullish_with_marker(df: "pd.DataFrame", marker: str = MISSING_VALUE_MARKER):
-    import pandas as pd
 
     if df is None or getattr(df, "empty", True):
         return df
@@ -372,7 +384,6 @@ def shrink_table(
       return an explicit failure string instead of a partial table.
     - Enforce a prompt size budget; if truncated, append an explicit notice.
     """
-    import pandas as pd
 
     if df is None or getattr(df, "empty", True):
         return "【数据获取失败】表格为空，本项不可用。"

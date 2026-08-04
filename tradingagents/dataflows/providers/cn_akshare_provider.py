@@ -20,11 +20,17 @@ from ..trade_calendar import (
     is_historical_analysis_date,
     snapshot_historical_refusal,
 )
-from ..utils import chronological, shrink_table, take_latest
+from ..utils import (
+    chronological,
+    format_hist_csv,
+    safe_float,
+    shrink_table,
+    slice_hist_df,
+    take_latest,
+)
 from ..vendor_result import (
     VendorEmpty,
     VendorFail,
-    VendorRefuse,
     result_to_prompt,
 )
 from ..financial_announce import (
@@ -135,7 +141,7 @@ class _AkshareLock:
             self._holders[threading.get_ident()] = (time.monotonic(), is_scheduled)
         return self
 
-    def __exit__(self, *exc_info):
+    def __exit__(self, *_exc_info):
         tid = threading.get_ident()
         with self._mu:
             info = self._holders.pop(tid, None)
@@ -190,10 +196,6 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 "cn_akshare requires 'akshare'. Install it with: pip install akshare"
             ) from exc
         return ak
-
-    def _locked(self, func, *args, **kwargs):
-        with AKSHARE_CALL_LOCK:
-            return func(*args, **kwargs)
 
     def _normalize_symbol(self, symbol: str) -> str:
         s = symbol.strip().lower()
@@ -271,27 +273,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
         if df is None or df.empty:
             return f"No data found for symbol '{symbol}' between {start} and {end}"
         out = self._normalize_hist_df(df)
-        out["Dividends"] = 0.0
-        out["Stock Splits"] = 0.0
-        out["Date"] = pd.to_datetime(out["Date"]).dt.strftime("%Y-%m-%d")
-
-        header = f"# Stock data for {symbol} from {start} to {end}\n"
-        header += f"# Total records: {len(out)}\n\n"
-        return header + out.to_csv(index=False)
+        return format_hist_csv(out, symbol, start, end)
 
     @staticmethod
     def _slice_hist_df(df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
-        if df is None or df.empty:
-            return pd.DataFrame()
-        start_dt = pd.to_datetime(start_date, errors="coerce")
-        end_dt = pd.to_datetime(end_date, errors="coerce")
-        if pd.isna(start_dt) or pd.isna(end_dt):
-            return df
-        out = df.copy()
-        out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-        out = out.dropna(subset=["Date"])
-        out = out[(out["Date"] >= start_dt) & (out["Date"] <= end_dt)]
-        return out.sort_values("Date").reset_index(drop=True)
+        return slice_hist_df(df, start_date, end_date)
 
     def _drop_incomplete_today_bar(
         self, hist_df: pd.DataFrame, end_date: str
@@ -1153,13 +1139,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
 
     @staticmethod
     def _safe_float(val) -> float | None:
-        if val is None:
-            return None
-        try:
-            f = float(val)
-            return f if not pd.isna(f) else None
-        except (ValueError, TypeError):
-            return None
+        return safe_float(val)
 
     def get_board_fund_flow(self, curr_date: str = None) -> str:
         """获取行业板块资金流向排名（即时快照）。

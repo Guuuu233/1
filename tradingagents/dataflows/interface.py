@@ -19,7 +19,6 @@ from .vendor_result import (
     VendorFail,
     VendorOk,
     VendorRefuse,
-    result_to_prompt,
 )
 
 # Tools organized by category
@@ -77,8 +76,6 @@ TOOLS_CATEGORIES = {
 }
 
 _registry = build_default_registry()
-
-VENDOR_LIST = _registry.list_names()
 
 PROVIDER_CALL_EXECUTOR_MAX_WORKERS = int(
     os.getenv("TA_PROVIDER_MAX_WORKERS", "8")

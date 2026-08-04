@@ -1,6 +1,7 @@
 """DataCollector: fetch all data once, serve windowed views to analyst agents."""
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 import copy
 from datetime import datetime, timedelta, timezone
@@ -56,6 +57,8 @@ FETCH_ALL_TIMEOUT = int(os.getenv("TA_DATA_FETCH_TIMEOUT", "300"))
 FETCH_MAX_WORKERS = int(os.getenv("TA_DATA_FETCH_MAX_WORKERS", "10"))
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 _OHLCV_COLS = ["date", "open", "high", "low", "close", "volume"]
 
@@ -322,7 +325,7 @@ def _safe(tool, payload: dict) -> Any:
         duration = time.time() - start_t
         # 仅在耗时较长时输出
         if duration > 0.5:
-            print(f"  [Timer] {getattr(tool, 'name', str(tool))} took {duration:.2f}s")
+            logger.debug("  [Timer] %s took %.2fs", getattr(tool, "name", str(tool)), duration)
         return res
     except Exception as exc:
         return f"{getattr(tool, 'name', str(tool))} 调用失败：{type(exc).__name__}: {exc}"
@@ -616,7 +619,7 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         for future in not_done:
             key = future_to_key[future]
             results[key] = f"{key} 数据拉取超时（>{FETCH_ALL_TIMEOUT}s），本次分析跳过该数据源"
-            print(f"  [Warning] {key} fetch timed out after {FETCH_ALL_TIMEOUT}s, skipped")
+            logger.warning("  [Warning] %s fetch timed out after %ss, skipped", key, FETCH_ALL_TIMEOUT)
     finally:
         # Provider routing has bounded timeouts, so completing the executor here
         # is finite and keeps stuck worker/socket threads from outliving the job.
@@ -683,9 +686,9 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
                 except Exception:
                     indicators_res[key] = "N/A"
         else:
-            print(f"  [Warning] No valid stock_data for indicator calculation.")
+            logger.warning("  [Warning] No valid stock_data for indicator calculation.")
     except Exception as e:
-        print(f"  [Error] Local indicator calculation failed: {e}")
+        logger.error("  [Error] Local indicator calculation failed: %s", e)
 
     for ind in INDICATORS:
         if ind not in indicators_res:
@@ -702,7 +705,7 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
     except Exception as e:
         results["vpa_indicators"] = f"VPA 计算失败：{e}"
 
-    print(f"[Timer] Total Data Collection for {ticker} took {time.time() - fetch_start:.2f}s")
+    logger.debug("[Timer] Total Data Collection for %s took %.2fs", ticker, time.time() - fetch_start)
     return results
 
 

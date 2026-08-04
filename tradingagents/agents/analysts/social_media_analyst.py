@@ -1,3 +1,4 @@
+import logging
 from tradingagents.agents.utils.context_utils import get_cn_stock_name
 import asyncio
 
@@ -7,6 +8,8 @@ from tradingagents.prompts import get_prompt
 from tradingagents.graph.intent_parser import build_horizon_context
 from tradingagents.agents.utils.agent_states import current_tracker_var, extract_verdict, check_llm_output_degraded, check_stream_chunk_degraded
 from api.database import log_llm_call
+
+logger = logging.getLogger(__name__)
 
 
 def create_social_media_analyst(llm, data_collector=None):
@@ -103,14 +106,14 @@ def create_social_media_analyst(llm, data_collector=None):
         except Exception as exc:
 
 
-            print(f"[Social Analyst] Stream error: {exc}")
+            logger.debug("[Social Analyst] Stream error: %s", exc)
 
 
 
         if not full_content.strip():
 
 
-            print(f"[Social Analyst] Stream yielded empty text, attempting invoke fallback...")
+            logger.debug("[Social Analyst] Stream yielded empty text, attempting invoke fallback...")
 
 
             try:

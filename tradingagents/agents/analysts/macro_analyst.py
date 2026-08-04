@@ -1,3 +1,4 @@
+import logging
 from tradingagents.agents.utils.context_utils import get_cn_stock_name
 import asyncio
 
@@ -7,6 +8,8 @@ from tradingagents.prompts import get_prompt
 from tradingagents.graph.intent_parser import build_horizon_context
 from tradingagents.agents.utils.agent_states import current_tracker_var, extract_verdict, check_llm_output_degraded, check_stream_chunk_degraded
 from api.database import log_llm_call
+
+logger = logging.getLogger(__name__)
 
 
 def create_macro_analyst(llm, data_collector=None):
@@ -23,7 +26,7 @@ def create_macro_analyst(llm, data_collector=None):
         stock_name = get_cn_stock_name(ticker)
 
         ticker_display = f"{ticker} ({stock_name})" if stock_name and stock_name != ticker else ticker
-        print(f"[Macro Analyst] START {ticker_display} {current_date}")
+        logger.debug("[Macro Analyst] START %s %s", ticker_display, current_date)
         horizon = "medium"  # 宏观面固定中长期视角
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])
@@ -101,14 +104,14 @@ def create_macro_analyst(llm, data_collector=None):
         except Exception as exc:
 
 
-            print(f"[Macro Analyst] Stream error: {exc}")
+            logger.debug("[Macro Analyst] Stream error: %s", exc)
 
 
 
         if not full_content.strip():
 
 
-            print(f"[Macro Analyst] Stream yielded empty text, attempting invoke fallback...")
+            logger.debug("[Macro Analyst] Stream yielded empty text, attempting invoke fallback...")
 
 
             try:
@@ -131,7 +134,7 @@ def create_macro_analyst(llm, data_collector=None):
 
                 full_content = f"分析报告生成失败：{exc}"
 
-        print(f"[Macro Analyst] DONE {ticker_display}, report length={len(full_content)}")
+        logger.debug("[Macro Analyst] DONE %s, report length=%s", ticker_display, len(full_content))
         if check_llm_output_degraded(full_content, "Macro Analyst"):
             full_content = "宏观板块分析生成异常（输出退化），本项不可用"
         _elapsed = _time.monotonic() - _t0

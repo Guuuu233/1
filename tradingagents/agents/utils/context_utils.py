@@ -8,7 +8,6 @@ from zoneinfo import ZoneInfo
 from tradingagents.dataflows.trade_calendar import (
     CN_TZ,
     cn_market_phase,
-    cn_today_str,
     is_cn_symbol,
     is_cn_trading_day,
     previous_cn_trading_day,
