@@ -155,6 +155,16 @@ market/news/fundamentals/macro.
 
 The analyst's full report remains available in state for bull/bear to read.
 
+**Golden-output citation-density regression (DAV-68 optimization ②).**
+`tests/test_evidence_citation_density.py` drives the real adjudication chain
+(research_manager → trader → risk_manager) with golden analyst reports and
+golden adjudicator outputs, then asserts a per-hop **citation density** floor:
+of the concrete evidence facts present in a node's input prompt, the node's
+output must cite at least a minimum fraction. The metric ties the output back
+to the wiring — if the evidence summaries (or the plan hand-off) are ever
+dropped, the available-fact count collapses and the test fails even though a
+mock LLM would still return the fixed golden output.
+
 ### Remaining gap (follow-up)
 
 `trader` and `risk_manager` still do not receive analyst reports (only
