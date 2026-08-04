@@ -1,4 +1,4 @@
-import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, CalibrationResponse, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, Provider, ProviderCreatePayload, ProviderUpdatePayload, ModelProfile, ModelProfileCreatePayload, ModelProfileUpdatePayload, RoleBinding, RoleBindingItem, ResolvedRole, CustomPrompt, CustomPromptItem, ResolvedCustomPrompt, PromptInjectionSwitch } from '@/types'
+import type { Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, CalibrationResponse, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, Provider, ModelProfile, ModelProfileCreatePayload, RoleBinding, RoleBindingItem, ResolvedRole, CustomPrompt, CustomPromptItem } from '@/types'
 
 export function getBaseUrl(): string {
     const envUrl = (import.meta.env.VITE_API_URL as string) || ''
@@ -80,13 +80,6 @@ class ApiService {
         return JSON.parse(raw) as T
     }
 
-    async startAnalysis(request: AnalysisRequest): Promise<AnalysisResponse> {
-        return this.request<AnalysisResponse>('/v1/analyze', {
-            method: 'POST',
-            body: JSON.stringify(request),
-        })
-    }
-
     async getJobStatus(jobId: string): Promise<JobStatus> {
         return this.request<JobStatus>(`/v1/jobs/${jobId}`)
     }
@@ -136,13 +129,6 @@ class ApiService {
         return this.request<ReportListResponse>(`/v1/reports?${params}`)
     }
 
-    async getLatestReportsBySymbols(symbols: string[]): Promise<{ reports: Report[] }> {
-        return this.request<{ reports: Report[] }>('/v1/reports/latest-by-symbols', {
-            method: 'POST',
-            body: JSON.stringify({ symbols }),
-        })
-    }
-
     async getReport(reportId: string): Promise<ReportDetail> {
         return this.request<ReportDetail>(`/v1/reports/${reportId}`)
     }
@@ -158,23 +144,7 @@ class ApiService {
         })
     }
 
-
-    async createReport(report: {
-        symbol: string
-        trade_date: string
-        decision?: string
-        result_data?: AnalysisReport
-    }): Promise<Report> {
-        return this.request<Report>('/v1/reports', {
-            method: 'POST',
-            body: JSON.stringify(report),
-        })
-    }
-
     // Watchlist
-    async getWatchlist(): Promise<{ items: WatchlistItem[] }> {
-        return this.request<{ items: WatchlistItem[] }>('/v1/watchlist')
-    }
     async addToWatchlist(input: string): Promise<WatchlistBatchResponse> {
         return this.request<WatchlistBatchResponse>('/v1/watchlist', {
             method: 'POST',
@@ -186,9 +156,6 @@ class ApiService {
     }
 
     // Scheduled Analysis
-    async getScheduled(): Promise<{ items: ScheduledAnalysis[] }> {
-        return this.request<{ items: ScheduledAnalysis[] }>('/v1/scheduled')
-    }
     async getPortfolioOverview(): Promise<PortfolioOverviewResponse> {
         return this.request<PortfolioOverviewResponse>('/v1/portfolio/overview')
     }
@@ -222,20 +189,11 @@ class ApiService {
             body: JSON.stringify({ item_ids }),
         })
     }
-    async triggerScheduledTest(id: string): Promise<AnalysisResponse> {
-        return this.request<AnalysisResponse>(`/v1/scheduled/${id}/trigger`, {
-            method: 'POST',
-        })
-    }
     async triggerScheduledBatch(item_ids: string[]): Promise<ScheduledBatchTriggerResponse> {
         return this.request<ScheduledBatchTriggerResponse>('/v1/scheduled/batch/trigger', {
             method: 'POST',
             body: JSON.stringify({ item_ids }),
         })
-    }
-
-    async getPortfolioImportState(): Promise<PortfolioImportState> {
-        return this.request<PortfolioImportState>('/v1/portfolio/imports')
     }
 
     async syncPortfolioImport(data: {
@@ -376,14 +334,6 @@ class ApiService {
         return this.request<FeedbackListResponse>(`/v1/feedbacks?page=${page}&page_size=${pageSize}`)
     }
 
-    async getFeedback(id: string): Promise<FeedbackItem> {
-        return this.request<FeedbackItem>(`/v1/feedbacks/${id}`)
-    }
-
-    async getFeedbackUnreadCount(): Promise<FeedbackUnreadResponse> {
-        return this.request<FeedbackUnreadResponse>('/v1/feedbacks/unread-count')
-    }
-
     async markFeedbackRead(id: string): Promise<void> {
         return this.request<void>(`/v1/feedbacks/${id}/read`, { method: 'POST' })
     }
@@ -391,26 +341,6 @@ class ApiService {
     // Multi-Provider & Role-Based Model Routing API
     async getProviders(): Promise<Provider[]> {
         return this.request<Provider[]>('/v1/providers')
-    }
-
-    async createProvider(data: ProviderCreatePayload): Promise<Provider> {
-        return this.request<Provider>('/v1/providers', {
-            method: 'POST',
-            body: JSON.stringify(data),
-        })
-    }
-
-    async updateProvider(id: string, data: ProviderUpdatePayload): Promise<Provider> {
-        return this.request<Provider>(`/v1/providers/${id}`, {
-            method: 'PATCH',
-            body: JSON.stringify(data),
-        })
-    }
-
-    async deleteProvider(id: string): Promise<void> {
-        return this.request<void>(`/v1/providers/${id}`, {
-            method: 'DELETE',
-        })
     }
 
     async syncModelProfiles(models: string[], providerId?: string): Promise<ModelProfile[]> {
@@ -428,19 +358,6 @@ class ApiService {
         return this.request<ModelProfile>('/v1/model-profiles', {
             method: 'POST',
             body: JSON.stringify(data),
-        })
-    }
-
-    async updateModelProfile(id: string, data: ModelProfileUpdatePayload): Promise<ModelProfile> {
-        return this.request<ModelProfile>(`/v1/model-profiles/${id}`, {
-            method: 'PATCH',
-            body: JSON.stringify(data),
-        })
-    }
-
-    async deleteModelProfile(id: string): Promise<void> {
-        return this.request<void>(`/v1/model-profiles/${id}`, {
-            method: 'DELETE',
         })
     }
 
@@ -486,25 +403,10 @@ class ApiService {
         })
     }
 
-    async getResolvedCustomPrompts(): Promise<ResolvedCustomPrompt[]> {
-        return this.request<ResolvedCustomPrompt[]>('/v1/custom-prompts/resolved')
-    }
-
     async migrateCustomPrompt(legacyText: string): Promise<CustomPrompt[]> {
         return this.request<CustomPrompt[]>('/v1/custom-prompts/migrate', {
             method: 'POST',
             body: JSON.stringify({ legacy_text: legacyText }),
-        })
-    }
-
-    async getPromptInjectionSwitch(): Promise<PromptInjectionSwitch> {
-        return this.request<PromptInjectionSwitch>('/v1/custom-prompts/switch')
-    }
-
-    async updatePromptInjectionSwitch(enabled: boolean): Promise<PromptInjectionSwitch> {
-        return this.request<PromptInjectionSwitch>('/v1/custom-prompts/switch', {
-            method: 'PATCH',
-            body: JSON.stringify({ enabled }),
         })
     }
 }
