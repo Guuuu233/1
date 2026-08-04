@@ -29,7 +29,7 @@ data migration involved.
 
 ## Vendor chain collapses three outcomes into two behaviors
 
-**Status:** Open (documented; not fixed in 3b-hotfix)  
+**Status:** Fixed in DAV-69 (typed vendor results). The result-type redesign below is implemented in `tradingagents/dataflows/vendor_result.py` and consumed by `route_to_vendor` in `tradingagents/dataflows/interface.py`.
 **Discovered:** 2026-07-29 during historical-news refusal work
 
 ### Symptom
@@ -62,7 +62,7 @@ High risk (multi-provider chain + mixed date semantics):
 5. `get_realtime_quotes` — shorter chain; lower risk after snapshot refuse
 6. `cn_market_data` / `institutional_risk` tools — config default may fall back to `yfinance` when category unset (also tracked for data_vendors commit)
 
-### Suggested fix (future refactor; not this commit)
+### Suggested fix (implemented in DAV-69)
 
 1. Introduce an explicit result type (or exception hierarchy), e.g.:
    - `VendorRefuse(reason)` — do not fall through to date-blind vendors; optional allow-list for same-semantics peers
@@ -71,6 +71,20 @@ High risk (multi-provider chain + mixed date semantics):
    - `VendorOk(payload)`
 2. Until that lands, **date-blind / near-window capabilities must be refused at `route_to_vendor` (or category policy)**, not only inside a single provider.
 3. Re-enabling investoday (or any historical-capable source) for news must be an **explicit same-source whitelist for both live and historical modes**, never a silent fallback hit.
+
+Implementation notes (DAV-69):
+
+- `VendorResult` / `VendorOk` / `VendorRefuse` / `VendorEmpty` / `VendorFail` live in
+  `tradingagents/dataflows/vendor_result.py`; `result_to_prompt()` unwraps a typed
+  result back to a prompt string for direct callers.
+- `route_to_vendor` now interprets: plain value or `VendorOk` = hit; `VendorRefuse` =
+  stop (continue only through `allow_peers`); `VendorEmpty` = confirmed none, stop;
+  `VendorFail` or exception = fall through to the next vendor.
+- Providers signal the new semantics: cn_akshare `get_global_news` (sina fail →
+  `VendorFail`, sina empty → `VendorEmpty`), cn_akshare `get_news` empty →
+  `VendorEmpty`, yfinance news/global/insider error strings → `VendorFail` and
+  "No ... found" → `VendorEmpty`. Plain strings remain backward-compatible hits.
+- Regression tests: `tests/test_vendor_chain_semantics.py`.
 
 ### Regression guard
 
