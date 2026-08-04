@@ -110,14 +110,13 @@ def _message(tool_calls=None):
 class TestConditionalLogicRouting:
     def test_analyst_tool_call_continues(self):
         logic = ConditionalLogic(max_debate_rounds=1, max_risk_discuss_rounds=1)
-        for method in ("market", "social", "news", "fundamentals", "macro", "smart_money", "volume_price"):
-            state = {"messages": [_message(tool_calls=[{"name": "get_stock_data"}])]}
-            assert getattr(logic, f"should_continue_{method}")(state) == "continue"
+        state = {"messages": [_message(tool_calls=[{"name": "get_stock_data"}])]}
+        assert logic.should_continue_analyst(state) == "continue"
 
     def test_analyst_no_tool_call_done(self):
         logic = ConditionalLogic(max_debate_rounds=1, max_risk_discuss_rounds=1)
         state = {"messages": [_message()]}
-        assert logic.should_continue_market(state) == "done"
+        assert logic.should_continue_analyst(state) == "done"
 
     def test_invest_debate_rounds_cap_routes_to_manager(self):
         logic = ConditionalLogic(max_debate_rounds=1)
