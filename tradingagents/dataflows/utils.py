@@ -25,6 +25,39 @@ def safe_float(value: Any, round_to: Optional[int] = None) -> Optional[float]:
     return f
 
 
+def slice_hist_df(df: "pd.DataFrame", start_date: str, end_date: str) -> "pd.DataFrame":
+    """Slice a OHLCV frame by ``Date`` into ``[start_date, end_date]``.
+
+    Shared by cn_akshare and cn_investoday providers (audit P2-1).
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    start_dt = pd.to_datetime(start_date, errors="coerce")
+    end_dt = pd.to_datetime(end_date, errors="coerce")
+    if pd.isna(start_dt) or pd.isna(end_dt):
+        return df
+    out = df.copy()
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    out = out.dropna(subset=["Date"])
+    out = out[(out["Date"] >= start_dt) & (out["Date"] <= end_dt)]
+    return out.sort_values("Date").reset_index(drop=True)
+
+
+def format_hist_csv(out: "pd.DataFrame", symbol: str, start: str, end: str) -> str:
+    """Render an OHLCV frame in the canonical AkShare-style CSV header format.
+
+    Shared by cn_akshare ``_format_ak_hist`` and cn_investoday ``_format_hist_csv``
+    (audit P2-3).
+    """
+    out = out.copy()
+    out["Dividends"] = 0.0
+    out["Stock Splits"] = 0.0
+    out["Date"] = pd.to_datetime(out["Date"]).dt.strftime("%Y-%m-%d")
+    header = f"# Stock data for {symbol} from {start} to {end}\n"
+    header += f"# Total records: {len(out)}\n\n"
+    return header + out.to_csv(index=False)
+
+
 def take_latest(df: "pd.DataFrame", date_col: str, n: int = 1) -> "pd.DataFrame":
     """Return the latest ``n`` rows by ``date_col`` regardless of input order.
 
