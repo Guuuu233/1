@@ -46,4 +46,5 @@ include = ["tradingagents*", "api*", "scheduler*"]
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+    "fakeredis>=2.37.0",
 ]
