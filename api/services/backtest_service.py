@@ -7,7 +7,6 @@ without touching any existing code.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import queue
@@ -156,7 +155,6 @@ def _get_trading_dates(start: str, end: str, interval_days: int) -> List[str]:
 def _get_price_after(symbol: str, base_date: str, hold_days: int) -> Optional[float]:
     """Fetch closing price hold_days trading days after base_date using akshare."""
     try:
-        import akshare as ak
         from tradingagents.dataflows.interface import route_to_vendor
         import pandas as pd
 

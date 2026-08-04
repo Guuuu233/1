@@ -31,7 +31,6 @@ from ..utils import (
 from ..vendor_result import (
     VendorEmpty,
     VendorFail,
-    VendorRefuse,
     result_to_prompt,
 )
 from ..financial_announce import (

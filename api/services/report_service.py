@@ -9,7 +9,7 @@ from numbers import Real
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Iterable, Literal
+from typing import List, Optional, Dict, Any, Iterable
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
