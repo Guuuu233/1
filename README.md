@@ -132,6 +132,8 @@ docker compose up -d
 
 镜像默认在同一容器内同时启动 API 服务与定时任务调度器，定时分析开箱即用，无需 Redis 等额外组件。如需分开部署（API/调度器/Redis 各自一个容器），使用 `docker-compose.split.yml`，详见 [guide/deployment.md](guide/deployment.md)。
 
+启动后访问 `http://localhost:8001` 即可使用（compose 将容器 8000 端口映射到宿主机 8001）。
+
 **方式二：docker run**
 
 ```bash
@@ -140,7 +142,7 @@ docker pull ghcr.io/kylinmountain/tradingagents-ashare:latest
 mkdir -p $(pwd)/data
 export TA_APP_SECRET_KEY=$(openssl rand -base64 32)
 
-docker run -d -p 8000:8000 \
+docker run -d -p 8001:8000 \
   --name tradingagents \
   --restart always \
   -v $(pwd)/data:/app/data \
@@ -149,7 +151,7 @@ docker run -d -p 8000:8000 \
   ghcr.io/kylinmountain/tradingagents-ashare:latest
 ```
 
-访问 `http://localhost:8000` 即可使用。
+访问 `http://localhost:8001` 即可使用。
 
 > **`TA_APP_SECRET_KEY`**：用于加密用户 LLM API Key 和签发登录 JWT。**未设置时服务（API 与调度器）会拒绝启动**；请先设置再启动，且生产环境设置后不可更改。仅限本地开发：如确需放行内置默认密钥，可显式设置 `TA_ALLOW_DEFAULT_SECRET=1`（不安全，禁止用于生产）。
 
