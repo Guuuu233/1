@@ -1,5 +1,3 @@
-import os
-import json
 from typing import Any, Optional
 
 import pandas as pd
@@ -68,7 +66,6 @@ def take_latest(df: "pd.DataFrame", date_col: str, n: int = 1) -> "pd.DataFrame"
     Selection order is newest-first. For LLM-facing text, pass the result through
     :func:`chronological` so "later rows = later events".
     """
-    import pandas as pd
 
     if df is None or getattr(df, "empty", True):
         return df
@@ -92,7 +89,6 @@ def take_latest(df: "pd.DataFrame", date_col: str, n: int = 1) -> "pd.DataFrame"
 
 def chronological(df: "pd.DataFrame", date_col: str) -> "pd.DataFrame":
     """Sort rows ascending by ``date_col`` for prompt/display (later = more recent)."""
-    import pandas as pd
 
     if df is None or getattr(df, "empty", True):
         return df
@@ -208,7 +204,6 @@ _NULL_RATIO_DROP = 0.80
 
 
 def _is_nullish(value) -> bool:
-    import pandas as pd
 
     if value is None:
         return True
@@ -286,7 +281,6 @@ def _drop_sparse_columns(
     null_ratio_drop: float = _NULL_RATIO_DROP,
     protect_cols: list | None = None,
 ):
-    import pandas as pd
 
     if df is None or getattr(df, "empty", True):
         return df
@@ -312,7 +306,6 @@ def _drop_sparse_columns(
 
 
 def _replace_nullish_with_marker(df: "pd.DataFrame", marker: str = MISSING_VALUE_MARKER):
-    import pandas as pd
 
     if df is None or getattr(df, "empty", True):
         return df
@@ -391,7 +384,6 @@ def shrink_table(
       return an explicit failure string instead of a partial table.
     - Enforce a prompt size budget; if truncated, append an explicit notice.
     """
-    import pandas as pd
 
     if df is None or getattr(df, "empty", True):
         return "【数据获取失败】表格为空，本项不可用。"
