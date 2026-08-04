@@ -44,6 +44,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 from sqlalchemy.orm import Session
 import pandas as pd
+import requests
 
 from api.database import UserDB, UserLLMConfigDB, VersionStatsDB, ReportDB, ImportedPortfolioPositionDB, FeedbackDB, SponsorDB, ProviderDB, ModelProfileDB, RoleBindingDB, init_db, get_db, get_db_ctx
 from api.job_store import get_job_store as _new_job_store
@@ -110,8 +111,8 @@ def _report_version_stats() -> None:
                 json={"v": APP_VERSION, "nonce": uuid.uuid4().hex},
                 timeout=30,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("version-stats report failed: %s", exc)
 
     threading.Thread(target=_send, daemon=True).start()
 
