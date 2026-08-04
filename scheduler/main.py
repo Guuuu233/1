@@ -20,7 +20,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Optional
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -90,7 +90,6 @@ from api.database import (
     init_db,
     get_db_ctx,
 )
-from api.job_store import get_job_store as _new_job_store
 from api.services import (
     auth_service,
     report_service,
@@ -103,9 +102,7 @@ from api.main import (
     _build_scheduled_analyze_request,
     _resolve_scheduled_trade_date,
     _run_job,
-    _set_job,
     _get_job,
-    _emit_job_event,
     get_job_store,
 )
 
