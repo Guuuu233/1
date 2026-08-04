@@ -108,6 +108,16 @@ def test_delete(store: RedisJobStore):
     store.delete_job("j1")
 
 
+def test_running_jobs(store: RedisJobStore):
+    store.set_job("j1", status="running", symbol="AAPL")
+    store.set_job("j2", status="completed")
+    store.set_job("j3", status="running", symbol="MSFT")
+    running = store.running_jobs()
+    assert set(running.keys()) == {"j1", "j3"}
+    assert running["j1"]["status"] == "running"
+    assert running["j3"]["symbol"] == "MSFT"
+
+
 def test_clear(store: RedisJobStore):
     store.set_job("j1", status="running")
     store.set_job("j2", status="completed")

@@ -48,6 +48,14 @@ class JobStore(Protocol):
         """Remove job state and associated event queue."""
         ...
 
+    def running_jobs(self) -> Dict[str, Dict[str, Any]]:
+        """Return ``{job_id: fields}`` for all jobs currently in 'running' status.
+
+        Used by startup recovery to enumerate in-flight jobs that survived a
+        process restart in a shared store (e.g. Redis in the split deployment).
+        """
+        ...
+
     def emit_event(self, job_id: str, event: str, data: Dict[str, Any]) -> None:
         """Push SSE event for job (thread-safe, works from both event loop and worker threads)."""
         ...
@@ -125,6 +133,14 @@ class InMemoryJobStore:
     def get_job(self, job_id: str) -> Dict[str, Any]:
         with self._lock:
             return dict(self._jobs.get(job_id, {}))
+
+    def running_jobs(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return {
+                job_id: dict(fields)
+                for job_id, fields in self._jobs.items()
+                if fields.get("status") == "running"
+            }
 
     def delete_job(self, job_id: str) -> None:
         with self._lock:

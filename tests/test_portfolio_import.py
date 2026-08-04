@@ -166,6 +166,7 @@ class TestPortfolioImportService:
                         "user_id": "user1",
                         "symbol": "600519.SH",
                         "horizon": "short",
+                        "job_id": "job-ctx-1",
                     },
                     "2026-03-30",
                 )
@@ -204,6 +205,7 @@ class TestPortfolioImportService:
                         "user_id": "user-failed",
                         "symbol": "300750.SZ",
                         "horizon": "short",
+                        "job_id": "job-fail-1",
                     },
                     "2026-03-30",
                 )

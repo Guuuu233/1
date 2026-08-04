@@ -93,6 +93,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_report_schema()
     _ensure_user_schema()
+    _ensure_scheduled_schema()
     _ensure_llm_call_log_schema()
 
 
@@ -152,6 +153,26 @@ def _ensure_user_schema() -> None:
 
     _migrate_tokens_to_hashed()
     _migrate_api_keys_reencrypt()
+
+
+def _ensure_scheduled_schema() -> None:
+    """Add job-persistence columns to scheduled_analyses for existing SQLite deployments.
+
+    The scheduler persists the running job's id/timestamps on the scheduled row
+    so startup recovery can tell a genuinely in-flight task (crashed process)
+    from an abandoned one, and re-queue it instead of dropping the analysis.
+    """
+    try:
+        with engine.begin() as conn:
+            columns = {row[1] for row in conn.execute(text("PRAGMA table_info(scheduled_analyses)"))}
+            if "last_job_id" not in columns:
+                conn.execute(text("ALTER TABLE scheduled_analyses ADD COLUMN last_job_id VARCHAR(36)"))
+            if "last_job_started_at" not in columns:
+                conn.execute(text("ALTER TABLE scheduled_analyses ADD COLUMN last_job_started_at DATETIME"))
+            if "last_job_heartbeat_at" not in columns:
+                conn.execute(text("ALTER TABLE scheduled_analyses ADD COLUMN last_job_heartbeat_at DATETIME"))
+    except Exception as e:
+        logger.error("Failed to ensure scheduled schema: %s", e)
 
 
 def _migrate_tokens_to_hashed() -> None:
@@ -477,6 +498,12 @@ class ScheduledAnalysisDB(Base):
     last_run_date = Column(String(10), nullable=True)
     last_run_status = Column(String(10), nullable=True)
     last_report_id = Column(String(36), nullable=True)
+    # Job-persistence fields: the scheduler writes these at claim time and the
+    # heartbeat refreshes last_job_heartbeat_at while the analysis runs, so a
+    # crash/restart can distinguish an in-flight task from an abandoned one.
+    last_job_id = Column(String(36), nullable=True)
+    last_job_started_at = Column(DateTime, nullable=True)
+    last_job_heartbeat_at = Column(DateTime, nullable=True)
     consecutive_failures = Column(Integer, default=0)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))

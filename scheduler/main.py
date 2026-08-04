@@ -14,10 +14,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
@@ -40,6 +42,24 @@ def _log(msg: str):
 
 # ── Concurrency ──────────────────────────────────────────────────────────────
 SCHEDULER_CONCURRENCY = int(os.getenv("SCHEDULER_CONCURRENCY", "3"))
+
+# How long to wait for in-flight jobs after SIGTERM/SIGINT before cancelling.
+# A job cancelled here stays persisted as "running" (its last_job_id was
+# written at claim time), so startup recovery re-queues it — the analysis is
+# not lost even when the drain times out.
+SCHEDULER_GRACEFUL_SHUTDOWN_SECONDS = int(os.getenv("SCHEDULER_GRACEFUL_SHUTDOWN_SECONDS", "900"))
+
+# Heartbeat interval for persisting running-job liveness to the DB.
+SCHEDULER_HEARTBEAT_SECONDS = int(os.getenv("SCHEDULER_HEARTBEAT_SECONDS", "30"))
+
+# A persisted heartbeat older than this many seconds marks a still-"running"
+# task as abandoned at startup (rather than genuinely in-flight when the
+# previous process died). The heartbeat refreshes every
+# SCHEDULER_HEARTBEAT_SECONDS, so this is a small multiple of that interval;
+# widen it for long analyses or long maintenance windows.
+SCHEDULER_HEARTBEAT_STALE_AFTER_SECONDS = int(
+    os.getenv("SCHEDULER_HEARTBEAT_STALE_AFTER_SECONDS", "900")
+)
 
 _semaphore: Optional[asyncio.Semaphore] = None
 _executor: Optional[ThreadPoolExecutor] = None
@@ -248,19 +268,55 @@ async def _run_scheduled_analysis_once(
             logger.error(f"[Scheduler] Could not record failure: {db_exc}")
 
 
+async def _run_job_heartbeat(task_id: str, job_id: str) -> None:
+    """Persist a heartbeat for a running scheduled job.
+
+    Refreshes ``last_job_heartbeat_at`` every ``SCHEDULER_HEARTBEAT_SECONDS``
+    while the analysis runs, so startup recovery can tell a genuinely in-flight
+    task from an abandoned one.  ``_run_scheduled_job`` cancels this task when
+    the analysis reaches a terminal state.
+    """
+    while True:
+        await asyncio.sleep(SCHEDULER_HEARTBEAT_SECONDS)
+
+        def _touch() -> None:
+            with get_db_ctx() as db:
+                item = (
+                    db.query(ScheduledAnalysisDB)
+                    .filter(ScheduledAnalysisDB.id == task_id)
+                    .first()
+                )
+                if item is not None and item.last_job_id == job_id:
+                    item.last_job_heartbeat_at = datetime.now(timezone.utc)
+                    db.commit()
+
+        try:
+            await asyncio.to_thread(_touch)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"[Scheduler] Heartbeat write failed for job {job_id}: {exc}")
+
+
 async def _run_scheduled_job(task: dict, trade_date: str):
     """Execute a single scheduled analysis job.
 
     Args:
-        task: dict with keys id, user_id, symbol, horizon (plain values,
+        task: dict with keys id, user_id, symbol, horizon, job_id (plain values,
               not an ORM instance, to avoid DetachedInstanceError).
         trade_date: YYYY-MM-DD string.
+
+    ``job_id`` is generated and persisted on the scheduled row at claim time
+    (see ``_scheduler_loop``), so a crash mid-analysis leaves a recoverable
+    trace for ``_recover_stale_tasks``.
     """
     user_id = task["user_id"]
     symbol = task["symbol"]
+    job_id = task["job_id"]
+    task_id = task["id"]
 
-    _log(f"[Scheduler] Running {symbol} for user={user_id}")
-    job_id = uuid4().hex
+    _log(f"[Scheduler] Running {symbol} for user={user_id} job={job_id}")
+    heartbeat = asyncio.create_task(_run_job_heartbeat(task_id, job_id))
     try:
         await _run_scheduled_analysis_once(
             task,
@@ -269,25 +325,75 @@ async def _run_scheduled_job(task: dict, trade_date: str):
             mark_schedule_run=True,
         )
     finally:
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except asyncio.CancelledError:
+            pass
         get_job_store().delete_job(job_id)
 
 
 # ── Scheduler loop ───────────────────────────────────────────────────────────
 
-async def _scheduler_loop():
+def _claim_pending_tasks(today: str, current_hhmm: str):
+    """Claim all pending scheduled tasks, persisting job ids, and return snapshots.
+
+    Each claimed task gets a fresh ``job_id`` written to ``last_job_id`` /
+    ``last_job_started_at`` on its scheduled row before the analysis launches,
+    so a crash mid-run leaves a recoverable trace (see ``_recover_stale_tasks``).
+
+    Returns a list of plain dicts (keys: id, user_id, symbol, horizon, job_id).
+    """
+    with get_db_ctx() as db:
+        tasks = scheduled_service.get_pending_tasks(db, today, current_hhmm)
+        if not tasks:
+            return []
+        claimed_at = datetime.now(timezone.utc)
+        snapshots = []
+        for task in tasks:
+            job_id = uuid4().hex
+            task.last_run_date = today
+            task.last_run_status = "running"
+            task.last_job_id = job_id
+            task.last_job_started_at = claimed_at
+            task.last_job_heartbeat_at = claimed_at
+            snapshots.append(
+                {
+                    "id": task.id,
+                    "user_id": task.user_id,
+                    "symbol": task.symbol,
+                    "horizon": task.horizon,
+                    "job_id": job_id,
+                }
+            )
+        db.commit()
+        return snapshots
+
+
+async def _scheduler_loop(stop_event: asyncio.Event):
     """Background loop: check every minute for scheduled tasks to trigger.
 
     Each task has its own trigger_time (HH:MM). The scheduler runs on trading
     days only, outside of trading hours (before 9:15 or after 15:00). Tasks
     are triggered when current time >= task.trigger_time and the task hasn't
     run today yet.
+
+    *stop_event* is set by the SIGTERM/SIGINT handler; when set, the loop
+    stops claiming new tasks and returns so ``_startup`` can drain in-flight
+    jobs.
     """
     from tradingagents.dataflows.trade_calendar import is_cn_trading_day
     from zoneinfo import ZoneInfo
 
     _log("[Scheduler] Loop started.")
-    while True:
-        await asyncio.sleep(60)
+    while not stop_event.is_set():
+        # Wake every 60s, or immediately once shutdown is requested.
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=60)
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            break
         try:
             now = datetime.now(tz=ZoneInfo("Asia/Shanghai"))
             today = now.strftime("%Y-%m-%d")
@@ -299,26 +405,7 @@ async def _scheduler_loop():
             if 8 * 60 < time_val < 20 * 60:
                 continue
 
-            def _claim_pending_tasks():
-                with get_db_ctx() as db:
-                    tasks = scheduled_service.get_pending_tasks(db, today, current_hhmm)
-                    if not tasks:
-                        return []
-                    for task in tasks:
-                        task.last_run_date = today
-                        task.last_run_status = "running"
-                    db.commit()
-                    return [
-                        {
-                            "id": task.id,
-                            "user_id": task.user_id,
-                            "symbol": task.symbol,
-                            "horizon": task.horizon,
-                        }
-                        for task in tasks
-                    ]
-
-            task_snapshots = await asyncio.to_thread(_claim_pending_tasks)
+            task_snapshots = await asyncio.to_thread(_claim_pending_tasks, today, current_hhmm)
             if not task_snapshots:
                 continue
 
@@ -332,10 +419,96 @@ async def _scheduler_loop():
             logger.error(f"[Scheduler] Error: {e}")
 
 
+async def _drain_inflight_jobs(timeout_seconds: int) -> None:
+    """Wait for in-flight background jobs to finish on shutdown.
+
+    Used after the scheduler loop exits (SIGTERM/SIGINT).  If *timeout_seconds*
+    elapses, the remaining jobs are cancelled.  A job cancelled here stays
+    ``running`` in the DB with its ``last_job_id`` persisted, so the next
+    startup's recovery re-queues it — the analysis is not lost.
+    """
+    deadline = time.monotonic() + max(0, timeout_seconds)
+    while _background_tasks:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        pending = list(_background_tasks)
+        _log(f"[Scheduler] Waiting for {len(pending)} in-flight job(s) ...")
+        try:
+            await asyncio.wait(pending, timeout=min(5.0, remaining))
+        except Exception as exc:
+            logger.warning(f"[Scheduler] Drain wait interrupted: {exc}")
+            break
+    remaining = list(_background_tasks)
+    if remaining:
+        _log(f"[Scheduler] Shutdown drain timed out; cancelling {len(remaining)} job(s).")
+        for task in remaining:
+            task.cancel()
+        await asyncio.gather(*remaining, return_exceptions=True)
+
+
 # ── Stale task recovery ──────────────────────────────────────────────────────
 
+def _run_date_start_utc(run_date: str):
+    """Start of a Shanghai-local run date as a naive UTC datetime.
+
+    Reports persist ``created_at`` in UTC (``report_service`` uses
+    ``datetime.now(timezone.utc)``), while ``last_run_date`` is the Shanghai
+    local date the scheduler claimed the run for.  Comparing a UTC timestamp
+    against a bare date string misclassifies runs that fall in the first 8 UTC
+    hours of a Shanghai day (see AGENTS.md 3.5 — no implicit date shapes).
+    """
+    from zoneinfo import ZoneInfo
+
+    naive_local = datetime.fromisoformat(f"{run_date}T00:00:00")
+    aware_local = naive_local.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    return aware_local.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _heartbeat_is_abandoned(heartbeat_at: Optional[datetime]) -> bool:
+    """True when a persisted heartbeat is older than the abandoned threshold.
+
+    ``last_job_heartbeat_at`` is refreshed every ``SCHEDULER_HEARTBEAT_SECONDS``
+    while a job runs, so a row whose heartbeat has been silent for longer than
+    ``SCHEDULER_HEARTBEAT_STALE_AFTER_SECONDS`` was not actively running when
+    this process started — treat it as abandoned rather than in-flight. A
+    missing heartbeat is treated as not abandoned so rows written before the
+    heartbeat column existed are still re-queued conservatively.
+    """
+    if heartbeat_at is None:
+        return False
+    if heartbeat_at.tzinfo is None:
+        # SQLite persists DATETIME columns as naive UTC (the writes here are
+        # aware UTC); normalize so the age comparison is tz-safe.
+        heartbeat_at = heartbeat_at.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - heartbeat_at).total_seconds()
+    return age_seconds > SCHEDULER_HEARTBEAT_STALE_AFTER_SECONDS
+
+
 def _recover_stale_tasks():
-    """Reset tasks stuck in 'running' state (from previous crash/restart)."""
+    """Recover tasks stuck in 'running' state (from previous crash/restart).
+
+    A row still ``running`` at startup means its analysis did not reach a
+    terminal state before the previous process exited:
+
+    - If a completed report exists for the claimed run, treat it as success.
+    - If the run persisted a ``last_job_id``, the task was in-flight when the
+      previous process exited. A fresh heartbeat (``last_job_heartbeat_at``
+      within ``SCHEDULER_HEARTBEAT_STALE_AFTER_SECONDS``) confirms it was
+      genuinely running — re-queue it for today so the analysis is not silently
+      lost. A stale heartbeat means the task was abandoned, so mark it ``stale``
+      and clear the run date.
+    - Otherwise mark it stale and clear the run date (legacy behavior).
+    """
+    # In the split deployment (REDIS_URL set) the shared job store survives a
+    # scheduler restart, so its running set cross-checks the DB "running" rows.
+    # Best-effort only: a down Redis must not block startup recovery.
+    try:
+        store_running_jobs = get_job_store().running_jobs()
+    except Exception as exc:
+        logger.warning(f"[Scheduler] Could not inspect job store at startup: {exc}")
+        store_running_jobs = {}
+
     with get_db_ctx() as db:
         stale = (
             db.query(ScheduledAnalysisDB)
@@ -345,21 +518,62 @@ def _recover_stale_tasks():
         if stale:
             recovered_count = 0
             reset_count = 0
+            requeued_count = 0
             for item in stale:
+                run_start_utc = (
+                    _run_date_start_utc(item.last_run_date)
+                    if item.last_run_date
+                    else None
+                )
                 has_report = (
                     item.last_report_id
-                    and item.last_run_date
+                    and run_start_utc is not None
                     and db.query(ReportDB)
                     .filter(
                         ReportDB.id == item.last_report_id,
                         ReportDB.status == "completed",
-                        ReportDB.created_at >= item.last_run_date,
+                        ReportDB.created_at >= run_start_utc,
                     )
                     .first()
                 )
                 if has_report:
                     item.last_run_status = "success"
                     recovered_count += 1
+                elif item.last_job_id:
+                    if _heartbeat_is_abandoned(item.last_job_heartbeat_at):
+                        # The heartbeat went silent longer than the stale
+                        # threshold ago, so the task was not actively running
+                        # when this process started — it is abandoned. Mark it
+                        # stale like legacy rows instead of re-queueing it.
+                        _log(
+                            f"[Scheduler] Marking task {item.id} stale: last "
+                            f"heartbeat older than "
+                            f"{SCHEDULER_HEARTBEAT_STALE_AFTER_SECONDS}s."
+                        )
+                        item.last_run_status = "stale"
+                        item.last_run_date = None
+                        item.last_job_id = None
+                        item.last_job_started_at = None
+                        item.last_job_heartbeat_at = None
+                        reset_count += 1
+                    else:
+                        # Fresh heartbeat (or none): genuinely in-flight when
+                        # the previous process died. Reset the run so it is
+                        # picked up again today instead of being dropped; clear
+                        # the persisted job trace with it.
+                        store_confirmed = item.last_job_id in store_running_jobs
+                        if store_confirmed:
+                            _log(
+                                f"[Scheduler] Re-queuing task {item.id}: job "
+                                f"{item.last_job_id} still tracked as running in the "
+                                "shared job store."
+                            )
+                        item.last_run_status = None
+                        item.last_run_date = None
+                        item.last_job_id = None
+                        item.last_job_started_at = None
+                        item.last_job_heartbeat_at = None
+                        requeued_count += 1
                 else:
                     item.last_run_status = "stale"
                     item.last_run_date = None
@@ -367,7 +581,8 @@ def _recover_stale_tasks():
             db.commit()
             _log(
                 f"[Scheduler] Reset {len(stale)} stale 'running' tasks on startup "
-                f"(recovered={recovered_count}, reset_to_stale={reset_count})."
+                f"(recovered={recovered_count}, requeued={requeued_count}, "
+                f"reset_to_stale={reset_count})."
             )
         report_reset = report_service.recover_stale_active_reports(db)
         if report_reset["total"]:
@@ -380,7 +595,12 @@ def _recover_stale_tasks():
 # ── Startup / main ───────────────────────────────────────────────────────────
 
 async def _startup():
-    """Initialize DB, pre-load caches, recover stale tasks, then run the loop."""
+    """Initialize DB, pre-load caches, recover stale tasks, then run the loop.
+
+    Installs SIGTERM/SIGINT handlers so container orchestration (docker stop /
+    docker-entrypoint forward_stop) triggers a graceful drain of in-flight jobs
+    instead of killing them mid-analysis.
+    """
     global _semaphore, _executor
 
     # Security startup guard (DAV-66): refuse to run the scheduler without a
@@ -431,8 +651,28 @@ async def _startup():
     await asyncio.to_thread(_load_cn_stock_map)
     _log("Stock map pre-loaded on startup.")
 
-    # Run the scheduler loop (blocks until cancelled)
-    await _scheduler_loop()
+    # ── Graceful shutdown: SIGTERM/SIGINT stop the loop, then drain ──
+    stop_event = asyncio.Event()
+
+    def _request_shutdown():
+        if not stop_event.is_set():
+            _log("[Scheduler] Shutdown requested (SIGTERM/SIGINT); draining in-flight jobs ...")
+        stop_event.set()
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(_sig, _request_shutdown)
+        except (NotImplementedError, RuntimeError):
+            # Not on the main thread or unsupported platform; fall through to
+            # the default handler rather than failing startup.
+            pass
+
+    try:
+        await _scheduler_loop(stop_event)
+    finally:
+        _log("[Scheduler] Scheduler loop exited; draining in-flight jobs ...")
+        await _drain_inflight_jobs(timeout_seconds=SCHEDULER_GRACEFUL_SHUTDOWN_SECONDS)
+        _log("[Scheduler] Shutdown complete.")
 
 
 def main():

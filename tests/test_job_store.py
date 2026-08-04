@@ -42,6 +42,24 @@ def test_delete_job():
     store.delete_job("j1")
 
 
+def test_running_jobs():
+    store = _make_store()
+    store.set_job("j1", status="running", symbol="AAPL")
+    store.set_job("j2", status="completed")
+    store.set_job("j3", status="running", symbol="MSFT")
+    running = store.running_jobs()
+    assert set(running.keys()) == {"j1", "j3"}
+    assert running["j1"] == {"status": "running", "symbol": "AAPL"}
+    assert running["j3"]["symbol"] == "MSFT"
+
+
+def test_running_jobs_empty_when_none():
+    store = _make_store()
+    store.set_job("j1", status="completed")
+    store.set_job("j2", status="failed")
+    assert store.running_jobs() == {}
+
+
 def test_emit_and_subscribe():
     async def scenario():
         store = _make_store()
