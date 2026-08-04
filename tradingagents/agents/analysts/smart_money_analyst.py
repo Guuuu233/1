@@ -1,3 +1,4 @@
+import logging
 from tradingagents.agents.utils.context_utils import get_cn_stock_name
 import asyncio
 
@@ -7,6 +8,8 @@ from tradingagents.prompts import get_prompt
 from tradingagents.graph.intent_parser import build_horizon_context
 from tradingagents.agents.utils.agent_states import current_tracker_var, extract_verdict, check_llm_output_degraded, check_stream_chunk_degraded
 from api.database import log_llm_call
+
+logger = logging.getLogger(__name__)
 
 
 def create_smart_money_analyst(llm, data_collector=None):
@@ -23,7 +26,7 @@ def create_smart_money_analyst(llm, data_collector=None):
         stock_name = get_cn_stock_name(ticker)
 
         ticker_display = f"{ticker} ({stock_name})" if stock_name and stock_name != ticker else ticker
-        print(f"[Smart Money Analyst] START {ticker_display} {current_date}")
+        logger.debug("[Smart Money Analyst] START %s %s", ticker_display, current_date)
         horizon = "short"  # 资金面固定短期视角
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])
@@ -103,14 +106,14 @@ def create_smart_money_analyst(llm, data_collector=None):
         except Exception as exc:
 
 
-            print(f"[Smart Money Analyst] Stream error: {exc}")
+            logger.debug("[Smart Money Analyst] Stream error: %s", exc)
 
 
 
         if not full_content.strip():
 
 
-            print(f"[Smart Money Analyst] Stream yielded empty text, attempting invoke fallback...")
+            logger.debug("[Smart Money Analyst] Stream yielded empty text, attempting invoke fallback...")
 
 
             try:
@@ -133,7 +136,7 @@ def create_smart_money_analyst(llm, data_collector=None):
 
                 full_content = f"分析报告生成失败：{exc}"
 
-        print(f"[Smart Money Analyst] DONE {ticker_display}, report length={len(full_content)}")
+        logger.debug("[Smart Money Analyst] DONE %s, report length=%s", ticker_display, len(full_content))
         if check_llm_output_degraded(full_content, "Smart Money Analyst"):
             full_content = "主力资金分析生成异常（输出退化），本项不可用"
         _elapsed = _time.monotonic() - _t0
