@@ -1263,13 +1263,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
             if df is None or df.empty:
                 errors.append("stock_individual_fund_flow: empty dataframe")
             else:
-                em_result = self._format_individual_fund_flow_em(
+                # _format_individual_fund_flow_em never returns None: it returns
+                # a formatted report or an explicit 【数据获取失败】 refusal (out of
+                # range / unparseable dates), and must not fall back to the
+                # same-day Sina snapshot for historical dates (lookahead risk).
+                return self._format_individual_fund_flow_em(
                     df, symbol, curr_date, cutoff
-                )
-                if em_result is not None:
-                    return em_result
-                errors.append(
-                    "stock_individual_fund_flow: 无可用记录（超出可得范围或日期不可解析）"
                 )
         except Exception as exc:
             errors.append(f"stock_individual_fund_flow: {type(exc).__name__}")
@@ -1317,13 +1316,16 @@ class CnAkshareProvider(BaseMarketDataProvider):
         symbol: str,
         curr_date: str,
         cutoff,
-    ) -> str | None:
+    ) -> str:
         """Format the Eastmoney per-day fund-flow series truncated to curr_date.
 
-        Returns None only when no usable record remains (out of the ~120 trading
-        day window or unparseable dates), in which case the caller tries the Sina
-        snapshot backup.  Out-of-range is still surfaced to the caller here as an
-        explicit refusal rather than an empty table.
+        Returns a formatted report string when usable records remain on or
+        before ``curr_date``.  When nothing usable remains (``curr_date`` is
+        outside the ~120-trading-day window or dates are unparseable), it
+        returns an explicit 【数据获取失败】 refusal string instead — it never
+        returns ``None`` and never falls back to a same-day snapshot, so a
+        historical-date query is surfaced as a refusal rather than risking
+        lookahead bias.  The caller therefore returns this value directly.
         """
         date_col = "日期" if "日期" in df.columns else None
         if date_col is None:
