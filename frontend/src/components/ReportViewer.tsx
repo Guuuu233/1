@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm'
 import { useAnalysisStore } from '@/stores/analysisStore'
 import type { ReportDetail } from '@/types'
 import { isLegacyEnglishReport, sanitizeReportMarkdown } from '@/utils/reportText'
+import { buildReportMarkdown, downloadMarkdown } from '@/utils/markdownExport'
 
 const REPORT_SECTIONS = [
     { key: 'market_report', title: '市场分析报告', team: '分析团队' },
@@ -89,19 +90,8 @@ export default function ReportViewer({ reportData, activeSection }: ReportViewer
     const handleExport = () => {
         const source = isHistorical ? reportData : report
         if (!source) return
-        const text = REPORT_SECTIONS
-            .filter(s => source[s.key as keyof typeof source])
-            .map(s => `## ${s.title}\n\n${source[s.key as keyof typeof source]}`)
-            .join('\n\n---\n\n') + `\n\n---\n\n${REPORT_DISCLAIMER}\n`
-        const blob = new Blob([text], { type: 'text/markdown' })
-        const url = URL.createObjectURL(blob)
-        const a = document.createElement('a')
-        a.href = url
-        a.download = `analysis-${isHistorical ? reportData?.symbol : report?.symbol || 'report'}.md`
-        document.body.appendChild(a)
-        a.click()
-        document.body.removeChild(a)
-        URL.revokeObjectURL(url)
+        const text = buildReportMarkdown(source, REPORT_SECTIONS, REPORT_DISCLAIMER)
+        downloadMarkdown(`analysis-${isHistorical ? reportData?.symbol : report?.symbol || 'report'}.md`, text)
     }
 
     // ── Historical mode: full accordion ──────────────────────────────────────
