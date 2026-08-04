@@ -81,10 +81,12 @@ def build_evidence_summary(report: str, max_chars: int = DEFAULT_MAX_CHARS) -> s
             direction prefix).
 
     Returns:
-        A compact, single-paragraph evidence summary.
+        A compact, single-paragraph evidence summary, or an empty string when
+        the report is empty (callers may then omit the summary line entirely
+        rather than inject a misleading placeholder).
     """
     if not report or not report.strip():
-        return "（报告无可用内容）"
+        return ""
 
     direction = extract_verdict_direction(report)
     body = strip_machine_blocks(report)

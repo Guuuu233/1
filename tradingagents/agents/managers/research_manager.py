@@ -3,6 +3,7 @@ import time
 
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
+from tradingagents.prompts.catalog import _resolve_language
 from tradingagents.agents.utils.agent_states import current_tracker_var
 from tradingagents.agents.utils.debate_utils import (
     format_claim_subset_for_prompt,
@@ -50,6 +51,18 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
         fundamentals_evidence_summary = build_evidence_summary(fundamentals_report)
         macro_evidence_summary = build_evidence_summary(state.get("macro_report", ""))
 
+        # Omit the macro/sector evidence line entirely when the macro analyst
+        # did not run (empty report -> empty summary). Injecting a placeholder
+        # would read as "macro concluded no data" instead of "analyst not run".
+        macro_evidence_line = ""
+        if macro_evidence_summary:
+            label = (
+                "宏观/板块证据摘要："
+                if _resolve_language(get_config()) == "zh"
+                else "Macro/sector evidence summary: "
+            )
+            macro_evidence_line = f"{label}{macro_evidence_summary}"
+
         injection_slots = build_injection_slots(custom_prompt, placement, role_key="research_manager")
         prompt = get_prompt("research_manager_prompt", config=get_config()).format(
             past_memory_str=past_memory_str,
@@ -60,7 +73,7 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             market_evidence_summary=market_evidence_summary,
             news_evidence_summary=news_evidence_summary,
             fundamentals_evidence_summary=fundamentals_evidence_summary,
-            macro_evidence_summary=macro_evidence_summary,
+            macro_evidence_line=macro_evidence_line,
             claims_text=claims_text,
             unresolved_claims_text=unresolved_claims_text,
             round_summary=round_summary_text,
