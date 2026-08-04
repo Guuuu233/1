@@ -3,8 +3,6 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 from tradingagents.graph.propagation import Propagator
 from tradingagents.graph.data_collector import DataCollector
 from tradingagents.graph.setup import GraphSetup

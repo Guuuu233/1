@@ -8,6 +8,7 @@ module is skipped.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import os
 import uuid
 
@@ -32,7 +33,7 @@ def _real_redis_available() -> bool:
 
 def _fakeredis_available() -> bool:
     try:
-        import fakeredis  # noqa: F401
+        importlib.import_module("fakeredis")
         return True
     except ImportError:
         return False

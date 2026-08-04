@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import pandas as pd
-import pytest
 
 from tradingagents.dataflows.trade_calendar import now_cn
 from tradingagents.dataflows.providers.cn_akshare_provider import CnAkshareProvider

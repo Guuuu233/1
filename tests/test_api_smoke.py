@@ -324,8 +324,7 @@ class TestChatCompletionsEndpoint:
         body = r.json()
         # Non-stream returns OpenAI-compatible format with job_id embedded in content
         assert "choices" in body
-        content = body["choices"][0]["message"]["content"]
-        # Extract job_id from content (format: "已启动分析任务：<job_id>")
+        # Extract job_id from the OpenAI-style id (format: "chatcmpl-<job_id>")
         job_id = body["id"].replace("chatcmpl-", "")
         result = _wait_job(self.client, self.token, job_id)
         assert result["status"] == "completed"
@@ -373,7 +372,7 @@ class TestRuntimeConfigWarmup:
 
     def test_model_change_schedules_warmup(self):
         model_name = f"gpt-test-quick-{uuid4().hex[:8]}"
-        with patch("api.main._probe_runtime_config", return_value={"status": "ok", "model": model_name}) as probe, \
+        with patch("api.main._probe_runtime_config", return_value={"status": "ok", "model": model_name}), \
              patch("api.main._run_config_warmup") as warmup:
             r = self.client.patch("/v1/config", headers=self.headers, json={
                 "quick_think_llm": model_name,

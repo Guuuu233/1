@@ -5,8 +5,6 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 
 # ---------------------------------------------------------------------------
 # Fixtures: lightweight stand-ins for ReportDB / UserDB

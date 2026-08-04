@@ -373,8 +373,6 @@ def test_provider_historical_refuses_ths_fallback(monkeypatch):
 
     class _EmptySina(_FinFixtureProvider):
         def _ak(self):
-            parent = super()._ak()
-
             class _Ak:
                 def stock_financial_report_sina(self, stock, symbol):
                     raise RuntimeError("sina down")

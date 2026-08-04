@@ -3,7 +3,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
-from api.database import ImportedPortfolioPositionDB, ReportDB, UserDB, get_db_ctx, init_db
+from api.database import ImportedPortfolioPositionDB, UserDB, get_db_ctx, init_db
 from api.services import auth_service, report_service
 
 
