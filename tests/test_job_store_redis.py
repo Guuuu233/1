@@ -1,11 +1,14 @@
 """Tests for RedisJobStore.
 
-Skipped automatically when Redis is not reachable on localhost.
-Uses DB 15 to avoid conflicts with production data.
+Runs against a real Redis when one is reachable on ``REDIS_TEST_URL`` (default
+``redis://localhost:6379/15``); otherwise falls back to in-process ``fakeredis``
+so the whole suite is executable offline. When neither backend is available the
+module is skipped.
 """
 from __future__ import annotations
 
 import asyncio
+import importlib
 import os
 import uuid
 
@@ -13,12 +16,12 @@ import pytest
 import redis
 
 # ---------------------------------------------------------------------------
-# Skip guard: skip the entire module when Redis is unreachable
+# Backend selection: prefer a real Redis, fall back to in-process fakeredis.
 # ---------------------------------------------------------------------------
 
 _REDIS_TEST_URL = os.environ.get("REDIS_TEST_URL", "redis://localhost:6379/15")
 
-def _redis_available() -> bool:
+def _real_redis_available() -> bool:
     try:
         r = redis.Redis.from_url(_REDIS_TEST_URL, decode_responses=True)
         r.ping()
@@ -27,9 +30,22 @@ def _redis_available() -> bool:
     except Exception:
         return False
 
+
+def _fakeredis_available() -> bool:
+    try:
+        importlib.import_module("fakeredis")
+        return True
+    except ImportError:
+        return False
+
+
+# Snapshot once at import time so every test in the module uses the same backend.
+REAL_REDIS_AVAILABLE = _real_redis_available()
+FAKEREDIS_AVAILABLE = _fakeredis_available()
+
 pytestmark = pytest.mark.skipif(
-    not _redis_available(),
-    reason="Redis not available at " + _REDIS_TEST_URL,
+    not (REAL_REDIS_AVAILABLE or FAKEREDIS_AVAILABLE),
+    reason="Neither real Redis at " + _REDIS_TEST_URL + " nor fakeredis is available",
 )
 
 from api.job_store_redis import RedisJobStore  # noqa: E402
@@ -40,9 +56,17 @@ from api.job_store_redis import RedisJobStore  # noqa: E402
 # ---------------------------------------------------------------------------
 
 @pytest.fixture()
-def store():
-    """Create a RedisJobStore with a unique prefix and flush matching keys after."""
+def store(monkeypatch):
+    """Create a RedisJobStore with a unique prefix and flush matching keys after.
+
+    When no real Redis is reachable, ``redis.Redis`` is swapped for
+    ``fakeredis.FakeRedis`` so ``RedisJobStore`` constructs an in-process
+    backend that shares state across instances via ``FakeRedis.from_url``.
+    """
     prefix = f"ta_test:{uuid.uuid4().hex[:8]}:"
+    if not REAL_REDIS_AVAILABLE:
+        import fakeredis
+        monkeypatch.setattr(redis, "Redis", fakeredis.FakeRedis)
     s = RedisJobStore(_REDIS_TEST_URL, prefix=prefix)
     yield s
     # Cleanup: delete all keys with this test prefix
@@ -108,6 +132,12 @@ def test_delete(store: RedisJobStore):
     store.delete_job("j1")
 
 
+def test_set_job_empty_fields_is_noop(store: RedisJobStore):
+    """set_job with no fields must not create a job hash."""
+    store.set_job("j1")
+    assert store.get_job("j1") == {}
+
+
 def test_running_jobs(store: RedisJobStore):
     store.set_job("j1", status="running", symbol="AAPL")
     store.set_job("j2", status="completed")
@@ -139,7 +169,6 @@ def test_pubsub(store: RedisJobStore):
         # We need the subscriber thread to be up before publishing.
         # Advance the generator to start the thread, then emit events.
         # Use a small delay to let the thread subscribe.
-        it = gen.__aiter__()
 
         # Emit after a short delay to give listener time to subscribe
         async def _emit_later():
@@ -164,6 +193,31 @@ def test_pubsub(store: RedisJobStore):
         assert collected[2]["data"] == {"result": "ok"}
         for ev in collected:
             assert "timestamp" in ev
+
+    asyncio.run(scenario())
+
+
+def test_pubsub_skips_malformed_payloads(store: RedisJobStore):
+    """A raw non-JSON message on the channel is skipped; valid events still arrive."""
+
+    async def scenario():
+        store.set_job("j1", status="running")
+        collected = []
+
+        async def _emit_later():
+            await asyncio.sleep(0.3)
+            # Publish a raw non-JSON payload directly on the channel; the
+            # listener must skip it and keep delivering valid events.
+            store._r.publish(store._channel_key("j1"), "not-json{{")
+            store.emit_event("j1", "job.completed", {"result": "ok"})
+
+        emitter = asyncio.create_task(_emit_later())
+        async for event in store.subscribe("j1", poll_interval=1.0):
+            collected.append(event)
+        await emitter
+
+        assert [ev["event"] for ev in collected] == ["job.completed"]
+        assert collected[0]["data"] == {"result": "ok"}
 
     asyncio.run(scenario())
 

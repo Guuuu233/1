@@ -115,6 +115,13 @@ class TestScheduled:
         # Midnight should be OK
         scheduled_service.create_scheduled(db, "user1", "000001.SZ", "short", "00:30")
 
+        # Boundary times must persist as scheduled rows, not just avoid raising.
+        items = {item["symbol"]: item for item in scheduled_service.list_scheduled(db, "user1")}
+        assert len(items) == 3
+        assert items["300750.SZ"]["trigger_time"] == "08:00"
+        assert items["600519.SH"]["trigger_time"] == "20:00"
+        assert items["000001.SZ"]["trigger_time"] == "00:30"
+
     def test_duplicate_rejected(self, db):
         scheduled_service.create_scheduled(db, "user1", "300750.SZ")
         with pytest.raises(ValueError, match="已有定时分析"):

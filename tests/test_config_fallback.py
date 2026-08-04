@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 import os
 
 # 模拟环境变量，因为 api.main 会在导入时读取它们

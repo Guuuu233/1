@@ -31,29 +31,6 @@ def _make_session():
     return session_factory(), engine
 
 
-def _machine_block(tag: str, payload: dict) -> str:
-    return f"固定正文\n<!-- {tag}: {json.dumps(payload, ensure_ascii=False)} -->"
-
-
-def _valid_machine_payload() -> dict:
-    return {
-        "responded_claim_ids": [],
-        "new_claims": [
-            {
-                "claim": "固定 claim",
-                "evidence": ["固定证据"],
-                "confidence": 0.72,
-                "target_claim_ids": [],
-            }
-        ],
-        "resolved_claim_ids": [],
-        "unresolved_claim_ids": [],
-        "next_focus_claim_ids": [],
-        "round_summary": "固定摘要",
-        "round_goal": "固定目标",
-    }
-
-
 @pytest.mark.parametrize("decision", ["BUY", "SELL", "HOLD"])
 def test_structured_report_keeps_legal_decisions_and_missing_fields_unknown(decision):
     structured = report_service.StructuredReport(decision=decision)

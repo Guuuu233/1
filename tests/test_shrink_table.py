@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import math
-
 import pandas as pd
-import pytest
 
 from tradingagents.dataflows.utils import (
     MISSING_VALUE_MARKER,
@@ -48,7 +45,8 @@ def test_shrink_table_reorders_by_name_and_drops_nan():
     text = shrink_table(df, max_rows=5, table_kind="balance", require_core_fields=True)
     assert "【数据获取失败】" not in text
     assert "nan" not in text.lower()
-    assert MISSING_VALUE_MARKER not in text or True  # may or may not appear
+    # All residual nulls become an explicit marker; this input has none.
+    assert MISSING_VALUE_MARKER not in text
     # Core columns present by name, not first-N positional.
     assert "资产总计" in text
     assert "负债合计" in text

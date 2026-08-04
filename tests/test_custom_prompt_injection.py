@@ -174,7 +174,7 @@ def test_T4_other_roles_no_injection():
     )
 
     with patch("tradingagents.graph.setup._load_agent_factories", return_value=factories):
-        with patch("tradingagents.graph.setup.StateGraph") as state_graph:
+        with patch("tradingagents.graph.setup.StateGraph"):
             setup = GraphSetup(
                 object(), object(), {"market": object()}, object(), object(), object(), object(), object(),
                 conditional, data_collector=object(),

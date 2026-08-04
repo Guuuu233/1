@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import re
-from datetime import timedelta
 from typing import Callable
 from unittest.mock import MagicMock
 
@@ -15,7 +14,7 @@ from tradingagents.dataflows.providers.base import BaseMarketDataProvider
 from tradingagents.dataflows.providers.cn_akshare_provider import CnAkshareProvider
 from tradingagents.dataflows.providers.cn_investoday_provider import CnInvestodayProvider
 from tradingagents.dataflows.providers.registry import build_default_registry
-from tradingagents.dataflows.trade_calendar import cn_today_str, now_cn
+from tradingagents.dataflows.trade_calendar import cn_today_str
 
 
 DATE_PARAM_NAMES = {
