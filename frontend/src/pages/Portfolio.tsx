@@ -6,9 +6,9 @@ import {
     Database, ImagePlus,
 } from 'lucide-react'
 import { api } from '@/services/api'
-import type { WatchlistItem, ScheduledAnalysis, StockSearchResult, Report } from '@/types'
+import type { WatchlistItem, ScheduledAnalysis, StockSearchResult, Report, AnalysisHorizon } from '@/types'
+import { HORIZON_LABELS } from '@/utils/reportDualHorizon'
 
-const HORIZON_LABELS: Record<string, string> = { short: '短线', medium: '中线' }
 const WATCHLIST_BATCH_SPLIT_RE = /[,\s，、；;]+/
 const SCHEDULED_TEST_TOOLTIP =
     '会立刻对当前勾选的股票批量发起最近交易日分析请求，并自动带上已导入的持仓上下文；若已开启邮箱报告，也可以顺带检查邮箱是否收到结果。不会改动原有定时设置。'
@@ -769,7 +769,7 @@ export default function Portfolio() {
                                             <div className="flex items-center gap-2 mt-1 flex-wrap">
                                                 {/* Horizon badge */}
                                                 <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400">
-                                                    {HORIZON_LABELS[task.horizon] || task.horizon}
+                                                    {HORIZON_LABELS[task.horizon as AnalysisHorizon] || task.horizon}
                                                 </span>
                                                 {/* Trigger time */}
                                                 <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 flex items-center gap-0.5">
