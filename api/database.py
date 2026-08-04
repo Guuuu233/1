@@ -74,7 +74,7 @@ class get_db_ctx:
         self.db = SessionLocal()
         return self.db
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, exc_type, _exc_val, _exc_tb) -> None:
         if self.db is not None:
             if exc_type is not None:
                 self.db.rollback()

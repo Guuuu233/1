@@ -141,7 +141,7 @@ class _AkshareLock:
             self._holders[threading.get_ident()] = (time.monotonic(), is_scheduled)
         return self
 
-    def __exit__(self, *exc_info):
+    def __exit__(self, *_exc_info):
         tid = threading.get_ident()
         with self._mu:
             info = self._holders.pop(tid, None)
