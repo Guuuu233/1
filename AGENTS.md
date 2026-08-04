@@ -32,7 +32,7 @@
 |---|---|---|
 | `tradingagents/` | 多智能体核心逻辑 | 改动需格外谨慎，这是上游 fork 的部分 |
 | `api/` | FastAPI 后端 | |
-| `frontend/` | Vue + TypeScript 前端 | |
+| `frontend/` | React + TypeScript 前端 | |
 | `scheduler/` | 定时任务 | |
 | `tests/` | 测试 | |
 
