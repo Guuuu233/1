@@ -14,7 +14,7 @@ get_lhb_detail fall back to THS / Sina when the EM interface fails).
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -23,7 +23,7 @@ import pytest
 from tradingagents.dataflows import interface as iface
 from tradingagents.dataflows.providers.base import ProviderResourcePolicy
 from tradingagents.dataflows.providers.cn_akshare_provider import CnAkshareProvider
-from tradingagents.dataflows.trade_calendar import cn_today_str
+from tradingagents.dataflows.trade_calendar import CN_TZ, cn_today_str
 from tradingagents.dataflows.vendor_result import (
     VendorEmpty,
     VendorFail,
@@ -66,7 +66,7 @@ class _FakeRegistry:
 
 _ROUTER_SAMPLE_ARGS = {
     "get_stock_data": ("600519", "2026-01-01", "2026-01-31"),
-    "get_global_news": ("2026-08-04", 7, 10),
+    "get_global_news": (cn_today_str(), 7, 10),
 }
 
 
@@ -287,7 +287,7 @@ def test_router_akshare_global_news_fail_falls_to_yfinance():
     registry = _FakeRegistry({"cn_akshare": ak, "yfinance": yf})
     with patch.object(iface, "_registry", registry), \
          patch.object(iface, "get_vendor", return_value="cn_akshare,yfinance"):
-        out = iface.route_to_vendor("get_global_news", "2026-08-04", 7, 10)
+        out = iface.route_to_vendor("get_global_news", cn_today_str(), 7, 10)
     assert out == "## yfinance global news"
 
 
@@ -306,8 +306,37 @@ def test_router_akshare_global_news_empty_stops_chain():
     registry = _FakeRegistry({"cn_akshare": ak, "yfinance": yf})
     with patch.object(iface, "_registry", registry), \
          patch.object(iface, "get_vendor", return_value="cn_akshare,yfinance"):
-        out = iface.route_to_vendor("get_global_news", "2026-08-04", 7, 10)
+        out = iface.route_to_vendor("get_global_news", cn_today_str(), 7, 10)
     assert out == "未获取到全球市场新闻"
+
+
+def test_router_global_news_fallback_with_dynamic_today():
+    """Deterministic regression for the two 2026-08-04 date bombs above.
+
+    The two router tests originally routed get_global_news with a hardcoded
+    calendar date standing in for 'today'. Once the real date passed it, the
+    router began refusing the call as historical near-window news and the
+    fall-through assertions failed. This test freezes the clock and routes
+    with cn_today_str(), so the as-of date is guaranteed to equal the frozen
+    today and the vendor chain semantics are exercised forever.
+    """
+    ak = _FakeProvider(
+        "cn_akshare",
+        lambda *a, **k: VendorFail("新浪财经快讯获取失败：ConnectionError"),
+        method="get_global_news",
+    )
+    yf = _FakeProvider(
+        "yfinance",
+        lambda *a, **k: "## yfinance global news",
+        method="get_global_news",
+    )
+    registry = _FakeRegistry({"cn_akshare": ak, "yfinance": yf})
+    frozen_today = datetime(2026, 8, 5, 0, 1, tzinfo=CN_TZ)
+    with patch.object(iface, "_registry", registry), \
+         patch.object(iface, "get_vendor", return_value="cn_akshare,yfinance"), \
+         patch("tradingagents.dataflows.trade_calendar.now_cn", return_value=frozen_today):
+        out = iface.route_to_vendor("get_global_news", cn_today_str(), 7, 10)
+    assert out == "## yfinance global news"
 
 
 # ── result_to_prompt helper ───────────────────────────────────────────
