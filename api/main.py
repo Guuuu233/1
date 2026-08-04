@@ -1334,25 +1334,6 @@ _require_api_user = RequireUser(allow_api_token=True)    # 允许 API Token
 _require_web_user = RequireUser(allow_api_token=False)   # 仅限网页登录
 
 
-def _optional_user(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_auth_scheme),
-) -> Optional[UserDB]:
-    if not credentials:
-        return None
-    try:
-        payload = auth_service.decode_access_token(credentials.credentials)
-    except Exception:
-        return None
-    user_id = str(payload.get("sub") or "")
-    if not user_id:
-        return None
-    with get_db_ctx() as db:
-        user = auth_service.get_user_by_id(db, user_id)
-        if user:
-            db.expunge(user)
-        return user
-
-
 def _set_job(job_key: str, **kwargs) -> None:
     # Callers may pass job_id=<value> as a stored field.  Since
     # store.set_job()'s first positional param is also called job_id,
