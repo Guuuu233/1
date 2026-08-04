@@ -5,7 +5,7 @@
 ## 特性
 
 - 🎨 **专业暗色主题** - 专为金融交易场景优化的深色界面
-- 🤖 **Agent 流水线可视化** - 实时显示 12 个智能体的协作状态
+- 🤖 **Agent 流水线可视化** - 实时显示 15 个智能体的协作状态
 - 📊 **实时日志流** - SSE 流式数据传输，毫秒级更新
 - 📈 **交互式报告** - 分层展示多维度分析报告
 - 🔄 **响应式设计** - 适配桌面、平板、手机多种设备
@@ -59,9 +59,7 @@ frontend/
 │   │   ├── Layout.tsx   # 布局组件
 │   │   ├── Sidebar.tsx  # 侧边导航
 │   │   ├── Header.tsx   # 顶部导航
-│   │   ├── AgentPipeline.tsx  # Agent 流水线
-│   │   ├── LogStream.tsx      # 实时日志
-│   │   └── ReportViewer.tsx   # 报告阅读器
+│   │   ├── ReportViewer.tsx   # 报告阅读器
 │   ├── pages/           # 页面组件
 │   │   ├── Dashboard.tsx      # 控制台
 │   │   ├── Analysis.tsx       # 分析页面
@@ -143,4 +141,4 @@ colors: {
 
 ## License
 
-MIT
+PolyForm Noncommercial 1.0.0
