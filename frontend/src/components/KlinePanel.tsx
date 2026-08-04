@@ -13,6 +13,7 @@ import { Activity, CandlestickChart } from 'lucide-react'
 import { api } from '@/services/api'
 import type { KlineCandle } from '@/types'
 import { useAnalysisStore } from '@/stores/analysisStore'
+import { formatNumber, formatVolume } from '@/utils/format'
 
 interface KlinePanelProps {
     symbol: string
@@ -51,21 +52,6 @@ const SYMBOL_NAME_MAP: Record<string, string> = {
 function getDisplayName(symbol: string): string {
     const s = symbol.toUpperCase()
     return SYMBOL_NAME_MAP[s] ? `${SYMBOL_NAME_MAP[s]}（${s}）` : s
-}
-
-function formatNumber(value?: number | null, digits = 2): string {
-    if (value == null || !Number.isFinite(value)) return '--'
-    return new Intl.NumberFormat('zh-CN', {
-        minimumFractionDigits: digits,
-        maximumFractionDigits: digits,
-    }).format(value)
-}
-
-function formatVolume(value?: number | null): string {
-    if (value == null || !Number.isFinite(value)) return '--'
-    if (Math.abs(value) >= 1e8) return `${formatNumber(value / 1e8, 2)}亿`
-    if (Math.abs(value) >= 1e4) return `${formatNumber(value / 1e4, 2)}万`
-    return formatNumber(value, 0)
 }
 
 const INDEX_PRESETS = [

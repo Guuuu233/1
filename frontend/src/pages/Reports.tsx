@@ -12,7 +12,8 @@ import RiskRadar from '@/components/RiskRadar'
 import KeyMetrics from '@/components/KeyMetrics'
 import { useAuthStore } from '@/stores/authStore'
 import { advanceProgress, getReportRunProgress } from '@/utils/progressFeedback'
-import { isLegacyEnglishReport } from '@/utils/reportText'
+import { isLegacyEnglishReport, parseDecisionAction } from '@/utils/reportText'
+import { buildReportMarkdown, downloadMarkdown, type MarkdownSection } from '@/utils/markdownExport'
 
 type ProgressState = {
     status: 'idle' | 'loading' | 'success' | 'error'
@@ -28,9 +29,9 @@ const IDLE_PROGRESS: ProgressState = {
 
 const parseDecision = (decisionText?: string): { action: 'add' | 'reduce' | 'hold'; label: string } => {
     if (!decisionText) return { action: 'hold', label: '观望' }
-    const text = decisionText.toUpperCase()
-    if (text.includes('BUY') || text.includes('增持') || text.includes('买入')) return { action: 'add', label: '增持' }
-    if (text.includes('SELL') || text.includes('减持') || text.includes('卖出')) return { action: 'reduce', label: '减持' }
+    const action = parseDecisionAction(decisionText)
+    if (action === 'buy' || action === 'add') return { action: 'add', label: '增持' }
+    if (action === 'sell' || action === 'reduce') return { action: 'reduce', label: '减持' }
     return { action: 'hold', label: '持有' }
 }
 
@@ -155,29 +156,19 @@ const renderStatusBadge = (report: Report) => {
     }
 }
 
+const REPORT_EXPORT_SECTIONS: MarkdownSection[] = [
+    { key: 'market_report', title: '市场分析报告' },
+    { key: 'sentiment_report', title: '舆情分析报告' },
+    { key: 'news_report', title: '新闻分析报告' },
+    { key: 'fundamentals_report', title: '基本面分析报告' },
+    { key: 'investment_plan', title: '研究团队决策' },
+    { key: 'trader_investment_plan', title: '交易团队计划' },
+    { key: 'final_trade_decision', title: '最终交易决策' },
+]
+
 function exportReport(report: ReportDetail) {
-    const sections = [
-        { key: 'market_report', title: '市场分析报告' },
-        { key: 'sentiment_report', title: '舆情分析报告' },
-        { key: 'news_report', title: '新闻分析报告' },
-        { key: 'fundamentals_report', title: '基本面分析报告' },
-        { key: 'investment_plan', title: '研究团队决策' },
-        { key: 'trader_investment_plan', title: '交易团队计划' },
-        { key: 'final_trade_decision', title: '最终交易决策' },
-    ]
-    const text = sections
-        .filter(s => report[s.key as keyof ReportDetail])
-        .map(s => `## ${s.title}\n\n${report[s.key as keyof ReportDetail]}`)
-        .join('\n\n---\n\n')
-    const blob = new Blob([text], { type: 'text/markdown' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `analysis-${report.symbol}-${report.trade_date}.md`
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    URL.revokeObjectURL(url)
+    const text = buildReportMarkdown(report, REPORT_EXPORT_SECTIONS)
+    downloadMarkdown(`analysis-${report.symbol}-${report.trade_date}.md`, text)
 }
 
 export default function Reports() {

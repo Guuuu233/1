@@ -20,6 +20,7 @@ import { useNavigate } from 'react-router-dom'
 import { api } from '@/services/api'
 import { useAuthStore } from '@/stores/authStore'
 import type { PortfolioPositionInput, TrackingBoardItem, TrackingBoardResponse } from '@/types'
+import { formatNumber, formatWithChineseUnit } from '@/utils/format'
 
 const CLAMP_TWO_LINES_STYLE: CSSProperties = {
     display: '-webkit-box',
@@ -1143,24 +1144,6 @@ function formatFooterTime(value?: string | null): string {
 function formatQuoteSource(value?: string | null): string {
     if (!value) return '--'
     return value.replace('_hq', '').replace('_', ' ')
-}
-
-function formatNumber(value: number, digits = 2): string {
-    return new Intl.NumberFormat('zh-CN', {
-        minimumFractionDigits: digits,
-        maximumFractionDigits: digits,
-    }).format(value)
-}
-
-function formatWithChineseUnit(value: number, baseDigits = 2): string {
-    const abs = Math.abs(value)
-    if (abs >= 1e8) {
-        return `${formatNumber(value / 1e8, 2)}亿`
-    }
-    if (abs >= 1e4) {
-        return `${formatNumber(value / 1e4, baseDigits === 0 ? 0 : 2)}万`
-    }
-    return formatNumber(value, baseDigits)
 }
 
 function parseLooseDate(value?: string | null): Date | null {

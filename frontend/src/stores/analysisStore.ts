@@ -7,8 +7,6 @@ import type {
     AnalysisReport,
     LogEntry,
     AgentStatusEvent,
-    AgentMessageEvent,
-    AgentToolCallEvent,
     AgentReportEvent,
     AgentSnapshotEvent,
     ReportChunkEvent,
@@ -91,8 +89,6 @@ interface AnalysisState {
     setJobStatus: (status: JobStatus | null) => void
     updateAgentStatus: (event: AgentStatusEvent) => void
     updateAgentSnapshot: (event: AgentSnapshotEvent) => void
-    addAgentMessage: (event: AgentMessageEvent) => void
-    addAgentToolCall: (event: AgentToolCallEvent) => void
     addAgentReport: (event: AgentReportEvent) => void
     addReportChunk: (event: ReportChunkEvent) => void
     addAgentToken: (event: AgentTokenEvent) => void
@@ -221,15 +217,6 @@ export const useAnalysisStore = create<AnalysisState>()(persist((set) => ({
             }))
         }
     }),
-
-    // 不再将消息和工具调用添加到日志（已移至后端）
-    addAgentMessage: () => {
-        // 消息已移至后端日志，前端不再显示
-    },
-
-    addAgentToolCall: () => {
-        // 工具调用已移至后端日志，前端不再显示
-    },
 
     addAgentReport: (event) => set((state) => ({
         report: {

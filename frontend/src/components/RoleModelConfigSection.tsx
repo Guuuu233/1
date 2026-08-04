@@ -82,7 +82,6 @@ const ROLE_GROUPS = [
 
 interface RoleModelConfigSectionProps {
     fetchedModels?: string[]
-    onRefreshRequired?: () => void
 }
 
 export default function RoleModelConfigSection({ fetchedModels = [] }: RoleModelConfigSectionProps) {
