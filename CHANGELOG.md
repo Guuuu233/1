@@ -68,7 +68,7 @@ M1~M5 里程碑（DAV-67~71，2026-07/08）竣工，随附 H1~H3 审计与清理
 - 移除协作面板流光动画。
 
 ### Removed
-- 移除 12 个未使用的依赖（backtrader、chainlit、redis、alembic、rich、typer 等）。
+- 移除 11 个未使用的依赖（backtrader、chainlit、alembic、rich、typer 等）。
 - 移除热榜选股功能（外部数据源不稳定且有合规风险）。
 - 移除对话框中冗余的系统消息（job.created、job.running、agent.tool_call）。
 
