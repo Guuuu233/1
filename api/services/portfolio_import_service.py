@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from api.database import ImportedPortfolioPositionDB
 from api.services import scheduled_service
 from tradingagents.agents.utils.context_utils import normalize_user_context
+from tradingagents.dataflows.utils import safe_float
 
 
 logger = logging.getLogger(__name__)
@@ -213,12 +214,7 @@ def _normalize_code(value: Any) -> str | None:
 
 
 def _to_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except Exception:
-        return None
+    return safe_float(value)
 
 
 def _latest_imported_at(positions: list[dict[str, Any]]) -> str | None:

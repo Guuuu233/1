@@ -21,7 +21,7 @@ from ..trade_calendar import (
     drop_incomplete_today_bar,
     snapshot_historical_refusal,
 )
-from ..utils import shrink_table
+from ..utils import safe_float, shrink_table
 
 logger = logging.getLogger(__name__)
 
@@ -104,13 +104,7 @@ class CnInvestodayProvider(BaseMarketDataProvider):
     @staticmethod
     def _safe_float(val: Any) -> float | None:
         """将接口返回值安全转为 float，失败或空为 None。"""
-        if val is None:
-            return None
-        try:
-            f = float(val)
-            return f
-        except (ValueError, TypeError):
-            return None
+        return safe_float(val)
 
     def _request_investoday(
         self,

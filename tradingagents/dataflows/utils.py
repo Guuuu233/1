@@ -1,6 +1,28 @@
 import os
 import json
+from typing import Any, Optional
+
 import pandas as pd
+
+
+def safe_float(value: Any, round_to: Optional[int] = None) -> Optional[float]:
+    """Convert ``value`` to float, returning None for empty/invalid/NaN input.
+
+    Mirrors the legacy per-module ``_to_float``/``_safe_float`` helpers
+    (audit P2-5): ``None`` and non-numeric values become None, NaN becomes
+    None, and ``round_to`` preserves call sites that rounded to 4 decimals.
+    """
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (ValueError, TypeError):
+        return None
+    if f != f:  # NaN
+        return None
+    if round_to is not None:
+        f = round(f, round_to)
+    return f
 
 
 def take_latest(df: "pd.DataFrame", date_col: str, n: int = 1) -> "pd.DataFrame":

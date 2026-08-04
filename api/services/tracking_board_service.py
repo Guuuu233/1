@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from api.database import ImportedPortfolioPositionDB, ReportDB
 from tradingagents.dataflows.interface import route_to_vendor
 from tradingagents.dataflows.trade_calendar import cn_today_str, previous_cn_trading_day
+from tradingagents.dataflows.utils import safe_float
 
 
 REFRESH_INTERVAL_SECONDS = 20
@@ -212,9 +213,4 @@ def _fetch_live_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
 
 
 def _to_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return round(float(value), 4)
-    except Exception:
-        return None
+    return safe_float(value, round_to=4)

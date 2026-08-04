@@ -20,7 +20,7 @@ from ..trade_calendar import (
     is_historical_analysis_date,
     snapshot_historical_refusal,
 )
-from ..utils import chronological, shrink_table, take_latest
+from ..utils import chronological, safe_float, shrink_table, take_latest
 from ..vendor_result import (
     VendorEmpty,
     VendorFail,
@@ -1149,13 +1149,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
 
     @staticmethod
     def _safe_float(val) -> float | None:
-        if val is None:
-            return None
-        try:
-            f = float(val)
-            return f if not pd.isna(f) else None
-        except (ValueError, TypeError):
-            return None
+        return safe_float(val)
 
     def get_board_fund_flow(self, curr_date: str = None) -> str:
         """获取行业板块资金流向排名（即时快照）。

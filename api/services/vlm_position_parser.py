@@ -9,6 +9,7 @@ import logging
 from typing import Any
 
 from api.services.vlm_service import call_vlm
+from tradingagents.dataflows.utils import safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +70,4 @@ def _parse_response(raw: str) -> list[dict[str, Any]]:
 
 
 def _to_float(val: Any) -> float | None:
-    if val is None:
-        return None
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return None
+    return safe_float(val)
