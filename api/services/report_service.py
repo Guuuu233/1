@@ -449,11 +449,6 @@ def canonicalize_report_result_data(
     return canonical_data
 
 
-def _canonicalize_result_data(result_data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Backward-compatible private alias for internal callers."""
-    return canonicalize_report_result_data(result_data)
-
-
 def extract_structured_data(
     final_trade_decision: str,
     fundamentals_report: str = "",
