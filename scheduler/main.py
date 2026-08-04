@@ -52,6 +52,15 @@ SCHEDULER_GRACEFUL_SHUTDOWN_SECONDS = int(os.getenv("SCHEDULER_GRACEFUL_SHUTDOWN
 # Heartbeat interval for persisting running-job liveness to the DB.
 SCHEDULER_HEARTBEAT_SECONDS = int(os.getenv("SCHEDULER_HEARTBEAT_SECONDS", "30"))
 
+# A persisted heartbeat older than this many seconds marks a still-"running"
+# task as abandoned at startup (rather than genuinely in-flight when the
+# previous process died). The heartbeat refreshes every
+# SCHEDULER_HEARTBEAT_SECONDS, so this is a small multiple of that interval;
+# widen it for long analyses or long maintenance windows.
+SCHEDULER_HEARTBEAT_STALE_AFTER_SECONDS = int(
+    os.getenv("SCHEDULER_HEARTBEAT_STALE_AFTER_SECONDS", "900")
+)
+
 _semaphore: Optional[asyncio.Semaphore] = None
 _executor: Optional[ThreadPoolExecutor] = None
 
@@ -456,6 +465,26 @@ def _run_date_start_utc(run_date: str):
     return aware_local.astimezone(timezone.utc).replace(tzinfo=None)
 
 
+def _heartbeat_is_abandoned(heartbeat_at: Optional[datetime]) -> bool:
+    """True when a persisted heartbeat is older than the abandoned threshold.
+
+    ``last_job_heartbeat_at`` is refreshed every ``SCHEDULER_HEARTBEAT_SECONDS``
+    while a job runs, so a row whose heartbeat has been silent for longer than
+    ``SCHEDULER_HEARTBEAT_STALE_AFTER_SECONDS`` was not actively running when
+    this process started — treat it as abandoned rather than in-flight. A
+    missing heartbeat is treated as not abandoned so rows written before the
+    heartbeat column existed are still re-queued conservatively.
+    """
+    if heartbeat_at is None:
+        return False
+    if heartbeat_at.tzinfo is None:
+        # SQLite persists DATETIME columns as naive UTC (the writes here are
+        # aware UTC); normalize so the age comparison is tz-safe.
+        heartbeat_at = heartbeat_at.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - heartbeat_at).total_seconds()
+    return age_seconds > SCHEDULER_HEARTBEAT_STALE_AFTER_SECONDS
+
+
 def _recover_stale_tasks():
     """Recover tasks stuck in 'running' state (from previous crash/restart).
 
@@ -463,9 +492,12 @@ def _recover_stale_tasks():
     terminal state before the previous process exited:
 
     - If a completed report exists for the claimed run, treat it as success.
-    - If the run persisted a ``last_job_id``, the task was genuinely in-flight
-      when the process died — re-queue it for today so the analysis is not
-      silently lost (previously this path marked it ``stale`` and dropped it).
+    - If the run persisted a ``last_job_id``, the task was in-flight when the
+      previous process exited. A fresh heartbeat (``last_job_heartbeat_at``
+      within ``SCHEDULER_HEARTBEAT_STALE_AFTER_SECONDS``) confirms it was
+      genuinely running — re-queue it for today so the analysis is not silently
+      lost. A stale heartbeat means the task was abandoned, so mark it ``stale``
+      and clear the run date.
     - Otherwise mark it stale and clear the run date (legacy behavior).
     """
     # In the split deployment (REDIS_URL set) the shared job store survives a
@@ -508,22 +540,40 @@ def _recover_stale_tasks():
                     item.last_run_status = "success"
                     recovered_count += 1
                 elif item.last_job_id:
-                    # Genuinely in-flight when the previous process died.
-                    # Reset the run so it is picked up again today instead of
-                    # being dropped; clear the persisted job trace with it.
-                    store_confirmed = item.last_job_id in store_running_jobs
-                    if store_confirmed:
+                    if _heartbeat_is_abandoned(item.last_job_heartbeat_at):
+                        # The heartbeat went silent longer than the stale
+                        # threshold ago, so the task was not actively running
+                        # when this process started — it is abandoned. Mark it
+                        # stale like legacy rows instead of re-queueing it.
                         _log(
-                            f"[Scheduler] Re-queuing task {item.id}: job "
-                            f"{item.last_job_id} still tracked as running in the "
-                            "shared job store."
+                            f"[Scheduler] Marking task {item.id} stale: last "
+                            f"heartbeat older than "
+                            f"{SCHEDULER_HEARTBEAT_STALE_AFTER_SECONDS}s."
                         )
-                    item.last_run_status = None
-                    item.last_run_date = None
-                    item.last_job_id = None
-                    item.last_job_started_at = None
-                    item.last_job_heartbeat_at = None
-                    requeued_count += 1
+                        item.last_run_status = "stale"
+                        item.last_run_date = None
+                        item.last_job_id = None
+                        item.last_job_started_at = None
+                        item.last_job_heartbeat_at = None
+                        reset_count += 1
+                    else:
+                        # Fresh heartbeat (or none): genuinely in-flight when
+                        # the previous process died. Reset the run so it is
+                        # picked up again today instead of being dropped; clear
+                        # the persisted job trace with it.
+                        store_confirmed = item.last_job_id in store_running_jobs
+                        if store_confirmed:
+                            _log(
+                                f"[Scheduler] Re-queuing task {item.id}: job "
+                                f"{item.last_job_id} still tracked as running in the "
+                                "shared job store."
+                            )
+                        item.last_run_status = None
+                        item.last_run_date = None
+                        item.last_job_id = None
+                        item.last_job_started_at = None
+                        item.last_job_heartbeat_at = None
+                        requeued_count += 1
                 else:
                     item.last_run_status = "stale"
                     item.last_run_date = None

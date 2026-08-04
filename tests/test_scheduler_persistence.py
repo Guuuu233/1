@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -61,6 +61,7 @@ def _add_scheduled(
     last_run_status: str | None = None,
     last_run_date: str | None = None,
     last_job_id: str | None = None,
+    last_job_heartbeat_at: datetime | None = None,
     last_report_id: str | None = None,
     is_active: bool = True,
 ) -> str:
@@ -76,6 +77,7 @@ def _add_scheduled(
             last_run_date=last_run_date,
             last_run_status=last_run_status,
             last_job_id=last_job_id,
+            last_job_heartbeat_at=last_job_heartbeat_at,
             last_report_id=last_report_id,
         )
     )
@@ -180,6 +182,66 @@ def test_recover_marks_legacy_running_without_job_id_stale():
         row = db.query(ScheduledAnalysisDB).filter(ScheduledAnalysisDB.id == task_id).first()
         assert row.last_run_status == "stale"
         assert row.last_run_date is None
+
+
+def test_recover_requeues_fresh_heartbeat_running_task():
+    """A running task with a recent heartbeat was genuinely in-flight when the
+    process died — re-queue it so the scheduled run is not lost."""
+    with _isolated_db() as db:
+        task_id = _add_scheduled(
+            db,
+            last_run_status="running",
+            last_run_date="2026-08-04",
+            last_job_id="deadbeef",
+            last_job_heartbeat_at=datetime.now(timezone.utc) - timedelta(seconds=30),
+        )
+        scheduler_main._recover_stale_tasks()
+
+        row = db.query(ScheduledAnalysisDB).filter(ScheduledAnalysisDB.id == task_id).first()
+        assert row is not None
+        assert row.last_run_status is None  # back to pending
+        assert row.last_run_date is None  # eligible again today
+        assert row.last_job_id is None  # persisted trace cleared
+        assert row.last_job_started_at is None
+        assert row.last_job_heartbeat_at is None
+
+
+def test_recover_marks_stale_when_heartbeat_abandoned():
+    """A running task whose heartbeat is older than the stale threshold was
+    abandoned, not crashed mid-analysis — mark it stale instead of re-queueing."""
+    with _isolated_db() as db:
+        task_id = _add_scheduled(
+            db,
+            last_run_status="running",
+            last_run_date="2026-08-04",
+            last_job_id="deadbeef",
+            last_job_heartbeat_at=datetime.now(timezone.utc) - timedelta(hours=6),
+        )
+        scheduler_main._recover_stale_tasks()
+
+        row = db.query(ScheduledAnalysisDB).filter(ScheduledAnalysisDB.id == task_id).first()
+        assert row is not None
+        assert row.last_run_status == "stale"
+        assert row.last_run_date is None
+        assert row.last_job_id is None
+
+
+def test_heartbeat_abandoned_helper():
+    """_heartbeat_is_abandoned treats missing heartbeats as not abandoned and
+    compares naive/aware timestamps against the stale threshold in UTC."""
+    now = datetime.now(timezone.utc)
+    assert scheduler_main._heartbeat_is_abandoned(None) is False
+    assert scheduler_main._heartbeat_is_abandoned(now - timedelta(seconds=30)) is False
+    assert (
+        scheduler_main._heartbeat_is_abandoned(now - timedelta(hours=2)) is True
+    )
+    # SQLite returns naive datetimes; they represent UTC in this codebase.
+    assert (
+        scheduler_main._heartbeat_is_abandoned(
+            (now - timedelta(hours=2)).replace(tzinfo=None)
+        )
+        is True
+    )
 
 
 def test_recover_uses_shanghai_date_boundary_for_report_match():
