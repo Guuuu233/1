@@ -14,10 +14,13 @@ from tradingagents.agents.utils.evidence_summary import (
 )
 
 
-def test_empty_report_returns_placeholder():
-    assert build_evidence_summary("") == "（报告无可用内容）"
-    assert build_evidence_summary(None) == "（报告无可用内容）"
-    assert build_evidence_summary("   \n  ") == "（报告无可用内容）"
+def test_empty_report_returns_empty_string():
+    # Empty input must produce an empty summary (not a placeholder), so callers
+    # can conditionally omit the evidence line instead of injecting a
+    # misleading "no content" marker for an analyst that did not run.
+    assert build_evidence_summary("") == ""
+    assert build_evidence_summary(None) == ""
+    assert build_evidence_summary("   \n  ") == ""
 
 
 def test_direction_extracted_from_verdict_block():

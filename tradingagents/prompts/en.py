@@ -98,7 +98,7 @@ Analyst first-hand evidence summaries (for evidence-level cross-checks, not rhet
 Market technical evidence summary: {market_evidence_summary}
 News/macro evidence summary: {news_evidence_summary}
 Fundamentals evidence summary: {fundamentals_evidence_summary}
-Macro/sector evidence summary: {macro_evidence_summary}
+{macro_evidence_line}
 
 Debate history:
 {history}

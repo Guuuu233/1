@@ -826,6 +826,57 @@ def test_T21_research_manager_receives_evidence_summaries():
     assert "趋势向上" not in prompt
 
 
+# T21b – macro analyst not run: the macro evidence line must be omitted
+#        entirely rather than injected as an empty/no-content placeholder
+#        (DAV-68 optimization ①).
+def test_T21b_macro_evidence_line_omitted_when_macro_report_empty():
+    import asyncio
+    from tradingagents.agents.managers.research_manager import create_research_manager
+
+    captured_prompts: list[str] = []
+
+    async def fake_astream(prompt, **kwargs):
+        captured_prompts.append(prompt)
+        yield MagicMock(content=RESEARCH_MANAGER_RESPONSE)
+
+    llm = MagicMock()
+    llm.astream = fake_astream
+    memory = MagicMock()
+    memory.get_memories = MagicMock(return_value=[])
+
+    # No macro_report key at all -> state.get("macro_report", "") == "".
+    state = _make_graph_state(
+        market_report=(
+            "市场技术面：RSI 48.2，股价 1835.5 站上 50 日均线。\n"
+            '<!-- VERDICT: {"direction": "偏多", "reason": "趋势向上"} -->'
+        ),
+        news_report=(
+            "新闻：行业政策利好落地，预计增速 12%。\n"
+            '<!-- VERDICT: {"direction": "偏多", "reason": "政策驱动"} -->'
+        ),
+        fundamentals_report=(
+            "基本面：营收同比 +15%，毛利率 45%。\n"
+            '<!-- VERDICT: {"direction": "中性", "reason": "估值合理"} -->'
+        ),
+        investment_debate_state=_make_debate_state(history="Bull: ok\nBear: no"),
+    )
+
+    node = create_research_manager(llm, memory, custom_prompt="", placement="after_data")
+    asyncio.run(node(state))
+
+    assert len(captured_prompts) == 1
+    prompt = captured_prompts[0]
+
+    # The other three evidence summaries are still injected…
+    assert "市场技术证据摘要：[分析师结论：偏多]" in prompt
+    assert "新闻/宏观证据摘要：[分析师结论：偏多]" in prompt
+    assert "基本面证据摘要：[分析师结论：中性]" in prompt
+    # …but the macro line is gone (no dangling label, no placeholder).
+    assert "宏观/板块证据摘要" not in prompt
+    assert "报告无可用内容" not in prompt
+    assert "Macro/sector evidence summary" not in prompt
+
+
 # ---------------------------------------------------------------------------
 # T22 – trader node: injection once, inside the user message after the
 #        investment-plan data block

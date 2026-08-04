@@ -181,7 +181,7 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 市场技术证据摘要：{market_evidence_summary}
 新闻/宏观证据摘要：{news_evidence_summary}
 基本面证据摘要：{fundamentals_evidence_summary}
-宏观/板块证据摘要：{macro_evidence_summary}
+{macro_evidence_line}
 
 本轮辩论历史：
 {history}
