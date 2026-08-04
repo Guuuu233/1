@@ -14,7 +14,7 @@ get_lhb_detail fall back to THS / Sina when the EM interface fails).
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -66,7 +66,6 @@ class _FakeRegistry:
 
 _ROUTER_SAMPLE_ARGS = {
     "get_stock_data": ("600519", "2026-01-01", "2026-01-31"),
-    "get_global_news": (cn_today_str(), 7, 10),
 }
 
 

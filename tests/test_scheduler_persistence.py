@@ -389,7 +389,9 @@ def test_scheduler_loop_exits_when_stop_event_set():
     async def scenario():
         stop = asyncio.Event()
         stop.set()
-        await scheduler_main._scheduler_loop(stop)
-        # Returns promptly once shutdown is requested.
+        # A stopped scheduler must return promptly — bound the wait so a future
+        # regression that ignores the stop event fails instead of hanging.
+        await asyncio.wait_for(scheduler_main._scheduler_loop(stop), timeout=2.0)
+        assert stop.is_set()
 
     asyncio.run(scenario())

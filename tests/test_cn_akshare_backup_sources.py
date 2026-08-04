@@ -22,10 +22,6 @@ from tradingagents.dataflows.trade_calendar import cn_today_str
 # ── Task 2: Eastmoney backup sources ──────────────────────────────────
 
 
-def _fake_ak(**methods):
-    return MagicMock(**{f"{name}.return_value": val for name, val in methods.items()})
-
-
 def test_board_fund_flow_falls_back_to_ths_when_em_fails():
     ths_df = pd.DataFrame(
         {
