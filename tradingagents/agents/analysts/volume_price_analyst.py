@@ -1,3 +1,5 @@
+import asyncio
+
 from tradingagents.agents.utils.context_utils import get_cn_stock_name
 from langchain_core.messages import HumanMessage, SystemMessage
 
