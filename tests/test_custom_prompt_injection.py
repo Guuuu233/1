@@ -1,12 +1,12 @@
 """Tests for Phase C custom-prompt injection.
 
-Test matrix (T1–T20):
+Test matrix (T1–T24):
   T1  – switch off: production _resolve_and_freeze_custom_prompts makes 0 resolver calls
   T2  – switch off: three final prompts byte-identical to pre-injection baseline
-  T3  – switch on: three roles each receive their own resolved text
-  T4  – other 12 roles do NOT receive any injection
+  T3  – switch on: each injectable role receives its own resolved text
+  T4  – non-injected roles do NOT receive any injection (bull/bear/manager/trader/risk_manager DO)
   T5  – production _resolve_and_freeze_custom_prompts resolves once for a job
-  T6  – snapshot structure contains all three inject roles
+  T6  – snapshot structure contains all five inject roles
   T7  – DB change after freeze does NOT affect already-frozen bundle
   T8  – production _resolve_and_freeze_custom_prompts raises ValueError if resolved text > 6000 chars
   T9  – existing factory signatures accept new parameters with defaults
@@ -21,6 +21,12 @@ Test matrix (T1–T20):
   T18 – research_manager node: injection once, after data before output requirements
   T19 – bull and bear nodes: node output first line is [PROMPT-OK], DEBATE_STATE parseable from output
   T20 – research_manager node: investment_plan first line is [PROMPT-OK], VERDICT parseable from output
+  T21 – research_manager node: receives first-hand market/news/fundamentals evidence summaries
+  T22 – trader node: injection once, in the user message after the investment-plan data block
+  T23 – risk_manager node: injection once, after data before output requirements
+  T24 – api.main _INJECT_ROLES includes trader and risk_manager
+
+Evidence-summary unit tests live in tests/test_evidence_summary.py.
 """
 from __future__ import annotations
 
@@ -116,7 +122,7 @@ def test_T2_switch_off_prompt_byte_identical():
 
 
 # ---------------------------------------------------------------------------
-# T3 – switch on: each role gets its own resolved text
+# T3 – switch on: each injectable role gets its own text
 # ---------------------------------------------------------------------------
 
 def test_T3_switch_on_each_role_gets_text():
@@ -126,6 +132,8 @@ def test_T3_switch_on_each_role_gets_text():
         "bull_researcher": "多头指令",
         "bear_researcher": "空头指令",
         "research_manager": "裁决指令",
+        "trader": "交易员指令",
+        "risk_manager": "风控指令",
     }
 
     for role, text in texts.items():
@@ -135,11 +143,11 @@ def test_T3_switch_on_each_role_gets_text():
 
 
 # ---------------------------------------------------------------------------
-# T4 – other 12 roles receive no injection
+# T4 – non-injected roles receive no injection
 # ---------------------------------------------------------------------------
 
 def test_T4_other_roles_no_injection():
-    """Exercise GraphSetup.setup_graph and verify only the three approved factories receive text."""
+    """Exercise GraphSetup.setup_graph and verify only the five approved factories receive text."""
     from types import SimpleNamespace
     from tradingagents.graph.setup import GraphSetup
 
@@ -150,6 +158,13 @@ def test_T4_other_roles_no_injection():
         "create_research_manager", "create_risk_manager", "create_smart_money_analyst",
         "create_social_media_analyst", "create_volume_price_analyst", "create_trader",
     )
+    injected_factories = {
+        "create_bull_researcher",
+        "create_bear_researcher",
+        "create_research_manager",
+        "create_trader",
+        "create_risk_manager",
+    }
     factories = {name: MagicMock(return_value=name) for name in factory_names}
     conditional = SimpleNamespace(
         should_continue_market=lambda *_: "done",
@@ -167,6 +182,8 @@ def test_T4_other_roles_no_injection():
                     "bull_researcher": "BULL",
                     "bear_researcher": "BEAR",
                     "research_manager": "MANAGER",
+                    "trader": "TRADER",
+                    "risk_manager": "RISK",
                 },
                 custom_prompt_placement="after_data",
             )
@@ -176,13 +193,15 @@ def test_T4_other_roles_no_injection():
         ("create_bull_researcher", "BULL"),
         ("create_bear_researcher", "BEAR"),
         ("create_research_manager", "MANAGER"),
+        ("create_trader", "TRADER"),
+        ("create_risk_manager", "RISK"),
     ):
         kwargs = factories[factory_name].call_args.kwargs
         assert kwargs["custom_prompt"] == expected
         assert kwargs["placement"] == "after_data"
 
     for factory_name in factory_names:
-        if factory_name not in {"create_bull_researcher", "create_bear_researcher", "create_research_manager"}:
+        if factory_name not in injected_factories:
             # Some analysts are not selected in this minimal graph fixture and are not called.
             if factories[factory_name].call_args is not None:
                 assert "custom_prompt" not in factories[factory_name].call_args.kwargs
@@ -219,11 +238,11 @@ def test_T5_resolve_called_once_for_two_graphs():
 
 
 # ---------------------------------------------------------------------------
-# T6 – snapshot structure contains all three inject roles
+# T6 – snapshot structure contains all five inject roles
 # ---------------------------------------------------------------------------
 
-def test_T6_snapshot_structure_has_three_roles():
-    inject_roles = ("bull_researcher", "bear_researcher", "research_manager")
+def test_T6_snapshot_structure_has_five_roles():
+    inject_roles = ("bull_researcher", "bear_researcher", "research_manager", "trader", "risk_manager")
     frozen_bundle = {
         rk: {"resolved_text": SAMPLE_PROMPT if rk == "bull_researcher" else "",
              "resolved_hash": "abc" if rk == "bull_researcher" else None,
@@ -233,7 +252,7 @@ def test_T6_snapshot_structure_has_three_roles():
     }
     snapshot = {"enabled": True, "placement": "before_data", "roles": deepcopy(frozen_bundle)}
 
-    # All three roles must be present even when some have empty text
+    # All five roles must be present even when some have empty text
     for rk in inject_roles:
         assert rk in snapshot["roles"]
         role_entry = snapshot["roles"][rk]
@@ -305,6 +324,8 @@ def test_T9_factory_signatures_accept_new_params():
     from tradingagents.agents.researchers.bull_researcher import create_bull_researcher
     from tradingagents.agents.researchers.bear_researcher import create_bear_researcher
     from tradingagents.agents.managers.research_manager import create_research_manager
+    from tradingagents.agents.managers.risk_manager import create_risk_manager
+    from tradingagents.agents.trader.trader import create_trader
 
     llm = MagicMock()
     memory = MagicMock()
@@ -314,10 +335,14 @@ def test_T9_factory_signatures_accept_new_params():
     node_bull = create_bull_researcher(llm, memory, custom_prompt=SAMPLE_PROMPT, placement="before_data")
     node_bear = create_bear_researcher(llm, memory, custom_prompt=SAMPLE_PROMPT, placement="after_data")
     node_mgr = create_research_manager(llm, memory, custom_prompt="", placement="before_data")
+    node_trader = create_trader(llm, memory, custom_prompt=SAMPLE_PROMPT, placement="after_data")
+    node_risk = create_risk_manager(llm, memory, custom_prompt=SAMPLE_PROMPT, placement="after_data")
 
     assert callable(node_bull)
     assert callable(node_bear)
     assert callable(node_mgr)
+    assert callable(node_trader)
+    assert callable(node_risk)
 
 
 # ---------------------------------------------------------------------------
@@ -735,3 +760,288 @@ def test_T20_research_manager_verdict_parseable():
 
     # [PROMPT-OK] must NOT contaminate the machine-readable block
     assert "[PROMPT-OK]" not in str(verdict_payload)
+
+
+# ---------------------------------------------------------------------------
+# T21 – research_manager node receives first-hand market/news/fundamentals
+#        evidence summaries (DAV-68 M2: adjudication must anchor on evidence)
+# ---------------------------------------------------------------------------
+
+def test_T21_research_manager_receives_evidence_summaries():
+    import asyncio
+    from tradingagents.agents.managers.research_manager import create_research_manager
+
+    captured_prompts: list[str] = []
+
+    async def fake_astream(prompt, **kwargs):
+        captured_prompts.append(prompt)
+        yield MagicMock(content=RESEARCH_MANAGER_RESPONSE)
+
+    llm = MagicMock()
+    llm.astream = fake_astream
+    memory = MagicMock()
+    memory.get_memories = MagicMock(return_value=[])
+
+    state = _make_graph_state(
+        market_report=(
+            "以下是本轮回测的市场技术分析。\n"
+            "市场技术面：RSI 48.2，股价 1835.5 站上 50 日均线。\n"
+            '<!-- VERDICT: {"direction": "偏多", "reason": "趋势向上"} -->'
+        ),
+        news_report=(
+            "新闻：行业政策利好落地，预计增速 12%。\n"
+            '<!-- VERDICT: {"direction": "偏多", "reason": "政策驱动"} -->'
+        ),
+        fundamentals_report=(
+            "基本面：营收同比 +15%，毛利率 45%，经营现金流为正。\n"
+            '<!-- VERDICT: {"direction": "中性", "reason": "估值合理"} -->'
+        ),
+        macro_report=(
+            "宏观/板块：板块资金净流入 23 亿，政策窗口开启。\n"
+            '<!-- VERDICT: {"direction": "偏多", "reason": "政策与资金共振"} -->'
+        ),
+        investment_debate_state=_make_debate_state(history="Bull: ok\nBear: no"),
+    )
+
+    node = create_research_manager(llm, memory, custom_prompt="", placement="after_data")
+    asyncio.run(node(state))
+
+    assert len(captured_prompts) == 1
+    prompt = captured_prompts[0]
+
+    # The evidence-summary section must be present with all three summaries.
+    assert "分析师一手证据摘要" in prompt
+    assert "市场技术证据摘要：[分析师结论：偏多]" in prompt
+    assert "RSI 48.2" in prompt
+    assert "1835.5" in prompt
+    assert "新闻/宏观证据摘要：[分析师结论：偏多]" in prompt
+    assert "基本面证据摘要：[分析师结论：中性]" in prompt
+    assert "宏观/板块证据摘要：[分析师结论：偏多]" in prompt
+    assert "+15%" in prompt or "15%" in prompt
+    assert "23 亿" in prompt or "净流入 23" in prompt
+
+    # Numberless boilerplate and the machine-readable VERDICT reason are NOT
+    # passed through — adjudicators get facts, not prose or protocol blocks.
+    assert "以下是本轮回测" not in prompt
+    assert "趋势向上" not in prompt
+
+
+# T21b – macro analyst not run: the macro evidence line must be omitted
+#        entirely rather than injected as an empty/no-content placeholder
+#        (DAV-68 optimization ①).
+def test_T21b_macro_evidence_line_omitted_when_macro_report_empty():
+    import asyncio
+    from tradingagents.agents.managers.research_manager import create_research_manager
+
+    captured_prompts: list[str] = []
+
+    async def fake_astream(prompt, **kwargs):
+        captured_prompts.append(prompt)
+        yield MagicMock(content=RESEARCH_MANAGER_RESPONSE)
+
+    llm = MagicMock()
+    llm.astream = fake_astream
+    memory = MagicMock()
+    memory.get_memories = MagicMock(return_value=[])
+
+    # No macro_report key at all -> state.get("macro_report", "") == "".
+    state = _make_graph_state(
+        market_report=(
+            "市场技术面：RSI 48.2，股价 1835.5 站上 50 日均线。\n"
+            '<!-- VERDICT: {"direction": "偏多", "reason": "趋势向上"} -->'
+        ),
+        news_report=(
+            "新闻：行业政策利好落地，预计增速 12%。\n"
+            '<!-- VERDICT: {"direction": "偏多", "reason": "政策驱动"} -->'
+        ),
+        fundamentals_report=(
+            "基本面：营收同比 +15%，毛利率 45%。\n"
+            '<!-- VERDICT: {"direction": "中性", "reason": "估值合理"} -->'
+        ),
+        investment_debate_state=_make_debate_state(history="Bull: ok\nBear: no"),
+    )
+
+    node = create_research_manager(llm, memory, custom_prompt="", placement="after_data")
+    asyncio.run(node(state))
+
+    assert len(captured_prompts) == 1
+    prompt = captured_prompts[0]
+
+    # The other three evidence summaries are still injected…
+    assert "市场技术证据摘要：[分析师结论：偏多]" in prompt
+    assert "新闻/宏观证据摘要：[分析师结论：偏多]" in prompt
+    assert "基本面证据摘要：[分析师结论：中性]" in prompt
+    # …but the macro line is gone (no dangling label, no placeholder).
+    assert "宏观/板块证据摘要" not in prompt
+    assert "报告无可用内容" not in prompt
+    assert "Macro/sector evidence summary" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# T22 – trader node: injection once, inside the user message after the
+#        investment-plan data block
+# ---------------------------------------------------------------------------
+
+TRADER_RESPONSE = "交易员方案：建议买入，仓位 20%。"
+
+
+def test_T22_trader_injection_position_after_data():
+    import asyncio
+    from tradingagents.agents.trader.trader import create_trader
+
+    captured_messages: list[list[dict]] = []
+
+    async def fake_astream(messages, **kwargs):
+        captured_messages.append(messages)
+        yield MagicMock(content=TRADER_RESPONSE)
+
+    llm = MagicMock()
+    llm.astream = fake_astream
+    memory = MagicMock()
+    memory.get_memories = MagicMock(return_value=[])
+
+    state = _make_graph_state(
+        company_of_interest="600519",
+        investment_plan="研究经理给交易员下发的投资方案",
+        trader_investment_plan="",
+        instrument_context={},
+        market_context={},
+        user_context={},
+        risk_feedback_state={},
+    )
+
+    node = create_trader(llm, memory, custom_prompt=CUSTOM_TEXT, placement="after_data")
+    asyncio.run(node(state))
+
+    assert len(captured_messages) == 1
+    messages = captured_messages[0]
+    user_content = messages[1]["content"]
+
+    assert user_content.count(CUSTOM_TEXT) == 1, "Custom text must appear exactly once"
+
+    # after_data for the trader: after the last data block (investment plan).
+    pos_plan = user_content.rfind("研究经理方案内容：")
+    pos_custom = user_content.find(CUSTOM_TEXT)
+    assert pos_plan < pos_custom, (
+        f"Position order wrong: plan={pos_plan} custom={pos_custom}"
+    )
+
+    # switch-off baseline: no custom text
+    captured2: list[list[dict]] = []
+
+    async def fake_astream2(messages2, **kwargs):
+        captured2.append(messages2)
+        yield MagicMock(content=TRADER_RESPONSE)
+
+    llm2 = MagicMock()
+    llm2.astream = fake_astream2
+    node_off = create_trader(llm2, memory, custom_prompt="", placement="after_data")
+    asyncio.run(node_off(state))
+    assert CUSTOM_TEXT not in captured2[0][1]["content"], (
+        "Empty custom_prompt must not appear in trader prompt"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T23 – risk_manager node: injection once, after data before output requirements
+# ---------------------------------------------------------------------------
+
+RISK_MANAGER_RESPONSE = """\
+[PROMPT-OK]
+风控结论：同意交易员方向，补充硬约束。
+
+<!-- RISK_JUDGE: {"verdict": "pass", "revision_reason": "", "hard_constraints": ["仓位不超过20%"], "soft_constraints": [], "execution_preconditions": ["放量突破确认"], "de_risk_triggers": ["跌破止损价"]} -->
+"""
+
+
+def _make_risk_debate_state(**overrides):
+    base = {
+        "history": "Aggressive: ok\nConservative: no\nNeutral: maybe",
+        "aggressive_history": "",
+        "conservative_history": "",
+        "neutral_history": "",
+        "latest_speaker": "",
+        "current_aggressive_response": "",
+        "current_conservative_response": "",
+        "current_neutral_response": "",
+        "judge_decision": "",
+        "count": 0,
+        "claims": [],
+        "focus_claim_ids": [],
+        "open_claim_ids": [],
+        "resolved_claim_ids": [],
+        "unresolved_claim_ids": [],
+        "round_summary": "",
+        "round_goal": "",
+        "claim_counter": 0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_T23_risk_manager_injection_position_after_data():
+    import asyncio
+    from tradingagents.agents.managers.risk_manager import create_risk_manager
+
+    captured_prompts: list[str] = []
+
+    async def fake_astream(prompt, **kwargs):
+        captured_prompts.append(prompt)
+        yield MagicMock(content=RISK_MANAGER_RESPONSE)
+
+    llm = MagicMock()
+    llm.astream = fake_astream
+    memory = MagicMock()
+    memory.get_memories = MagicMock(return_value=[])
+
+    state = _make_graph_state(
+        company_of_interest="600519",
+        trader_investment_plan="交易员方案",
+        risk_debate_state=_make_risk_debate_state(),
+        instrument_context={},
+        market_context={},
+        user_context={},
+    )
+
+    node = create_risk_manager(llm, memory, custom_prompt=CUSTOM_TEXT, placement="after_data")
+    asyncio.run(node(state))
+
+    assert len(captured_prompts) == 1
+    prompt = captured_prompts[0]
+
+    assert prompt.count(CUSTOM_TEXT) == 1, "Custom text must appear exactly once"
+
+    # after_data: after last data field, before 输出要求
+    pos_data = prompt.rfind("上一轮摘要：")
+    pos_custom = prompt.find(CUSTOM_TEXT)
+    pos_req = prompt.find("输出要求：")
+    assert pos_data < pos_custom < pos_req, (
+        f"Position order wrong: last_data={pos_data} custom={pos_custom} requirements={pos_req}"
+    )
+
+    # switch-off baseline: no custom text
+    captured2: list[str] = []
+
+    async def fake_astream2(prompt2, **kwargs):
+        captured2.append(prompt2)
+        yield MagicMock(content=RISK_MANAGER_RESPONSE)
+
+    llm2 = MagicMock()
+    llm2.astream = fake_astream2
+    node_off = create_risk_manager(llm2, memory, custom_prompt="", placement="after_data")
+    asyncio.run(node_off(state))
+    assert CUSTOM_TEXT not in captured2[0], "Empty custom_prompt must not appear in prompt"
+
+
+# ---------------------------------------------------------------------------
+# T24 – api.main._INJECT_ROLES must cover trader and risk_manager
+# ---------------------------------------------------------------------------
+
+def test_T24_inject_roles_include_trader_and_risk_manager():
+    from api.main import _INJECT_ROLES
+
+    assert "trader" in _INJECT_ROLES
+    assert "risk_manager" in _INJECT_ROLES
+    assert "bull_researcher" in _INJECT_ROLES
+    assert "bear_researcher" in _INJECT_ROLES
+    assert "research_manager" in _INJECT_ROLES

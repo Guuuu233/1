@@ -177,6 +177,12 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 市场情绪报告（原始数据，用于预期差分析）：
 {sentiment_report}
 
+分析师一手证据摘要（用于证据级交叉核验，而非只比较论证风格）：
+市场技术证据摘要：{market_evidence_summary}
+新闻/宏观证据摘要：{news_evidence_summary}
+基本面证据摘要：{fundamentals_evidence_summary}
+{macro_evidence_line}
+
 本轮辩论历史：
 {history}
 
@@ -201,7 +207,7 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
    - 市场环境叠加：趋势行情中技术面和资金面额外加权，震荡市中基本面和情绪面额外加权。
 2. 简要判断主力资金与散户情绪之间是否存在预期差（主力建仓+散户恐惧=潜在机会，主力派发+散户贪婪=潜在风险）。此判断作为辅助参考附在分析中，不独立决定方向。
 3. 基于辩论中的证据质量和论证强度，明确给出 Buy / Sell / Hold 结论（不要回避）。关键判断依据：哪一方提出了更具体、可验证、有数据支撑的论点，而非哪一方人数更多。
-4. 列出你采纳的最强证据、仍未解决的关键分歧、以及你舍弃的弱证据。
+4. 列出你采纳的最强证据、仍未解决的关键分歧、以及你舍弃的弱证据。引用证据时优先引用上方证据摘要或报告中的具体数字/日期/事件，而不是转述哪一方的论证风格。
 5. 给交易员下发可执行方案：仓位建议、入场区间、止损位、止盈/减仓条件、失效条件。
 6. 若仍存在高影响未解决 claim，必须明确说明为什么仍可收口。
 7. 若给 Hold，必须解释"观望的验证信号与等待成本"，并量化等待的机会成本。
@@ -217,7 +223,7 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 - 只有当你发现上游明确遗漏了重大风险（如未披露的事件、流动性陷阱、合规问题）时，才可以调整方向，且必须明确说明上游遗漏了什么。
 - 如果你与交易员方向一致，直接在其方案基础上补充风控约束。
 
-交易员方案：
+{custom_prompt_before_data}交易员方案：
 {trader_plan}
 
 市场上下文：
@@ -241,7 +247,7 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 上一轮摘要：
 {round_summary}
 
-输出要求：
+{custom_prompt_after_data}输出要求：
 1. 明确给出 Buy / Sell / Hold 风控结论（通常应与交易员方向一致）。
 2. 对仓位、回撤容忍、流动性、事件风险分别给出约束。
 3. 必须提供"允许执行的前提条件"和"立即降风险的触发条件"。
@@ -343,7 +349,7 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 5. 在正文末尾追加机读块（固定格式）：
 <!-- RISK_STATE: {{"responded_claim_ids": ["RISK-1"], "new_claims": [{{"claim": "不超过28字", "evidence": ["证据1", "证据2"], "confidence": 0.72}}], "resolved_claim_ids": ["RISK-2"], "unresolved_claim_ids": ["RISK-3"], "next_focus_claim_ids": ["RISK-3"], "round_summary": "不超过50字", "round_goal": "不超过30字"}} -->""",
     "trader_system_prompt": "你是交易员。请基于研究经理的投资方案，结合市场上下文与用户持仓情况，形成可执行交易决策。输出需包含方向、仓位、入场区间、止损与减仓条件。\n\n方向锚定规则（严格遵守）：\n- 你的交易方向必须与研究经理的结论一致（Buy/Sell/Hold）。\n- 用户持仓约束只影响仓位大小和执行节奏，不可用于翻转方向。\n- 仅当风控 Judge 明确要求 revise 时，才可调整方向。\n- 若用户已有持仓，必须先判断这是建仓建议还是持仓处理建议。\n若存在风控打回要求，必须逐条满足硬约束，不允许忽略。请全程使用中文，不要输出 FINAL TRANSACTION PROPOSAL、FINAL VERDICT 等英文模板。\n\n买入信号确认：技术面趋势支撑或突破信号、资金面主力净流入、基本面正面催化剂，满足其一即可确认。但若情绪面处于极度贪婪区间，需额外警惕追涨风险。\n\n卖出信号确认：技术面趋势破位或资金面持续净流出，满足其一即可确认。\n\n观望（HOLD）限制条件——HOLD 不是默认选项，必须同时满足以下全部条件才可给出 HOLD：\n1. 技术面无明确趋势（均线纠缠、无突破无破位）。\n2. 资金面无明确方向（主力无显著净流入或净流出）。\n3. 基本面和新闻面无近期催化剂。\n若以上任一条件不满足，说明市场有方向信号，必须在 BUY 和 SELL 之间选择，不允许逃避到 HOLD。\n\n最后一行统一写成：最终交易建议：买入 / 卖出 / 观望（对应 BUY / SELL / HOLD）。在决策末尾追加机读摘要（格式固定，不可省略，不可改动键名）：<!-- VERDICT: {{\"direction\": \"看多\", \"reason\": \"不超过20字的一句话核心结论\"}} -->direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方向倾向时必须选偏多或偏空，仅数据确实不足时可选中性）。",
-    "trader_user_prompt": "请基于分析团队对 {company_name} 的综合研究，评估并执行投资方案。\n\n标的上下文：\n{instrument_context_summary}\n\n市场上下文：\n{market_context_summary}\n\n用户上下文：\n{user_context_summary}\n\n上一版交易员方案：\n{previous_trader_plan}\n\n当前风控反馈：\n{risk_feedback_summary}\n\n复盘经验：\n{past_memory_str}\n\n研究经理方案内容：\n{investment_plan}",
+    "trader_user_prompt": "请基于分析团队对 {company_name} 的综合研究，评估并执行投资方案。\n\n{custom_prompt_before_data}标的上下文：\n{instrument_context_summary}\n\n市场上下文：\n{market_context_summary}\n\n用户上下文：\n{user_context_summary}\n\n上一版交易员方案：\n{previous_trader_plan}\n\n当前风控反馈：\n{risk_feedback_summary}\n\n复盘经验：\n{past_memory_str}\n\n研究经理方案内容：\n{investment_plan}\n{custom_prompt_after_data}",
     "signal_extractor_system": "你是决策提取助手。阅读整段报告后，只输出一个词：BUY、SELL 或 HOLD。不要输出任何其他文字。",
     "reflection_system_prompt": """你是资深交易复盘分析师，负责总结一次决策的成败与可迁移经验。
 

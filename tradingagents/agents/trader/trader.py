@@ -10,9 +10,10 @@ from tradingagents.agents.utils.debate_utils import (
     build_empty_risk_debate_state,
     summarize_risk_feedback,
 )
+from tradingagents.agents.utils.prompt_injection import build_injection_slots, Placement, DEFAULT_PLACEMENT
 
 
-def create_trader(llm, memory):
+def create_trader(llm, memory, custom_prompt: str = "", placement: Placement = DEFAULT_PLACEMENT):
     async def trader_node(state, name):
         company_name = state["company_of_interest"]
         investment_plan = state["investment_plan"]
@@ -37,6 +38,21 @@ def create_trader(llm, memory):
         context_view = build_agent_context_view(state, "trader")
         risk_feedback_summary = summarize_risk_feedback(risk_feedback_state)
 
+        # Custom-prompt injection (3000-char constraints e.g. confidence ceiling /
+        # falsification conditions) must reach the trader like any other data-fed role.
+        injection_slots = build_injection_slots(custom_prompt, placement, role_key="trader")
+        user_prompt = get_prompt("trader_user_prompt", config=config).format(
+            company_name=company_name,
+            investment_plan=investment_plan,
+            previous_trader_plan=previous_trader_plan or "无",
+            instrument_context_summary=context_view["instrument_context_summary"],
+            market_context_summary=context_view["market_context_summary"],
+            user_context_summary=context_view["user_context_summary"],
+            risk_feedback_summary=risk_feedback_summary,
+            past_memory_str=past_memory_str,
+            **injection_slots,
+        )
+
         messages = [
             {
                 "role": "system",
@@ -44,16 +60,7 @@ def create_trader(llm, memory):
             },
             {
                 "role": "user",
-                "content": get_prompt("trader_user_prompt", config=config).format(
-                    company_name=company_name,
-                    investment_plan=investment_plan,
-                    previous_trader_plan=previous_trader_plan or "无",
-                    instrument_context_summary=context_view["instrument_context_summary"],
-                    market_context_summary=context_view["market_context_summary"],
-                    user_context_summary=context_view["user_context_summary"],
-                    risk_feedback_summary=risk_feedback_summary,
-                    past_memory_str=past_memory_str,
-                ),
+                "content": user_prompt,
             },
         ]
 

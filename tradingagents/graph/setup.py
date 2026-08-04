@@ -186,7 +186,9 @@ class GraphSetup:
             placement=self.custom_prompt_placement,
         )
         trader_node = factories["create_trader"](
-            self._get_role_llm("trader", self.quick_thinking_llm), self.trader_memory
+            self._get_role_llm("trader", self.quick_thinking_llm), self.trader_memory,
+            custom_prompt=self.custom_prompts.get("trader", ""),
+            placement=self.custom_prompt_placement,
         )
 
         # Create risk analysis nodes
@@ -194,7 +196,9 @@ class GraphSetup:
         neutral_analyst = factories["create_neutral_debator"](self._get_role_llm("neutral_analyst", self.quick_thinking_llm))
         conservative_analyst = factories["create_conservative_debator"](self._get_role_llm("conservative_analyst", self.quick_thinking_llm))
         risk_manager_node = factories["create_risk_manager"](
-            self._get_role_llm("risk_manager", self.deep_thinking_llm), self.risk_manager_memory
+            self._get_role_llm("risk_manager", self.deep_thinking_llm), self.risk_manager_memory,
+            custom_prompt=self.custom_prompts.get("risk_manager", ""),
+            placement=self.custom_prompt_placement,
         )
 
         # Create workflow

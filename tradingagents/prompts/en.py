@@ -94,6 +94,12 @@ Volume-Price analysis report (raw data for volume-price confirmation):
 Market sentiment report (raw data for divergence analysis):
 {sentiment_report}
 
+Analyst first-hand evidence summaries (for evidence-level cross-checks, not rhetoric comparison):
+Market technical evidence summary: {market_evidence_summary}
+News/macro evidence summary: {news_evidence_summary}
+Fundamentals evidence summary: {fundamentals_evidence_summary}
+{macro_evidence_line}
+
 Debate history:
 {history}
 
@@ -115,7 +121,7 @@ Output:
 1) Tally analyst verdicts and compute bull/bear ratio.
 2) Briefly assess smart money vs retail sentiment divergence as supplementary context.
 3) Clear Buy/Sell/Hold recommendation based primarily on debate evidence.
-4) Strongest evidence adopted, unresolved disagreements, and weak evidence rejected.
+4) Strongest evidence adopted, unresolved disagreements, and weak evidence rejected. When citing evidence, prefer concrete numbers/dates/events from the evidence summaries above, rather than describing whose argumentation style was more polished.
 5) Detailed execution plan for trader.
 Avoid defaulting to Hold unless strongly justified.
 At the very end, append this machine-readable line (fixed format, do not omit):
@@ -129,7 +135,7 @@ Core principles:
 - You may only override the trader's direction if you identify a material risk that upstream clearly missed (e.g., undisclosed events, liquidity traps, compliance issues). You must explicitly state what was missed.
 - If you agree with the trader's direction, build on their plan by adding risk constraints.
 
-Trader plan:
+{custom_prompt_before_data}Trader plan:
 {trader_plan}
 
 Market context:
@@ -153,7 +159,7 @@ Unresolved risk claims:
 Last round summary:
 {round_summary}
 
-Output requirements:
+{custom_prompt_after_data}Output requirements:
 1. State a clear Buy/Sell/Hold conclusion (should normally align with the trader's direction).
 2. Provide constraints on position sizing, drawdown tolerance, liquidity, and event risk.
 3. Must provide "execution preconditions" and "immediate de-risk triggers".
@@ -240,7 +246,7 @@ Round goal: {round_goal}
 Debate actively and provide a balanced, risk-adjusted middle-ground recommendation. Explicitly identify which side added real information. At the very end append:
 <!-- RISK_STATE: {{"responded_claim_ids": ["RISK-1"], "new_claims": [{{"claim": "under 18 words", "evidence": ["evidence 1", "evidence 2"], "confidence": 0.72}}], "resolved_claim_ids": ["RISK-2"], "unresolved_claim_ids": ["RISK-3"], "next_focus_claim_ids": ["RISK-3"], "round_summary": "under 30 words", "round_goal": "under 20 words"}} -->""",
     "trader_system_prompt": "You are a trading agent. Produce a concrete Buy/Sell/Hold recommendation from analyst plans, market context, user constraints, risk feedback, and lessons learned. If the user already holds the position, explicitly decide whether this is a new entry, add, reduce, hold, or exit plan. If risk feedback requests a revision, satisfy every hard constraint explicitly. End with: FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL**. At the very end append this machine-readable line: <!-- VERDICT: {{\"direction\": \"BULLISH\", \"reason\": \"one-sentence conclusion under 15 words\"}} --> direction must be one of: BULLISH / LEAN_BULLISH / NEUTRAL / LEAN_BEARISH / BEARISH (use LEAN_BULLISH or LEAN_BEARISH when data leans directionally but lacks full confirmation; use NEUTRAL only when data is genuinely insufficient).",
-    "trader_user_prompt": "Based on analyst synthesis, evaluate this plan for {company_name} and make a strategic decision.\n\nInstrument context:\n{instrument_context_summary}\n\nMarket context:\n{market_context_summary}\n\nUser context:\n{user_context_summary}\n\nPrevious trader plan:\n{previous_trader_plan}\n\nCurrent risk feedback:\n{risk_feedback_summary}\n\nLessons learned:\n{past_memory_str}\n\nProposed investment plan: {investment_plan}",
+    "trader_user_prompt": "Based on analyst synthesis, evaluate this plan for {company_name} and make a strategic decision.\n\n{custom_prompt_before_data}Instrument context:\n{instrument_context_summary}\n\nMarket context:\n{market_context_summary}\n\nUser context:\n{user_context_summary}\n\nPrevious trader plan:\n{previous_trader_plan}\n\nCurrent risk feedback:\n{risk_feedback_summary}\n\nLessons learned:\n{past_memory_str}\n\nProposed investment plan: {investment_plan}\n{custom_prompt_after_data}",
     "signal_extractor_system": "You are an extraction assistant. Read the report and output only one token: BUY, SELL, or HOLD.",
     "reflection_system_prompt": """You are an expert financial analyst reviewing trading analysis and decisions.
 For each case, explain what was right or wrong, why, and how to improve.
