@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.6.0] - 2026-08-05
+
+M1~M5 里程碑（DAV-67~71，2026-07/08）竣工，随附 H1~H3 审计与清理轮记录（见 Unreleased）。
+
+### Added
+- **M1（DAV-67）**：收口 2026-08-04 十项修复——交易日历 fallback、近窗豁免、中文前置、3000 字提示词恢复、SSRF allowlist、新浪资金流备用源、数据库路径、start.sh、socksio、max_tokens。
+- **M2（DAV-68）**：裁决者证据闭环——`research_manager` 接收 market/news/fundamentals/macro 一手证据摘要（≤300 字符，`build_evidence_summary`），macro 分析接线补齐；trader/risk_manager 自定义提示词注入；golden-output citation-density 回归（`tests/test_evidence_citation_density.py`）。
+- **M3（DAV-69）**：数据源语义重构（`VendorResult`/`VendorRefuse`/`VendorFail`/`VendorEmpty`/`VendorOk` 类型化结果，拒绝/失败/确认空正确区分）；东财受限接口备用源；任务状态落库 + SIGTERM 优雅关停；调度心跳区分崩溃任务与弃单任务。
+- **M4（DAV-70）**：校准度统计闭环——可靠性曲线（按 probability 分桶统计实际上涨率）+ Brier score + 前端校准度面板，支持按日期段/提示词版本/模型过滤。
+- **M5（DAV-71）**：安全与体验收尾——`TA_APP_SECRET_KEY` 未设置拒绝启动（DAV-66）、前端死任务轮询修复、旧版英文报告「旧版报告」标识、全量回归 + 文档收口。
+
+### Changed
+- 模型配置新增推荐厂商预设与引导入口；支持从代理自动拉取模型并同步进角色模型配置。
+- 角色级模型路由与数据供应商扩展；历史日期分析严格执行日期语义（快照源拒绝服务、财报按公告日期截断、按列名取数而非位置切片）。
+- 七个分析师补齐 stream 退化中止保护；结构化报告新增 probability/data_gaps/falsification_conditions 等字段。
+- 线程池饱和 524 修复；长时分析超过软超时后继续执行；股票识别兜底与错误信息人性化。
+
+### Fixed
+- 修复历史数据日期边界：报表/新闻/龙虎榜/资金流等近窗来源在历史分析日期被拒，财报按有效公告日截断。
+- 修复风控/持仓字段默认零填充：缺失质押、融资融券风险字段显式拒绝而非填 0。
+- 修复调度任务重复触发与运行中重启丢失（任务状态落库 + 启动恢复）。
+- 修复信号侧否定词误判导致的 BUY 决策偏差。
+
+### Removed
+- 移除盘中概念板块异动扫描（外部数据源不稳定且有合规风险，回滚 #200）。
+
+## Unreleased
+
+### 审计与清理轮（H1~H3）
+- **H1（DAV-73）**：全仓只读审计（286 个非 git 文件），产出 `work/code-audit-report.md`（P1 24 条施工依据）。
+- **H2（DAV-74）**：测试体检 + 日期炸弹修复（P1-4），全量 780 passed / 0 failed；登记覆盖缺口（Redis fakeredis 恢复、裁决链行为级测试）。
+- **H3（DAV-75）**：按审计报告逐条销号——删死代码、合并重复逻辑、清理未用导入与孤立文件、依赖体检（移除 `langchain-experimental`、补 `python-dotenv`）、文档同步（README/CHANGELOG/AGENTS/frontend README 与代码一致）。
+
 ## [v0.5.0] - 2026-03-22
 
 ### Added
