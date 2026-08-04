@@ -11,7 +11,6 @@ requires-python = ">=3.10"
 dependencies = [
     "langchain-core>=0.3.81",
     "langchain-anthropic>=0.3.15",
-    "langchain-experimental>=0.3.4",
     "langchain-google-genai>=2.1.5",
     "langchain-openai>=0.3.23",
     "langgraph>=0.4.8",
@@ -34,6 +33,7 @@ dependencies = [
     "json-repair>=0.44.0",
     "markdown>=3.7",
     "redis[hiredis]>=5.0.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.scripts]
