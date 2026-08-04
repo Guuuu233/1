@@ -1,13 +1,19 @@
-export function detectDecisionLabel(text?: string | null): string | null {
-    if (!text) return null
-    const normalized = text.toLowerCase()
-    if (normalized.includes('增持')) return '增持'
-    if (normalized.includes('减持')) return '减持'
-    if (normalized.includes('buy') || normalized.includes('买入')) return '买入'
-    if (normalized.includes('sell') || normalized.includes('卖出')) return '卖出'
-    if (normalized.includes('watch') || normalized.includes('观望')) return '观望'
-    if (normalized.includes('hold') || normalized.includes('持有')) return '持有'
-    return null
+/**
+ * Single canonical mapping from a decision string (Chinese or legacy English)
+ * to a display action. Previously duplicated in Analysis.tsx, Reports.tsx and
+ * DecisionCard.tsx with inconsistent semantics (Reports mapped BUY→add while
+ * DecisionCard mapped BUY→buy); all call sites now share this one function.
+ */
+export function parseDecisionAction(decision?: string | null): 'buy' | 'sell' | 'hold' | 'add' | 'reduce' | 'watch' | undefined {
+    if (!decision) return undefined
+    const d = decision.toUpperCase()
+    if (d.includes('SELL') || d.includes('卖出')) return 'sell'
+    if (d.includes('REDUCE') || d.includes('减持')) return 'reduce'
+    if (d.includes('WATCH') || d.includes('观望')) return 'watch'
+    if (d.includes('HOLD') || d.includes('持有')) return 'hold'
+    if (d.includes('ADD') || d.includes('增持')) return 'add'
+    if (d.includes('BUY') || d.includes('买入')) return 'buy'
+    return undefined
 }
 
 export function sanitizeReportMarkdown(text?: string | null): string {

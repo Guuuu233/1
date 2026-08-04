@@ -12,7 +12,7 @@ import RiskRadar from '@/components/RiskRadar'
 import KeyMetrics from '@/components/KeyMetrics'
 import { useAuthStore } from '@/stores/authStore'
 import { advanceProgress, getReportRunProgress } from '@/utils/progressFeedback'
-import { isLegacyEnglishReport } from '@/utils/reportText'
+import { isLegacyEnglishReport, parseDecisionAction } from '@/utils/reportText'
 
 type ProgressState = {
     status: 'idle' | 'loading' | 'success' | 'error'
@@ -28,9 +28,9 @@ const IDLE_PROGRESS: ProgressState = {
 
 const parseDecision = (decisionText?: string): { action: 'add' | 'reduce' | 'hold'; label: string } => {
     if (!decisionText) return { action: 'hold', label: '观望' }
-    const text = decisionText.toUpperCase()
-    if (text.includes('BUY') || text.includes('增持') || text.includes('买入')) return { action: 'add', label: '增持' }
-    if (text.includes('SELL') || text.includes('减持') || text.includes('卖出')) return { action: 'reduce', label: '减持' }
+    const action = parseDecisionAction(decisionText)
+    if (action === 'buy' || action === 'add') return { action: 'add', label: '增持' }
+    if (action === 'sell' || action === 'reduce') return { action: 'reduce', label: '减持' }
     return { action: 'hold', label: '持有' }
 }
 
