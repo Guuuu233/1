@@ -420,6 +420,14 @@ def _serialize_datetime_utc(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat()
 
 
+class _TokenDatetimeFieldsMixin:
+    """Shared JSON serializer for token ``created_at``/``last_used_at`` (audit P2-6)."""
+
+    @field_serializer("created_at", "last_used_at", when_used="json")
+    def serialize_token_datetimes(self, value: Optional[datetime]) -> Optional[str]:
+        return _serialize_datetime_utc(value)
+
+
 _cn_stock_map_loaded_at: float = 0  # timestamp of last load
 _STOCK_MAP_TTL = 7 * 86400  # 7 days
 
@@ -756,22 +764,8 @@ class KlineResponse(BaseModel):
 
 
 # Report API Models
-def _strict_unit_interval(value: Any, field_name: str) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise ValueError(f"{field_name} must be a finite number in [0, 1]")
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{field_name} must be a finite number in [0, 1]") from exc
-    if not math.isfinite(numeric) or not 0.0 <= numeric <= 1.0:
-        raise ValueError(f"{field_name} must be a finite number in [0, 1]")
-    return numeric
-
-
 def _strict_report_probability(value: Any) -> Any:
-    return _strict_unit_interval(value, "probability")
+    return report_service._strict_unit_interval(value, "probability")
 
 
 def _strict_report_confidence(value: Any) -> Any:
@@ -1182,7 +1176,7 @@ class PortfolioImportSyncRequest(BaseModel):
     auto_apply_scheduled: bool = Field(True, description="是否自动将持仓股票加入定时任务")
 
 
-class UserTokenResponse(BaseModel):
+class UserTokenResponse(_TokenDatetimeFieldsMixin, BaseModel):
     id: str
     name: str
     token: str
@@ -1192,12 +1186,8 @@ class UserTokenResponse(BaseModel):
 
     model_config = {"from_attributes": True}
 
-    @field_serializer("created_at", "last_used_at", when_used="json")
-    def serialize_token_datetimes(self, value: Optional[datetime]) -> Optional[str]:
-        return _serialize_datetime_utc(value)
 
-
-class UserTokenListItem(BaseModel):
+class UserTokenListItem(_TokenDatetimeFieldsMixin, BaseModel):
     """Token info for list endpoint — never exposes the full token."""
     id: str
     name: str
@@ -1206,10 +1196,6 @@ class UserTokenListItem(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
-
-    @field_serializer("created_at", "last_used_at", when_used="json")
-    def serialize_token_datetimes(self, value: Optional[datetime]) -> Optional[str]:
-        return _serialize_datetime_utc(value)
 
 
 class UserTokenCreateRequest(BaseModel):
