@@ -167,7 +167,7 @@ def test_T4_other_roles_no_injection():
     }
     factories = {name: MagicMock(return_value=name) for name in factory_names}
     conditional = SimpleNamespace(
-        should_continue_market=lambda *_: "done",
+        should_continue_analyst=lambda *_: "done",
         should_continue_debate=lambda *_: "Research Manager",
         should_continue_risk_analysis=lambda *_: "Risk Judge",
         should_revise_after_risk_judge=lambda *_: "END",
