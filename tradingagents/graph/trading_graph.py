@@ -49,6 +49,17 @@ from .reflection import Reflector
 from .signal_processing import SignalProcessor
 
 
+def _state_logging_enabled() -> bool:
+    """Whether full-state eval_results logging is enabled.
+
+    Disabled by default; opt in via TA_TRACE=1 (or true/yes/on). When enabled,
+    logs are written under TA_RESULTS_DIR (default ./results) instead of a
+    hardcoded eval_results/ directory.
+    """
+    raw = os.getenv("TA_TRACE")
+    return raw is not None and raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 class TradingAgentsGraph:
     """Main class that orchestrates the trading agents framework."""
 
@@ -459,12 +470,15 @@ class TradingAgentsGraph:
         }
         self.log_states_dict[str(trade_date)] = entry
 
-        directory = Path(f"eval_results/{ticker}/TradingAgentsStrategy_logs/")
+        if not _state_logging_enabled():
+            return
+        directory = (
+            Path(os.getenv("TA_RESULTS_DIR", "./results"))
+            / ticker
+            / "TradingAgentsStrategy_logs"
+        )
         directory.mkdir(parents=True, exist_ok=True)
-        with open(
-            f"eval_results/{ticker}/TradingAgentsStrategy_logs/dual_horizon_{trade_date}.json",
-            "w",
-        ) as f:
+        with open(directory / f"dual_horizon_{trade_date}.json", "w") as f:
             json.dump(entry, f, indent=4, ensure_ascii=False)
 
     def _log_state(self, trade_date, final_state):
@@ -523,15 +537,19 @@ class TradingAgentsGraph:
             "final_trade_decision": final_state["final_trade_decision"],
         }
 
-        # Save to file
+        # Save to file — only when state logging is explicitly enabled; writes
+        # land under TA_RESULTS_DIR instead of a hardcoded eval_results/ dir.
+        if not _state_logging_enabled():
+            return
         safe_ticker = self._safe_ticker(self.ticker or "unknown")
-        directory = Path(f"eval_results/{safe_ticker}/TradingAgentsStrategy_logs/")
+        directory = (
+            Path(os.getenv("TA_RESULTS_DIR", "./results"))
+            / safe_ticker
+            / "TradingAgentsStrategy_logs"
+        )
         directory.mkdir(parents=True, exist_ok=True)
 
-        with open(
-            f"eval_results/{safe_ticker}/TradingAgentsStrategy_logs/full_states_log_{trade_date}.json",
-            "w",
-        ) as f:
+        with open(directory / f"full_states_log_{trade_date}.json", "w") as f:
             json.dump(self.log_states_dict, f, indent=4)
 
     def reflect_and_remember(self, returns_losses):
