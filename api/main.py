@@ -764,6 +764,10 @@ class KlineResponse(BaseModel):
 
 
 # Report API Models
+# Re-export for backward compat: single implementation lives in report_service (audit P2-7).
+_strict_unit_interval = report_service._strict_unit_interval
+
+
 def _strict_report_probability(value: Any) -> Any:
     return report_service._strict_unit_interval(value, "probability")
 

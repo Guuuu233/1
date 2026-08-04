@@ -17,6 +17,7 @@ import io
 
 from tradingagents.agents.utils.agent_utils import (
     get_stock_data,
+    get_indicators,
     get_fundamentals,
     get_balance_sheet,
     get_cashflow,
