@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import traceback
+import unicodedata
 import urllib.parse
 from contextlib import asynccontextmanager
 from io import StringIO
@@ -374,6 +375,9 @@ _background_tasks: set = set()
 # ── A-share stock name → code cache ──────────────────────────────────────────
 _cn_stock_map: Optional[Dict[str, str]] = None  # name -> "XXXXXX.SH/SZ"
 _cn_stock_reverse_map: Optional[Dict[str, str]] = None  # code -> name
+# NFKC-normalized name → code view of the same cache (built lazily).
+_cn_stock_map_norm: Optional[Dict[str, str]] = None
+_cn_stock_map_norm_src: Optional[Dict[str, str]] = None  # source map this view is built from
 _cn_stock_map_lock = Lock()
 
 
@@ -438,12 +442,14 @@ def _load_cn_stock_map() -> Dict[str, str]:
     Uses akshare stock_info_a_code_name (static list, no anti-crawl) for A-shares,
     plus fund_name_em for ETFs/funds.
     """
-    global _cn_stock_map, _cn_stock_reverse_map, _cn_stock_map_loaded_at
+    global _cn_stock_map, _cn_stock_reverse_map, _cn_stock_map_norm, _cn_stock_map_norm_src, _cn_stock_map_loaded_at
     import time as _time
     now = _time.time()
     if _cn_stock_map is not None and (now - _cn_stock_map_loaded_at) > _STOCK_MAP_TTL:
         _cn_stock_map = None  # expire cache
         _cn_stock_reverse_map = None
+        _cn_stock_map_norm = None
+        _cn_stock_map_norm_src = None
     if _cn_stock_map is not None:
         return _cn_stock_map
     with _cn_stock_map_lock:
@@ -478,6 +484,8 @@ def _load_cn_stock_map() -> Dict[str, str]:
                 _log(f"[StockMap] ETF/fund load skipped: {fe}")
             _cn_stock_map = result
             _cn_stock_reverse_map = {code: name for name, code in result.items()}
+            _cn_stock_map_norm = None  # lazily rebuilt via _get_normalized_stock_map
+            _cn_stock_map_norm_src = None
             _cn_stock_map_loaded_at = now
             _log(f"[StockMap] Loaded {stock_count} stocks + {fund_count} ETFs/funds = {len(result)} total.")
         except Exception as e:
@@ -506,24 +514,100 @@ def _get_reverse_stock_map_cached_only() -> Dict[str, str]:
     return dict(_cn_stock_reverse_map)
 
 
-def _search_cn_stock_by_name(query: str) -> Optional[str]:
-    """Look up A-share stock code by company name (exact then partial match)."""
-    query = query.strip()
-    if not query:
-        return None
+def _get_normalized_stock_map() -> Dict[str, str]:
+    """NFKC-normalized name→code view of the stock map, cached per source map.
+
+    A-share names may carry a full-width share-class letter (京东方Ａ); all
+    matching in ``_search_cn_stock_by_name`` runs on this normalized view so a
+    half-width query (京东方A) still hits. The view is rebuilt whenever the
+    source ``_cn_stock_map`` object is replaced (TTL refresh or test seeding).
+    """
     stock_map = _load_cn_stock_map()
-    # 1. Exact match
-    if query in stock_map:
-        return stock_map[query]
-    # 2. Partial match: query is substring of a stock name or vice versa
-    candidates = [(name, code) for name, code in stock_map.items()
-                  if query in name or name in query]
+    global _cn_stock_map_norm, _cn_stock_map_norm_src
+    if _cn_stock_map_norm is None or _cn_stock_map_norm_src is not stock_map:
+        _cn_stock_map_norm = {
+            unicodedata.normalize("NFKC", name): code
+            for name, code in stock_map.items()
+        }
+        _cn_stock_map_norm_src = stock_map
+    return _cn_stock_map_norm
+
+
+_CN_STOCK_INTENT_PREFIXES = (
+    "帮我分析一下", "帮我分析", "请分析一下", "帮忙分析一下", "帮我看看",
+    "帮忙看看", "请分析", "分析一下", "帮我查一下", "查一下", "解读一下",
+    "复盘一下", "分析", "解读", "复盘", "看看", "看下", "关注", "推荐",
+    "查询", "请问", "请", "我想", "我要", "给我", "帮忙",
+)
+_CN_STOCK_INTENT_SUFFIXES = (
+    "怎么样呢", "怎么样啊", "走势怎么样", "如何看待", "怎么样", "怎么看",
+    "走势如何", "如何呢", "如何", "呢", "吧", "啊",
+)
+_CN_STOCK_STRIP_MAX_ROUNDS = 5
+
+
+def _strip_cn_stock_intent_words(text: str) -> str:
+    """Strip leading request verbs / trailing interrogative particles.
+
+    Only used as a last resort for whole-sentence queries (LLM-failure fallback,
+    e.g. "分析京东方" → "京东方"). Conservative on purpose: only unambiguous
+    request words are stripped, never nouns/adjectives that could begin a company
+    name (e.g. 今天国际 must not lose its 今天 prefix).
+    """
+    s = text.strip()
+    for _ in range(_CN_STOCK_STRIP_MAX_ROUNDS):
+        before = s
+        for prefix in _CN_STOCK_INTENT_PREFIXES:
+            if s.startswith(prefix):
+                s = s[len(prefix):].lstrip(" ，,、\t")
+                break
+        for suffix in _CN_STOCK_INTENT_SUFFIXES:
+            if s.endswith(suffix):
+                s = s[:-len(suffix)].rstrip(" ，,、\t")
+                break
+        s = s.strip()
+        if s == before:
+            break
+    return s
+
+
+def _match_cn_stock_name(norm_map: Dict[str, str], norm_query: str) -> Optional[str]:
+    """Exact → substring → shortest-name scoring, all on NFKC-normalized text."""
+    if norm_query in norm_map:
+        return norm_map[norm_query]
+    candidates = [(name, code) for name, code in norm_map.items()
+                  if norm_query in name or name in norm_query]
     if len(candidates) == 1:
         return candidates[0][1]
-    # 3. If multiple partial matches, pick the one with shortest name (closest match)
+    # Multiple partial matches: pick the one with shortest name (closest match).
     if candidates:
         candidates.sort(key=lambda x: len(x[0]))
         return candidates[0][1]
+    return None
+
+
+def _search_cn_stock_by_name(query: str) -> Optional[str]:
+    """Look up A-share stock code by company name (exact then partial match).
+
+    Matching runs on NFKC-normalized text so a full-width share-class letter in
+    the map (京东方Ａ) matches a half-width query (京东方A) and vice versa. As a
+    last resort for whole sentences (LLM-failure fallback passes the raw user
+    message), request intent words are stripped and the remainder is matched.
+    """
+    query = query.strip()
+    if not query:
+        return None
+    norm_map = _get_normalized_stock_map()
+    norm_query = unicodedata.normalize("NFKC", query)
+    hit = _match_cn_stock_name(norm_map, norm_query)
+    if hit:
+        return hit
+    # 原文兜底：剥离常见意图词后再匹配（"分析京东方" → "京东方"）。
+    stripped = _strip_cn_stock_intent_words(norm_query)
+    if stripped and stripped != norm_query:
+        hit = _match_cn_stock_name(norm_map, stripped)
+        if hit:
+            return hit
     return None
 
 
