@@ -35,12 +35,23 @@ DEFAULT_CONFIG = {
     "investoday_base_url": (
         os.getenv("INVESTODAY_BASE_URL", "https://data-api.investoday.net/data").strip()
     ),
+    "fuyao_api_key": os.getenv("FUYAO_API_KEY", "").strip(),
+    "fuyao_base_url": (
+        os.getenv("FUYAO_BASE_URL", "https://fuyao.aicubes.cn").strip()
+    ),
     "data_vendors": {
-        "core_stock_apis": "cn_akshare,cn_baostock,cn_investoday,yfinance",
+        "core_stock_apis": "cn_akshare,cn_baostock,cn_investoday,yfinance,cn_fuyao",
         "technical_indicators": "cn_akshare,cn_baostock,cn_investoday,yfinance",
-        "fundamental_data": "cn_akshare,cn_baostock,cn_investoday,yfinance",
+        "fundamental_data": "cn_fuyao,cn_akshare,cn_baostock,cn_investoday,yfinance",
         "news_data": "cn_akshare,cn_baostock,cn_investoday,yfinance",
-        "realtime_data": "cn_akshare,cn_investoday",
+        "realtime_data": "cn_akshare,cn_investoday,cn_fuyao",
+        "cn_market_data": "cn_akshare,cn_fuyao",
     },
-    "tool_vendors": {},
+    "tool_vendors": {
+        "get_zt_pool": "cn_akshare,cn_fuyao",
+        "get_lhb_detail": "cn_akshare,cn_fuyao",
+        "get_board_fund_flow": "cn_akshare",
+        "get_individual_fund_flow": "cn_akshare",
+        "get_hot_stocks_xq": "cn_akshare",
+    },
 }

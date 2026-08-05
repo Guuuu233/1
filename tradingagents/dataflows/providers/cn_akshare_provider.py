@@ -1428,17 +1428,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
             )
             return res.to_prompt()
         except Exception as exc:
-            res = DataResult(
-                ok=False,
-                data=None,
-                error=(
-                    f"龙虎榜数据获取失败：{em_error}；"
-                    f"新浪备用源失败：{type(exc).__name__}: {exc}"
-                ),
-                source=source_name,
-                title=title,
+            # 东财 + 新浪备用源均失败：显式 VendorFail，链路继续到备用 vendor
+            # （如 cn_fuyao），而不是用纯字符串把失败伪装成成功命中。
+            return VendorFail(
+                f"龙虎榜数据获取失败：{em_error}；"
+                f"新浪备用源失败：{type(exc).__name__}: {exc}"
             )
-            return res.to_prompt()
 
     def get_zt_pool(self, date: str) -> str:
         """获取涨停板情绪池，反映市场整体情绪温度。
@@ -1487,14 +1482,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
             _fetch_one, request_date, max_back=5, start_offset=0
         )
         if not result.ok:
-            res = DataResult(
-                ok=False,
-                data=None,
-                error=f"涨停板情绪池数据获取失败：{result.error}",
-                source=source_name,
-                title=title,
-            )
-            return res.to_prompt()
+            # 东财（及内部备用）整体失败：显式 VendorFail，链路继续到备用 vendor
+            # （如 cn_fuyao），而不是用纯字符串把失败伪装成成功命中。
+            return VendorFail(f"涨停板情绪池数据获取失败：{result.error}")
 
         header = result.date_header()
         msg = f"{header}\n{result.data}" if header else str(result.data)

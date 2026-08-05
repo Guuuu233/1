@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -203,6 +204,34 @@ def _fetch_cn_trade_dates_from_akshare() -> list[date]:
     return dates
 
 
+def _fetch_cn_trade_dates_from_fuyao() -> list[date]:
+    """同花顺 fuyao 交易日历（近一年）作 akshare 失败后的在线对照/备用源。
+
+    仅在配置了 ``FUYAO_API_KEY`` 时尝试；失败抛异常，由调用方决定兜底。
+    近一年窗口不足以覆盖所有历史查询，因此仅作 fallback，不替代主源。
+    """
+    api_key = os.getenv("FUYAO_API_KEY", "").strip()
+    if not api_key:
+        raise TradeCalendarUnavailableError(
+            "交易日历不可用：未配置 FUYAO_API_KEY（无 fuyao 在线对照源）"
+        )
+    from .providers.cn_fuyao_provider import fetch_trading_days_ths
+
+    raw = fetch_trading_days_ths(api_key)
+    dates = sorted(
+        {
+            datetime.strptime(d, "%Y%m%d").date()
+            for d in raw
+            if re.fullmatch(r"\d{8}", d)
+        }
+    )
+    if not dates:
+        raise TradeCalendarUnavailableError(
+            "交易日历不可用：fuyao 交易日历无有效日期"
+        )
+    return dates
+
+
 def _load_cn_trade_dates() -> tuple[list[date], set[date]]:
     """Load/cached CN trading dates. On total failure returns empty containers.
 
@@ -219,10 +248,14 @@ def _load_cn_trade_dates() -> tuple[list[date], set[date]]:
     try:
         dates = _fetch_cn_trade_dates_from_akshare()
     except Exception:
-        # Keep serving a previously successful calendar past TTL if present.
-        if cached_dates is not None:
-            return cached_dates, _TRADE_DATES_CACHE["dates_set"]
-        return [], set()
+        try:
+            dates = _fetch_cn_trade_dates_from_fuyao()
+        except Exception as exc:
+            logger.debug("fuyao trading-days fallback unavailable: %s", exc)
+            # Keep serving a previously successful calendar past TTL if present.
+            if cached_dates is not None:
+                return cached_dates, _TRADE_DATES_CACHE["dates_set"]
+            return [], set()
 
     dates_set = set(dates)
     _TRADE_DATES_CACHE["dates"] = dates
