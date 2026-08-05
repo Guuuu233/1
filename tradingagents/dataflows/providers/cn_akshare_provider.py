@@ -156,6 +156,38 @@ class _AkshareLock:
 AKSHARE_CALL_LOCK = _AkshareLock(total=5, scheduled_max=3)
 
 
+# ── 新浪历史资金流（Source 2.5）─────────────────────────────────────────────
+# akshare 无此接口封装，直调新浪 quotes_service JSON API。历史分析日东财被限流时
+# 用它提供逐日资金流；opendate <= curr_date 过滤，防前视纪律不变。
+_SINA_HIST_FUND_FLOW_URL = (
+    "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+    "MoneyFlow.ssl_qsfx_zjlrqs?page=1&num={num}&sort=opendate&asc=0&daima={daima}"
+)
+_SINA_HIST_FUND_FLOW_HEADERS = {
+    "Referer": "https://finance.sina.com.cn/",
+    "User-Agent": "Mozilla/5.0",
+}
+_SINA_HIST_FUND_FLOW_TIMEOUT = 10  # 秒
+_SINA_HIST_FUND_FLOW_FETCH = 20  # 请求行数：取足够多，再按 curr_date 截断
+_SINA_HIST_FUND_FLOW_SHOW = 5  # 展示最近 N 日（与东财版“近5日”对齐）
+
+
+def _sina_amount_yi(value) -> str:
+    """Format a raw-yuan amount as 亿元 (2 dp); empty/invalid → ''."""
+    f = safe_float(value)
+    if f is None:
+        return ""
+    return f"{round(f / 1e8, 2):.2f}"
+
+
+def _sina_ratio_pct(value) -> str:
+    """Format a ratio fraction as a percent string; empty/invalid → ''."""
+    f = safe_float(value)
+    if f is None:
+        return ""
+    return f"{round(f * 100, 2):.2f}%"
+
+
 class CnAkshareProvider(BaseMarketDataProvider):
     """A-share provider backed by AkShare."""
 
@@ -1253,10 +1285,22 @@ class CnAkshareProvider(BaseMarketDataProvider):
         except Exception as exc:
             errors.append(f"stock_individual_fund_flow: {type(exc).__name__}")
 
-        # Source 2: 新浪即时截面（当日快照，无历史序列）
+        # Source 2.5: 新浪历史资金流（新增）。历史分析日东财被限流时，
+        # 用新浪逐日序列按 curr_date 截断（防前视纪律不变）。
         if is_historical_analysis_date(curr_date):
+            try:
+                hist_text = self._fetch_sina_historical_fund_flow(
+                    symbol, curr_date, cutoff
+                )
+                if hist_text is not None:
+                    return hist_text
+                errors.append(
+                    "sina historical fund flow: no rows on or before curr_date"
+                )
+            except Exception as exc:
+                errors.append(f"sina historical fund flow: {type(exc).__name__}")
             return (
-                f"【数据获取失败】个股资金流向东财接口失败且新浪备用源为当日快照，"
+                f"【数据获取失败】个股资金流向东财与新浪历史接口均失败，"
                 f"历史日期 {curr_date} 下无法截断，{symbol} 本项不可用。"
                 f"（{'；'.join(errors)}）"
             )
@@ -1289,6 +1333,117 @@ class CnAkshareProvider(BaseMarketDataProvider):
             errors.append(f"stock_fund_flow_individual: {type(exc).__name__}")
 
         return f"个股资金流向数据获取失败（东财/新浪均失败：{'；'.join(errors)}）"
+
+    def _fetch_sina_historical_fund_flow(
+        self, symbol: str, curr_date: str, cutoff
+    ) -> str | None:
+        """Source 2.5: fetch and render the Sina historical per-day money flow.
+
+        Direct requests call (akshare has no wrapper for this endpoint) with the
+        required Referer/User-Agent and a 10s timeout. Rows are filtered to
+        ``opendate <= curr_date`` (anti-lookahead unchanged) and the latest N
+        days are rendered EM-style. Returns ``None`` when nothing usable remains
+        on/before ``curr_date``; raises on network/HTTP/parse failure so the
+        caller records an explicit error.
+        """
+        import json
+        import requests as _requests
+
+        url = _SINA_HIST_FUND_FLOW_URL.format(
+            num=_SINA_HIST_FUND_FLOW_FETCH,
+            daima=self._sina_symbol(symbol),
+        )
+        resp = _requests.get(
+            url,
+            headers=_SINA_HIST_FUND_FLOW_HEADERS,
+            timeout=_SINA_HIST_FUND_FLOW_TIMEOUT,
+        )
+        resp.raise_for_status()
+        payload = json.loads(resp.text or "[]")
+        if not isinstance(payload, list):
+            return None
+        kept: list[dict] = []
+        cutoff_ts = pd.Timestamp(cutoff)
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            day = str(row.get("opendate", "")).strip()
+            if not day:
+                continue
+            try:
+                day_ts = pd.Timestamp(day)
+            except Exception:
+                continue
+            if pd.notna(day_ts) and day_ts <= cutoff_ts:
+                kept.append(row)
+        if not kept:
+            return None
+        kept.sort(key=lambda r: str(r.get("opendate", "")))
+        return self._format_sina_historical_fund_flow(kept, symbol, curr_date)
+
+    def _format_sina_historical_fund_flow(
+        self, rows: list[dict], symbol: str, curr_date: str
+    ) -> str | None:
+        """Render Sina historical rows as an Eastmoney-aligned per-day table.
+
+        Maps netamount/r0_net/ratioamount (plus r1_net..r4_net when present) to
+        the labels the Eastmoney table uses; amounts are shown in 亿元. When the
+        interface lacks the sub-order breakdown, that is stated explicitly.
+        """
+        records: list[dict] = []
+        has_sub_orders = False
+        for row in rows:
+            date = str(row.get("opendate", "")).strip()
+            if not date:
+                continue
+            rec = {
+                "日期": date,
+                "净流入额(亿)": _sina_amount_yi(row.get("netamount")),
+                "主力净流入(亿)": _sina_amount_yi(row.get("r0_net")),
+                "净占比": _sina_ratio_pct(row.get("ratioamount")),
+                "超大单净流入(亿)": "",
+                "大单净流入(亿)": "",
+                "中单净流入(亿)": "",
+                "小单净流入(亿)": "",
+            }
+            for key, label in (
+                ("r1_net", "超大单净流入(亿)"),
+                ("r2_net", "大单净流入(亿)"),
+                ("r3_net", "中单净流入(亿)"),
+                ("r4_net", "小单净流入(亿)"),
+            ):
+                val = row.get(key)
+                if val is not None and str(val).strip():
+                    rec[label] = _sina_amount_yi(val)
+                    has_sub_orders = True
+            records.append(rec)
+        if not records:
+            return None
+        df = pd.DataFrame(records)
+        if not has_sub_orders:
+            df = df.drop(
+                columns=[
+                    "超大单净流入(亿)",
+                    "大单净流入(亿)",
+                    "中单净流入(亿)",
+                    "小单净流入(亿)",
+                ]
+            )
+        df_recent = chronological(
+            take_latest(df, "日期", _SINA_HIST_FUND_FLOW_SHOW), "日期"
+        )
+        if df_recent is None or df_recent.empty:
+            return None
+        latest_day = pd.to_datetime(df_recent["日期"], errors="coerce").max()
+        latest_str = latest_day.date().isoformat() if pd.notna(latest_day) else curr_date
+        header = (
+            f"【备用数据源：新浪历史】{symbol} 近{len(df_recent)}日主力资金净流向"
+            f"（截至于 {curr_date}，最新数据日 {latest_str}，单位：亿元）：\n"
+            f"{df_recent.to_string(index=False)}"
+        )
+        if not has_sub_orders:
+            header += "\n（新浪历史接口未提供超大单/大单/中单/小单明细）"
+        return header
 
     def _format_individual_fund_flow_em(
         self,
