@@ -157,3 +157,29 @@ def test_create_report_persists_new_structured_fields():
         assert persisted.to_dict()["not_applicable"] is True
     finally:
         db.close()
+
+
+def test_create_report_strips_thinking_traces_before_persist():
+    db = _make_session()
+    try:
+        report = report_service.create_report(
+            db=db,
+            symbol="600206.SH",
+            trade_date="2026-08-05",
+            decision="BUY",
+            result_data={
+                "final_trade_decision": "Let me think about this.\nDecision: BUY",
+                "volume_price_report": "Hmm, wait.\nHigh node at 11.80",
+                "trader_investment_plan": "I think the entry is at 11.40.\nPlan: buy.",
+            },
+        )
+
+        persisted = db.query(ReportDB).filter(ReportDB.id == report.id).one()
+        assert "Let me think" not in (persisted.final_trade_decision or "")
+        assert "Decision: BUY" in (persisted.final_trade_decision or "")
+        assert "Hmm" not in (persisted.volume_price_report or "")
+        assert "High node at 11.80" in (persisted.volume_price_report or "")
+        assert "I think" not in (persisted.trader_investment_plan or "")
+        assert "Plan: buy." in (persisted.trader_investment_plan or "")
+    finally:
+        db.close()

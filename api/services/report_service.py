@@ -17,6 +17,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session, load_only
 
 from api.database import ReportDB
+from tradingagents.llm_clients.thinking_cleaner import clean_report_result_data
 
 
 REPORT_SUMMARY_COLUMNS = (
@@ -780,6 +781,10 @@ def create_report(
     """Create or finalize a report."""
     validated_probability = _coerce_probability_value(probability)
     canonical_result_data = canonicalize_report_result_data(result_data)
+    # Bug D: strip AI thinking monologue from report sections before they are
+    # persisted, so neither the DB text columns nor result_data carry reasoning
+    # filler (e.g. "Let me think", "Hmm, wait,").
+    canonical_result_data = clean_report_result_data(canonical_result_data)
     canonical_risk_items = _canonicalize_structured_items(risk_items, RiskItemSchema, "risk_items")
     canonical_key_metrics = _canonicalize_structured_items(key_metrics, KeyMetricSchema, "key_metrics")
     resolved = resolve_report_fields(
