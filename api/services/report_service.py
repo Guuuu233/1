@@ -480,6 +480,7 @@ def extract_structured_data(
             "提取要求（请确保输出为有效的 JSON 对象，不要包裹在 markdown 代码块中）：\n"
             "1. decision：决策方向关键词（BUY/SELL/HOLD 或 增持/减持/持有）\n"
             "2. confidence：整体置信度（0-100 整数），若文中未明确给出则为 null；"
+            "若原文为 x/75 上限格式（如“置信度：62/75”），取分子（62）作为置信度；"
             "禁止把 confidence 换算为 probability 或代填 probability 字段\n"
             "3. target_price / stop_loss_price：纯数字，若未提及则为 null\n"
             "4. risks：最多5条主要风险，每条包含名称（15字内）、等级（high/medium/low）、一句话说明\n"
@@ -507,10 +508,21 @@ def extract_structured_data(
 
 # ─── Fallback regex extraction (used when LLM extraction unavailable) ─────────
 
+# Confidence appears both as a percent ("置信度：55%") and as an upper-bound
+# fraction ("置信度：62/75" — the 3000-char prompt caps confidence at 75, so the
+# LLM emits the numerator/denominator). Match both; take the numerator.
+_CONFIDENCE_PATTERNS = (
+    r'置信度[:：]\s*(\d+)%',
+    r'confidence[:：]\s*(\d+)%',
+    r'置信度[:：]\s*(\d+)\s*[/／]\s*\d+',
+    r'confidence[:：]\s*(\d+)\s*[/／]\s*\d+',
+)
+
+
 def _extract_confidence_regex(text: Optional[str]) -> Optional[int]:
     if not text:
         return None
-    for pattern in (r'置信度[:：]\s*(\d+)%', r'confidence[:：]\s*(\d+)%'):
+    for pattern in _CONFIDENCE_PATTERNS:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
             v = int(m.group(1))
@@ -590,7 +602,12 @@ def resolve_report_fields(
     if confidence_override is not None:
         confidence = _coerce_confidence_value(confidence_override)
     else:
+        # Confidence often lives in trader_investment_plan rather than
+        # final_trade_decision (600206.SH repro); fall back just like
+        # target_price / stop_loss below.
         confidence = _extract_confidence_regex(final_trade_decision)
+        if confidence is None:
+            confidence = _extract_confidence_regex(trader_investment_plan)
 
     target_price = target_price_override if target_price_override is not None else _extract_price_regex(final_trade_decision, "target")
     if target_price is None:
