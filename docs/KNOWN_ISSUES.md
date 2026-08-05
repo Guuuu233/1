@@ -211,3 +211,33 @@ report that is already hundreds of KB.
 Retrieve the text via `custom_prompt_service.resolve_role_prompt()` /
 `resolve_all_roles_prompts()` — do not re-concatenate global + override at the call
 site, or the two implementations will drift.
+
+---
+
+## 同花顺（fuyao.aicubes.cn）数据源接入
+
+**Status:** DAV-83 已接入；存在若干已知边界。  
+**Discovered:** 2026-08-05
+
+### 接入情况
+
+- 新增 `cn_fuyao` provider：行情快照、历史日 K（前复权）、三大报表、财务指标（五类能力）、
+  涨跌停池/连板天梯、龙虎榜、交易日历。
+- 路由：`fundamental_data` 以 `cn_fuyao` 为主源（失败降级现有弱源）；`get_zt_pool` /
+  `get_lhb_detail` 以东财为主、`cn_fuyao` 备用；`core_stock_apis` / `realtime_data` 在
+  `cn_fuyao` 提供第三备用；交易日历在 AKShare 不可用时以 fuyao 近一年日历在线对照。
+- 错误码映射：`1001~1004` 参数错误显式报错；`2001/2003` Key 无效显式报错；
+  `3001/3002` 标的不存在/数据未就绪 → `VendorEmpty`；`4001` 频率超限退避重试后
+  → `VendorFail`；`5001~5003` 服务端错误 → `VendorFail`。
+
+### 已知边界
+
+- 三大报表按 `period_end` 落在 `[curr_date-8y, curr_date]` 区间取数，未做「披露日」级
+  前视剔除（与 Investoday 现有实现一致）；对临近披露窗口的极端历史回测可能存在轻微前视。
+- 财务指标 `get_fundamentals` 的报告期（`yyyy-N`）按披露截止日启发式选取
+  （一季报 4/30、中报 8/31、三季报 10/31、年报次年 4/30），非逐票公告日精确映射。
+- 龙虎榜 `date` 仅支持一年内（接口约束）；超出返回参数错误。
+- 交易日历 fallback 依赖 `FUYAO_API_KEY`；近一年窗口不足以覆盖更早历史查询。
+- 涨跌停/龙虎榜备用链依赖 `cn_akshare.get_zt_pool` / `get_lhb_detail` 在东财失败时返回
+  `VendorFail`（已改为显式 VendorFail），否则纯字符串会截断 vendor 链。
+

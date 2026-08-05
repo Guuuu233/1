@@ -105,6 +105,7 @@ Web 界面「设置」里点"获取模型列表"时，后端会从 Base URL 拉�
 - **Docker（容器内访问宿主机代理）**：设置 `TA_MODELS_FETCH_ALLOWLIST=host.docker.internal:8317`
 - **裸机（本机直接跑，代理在本机）**：设置 `TA_MODELS_FETCH_ALLOWLIST=127.0.0.1:8317`
 - **远程/公网代理**：设置 `TA_MODELS_FETCH_ALLOWLIST=<远程域名>:<端口>`
+- **同花顺数据源**：如将 `fuyao.aicubes.cn` 配为 OpenAI 兼容 Base URL（`TA_BASE_URL`），需加入白名单：`TA_MODELS_FETCH_ALLOWLIST=fuyao.aicubes.cn:443`。数据源本身的抓取不受该白名单限制（见下节数据源）。
 
 注意事项：
 

@@ -107,6 +107,8 @@
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
+| `FUYAO_API_KEY` | （空） | 同花顺金融数据 API（fuyao.aicubes.cn）key，财务数据主源 + 涨跌停/龙虎榜备用源。到 https://fuyao.aicubes.cn/ 登录签发 |
+| `FUYAO_BASE_URL` | `https://fuyao.aicubes.cn` | 同花顺 API 服务地址 |
 | `XQ_A_TOKEN` | （空） | 雪球 token，提升 A 股行情/财务数据稳定性 |
 | `INVESTODAY_API_KEY` | （空） | Investoday 数据服务 key |
 | `INVESTODAY_BASE_URL` | `https://data-api.investoday.net/data` | Investoday 服务地址 |
