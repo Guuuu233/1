@@ -10,6 +10,7 @@ import remarkGfm from 'remark-gfm'
 import { api, isNotFoundError } from '@/services/api'
 import { useAnalysisStore } from '@/stores/analysisStore'
 import {
+    classifyDbReportStatus,
     classifyRecoveredJobStatus,
     DEFAULT_OVERTIME_NOTICE,
     getJobLifecycleUpdate,
@@ -24,6 +25,7 @@ import type {
     AnalysisReport,
     ReportChunkEvent,
     Report,
+    ReportDetail,
 } from '@/types'
 
 interface ChatCopilotPanelProps {
@@ -211,6 +213,66 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
         signal.addEventListener('abort', onAbort, { once: true })
     })
 
+    // DB reports 表持久化了任务的最终状态（report.id == job_id）。当内存 job
+    // 丢失（404）或线程挂起（running 停滞）时，回查落库报告即可解锁前端，
+    // 无需等到 5 分钟轮询上限。返回 true 表示已按落库状态收尾。
+    const recoverFromDbReport = async (jobId: string, signal: AbortSignal): Promise<boolean> => {
+        let dbReport: ReportDetail
+        try {
+            dbReport = await api.getReportByJob(jobId)
+        } catch (error) {
+            if (signal.aborted) return false
+            if (isNotFoundError(error)) return false
+            console.warn('DB 报告状态回查失败，将继续依赖任务轮询:', error)
+            return false
+        }
+        if (signal.aborted) return false
+
+        const disposition = classifyDbReportStatus(dbReport)
+        if (disposition === 'completed') {
+            const result = dbReport.result_data ?? {
+                symbol: dbReport.symbol,
+                trade_date: dbReport.trade_date,
+                decision: dbReport.decision,
+                direction: dbReport.direction,
+            } as AnalysisReport
+
+            setReport(result)
+            const symbol = result.symbol
+            if (symbol) {
+                setCurrentSymbol(symbol)
+                onSymbolDetected(symbol)
+            }
+            setStructuredData({
+                riskItems: dbReport.risk_items,
+                keyMetrics: dbReport.key_metrics,
+                confidence: dbReport.confidence,
+                targetPrice: dbReport.target_price,
+                stopLoss: dbReport.stop_loss_price,
+            })
+            pendingAgentMsgIdsRef.current = new Set()
+            forceUpdate(n => n + 1)
+            markAgentMessagesComplete()
+            pushAssistant(
+                `**分析完成（已从中断连接恢复）**\n\n方向倾向：**${String(result.direction || '未知')}**\n\n执行动作：**${String(dbReport.decision || result.decision || 'HOLD')}**\n\n> 免责声明：以上内容由模型基于公开数据与规则生成，仅供研究参考，不构成任何投资建议或收益承诺。`
+            )
+            setCurrentHorizon(null)
+            setIsAnalyzing(false)
+            setAnalysisRunState('completed')
+            return true
+        }
+
+        if (disposition === 'failed') {
+            pushAssistant(`分析失败：${dbReport.error || 'unknown error'}`)
+            setCurrentHorizon(null)
+            setIsAnalyzing(false)
+            setAnalysisRunState('failed', dbReport.error || 'unknown error')
+            return true
+        }
+
+        return false
+    }
+
     const recoverInterruptedJob = async (signal: AbortSignal) => {
         const { currentJobId } = useAnalysisStore.getState()
         if (!currentJobId) return false
@@ -287,12 +349,16 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
                 if (status.overtime || status.status === 'failed') {
                     setAnalysisOvertimeNotice(DEFAULT_OVERTIME_NOTICE)
                 }
+
+                // 内存 job 仍 running（可能线程挂起但报告已落库）：回查 DB 报告解锁
+                if (await recoverFromDbReport(currentJobId, signal)) return true
             } catch (error) {
                 if (signal.aborted) return false
                 // Job no longer exists (e.g. server restarted and dropped the
-                // in-memory job store). Stop polling instead of retrying a
-                // resource that can never come back.
+                // in-memory job store). Check whether the persistent report
+                // already reached a terminal state before giving up.
                 if (isNotFoundError(error)) {
+                    if (await recoverFromDbReport(currentJobId, signal)) return true
                     pushAssistant(JOB_NOT_FOUND_MESSAGE)
                     setCurrentHorizon(null)
                     setIsAnalyzing(false)

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+    classifyDbReportStatus,
     classifyRecoveredJobStatus,
     getJobLifecycleUpdate,
     hasRecoveryPollingReachedLimit,
@@ -40,9 +41,28 @@ describe('getJobLifecycleUpdate', () => {
 })
 
 describe('hasRecoveryPollingReachedLimit', () => {
-    it('stops recovery polling after two hours of three-second retries', () => {
+    it('caps recovery polling at ~5 minutes of three-second retries (not two hours)', () => {
+        // 5 * 60 / 3 = 100 attempts → a 5-minute window instead of the old 2h.
+        expect(RECOVERY_POLL_MAX_ATTEMPTS).toBe(100)
         expect(hasRecoveryPollingReachedLimit(RECOVERY_POLL_MAX_ATTEMPTS - 1)).toBe(false)
         expect(hasRecoveryPollingReachedLimit(RECOVERY_POLL_MAX_ATTEMPTS)).toBe(true)
+    })
+})
+
+describe('classifyDbReportStatus', () => {
+    it('unlocks recovery when the persisted report reached a terminal state', () => {
+        expect(classifyDbReportStatus({ status: 'completed' })).toBe('completed')
+        expect(classifyDbReportStatus({ status: 'failed', error: 'model crashed' })).toBe('failed')
+    })
+
+    it('keeps polling while the persisted report is still active', () => {
+        expect(classifyDbReportStatus({ status: 'running' })).toBe('active')
+        expect(classifyDbReportStatus({ status: 'pending' })).toBe('active')
+    })
+
+    it('reports not-found when no persisted report exists', () => {
+        expect(classifyDbReportStatus(null)).toBe('not_found')
+        expect(classifyDbReportStatus(undefined)).toBe('not_found')
     })
 })
 

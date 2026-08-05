@@ -133,6 +133,17 @@ class ApiService {
         return this.request<ReportDetail>(`/v1/reports/${reportId}`)
     }
 
+    /**
+     * Fetch the persisted report row for a job. The backend keys the reports
+     * table by job id (report.id == job_id), so this doubles as the
+     * "report status by job id" lookup used during interrupted-job recovery:
+     * it lets the frontend unlock when the in-memory job is gone or stuck
+     * running but the report already reached a terminal state.
+     */
+    async getReportByJob(jobId: string): Promise<ReportDetail> {
+        return this.getReport(jobId)
+    }
+
     async getLatestAnnouncement(): Promise<Announcement | null> {
         const data = await this.request<LatestAnnouncementResponse>('/v1/announcements/latest')
         return data.announcement
