@@ -413,7 +413,7 @@ def _fetch_realtime_context(ticker: str, trade_date: str) -> Dict[str, Any]:
             )
 
         source = quote.get("source")
-        if source not in {"sina", "eastmoney", "investoday"}:
+        if source not in {"sina", "eastmoney", "investoday", "fuyao"}:
             return _unavailable_realtime_context(
                 retrieved_at, "实时行情源返回 source 字段结构异常"
             )

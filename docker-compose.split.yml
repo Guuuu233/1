@@ -38,6 +38,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       TA_DISABLE_SCHEDULER: "1"
       TA_APP_SECRET_KEY: ${TA_APP_SECRET_KEY:?请先设置 TA_APP_SECRET_KEY，如 export TA_APP_SECRET_KEY=$(openssl rand -base64 32)}
+      FUYAO_API_KEY: ${FUYAO_API_KEY}
+      FUYAO_BASE_URL: ${FUYAO_BASE_URL}
       # 常用可选变量（取消注释并填值；完整清单见 guide/configuration.md）：
       # TA_API_KEY: "你的 LLM API Key"
       # TA_BASE_URL: "https://api.openai.com/v1"
@@ -60,6 +62,8 @@ services:
       TA_DISABLE_API: "1"
       SCHEDULER_CONCURRENCY: "3"
       TA_APP_SECRET_KEY: ${TA_APP_SECRET_KEY:?请先设置 TA_APP_SECRET_KEY，如 export TA_APP_SECRET_KEY=$(openssl rand -base64 32)}
+      FUYAO_API_KEY: ${FUYAO_API_KEY}
+      FUYAO_BASE_URL: ${FUYAO_BASE_URL}
 
 volumes:
   redis-data:

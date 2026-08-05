@@ -111,6 +111,54 @@ def test_normalize_hard_fails_when_calendar_unavailable():
     assert "交易日历不可用" in str(ei.value)
 
 
+# ── 日历 fallback：akshare 失败 → fuyao 对照 → 缓存兜底 ───────────────
+
+
+def test_calendar_falls_back_to_fuyao_when_akshare_fails():
+    """akshare 交易日历失败 → 用 fuyao 近一年日历作在线对照，并写入缓存。"""
+    fuyao_dates = [date(2026, 8, 3), date(2026, 8, 4), date(2026, 8, 5)]
+    with patch.object(
+        tc, "_fetch_cn_trade_dates_from_akshare", side_effect=RuntimeError("akshare down")
+    ), patch.object(
+        tc, "_fetch_cn_trade_dates_from_fuyao", return_value=fuyao_dates
+    ):
+        dates, dates_set = tc._load_cn_trade_dates()
+    assert dates == fuyao_dates
+    assert dates_set == set(fuyao_dates)
+    assert tc._TRADE_DATES_CACHE["dates"] == fuyao_dates
+
+
+def test_calendar_uses_cached_dates_when_akshare_and_fuyao_fail():
+    """akshare 与 fuyao 均失败 → 用此前成功日历（已过期缓存）兜底。"""
+    cached = [date(2026, 8, 3), date(2026, 8, 4)]
+    tc._TRADE_DATES_CACHE["dates"] = cached
+    tc._TRADE_DATES_CACHE["dates_set"] = set(cached)
+    tc._TRADE_DATES_CACHE["loaded_at"] = 0.0  # 超过 TTL，强制重新加载
+    with patch.object(
+        tc, "_fetch_cn_trade_dates_from_akshare", side_effect=RuntimeError("akshare down")
+    ), patch.object(
+        tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=RuntimeError("fuyao down")
+    ):
+        dates, dates_set = tc._load_cn_trade_dates()
+    assert dates == cached
+    assert dates_set == set(cached)
+
+
+def test_calendar_returns_empty_when_all_sources_fail_and_no_cache():
+    """akshare 与 fuyao 均失败且无缓存 → 空容器；require_cn_trade_dates 显式报错。"""
+    tc.clear_cn_trade_date_cache()
+    with patch.object(
+        tc, "_fetch_cn_trade_dates_from_akshare", side_effect=RuntimeError("akshare down")
+    ), patch.object(
+        tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=RuntimeError("fuyao down")
+    ):
+        dates, dates_set = tc._load_cn_trade_dates()
+        assert dates == []
+        assert dates_set == set()
+        with pytest.raises(tc.TradeCalendarUnavailableError):
+            tc.require_cn_trade_dates()
+
+
 # ── fetch_with_date_fallback ──────────────────────────────────────────
 
 
