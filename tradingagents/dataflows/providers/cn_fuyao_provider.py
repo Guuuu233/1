@@ -1,13 +1,16 @@
 """A-share market data via 同花顺 (THS) 金融数据 API (fuyao.aicubes.cn).
 
 覆盖：行情快照（批量）、历史日 K（前复权）、三大报表、财务指标（五类能力）、
-涨跌停池 / 连板天梯、龙虎榜、交易日历。统一 ``ApiResponse`` 信封，错误码按
-``code`` 映射到现有 vendor 链语义（见 ``tradingagents/dataflows/vendor_result.py``）：
+涨跌停池（含连板分布，未接线 /limit-up-ladder）、龙虎榜、交易日历。统一
+``ApiResponse`` 信封，错误码按 ``code`` 映射到现有 vendor 链语义（见
+``tradingagents/dataflows/vendor_result.py``）：
 
 - ``0`` 成功
 - ``1001~1004`` 参数错误 —— 客户端 bug，显式 ``ValueError``
 - ``2001/2003`` Key 无效 / 无权限 —— 显式 ``NotImplementedError``
-- ``3001`` 标的不存在、``3002`` 数据未就绪 —— ``VendorEmpty``（确认无数据）
+- ``3001`` 标的不存在 / 未覆盖、``3002`` 数据未就绪、``3004`` —— ``VendorEmpty``
+  （确认无数据）；财务数据路径（``get_fundamentals`` / 三大报表）下 ``3001``
+  改为 ``VendorFail``，触发降级到现有弱源（见 ``_map_api_error``）
 - ``4001`` 频率超限 —— 退避重试后仍失败走 ``VendorFail``（切换备用源）
 - ``5001~5003`` 服务端错误 —— ``VendorFail``
 
@@ -50,7 +53,6 @@ _HISTORICAL_PATH = "/api/a-share/prices/historical"
 _FINANCIALS_BASE = "/api/a-share/financials"
 _INDICATORS_PATH = "/api/a-share/financials/indicators"
 _LIMIT_UP_POOL_PATH = "/api/a-share/special-data/limit-up-pool"
-_LIMIT_UP_LADDER_PATH = "/api/a-share/special-data/limit-up-ladder"
 _DRAGON_TIGER_LIST_PATH = "/api/a-share/special-data/dragon-tiger-list"
 _TRADING_DAYS_PATH = "/api/a-share/calendar/trading-days"
 
@@ -212,8 +214,16 @@ class CnFuyaoProvider(BaseMarketDataProvider):
 
         raise FuyaoApiError(4001, "频率超限（重试后仍失败）")  # pragma: no cover
 
-    def _map_api_error(self, exc: FuyaoApiError) -> Any:
-        """按错误码把 :class:`FuyaoApiError` 转成 vendor 链语义（返回类型或抛异常）。"""
+    def _map_api_error(
+        self, exc: FuyaoApiError, *, fundamentals_3001_fail: bool = False
+    ) -> Any:
+        """按错误码把 :class:`FuyaoApiError` 转成 vendor 链语义（返回类型或抛异常）。
+
+        ``fundamentals_3001_fail=True`` 用于财务数据路径（``get_fundamentals`` /
+        三大报表）：该路径下 ``3001``（标的不存在/未覆盖）映射为 ``VendorFail``
+        以触发降级到 cn_akshare / cn_baostock / cn_investoday 等弱源；``3002``
+        （数据未就绪）与其余路径保持 ``VendorEmpty``。其余错误码两路径一致。
+        """
         if exc.code in (1001, 1002, 1003, 1004):
             raise ValueError(f"[cn_fuyao] 参数错误 code={exc.code}: {exc.message}")
         if exc.code in (2001, 2003):
@@ -221,6 +231,11 @@ class CnFuyaoProvider(BaseMarketDataProvider):
                 f"[cn_fuyao] API Key 无效或无权限 code={exc.code}: {exc.message}"
             )
         if exc.code in (3001, 3002, 3004):
+            if fundamentals_3001_fail and exc.code == 3001:
+                return VendorFail(
+                    f"[cn_fuyao] {exc.message}（code=3001，标的不存在/未覆盖，"
+                    "财务路径降级到弱源）"
+                )
             return VendorEmpty(f"[cn_fuyao] {exc.message}（code={exc.code}）")
         if exc.code == 4001:
             return VendorFail(f"[cn_fuyao] 频率超限 code=4001: {exc.message}")
@@ -434,7 +449,7 @@ class CnFuyaoProvider(BaseMarketDataProvider):
         try:
             payload = self._request_fuyao(path, params)
         except FuyaoApiError as exc:
-            return self._map_api_error(exc)
+            return self._map_api_error(exc, fundamentals_3001_fail=True)
 
         items = ((payload.get("data") or {}).get("item")) or []
         if not items:
@@ -502,7 +517,7 @@ class CnFuyaoProvider(BaseMarketDataProvider):
         try:
             payload = self._request_fuyao(_INDICATORS_PATH, params)
         except FuyaoApiError as exc:
-            return self._map_api_error(exc)
+            return self._map_api_error(exc, fundamentals_3001_fail=True)
 
         data = payload.get("data") or {}
         abilities = data.get("abilities") or []
@@ -530,7 +545,7 @@ class CnFuyaoProvider(BaseMarketDataProvider):
         header = f"## Fundamentals for {ticker}（同花顺 fuyao 财务指标，report={report}）"
         return header + "\n\n" + "\n".join(lines)
 
-    # ── 涨跌停池 / 连板天梯 / 龙虎榜 ──────────────────────────────────
+    # ── 涨跌停池（含连板分布）/ 龙虎榜 ─────────────────────────────────
 
     @staticmethod
     def _format_zt_pool(data: dict[str, Any], day: str) -> str:

@@ -278,6 +278,51 @@ def test_get_fundamentals_indicators():
     assert mock_get.call_args[1]["params"]["report"] == "2026-1"
 
 
+# ── 财务路径 3001/3002 分治（fuyao 主源 → 弱源降级）──────────────────
+
+
+def test_get_fundamentals_3001_maps_to_vendor_fail():
+    """财务指标路径：3001（标的不存在/未覆盖）→ VendorFail，触发弱源降级。"""
+    body = {"code": 3001, "message": "标的不存在", "data": None}
+    provider = CnFuyaoProvider()
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_fuyao_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ):
+        out = provider.get_fundamentals("999999.SH", "2026-08-05")
+    assert isinstance(out, VendorFail)
+    assert "3001" in out.error
+
+
+def test_get_income_statement_3001_maps_to_vendor_fail():
+    """三大报表路径：3001 → VendorFail（与 get_fundamentals 一致）。"""
+    body = {"code": 3001, "message": "标的不存在", "data": None}
+    provider = CnFuyaoProvider()
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_fuyao_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ):
+        out = provider.get_income_statement("999999.SH", "annual", "2026-08-05")
+    assert isinstance(out, VendorFail)
+    assert "3001" in out.error
+
+
+def test_get_fundamentals_3002_maps_to_vendor_empty():
+    """财务指标路径：3002（数据未就绪）保持 VendorEmpty（确认无数据）。"""
+    body = {"code": 3002, "message": "数据未就绪", "data": None}
+    provider = CnFuyaoProvider()
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_fuyao_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ):
+        out = provider.get_fundamentals("600519.SH", "2026-08-05")
+    assert isinstance(out, VendorEmpty)
+    assert "3002" in out.message
+
+
 # ── 错误码映射 ────────────────────────────────────────────────────────
 
 
@@ -582,6 +627,28 @@ def test_route_fundamentals_uses_fuyao_primary_before_akshare():
         "2026-08-05",
     )
     assert out == "## 利润表（同花顺 fuyao）"
+
+
+def test_route_fundamentals_fuyao_3001_falls_back_to_weak_source():
+    """fuyao 财务路径 3001 → VendorFail：接线应降级到弱源（cn_akshare）。"""
+    fuyao = _FakeProvider(
+        "cn_fuyao",
+        lambda *a, **k: VendorFail("标的不存在（code=3001，财务路径降级到弱源）"),
+        method="get_fundamentals",
+    )
+    akshare = _FakeProvider(
+        "cn_akshare",
+        lambda *a, **k: "## Fundamentals（cn_akshare 弱源）",
+        method="get_fundamentals",
+    )
+    out = _route(
+        {"cn_fuyao": fuyao, "cn_akshare": akshare},
+        "cn_fuyao,cn_akshare",
+        "get_fundamentals",
+        "999999.SH",
+        "2026-08-05",
+    )
+    assert "cn_akshare" in out
 
 
 def test_route_zt_pool_falls_back_to_fuyao_when_akshare_vendor_fail():
