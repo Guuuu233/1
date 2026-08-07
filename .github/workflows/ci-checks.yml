@@ -45,7 +45,7 @@ jobs:
           python scripts/smoke_providers.py
           python scripts/smoke_custom_prompts.py
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
       - name: Frontend build/lint/test discovery gate
