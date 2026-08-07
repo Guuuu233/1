@@ -1365,6 +1365,13 @@ def _build_runtime_config(overrides: Dict[str, Any], user_id: Optional[str] = No
     if not quick and deep:
         config["quick_think_llm"] = deep
 
+    # ── Pass user_id through to the graph ──
+    # TradingAgentsGraph consumes config["user_id"] to resolve per-role model
+    # bindings (resolve_all_roles) and open its own DB session. Without this,
+    # role_llms silently falls back to the default quick/deep models.
+    if user_id:
+        config["user_id"] = user_id
+
     return config
 
 

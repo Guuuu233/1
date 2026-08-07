@@ -40,10 +40,22 @@ class TestConfigFallback(unittest.TestCase):
         """验证: OpenAIClient 不再有硬编码的 gpt-4o-mini 降级"""
         client = OpenAIClient(model="actual-model", provider="openai")
         self.assertEqual(client.model, "actual-model")
-        
+
         # 如果真的传入空，它就应该是空（或者触发基类的初始化，但不应该自造 gpt-4o-mini）
         client_empty = OpenAIClient(model="", provider="openai")
         self.assertEqual(client_empty.model, "", "构造函数不应自造模型名")
+
+    def test_runtime_config_includes_user_id(self):
+        """验证: 构建 runtime config 时写入 user_id，供 graph 解析角色模型绑定 (DAV-89)。"""
+        with patch('api.main.DEFAULT_CONFIG', {"quick_think_llm": "q", "deep_think_llm": "d"}):
+            config = _build_runtime_config({}, user_id="user-abc")
+            self.assertEqual(config.get("user_id"), "user-abc")
+
+    def test_runtime_config_omits_user_id_when_none(self):
+        """验证: 无 user_id 时 config 不包含该键，避免污染无用户上下文。"""
+        with patch('api.main.DEFAULT_CONFIG', {"quick_think_llm": "q", "deep_think_llm": "d"}):
+            config = _build_runtime_config({})
+            self.assertNotIn("user_id", config)
 
 if __name__ == "__main__":
     unittest.main()
