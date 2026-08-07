@@ -78,17 +78,23 @@ class OpenAIClient(BaseLLMClient):
         self.provider = provider.lower()
 
     def get_llm(self) -> Any:
-        """Return configured ChatOpenAI instance with long timeout and no retries."""
+        """Return configured ChatOpenAI instance with long timeout and transient-error retry."""
         llm_kwargs = {"model": self.model}
 
         if not UnifiedChatOpenAI._is_reasoning_model(self.model):
             llm_kwargs["temperature"] = self.kwargs.get("temperature", 0)
 
-        # ── 极致稳定性配置 ──
-        # 1. 禁用一切重试：避免 Thinking 模型重复扣费或因重连导致的状态丢失
-        llm_kwargs["max_retries"] = 0
-        
-        # 2. 超长超时：默认 300 秒，给足推理模型思考时间
+        # ── 稳定性配置 ──
+        # 瞬时错误重试（DAV-91）：交由 OpenAI SDK 内置重试策略实现。SDK 只对
+        # "请求根本没有成功响应"的瞬时故障重试——网络层（ConnectionError/EOF/
+        # ReadTimeout/APIConnectionError）、上游 5xx（500/502/503）、限流 429、
+        # 以及服务器 x-should-retry 标记；401/403/400/404/内容审查等不可重试错误
+        # 直接失败，不浪费配额。正常完成的调用零重试，不因重试重复扣费。
+        # 次数由 TA_LLM_RETRY_TIMES 环境变量控制（默认 2，0 恢复完全禁用），
+        # 也可用构造参数 max_retries 覆盖；SDK 内部为指数退避 + 抖动。
+        llm_kwargs["max_retries"] = self._resolve_max_retries()
+
+        # 超长超时：默认 300 秒，给足推理模型思考时间
         llm_kwargs["timeout"] = self.kwargs.get("timeout", 300.0)
         
         target_url = self.base_url or "https://api.openai.com/v1"
@@ -97,7 +103,7 @@ class OpenAIClient(BaseLLMClient):
         elif self.provider == "ollama": target_url = "http://localhost:11434/v1"
         elif self.provider == "deepseek": target_url = "https://api.deepseek.com"
 
-        print(f"[LLM Client] Init {self.provider} ({self.model}) at {target_url} (Retries=0, Timeout={llm_kwargs['timeout']}s)")
+        print(f"[LLM Client] Init {self.provider} ({self.model}) at {target_url} (Retries={llm_kwargs['max_retries']}, Timeout={llm_kwargs['timeout']}s)")
 
         if self.provider == "xai":
             llm_kwargs["base_url"] = "https://api.x.ai/v1"
@@ -117,12 +123,29 @@ class OpenAIClient(BaseLLMClient):
         elif self.base_url:
             llm_kwargs["base_url"] = self.base_url
 
-        # Pass remaining keys
-        for key in ("api_key", "callbacks", "reasoning_effort"):
+        # Pass remaining keys. http_client / http_async_client 用于注入自定义
+        # httpx 客户端（代理、测试 MockTransport 等），透传给 ChatOpenAI 底层 SDK。
+        for key in ("api_key", "callbacks", "reasoning_effort", "http_client", "http_async_client"):
             if key in self.kwargs:
                 llm_kwargs[key] = self.kwargs[key]
 
         return UnifiedChatOpenAI(**llm_kwargs)
+
+    def _resolve_max_retries(self) -> int:
+        """解析瞬时错误重试次数。
+
+        优先级：构造参数 max_retries > 环境变量 TA_LLM_RETRY_TIMES > 默认 2。
+        0 保留旧行为（完全禁用重试）。
+        """
+        if "max_retries" in self.kwargs:
+            return max(0, int(self.kwargs["max_retries"]))
+        raw = os.environ.get("TA_LLM_RETRY_TIMES", "2")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            _logger.warning("Invalid TA_LLM_RETRY_TIMES=%r, falling back to 2", raw)
+            value = 2
+        return max(0, value)
 
     def validate_model(self) -> bool:
         return validate_model(self.provider, self.model)
