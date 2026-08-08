@@ -432,8 +432,13 @@ class _TokenDatetimeFieldsMixin:
         return _serialize_datetime_utc(value)
 
 
-_cn_stock_map_loaded_at: float = 0  # timestamp of last load
+_cn_stock_map_loaded_at: float = 0  # timestamp of last successful load
+_cn_stock_map_last_failure_at: float = 0  # timestamp of last failed load (0 = no recent failure)
 _STOCK_MAP_TTL = 7 * 86400  # 7 days
+# After a failed load, back off this long before retrying AkShare. A short
+# failure must not hammer a rate-limited endpoint nor freeze the cache for the
+# full 7-day TTL. Configurable via TA_STOCK_MAP_RETRY_INTERVAL (seconds).
+_STOCK_MAP_FAILURE_RETRY_INTERVAL = int(os.getenv("TA_STOCK_MAP_RETRY_INTERVAL", "1800"))
 
 
 def _load_cn_stock_map() -> Dict[str, str]:
@@ -441,8 +446,13 @@ def _load_cn_stock_map() -> Dict[str, str]:
 
     Uses akshare stock_info_a_code_name (static list, no anti-crawl) for A-shares,
     plus fund_name_em for ETFs/funds.
+
+    Failure handling (DAV-92): a failed load records ``_cn_stock_map_last_failure_at``
+    and is NOT treated as a valid cache, so the 7-day TTL only starts on success.
+    Subsequent calls back off for ``_STOCK_MAP_FAILURE_RETRY_INTERVAL`` instead of
+    retrying on every request or freezing for the full TTL.
     """
-    global _cn_stock_map, _cn_stock_reverse_map, _cn_stock_map_norm, _cn_stock_map_norm_src, _cn_stock_map_loaded_at
+    global _cn_stock_map, _cn_stock_reverse_map, _cn_stock_map_norm, _cn_stock_map_norm_src, _cn_stock_map_loaded_at, _cn_stock_map_last_failure_at
     import time as _time
     now = _time.time()
     if _cn_stock_map is not None and (now - _cn_stock_map_loaded_at) > _STOCK_MAP_TTL:
@@ -455,6 +465,11 @@ def _load_cn_stock_map() -> Dict[str, str]:
     with _cn_stock_map_lock:
         if _cn_stock_map is not None and (now - _cn_stock_map_loaded_at) <= _STOCK_MAP_TTL:
             return _cn_stock_map
+        # A recent failed load must not hammer AkShare; wait out the retry window.
+        if _cn_stock_map is None and _cn_stock_map_last_failure_at and (
+            now - _cn_stock_map_last_failure_at
+        ) < _STOCK_MAP_FAILURE_RETRY_INTERVAL:
+            return {}
         result: Dict[str, str] = {}
         try:
             import akshare as ak
@@ -487,9 +502,11 @@ def _load_cn_stock_map() -> Dict[str, str]:
             _cn_stock_map_norm = None  # lazily rebuilt via _get_normalized_stock_map
             _cn_stock_map_norm_src = None
             _cn_stock_map_loaded_at = now
+            _cn_stock_map_last_failure_at = 0  # success clears the failure marker
             _log(f"[StockMap] Loaded {stock_count} stocks + {fund_count} ETFs/funds = {len(result)} total.")
         except Exception as e:
-            _log(f"[StockMap] Failed to load: {e}")
+            _cn_stock_map_last_failure_at = now
+            _log(f"[StockMap] Failed to load: {e}; will retry in {_STOCK_MAP_FAILURE_RETRY_INTERVAL // 60} minutes")
             if _cn_stock_map is None:
                 _cn_stock_map = {}
                 _cn_stock_reverse_map = {}
