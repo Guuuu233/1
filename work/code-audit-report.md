@@ -220,7 +220,7 @@
 |---|---|---|
 | P2-55 | `tradingagents/llm_clients/TODO.md` | 源码包内遗留任务文档（4 条未完成项：validate_model 未调用、参数未统一、base_url 被忽略、validators 未同步），建议转 issue 后删除或移到 docs/ |
 | P2-56 | `api/database.py:84` `exc_val`/`exc_tb`、`scripts/smoke_custom_prompts.py:61` `exc_val`/`exc_tb`、`cn_akshare_provider.py:138` `exc_info` | `except ... as` 绑定未使用变量（可改 `except Exception:`） |
-| P2-57 | `tradingagents/dataflows/alpha_vantage.py`（4 行） | 纯再导出 shim；若全仓无消费者可整体删除（grep 未发现导入者） |
+| P2-57 | `tradingagents/dataflows/alpha_vantage.py`（4 行） | **不适用**——纯再导出 shim，无真实逻辑，无需处理（grep 复核仍无任何消费者；保留零副作用，删除亦无实际收益） |
 | P2-58 | `scheduler/__init__.py`、`tests/__init__.py`、`tradingagents/dataflows/__init__.py` | 空文件（包标记，正常，仅记录） |
 
 ### 4.7 前端依赖
