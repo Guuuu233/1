@@ -150,6 +150,9 @@
 - `scheduler/main.py:23` `Any`、`Dict`；`:93` `_new_job_store`；`:106` `_set_job`；`:108` `_emit_job_event`
 - `api/main.py:40` `fastapi.status`（另 `:825/:1577/:1596` 的 `status` 重定义、`:2996` 循环变量遮蔽 `status`）；`:48` `UserLLMConfigDB`/`ReportDB`/`ImportedPortfolioPositionDB`/`ModelProfileDB`/`RoleBindingDB`
 - `tradingagents/graph/data_collector.py:17` `get_indicators`；`:686` 无占位 f-string
+  > 注（DAV-82 收口 · P2-15 回补）：`get_indicators` **保留原因——测试 patch 目标**。`tests/test_dav28_data_boundaries.py`
+  > 以 `patch.multiple("tradingagents.graph.data_collector", **patch_targets)` 批量替换该模块内的
+  > `get_indicators`/`get_stock_data` 等数据入口；删除此导入会触发 `AttributeError`，使相关离线用例失败。
 - `tradingagents/graph/trading_graph.py:3,8,9,10,19` `asyncio`/`date`/`Tuple`/`sqlite3`/`AgentState`/`InvestDebateState`/`RiskDebateState`
 - `tradingagents/graph/setup.py:3` `List`；`propagation.py:4` `AgentState`
 - `tradingagents/dataflows/interface.py:17` `result_to_prompt`
