@@ -5,6 +5,7 @@ import {
     isLegacyEnglishDirection,
     isLegacyEnglishReport,
     localizeDirection,
+    parseDecisionAction,
     sanitizeReportMarkdown,
 } from '@/utils/reportText'
 
@@ -99,6 +100,50 @@ describe('isLegacyEnglishReport', () => {
     it('treats reports with no content and no direction as non-legacy', () => {
         expect(isLegacyEnglishReport({ symbol: '600519' })).toBe(false)
         expect(isLegacyEnglishReport({})).toBe(false)
+    })
+})
+
+describe('parseDecisionAction', () => {
+    it('maps English action words case-insensitively', () => {
+        expect(parseDecisionAction('BUY')).toBe('buy')
+        expect(parseDecisionAction('buy')).toBe('buy')
+        expect(parseDecisionAction('SELL')).toBe('sell')
+        expect(parseDecisionAction('HOLD')).toBe('hold')
+        expect(parseDecisionAction('ADD')).toBe('add')
+        expect(parseDecisionAction('REDUCE')).toBe('reduce')
+        expect(parseDecisionAction('WATCH')).toBe('watch')
+    })
+
+    it('maps Chinese action words', () => {
+        expect(parseDecisionAction('买入')).toBe('buy')
+        expect(parseDecisionAction('卖出')).toBe('sell')
+        expect(parseDecisionAction('持有')).toBe('hold')
+        expect(parseDecisionAction('增持')).toBe('add')
+        expect(parseDecisionAction('减持')).toBe('reduce')
+        expect(parseDecisionAction('观望')).toBe('watch')
+    })
+
+    it('returns undefined for empty, nullish, and unmatched inputs', () => {
+        expect(parseDecisionAction(undefined)).toBeUndefined()
+        expect(parseDecisionAction(null)).toBeUndefined()
+        expect(parseDecisionAction('')).toBeUndefined()
+        expect(parseDecisionAction('看多')).toBeUndefined()
+        expect(parseDecisionAction('未知操作')).toBeUndefined()
+    })
+
+    it('matches actions inside longer decision phrases', () => {
+        expect(parseDecisionAction('短线买入')).toBe('buy')
+        expect(parseDecisionAction('部分减持')).toBe('reduce')
+        expect(parseDecisionAction('继续持有')).toBe('hold')
+    })
+
+    it('applies precedence when a phrase contains multiple actions', () => {
+        // HOLD is checked before BUY, so "buy and hold" resolves to hold.
+        expect(parseDecisionAction('BUY AND HOLD')).toBe('hold')
+        // WATCH is checked before HOLD, so 观望 wins over 持有.
+        expect(parseDecisionAction('观望持有')).toBe('watch')
+        // SELL is checked before BUY.
+        expect(parseDecisionAction('BUY, then SELL')).toBe('sell')
     })
 })
 
