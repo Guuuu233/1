@@ -126,6 +126,34 @@ def _resolve_scheduled_trade_date(trade_date: str) -> str:
     return normalize_to_trading_day(trade_date)
 
 
+def _normalize_analysis_trade_date(trade_date: Optional[str]) -> str:
+    """Normalize an ordinary-analysis as-of date to the latest CN trading day.
+
+    Mirrors the scheduled path (``_resolve_scheduled_trade_date``) so a
+    weekend/holiday request date rolls back to the nearest prior trading day
+    (never forward — prevents future-data leakage). A missing/empty date
+    defaults to today and is then snapped back to the latest trading day.
+
+    If the calendar cannot be loaded (or the request day is outside the usable
+    range), the raw value is preserved so existing degradation behavior is kept
+    and no new exception path is introduced.
+    """
+    from tradingagents.dataflows.trade_calendar import (
+        TradeCalendarUnavailableError,
+        normalize_to_trading_day,
+    )
+
+    raw = trade_date or cn_today_str()
+    try:
+        return normalize_to_trading_day(raw)
+    except TradeCalendarUnavailableError as exc:
+        logger.warning("Analysis trade_date calendar unavailable; keeping raw %r: %s", raw, exc)
+        return raw
+    except Exception as exc:  # pragma: no cover - defensive: never break a request
+        logger.warning("Analysis trade_date normalization failed; keeping raw %r: %s", raw, exc)
+        return raw
+
+
 def _build_scheduled_analyze_request(
     db: Session,
     user_id: str,
@@ -2140,6 +2168,11 @@ async def _run_job_inner(
     request_source: str = "api",
 ) -> None:
     job_start_t = time.time()
+    # DAV-98: one normalization at the job boundary covers every downstream
+    # consumer (report init, data collector, dual-horizon assembly). Idempotent
+    # for already-normalized scheduled runs; falls back to the raw date when
+    # the calendar is unavailable.
+    request.trade_date = _normalize_analysis_trade_date(request.trade_date)
     # Normalize for logic but keep original for display
     display_name = request.symbol
     normalized_symbol = _normalize_symbol(request.symbol)
@@ -3636,6 +3669,9 @@ async def analyze(
     request: AnalyzeRequest,
     current_user: UserDB = Depends(_require_api_user),
 ) -> AnalyzeResponse:
+    # Ordinary-analysis entry: normalize the as-of date to a trading day so
+    # weekend/holiday requests don't feed non-trading dates downstream (DAV-98).
+    request.trade_date = _normalize_analysis_trade_date(request.trade_date)
     explicit_context = _extract_request_user_context(request)
 
     def _load_user_context() -> Dict[str, Any]:
@@ -3992,6 +4028,8 @@ async def chat_completions(
                 symbol, trade_date, horizons, focus_areas, specific_questions, inferred_user_context = \
                     await _ai_extract_symbol_and_date_streaming(text, config, job_id)
                 horizons = _normalize_analysis_horizons(horizons, query=text)
+                # DAV-98: snap a weekend/holiday as-of date to the nearest trading day.
+                trade_date = _normalize_analysis_trade_date(trade_date)
 
                 if not symbol:
                     _emit_job_event(job_id, "job.failed", {
@@ -4022,7 +4060,7 @@ async def chat_completions(
                 pre_intent["user_context"] = merged_user_context
                 analyze_req = AnalyzeRequest(
                     symbol=symbol,
-                    trade_date=trade_date or cn_today_str(),
+                    trade_date=trade_date,
                     selected_analysts=request.selected_analysts,
                     config_overrides=request.config_overrides,
                     dry_run=request.dry_run,
@@ -4076,6 +4114,8 @@ async def chat_completions(
     symbol, trade_date, horizons, focus_areas, specific_questions, inferred_user_context = \
         await asyncio.to_thread(_ai_extract_symbol_and_date, text, config)
     horizons = _normalize_analysis_horizons(horizons, query=text)
+    # DAV-98: snap a weekend/holiday as-of date to the nearest trading day.
+    trade_date = _normalize_analysis_trade_date(trade_date)
 
     if not symbol:
         raise HTTPException(status_code=400, detail="抱歉，我没能从您的消息中识别出股票标的。请输入代码（如 600519.SH）或可识别的公司名称。")
@@ -4103,7 +4143,7 @@ async def chat_completions(
     pre_intent["user_context"] = merged_user_context
     analyze_req = AnalyzeRequest(
         symbol=symbol,
-        trade_date=trade_date or cn_today_str(),
+        trade_date=trade_date,
         selected_analysts=request.selected_analysts,
         config_overrides=request.config_overrides,
         dry_run=request.dry_run,
