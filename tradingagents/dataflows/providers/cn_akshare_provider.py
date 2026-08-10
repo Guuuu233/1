@@ -172,6 +172,9 @@ _SINA_HIST_FUND_FLOW_TIMEOUT = 10  # 秒
 _SINA_HIST_FUND_FLOW_FETCH = 20  # 请求行数：取足够多，再按 curr_date 截断
 _SINA_HIST_FUND_FLOW_SHOW = 5  # 展示最近 N 日（与东财版“近5日”对齐）
 _SINA_HIST_CORE_AMOUNT_FIELDS = ("netamount", "r0_net")
+_FUND_AMOUNT_TEXT_RE = re.compile(
+    r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*(?:万亿|亿元|万元|亿|万)?$"
+)
 
 
 def _sina_amount_yi(value) -> str:
@@ -188,6 +191,27 @@ def _sina_ratio_pct(value) -> str:
     if f is None:
         return ""
     return f"{round(f * 100, 2):.2f}%"
+
+
+def _usable_fund_amount_text(value) -> str | None:
+    """Return a usable fund amount while preserving legal unit-bearing text."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    numeric = safe_float(value)
+    if numeric is not None and math.isfinite(numeric):
+        return text
+    if _FUND_AMOUNT_TEXT_RE.fullmatch(text):
+        return text
+    return None
 
 
 class CnAkshareProvider(BaseMarketDataProvider):
@@ -1254,7 +1278,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
         （RemoteDisconnected），失败时优先回退到新浪历史收盘序列；当前分析日
         只有在历史接口含 curr_date 当天收盘行时才直接返回，否则继续尝试
         同花顺即时资金流净额快照 ``stock_fund_flow_individual``；该快照的
-        ``净额`` 不是新浪历史 ``netamount``/``r0_net`` 同口径的主力序列。
+        ``净额`` 不是新浪历史 ``netamount``/``r0_net`` 同口径的主力序列；
+        匹配目标行后必须先验证 ``净额`` 可用，带单位文本会原样保留。
         """
         if not curr_date:
             return (
@@ -1331,6 +1356,17 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     f"（{'；'.join(errors)}）"
                 )
             row = stock_df.iloc[0]
+            if "净额" not in stock_df.columns:
+                return (
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照缺少净额字段"
+                    f"（{'；'.join(errors)}）"
+                )
+            net_amount = _usable_fund_amount_text(row["净额"])
+            if net_amount is None:
+                return (
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照净额缺失或不可解析"
+                    f"（{'；'.join(errors)}）"
+                )
 
             def _v(col: str) -> str:
                 if col not in stock_df.columns:
@@ -1341,7 +1377,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             return (
                 f"【备用数据源：同花顺即时资金流净额快照】{symbol} 当日资金流净额快照"
                 f"（{curr_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
-                f"资金净额: {_v('净额')} | 流入资金: {_v('流入资金')} | "
+                f"资金净额: {net_amount} | 流入资金: {_v('流入资金')} | "
                 f"流出资金: {_v('流出资金')} | 换手率: {_v('换手率')}\n"
                 "（该快照不是新浪历史 netamount/r0_net 同口径主力序列）"
             )
