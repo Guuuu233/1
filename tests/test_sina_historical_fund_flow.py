@@ -94,9 +94,10 @@ class _SinaHistFixtureProvider(CnAkshareProvider):
 
 
 class _CurrentDaySnapshotProvider(CnAkshareProvider):
-    """Eastmoney fails on a current date: the same-day snapshot must still work."""
+    """Eastmoney fails on a current date: the instant snapshot remains available."""
 
-    def __init__(self):
+    def __init__(self, snapshot_error=None):
+        self._snapshot_error = snapshot_error
         self._row = {
             "股票代码": "600519",
             "最新价": "1700.00",
@@ -109,16 +110,19 @@ class _CurrentDaySnapshotProvider(CnAkshareProvider):
 
     def _ak(self):
         class _Ak:
-            def __init__(self, row):
+            def __init__(self, row, snapshot_error):
                 self._row = row
+                self._snapshot_error = snapshot_error
 
             def stock_individual_fund_flow(self, stock, market):
                 raise RuntimeError("eastmoney rate-limited")
 
             def stock_fund_flow_individual(self, symbol="即时"):
+                if self._snapshot_error is not None:
+                    raise self._snapshot_error
                 return pd.DataFrame([self._row])
 
-        return _Ak(self._row)
+        return _Ak(self._row, self._snapshot_error)
 
 
 def test_sina_historical_fund_flow_serves_historical_date():
@@ -177,13 +181,52 @@ def test_sina_history_empty_rows_reports_explicitly():
     assert "不可用" in text
 
 
-def test_current_day_keeps_snapshot_path():
-    """Current-date path is untouched: same-day Sina snapshot still serves."""
+def test_current_day_history_close_precedes_snapshot_after_eastmoney_failure():
+    """A same-day Sina close row is preferred over the live snapshot path."""
     today = cn_today_str()
+    rows = [
+        *_SINA_HIST_ROWS,
+        {
+            "opendate": today,
+            "trade": "72.80",
+            "netamount": "-286620931.5",
+            "ratioamount": "-0.1331",
+            "r0_net": "-381071910.46",
+        },
+    ]
     provider = _CurrentDaySnapshotProvider()
-    with patch("requests.get", side_effect=AssertionError("must not call sina history today")):
+    with patch("requests.get", return_value=_FakeResp(rows)):
         text = provider.get_individual_fund_flow("600519", curr_date=today)
 
+    assert "新浪历史/收盘数据" in text
+    assert today in text
+    assert "-2.87" in text
+    assert "-3.81" in text
+    assert "当日主力资金净流向快照" not in text
+
+
+def test_current_day_without_close_row_still_tries_snapshot():
+    """Before the Sina close arrives, the existing instant snapshot is tried."""
+    today = cn_today_str()
+    provider = _CurrentDaySnapshotProvider()
+    with patch("requests.get", return_value=_FakeResp(_SINA_HIST_ROWS)) as mock_get:
+        text = provider.get_individual_fund_flow("600519", curr_date=today)
+
+    assert mock_get.called
     assert "当日主力资金净流向快照" in text
     assert "净额: 5.60亿" in text
     assert "最新价 1700.00" in text
+
+
+def test_current_day_without_close_or_snapshot_reports_data_gap():
+    """A missing close plus failed snapshot is an explicit data gap."""
+    today = cn_today_str()
+    provider = _CurrentDaySnapshotProvider(
+        snapshot_error=AttributeError("stock_fund_flow_individual unavailable")
+    )
+    with patch("requests.get", return_value=_FakeResp(_SINA_HIST_ROWS)):
+        text = provider.get_individual_fund_flow("600519", curr_date=today)
+
+    assert "【数据获取失败】" in text
+    assert "stock_fund_flow_individual: AttributeError" in text
+    assert "当日主力资金净流向快照" not in text

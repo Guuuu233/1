@@ -78,7 +78,8 @@ def test_individual_fund_flow_falls_back_to_sina_when_em_fails():
     ak.stock_fund_flow_individual.return_value = sina_df
     p = CnAkshareProvider()
     p._ak = lambda: ak
-    out = p.get_individual_fund_flow("600519", curr_date=cn_today_str())
+    with patch("requests.get", side_effect=ConnectionError("Sina history unavailable")):
+        out = p.get_individual_fund_flow("600519", curr_date=cn_today_str())
     assert "新浪" in out
     assert "3.61亿" in out
     assert "600519" in out
