@@ -7,7 +7,9 @@ historical, the old Sina backup was a same-day snapshot and had to be refused
 
 Fix: add the Sina historical money-flow endpoint as Source 2.5 (direct requests,
 Referer/UA, 10s timeout; akshare has no wrapper). Rows are filtered to
-``opendate <= curr_date`` and rendered like the Eastmoney table.
+``opendate <= curr_date`` and rendered like the Eastmoney table. If the current
+close row is absent, the provider falls back to the Tonghuashun generic funds
+net-flow snapshot, which is not a same-semantic Sina main-force series.
 """
 
 import json
@@ -94,10 +96,11 @@ class _SinaHistFixtureProvider(CnAkshareProvider):
 
 
 class _CurrentDaySnapshotProvider(CnAkshareProvider):
-    """Eastmoney fails on a current date: the same-day snapshot must still work."""
+    """Eastmoney fails on a current date: the THS funds-net snapshot remains available."""
 
-    def __init__(self):
-        self._row = {
+    def __init__(self, snapshot_error=None, row=None):
+        self._snapshot_error = snapshot_error
+        self._row = row if row is not None else {
             "股票代码": "600519",
             "最新价": "1700.00",
             "涨跌幅": "1.23",
@@ -109,16 +112,19 @@ class _CurrentDaySnapshotProvider(CnAkshareProvider):
 
     def _ak(self):
         class _Ak:
-            def __init__(self, row):
+            def __init__(self, row, snapshot_error):
                 self._row = row
+                self._snapshot_error = snapshot_error
 
             def stock_individual_fund_flow(self, stock, market):
                 raise RuntimeError("eastmoney rate-limited")
 
             def stock_fund_flow_individual(self, symbol="即时"):
+                if self._snapshot_error is not None:
+                    raise self._snapshot_error
                 return pd.DataFrame([self._row])
 
-        return _Ak(self._row)
+        return _Ak(self._row, self._snapshot_error)
 
 
 def test_sina_historical_fund_flow_serves_historical_date():
@@ -177,13 +183,143 @@ def test_sina_history_empty_rows_reports_explicitly():
     assert "不可用" in text
 
 
-def test_current_day_keeps_snapshot_path():
-    """Current-date path is untouched: same-day Sina snapshot still serves."""
+def test_current_day_history_close_precedes_snapshot_after_eastmoney_failure():
+    """A same-day Sina close row is preferred over the live snapshot path."""
     today = cn_today_str()
+    rows = [
+        *_SINA_HIST_ROWS,
+        {
+            "opendate": today,
+            "trade": "72.80",
+            "netamount": "-286620931.5",
+            "ratioamount": "-0.1331",
+            "r0_net": "-381071910.46",
+        },
+    ]
     provider = _CurrentDaySnapshotProvider()
-    with patch("requests.get", side_effect=AssertionError("must not call sina history today")):
+    with patch("requests.get", return_value=_FakeResp(rows)):
         text = provider.get_individual_fund_flow("600519", curr_date=today)
 
-    assert "当日主力资金净流向快照" in text
-    assert "净额: 5.60亿" in text
+    assert "新浪历史/收盘数据" in text
+    assert today in text
+    assert "-2.87" in text
+    assert "-3.81" in text
+    assert "【备用数据源：同花顺即时资金流净额快照】" not in text
+
+
+def test_current_day_without_close_row_still_tries_snapshot():
+    """Before the Sina close arrives, a unit-bearing THS net amount is preserved."""
+    today = cn_today_str()
+    provider = _CurrentDaySnapshotProvider()
+    with patch("requests.get", return_value=_FakeResp(_SINA_HIST_ROWS)) as mock_get:
+        text = provider.get_individual_fund_flow("600519", curr_date=today)
+
+    assert mock_get.called
+    assert "同花顺即时资金流净额快照" in text
+    assert "资金净额: 5.60亿" in text
+    assert "不是新浪历史 netamount/r0_net 同口径主力序列" in text
     assert "最新价 1700.00" in text
+    assert "【数据获取失败】" not in text
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"股票代码": "600519"},
+        {"股票代码": "600519", "净额": None},
+        {"股票代码": "600519", "净额": float("nan")},
+        {"股票代码": "600519", "净额": ""},
+        {"股票代码": "600519", "净额": "not-a-number"},
+    ],
+    ids=["missing-column", "none", "nan", "empty", "invalid"],
+)
+def test_ths_matched_row_without_usable_net_amount_reports_gap(row):
+    """A matched THS row without 净额 must not become a success response."""
+    today = cn_today_str()
+    provider = _CurrentDaySnapshotProvider(row=row)
+    with patch("requests.get", return_value=_FakeResp(_SINA_HIST_ROWS)):
+        text = provider.get_individual_fund_flow("600519", curr_date=today)
+
+    assert "【数据获取失败】" in text
+    assert "同花顺即时资金流净额快照" in text
+    assert "【备用数据源：同花顺即时资金流净额快照】" not in text
+
+
+def test_current_day_without_close_or_snapshot_reports_data_gap():
+    """A missing close plus failed snapshot is an explicit data gap."""
+    today = cn_today_str()
+    provider = _CurrentDaySnapshotProvider(
+        snapshot_error=AttributeError("stock_fund_flow_individual unavailable")
+    )
+    with patch("requests.get", return_value=_FakeResp(_SINA_HIST_ROWS)):
+        text = provider.get_individual_fund_flow("600519", curr_date=today)
+
+    assert "【数据获取失败】" in text
+    assert "stock_fund_flow_individual: AttributeError" in text
+    assert "【备用数据源：同花顺即时资金流净额快照】" not in text
+
+
+def test_current_day_invalid_close_amount_uses_ths_snapshot():
+    """A date-matched but unusable close row must not mask the THS fallback."""
+    today = cn_today_str()
+    rows = [
+        *_SINA_HIST_ROWS,
+        {"opendate": today, "netamount": "", "r0_net": "not-a-number"},
+    ]
+    provider = _CurrentDaySnapshotProvider()
+    with patch("requests.get", return_value=_FakeResp(rows)):
+        text = provider.get_individual_fund_flow("600519", curr_date=today)
+
+    assert "同花顺即时资金流净额快照" in text
+    assert "新浪历史/收盘数据" not in text
+    assert "资金净额: 5.60亿" in text
+
+
+def test_current_day_invalid_close_amount_and_ths_failure_reports_gap():
+    """An unusable close and failed THS snapshot must remain an explicit gap."""
+    today = cn_today_str()
+    rows = [
+        *_SINA_HIST_ROWS,
+        {"opendate": today, "netamount": "NaN", "r0_net": None},
+    ]
+    provider = _CurrentDaySnapshotProvider(
+        snapshot_error=AttributeError("stock_fund_flow_individual unavailable")
+    )
+    with patch("requests.get", return_value=_FakeResp(rows)):
+        text = provider.get_individual_fund_flow("600519", curr_date=today)
+
+    assert "【数据获取失败】" in text
+    assert "stock_fund_flow_individual: AttributeError" in text
+    assert "新浪历史/收盘数据" not in text
+
+
+def test_current_day_zero_core_amount_is_valid_close_data():
+    """Numeric zero is valid and must not be treated as a missing close."""
+    today = cn_today_str()
+    rows = [{"opendate": today, "netamount": "0", "r0_net": ""}]
+    provider = _CurrentDaySnapshotProvider(
+        snapshot_error=AssertionError("THS snapshot should not run for a valid close")
+    )
+    with patch("requests.get", return_value=_FakeResp(rows)):
+        text = provider.get_individual_fund_flow("600519", curr_date=today)
+
+    assert "新浪历史/收盘数据" in text
+    assert "0.00" in text
+    assert "【数据获取失败】" not in text
+
+
+@pytest.mark.parametrize("bad_value", ["inf", "-inf", "1e309"])
+def test_current_day_nonfinite_close_amount_uses_ths_snapshot(bad_value):
+    """Non-finite core amounts must not masquerade as a historical close."""
+    today = cn_today_str()
+    rows = [
+        *_SINA_HIST_ROWS,
+        {"opendate": today, "netamount": bad_value, "r0_net": ""},
+    ]
+    provider = _CurrentDaySnapshotProvider()
+    with patch("requests.get", return_value=_FakeResp(rows)):
+        text = provider.get_individual_fund_flow("600519", curr_date=today)
+
+    assert "同花顺即时资金流净额快照" in text
+    assert "资金净额: 5.60亿" in text
+    assert "新浪历史/收盘数据" not in text

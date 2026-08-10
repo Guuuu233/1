@@ -1,4 +1,5 @@
 import logging
+import math
 import re
 import time
 import threading
@@ -170,6 +171,10 @@ _SINA_HIST_FUND_FLOW_HEADERS = {
 _SINA_HIST_FUND_FLOW_TIMEOUT = 10  # 秒
 _SINA_HIST_FUND_FLOW_FETCH = 20  # 请求行数：取足够多，再按 curr_date 截断
 _SINA_HIST_FUND_FLOW_SHOW = 5  # 展示最近 N 日（与东财版“近5日”对齐）
+_SINA_HIST_CORE_AMOUNT_FIELDS = ("netamount", "r0_net")
+_FUND_AMOUNT_TEXT_RE = re.compile(
+    r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*(?:万亿|亿元|万元|亿|万)?$"
+)
 
 
 def _sina_amount_yi(value) -> str:
@@ -186,6 +191,27 @@ def _sina_ratio_pct(value) -> str:
     if f is None:
         return ""
     return f"{round(f * 100, 2):.2f}%"
+
+
+def _usable_fund_amount_text(value) -> str | None:
+    """Return a usable fund amount while preserving legal unit-bearing text."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    numeric = safe_float(value)
+    if numeric is not None and math.isfinite(numeric):
+        return text
+    if _FUND_AMOUNT_TEXT_RE.fullmatch(text):
+        return text
+    return None
 
 
 class CnAkshareProvider(BaseMarketDataProvider):
@@ -1249,9 +1275,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
         """获取个股近期主力资金净流向，并按 curr_date 截断。
 
         东财 ``stock_individual_fund_flow`` 对当前 IP 间歇不可达
-        （RemoteDisconnected），失败时回退到新浪全市场即时截面
-        ``stock_fund_flow_individual``。新浪仅提供当日快照（无历史序列），
-        因此只在非历史分析日作为备用源。
+        （RemoteDisconnected），失败时优先回退到新浪历史收盘序列；当前分析日
+        只有在历史接口含 curr_date 当天收盘行时才直接返回，否则继续尝试
+        同花顺即时资金流净额快照 ``stock_fund_flow_individual``；该快照的
+        ``净额`` 不是新浪历史 ``netamount``/``r0_net`` 同口径的主力序列；
+        匹配目标行后必须先验证 ``净额`` 可用，带单位文本会原样保留。
         """
         if not curr_date:
             return (
@@ -1265,6 +1293,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         ak = self._ak()
         code = self._normalize_symbol(symbol)
         errors: list[str] = []
+        is_historical = is_historical_analysis_date(curr_date)
 
         # Source 1: 东财（近 120 交易日逐日序列，可按 curr_date 截断）
         try:
@@ -1285,25 +1314,36 @@ class CnAkshareProvider(BaseMarketDataProvider):
         except Exception as exc:
             errors.append(f"stock_individual_fund_flow: {type(exc).__name__}")
 
-        # Source 2.5: 新浪历史资金流（新增）。历史分析日东财被限流时，
-        # 用新浪逐日序列按 curr_date 截断（防前视纪律不变）。
-        if is_historical_analysis_date(curr_date):
-            try:
-                hist_text = self._fetch_sina_historical_fund_flow(
-                    symbol, curr_date, cutoff
-                )
-                if hist_text is not None:
-                    return hist_text
+        # Source 2.5: 新浪历史资金流。收盘行可覆盖当日分析；盘中尚无当日行时，
+        # 只有非历史日期才继续走即时快照，避免把前一交易日误报成今天数据。
+        try:
+            hist_text = self._fetch_sina_historical_fund_flow(
+                symbol,
+                curr_date,
+                cutoff,
+                require_curr_date=not is_historical,
+            )
+            if hist_text is not None:
+                return hist_text
+            if is_historical:
                 errors.append(
                     "sina historical fund flow: no rows on or before curr_date"
                 )
-            except Exception as exc:
-                errors.append(f"sina historical fund flow: {type(exc).__name__}")
+            else:
+                errors.append(
+                    "sina historical fund flow: no current-day close row"
+                )
+        except Exception as exc:
+            errors.append(f"sina historical fund flow: {type(exc).__name__}")
+
+        if is_historical:
             return (
                 f"【数据获取失败】个股资金流向东财与新浪历史接口均失败，"
                 f"历史日期 {curr_date} 下无法截断，{symbol} 本项不可用。"
                 f"（{'；'.join(errors)}）"
             )
+
+        # Source 3: 同花顺即时资金流净额快照（历史接口尚无当日收盘行时）。
         try:
             with AKSHARE_CALL_LOCK:
                 df = ak.stock_fund_flow_individual(symbol="即时")
@@ -1312,10 +1352,21 @@ class CnAkshareProvider(BaseMarketDataProvider):
             stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
             if stock_df.empty:
                 return (
-                    f"【备用数据源：新浪】{symbol} 当日资金流向快照无记录"
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照无记录"
                     f"（{'；'.join(errors)}）"
                 )
             row = stock_df.iloc[0]
+            if "净额" not in stock_df.columns:
+                return (
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照缺少净额字段"
+                    f"（{'；'.join(errors)}）"
+                )
+            net_amount = _usable_fund_amount_text(row["净额"])
+            if net_amount is None:
+                return (
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照净额缺失或不可解析"
+                    f"（{'；'.join(errors)}）"
+                )
 
             def _v(col: str) -> str:
                 if col not in stock_df.columns:
@@ -1324,27 +1375,39 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 return "" if pd.isna(val) else str(val)
 
             return (
-                f"【备用数据源：新浪】{symbol} 当日主力资金净流向快照"
+                f"【备用数据源：同花顺即时资金流净额快照】{symbol} 当日资金流净额快照"
                 f"（{curr_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
-                f"净额: {_v('净额')} | 流入资金: {_v('流入资金')} | "
-                f"流出资金: {_v('流出资金')} | 换手率: {_v('换手率')}"
+                f"资金净额: {net_amount} | 流入资金: {_v('流入资金')} | "
+                f"流出资金: {_v('流出资金')} | 换手率: {_v('换手率')}\n"
+                "（该快照不是新浪历史 netamount/r0_net 同口径主力序列）"
             )
         except Exception as exc:
             errors.append(f"stock_fund_flow_individual: {type(exc).__name__}")
 
-        return f"个股资金流向数据获取失败（东财/新浪均失败：{'；'.join(errors)}）"
+        return f"【数据获取失败】个股资金流向数据获取失败（东财/新浪历史/同花顺即时资金流净额快照均失败：{'；'.join(errors)}）"
 
     def _fetch_sina_historical_fund_flow(
-        self, symbol: str, curr_date: str, cutoff
+        self,
+        symbol: str,
+        curr_date: str,
+        cutoff,
+        *,
+        require_curr_date: bool = False,
     ) -> str | None:
         """Source 2.5: fetch and render the Sina historical per-day money flow.
 
         Direct requests call (akshare has no wrapper for this endpoint) with the
         required Referer/User-Agent and a 10s timeout. Rows are filtered to
         ``opendate <= curr_date`` (anti-lookahead unchanged) and the latest N
-        days are rendered EM-style. Returns ``None`` when nothing usable remains
-        on/before ``curr_date``; raises on network/HTTP/parse failure so the
-        caller records an explicit error.
+        days are rendered EM-style. Rows without at least one finite
+        ``netamount`` or ``r0_net`` are discarded before date selection; numeric
+        zero is valid, while non-empty invalid values and infinities are not.
+        When ``require_curr_date`` is true, a prior close is not enough: the
+        caller must fall back to the current snapshot path until the historical
+        endpoint exposes the requested day's close.
+        Returns ``None`` when nothing usable remains on/before ``curr_date`` (or
+        when the required current-day row is absent); raises on network/HTTP/parse
+        failure so the caller records an explicit error.
         """
         import json
         import requests as _requests
@@ -1363,7 +1426,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
         if not isinstance(payload, list):
             return None
         kept: list[dict] = []
-        cutoff_ts = pd.Timestamp(cutoff)
+        cutoff_ts = pd.Timestamp(cutoff).normalize()
+        has_curr_date = False
         for row in payload:
             if not isinstance(row, dict):
                 continue
@@ -1374,9 +1438,25 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 day_ts = pd.Timestamp(day)
             except Exception:
                 continue
-            if pd.notna(day_ts) and day_ts <= cutoff_ts:
+            core_amounts: list[float] = []
+            invalid_core_amount = False
+            for field in _SINA_HIST_CORE_AMOUNT_FIELDS:
+                raw_value = row.get(field)
+                if raw_value is None or (
+                    isinstance(raw_value, str) and not raw_value.strip()
+                ):
+                    continue
+                value = safe_float(raw_value)
+                if value is None or not math.isfinite(value):
+                    invalid_core_amount = True
+                    break
+                core_amounts.append(value)
+            if invalid_core_amount or not core_amounts:
+                continue
+            if pd.notna(day_ts) and day_ts.normalize() <= cutoff_ts:
                 kept.append(row)
-        if not kept:
+                has_curr_date = has_curr_date or day_ts.normalize() == cutoff_ts
+        if not kept or (require_curr_date and not has_curr_date):
             return None
         kept.sort(key=lambda r: str(r.get("opendate", "")))
         return self._format_sina_historical_fund_flow(kept, symbol, curr_date)
@@ -1437,7 +1517,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         latest_day = pd.to_datetime(df_recent["日期"], errors="coerce").max()
         latest_str = latest_day.date().isoformat() if pd.notna(latest_day) else curr_date
         header = (
-            f"【备用数据源：新浪历史】{symbol} 近{len(df_recent)}日主力资金净流向"
+            f"【备用数据源：新浪历史/收盘数据】{symbol} 近{len(df_recent)}日主力资金净流向"
             f"（截至于 {curr_date}，最新数据日 {latest_str}，单位：亿元）：\n"
             f"{df_recent.to_string(index=False)}"
         )

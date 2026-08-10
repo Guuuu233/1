@@ -65,8 +65,9 @@ def create_smart_money_analyst(llm, data_collector=None):
             )),
             HumanMessage(content=(
                 horizon_ctx + "\n"
-                f"请分析 {ticker_display} 在 {current_date} 的主力资金行为。\n\n"
-                f"【近5日主力资金净流向】\n{fund_flow}\n\n"
+                f"请分析 {ticker_display} 在 {current_date} 的资金流数据。若来源为同花顺即时资金流净额快照，"
+                "不得将其视为新浪历史 netamount/r0_net 同口径的主力序列。\n\n"
+                f"【资金流数据（来源、日期与口径见数据）】\n{fund_flow}\n\n"
                 f"【龙虎榜数据】\n{lhb}\n\n"
                 f"【成交量指标(vwma)】\n{volume}"
             )),
