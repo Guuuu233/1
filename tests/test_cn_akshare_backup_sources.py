@@ -5,8 +5,9 @@ connection (RemoteDisconnected) on the current IP. Each affected method now
 falls back to an alternative source inside the provider:
 
 - get_board_fund_flow        EM stock_fund_flow_industry  -> THS stock_board_industry_summary_ths
-- get_individual_fund_flow   EM stock_individual_fund_flow -> Sina historical API (DAV-88 Bug E) for past
-  dates; Sina stock_fund_flow_individual (today snapshot only) for current dates
+- get_individual_fund_flow   EM stock_individual_fund_flow -> Sina historical close API
+  (DAV-88 Bug E) for dated rows; Tonghuashun stock_fund_flow_individual for the
+  current-day instant snapshot when the close row is unavailable
 - get_lhb_detail             EM stock_lhb_detail_em        -> Sina stock_lhb_detail_daily_sina
 """
 
@@ -60,7 +61,7 @@ def test_board_fund_flow_em_success_keeps_primary_format():
     assert "电力" in out
 
 
-def test_individual_fund_flow_falls_back_to_sina_when_em_fails():
+def test_individual_fund_flow_falls_back_to_ths_when_em_fails():
     sina_df = pd.DataFrame(
         {
             "股票代码": ["600519", "000001"],
@@ -80,16 +81,18 @@ def test_individual_fund_flow_falls_back_to_sina_when_em_fails():
     p._ak = lambda: ak
     with patch("requests.get", side_effect=ConnectionError("Sina history unavailable")):
         out = p.get_individual_fund_flow("600519", curr_date=cn_today_str())
-    assert "新浪" in out
+    assert "同花顺即时快照" in out
+    assert "新浪历史/收盘数据" not in out
     assert "3.61亿" in out
     assert "600519" in out
 
 
 def test_individual_fund_flow_sina_refuses_historical_date():
-    """Historical date: the today-snapshot must never leak (anti-lookahead).
+    """Historical date: the THS instant snapshot must never leak (anti-lookahead).
 
     For past dates the Sina historical API (Source 2.5) is tried first; when it
-    also fails the result is an explicit refusal — never the same-day snapshot.
+    also fails the result is an explicit refusal — never the current-day THS
+    instant snapshot.
     """
     ak = MagicMock()
     ak.stock_individual_fund_flow.side_effect = ConnectionError("RemoteDisconnected")

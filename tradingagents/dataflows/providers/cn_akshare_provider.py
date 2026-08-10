@@ -170,6 +170,7 @@ _SINA_HIST_FUND_FLOW_HEADERS = {
 _SINA_HIST_FUND_FLOW_TIMEOUT = 10  # 秒
 _SINA_HIST_FUND_FLOW_FETCH = 20  # 请求行数：取足够多，再按 curr_date 截断
 _SINA_HIST_FUND_FLOW_SHOW = 5  # 展示最近 N 日（与东财版“近5日”对齐）
+_SINA_HIST_CORE_AMOUNT_FIELDS = ("netamount", "r0_net")
 
 
 def _sina_amount_yi(value) -> str:
@@ -1251,7 +1252,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         东财 ``stock_individual_fund_flow`` 对当前 IP 间歇不可达
         （RemoteDisconnected），失败时优先回退到新浪历史收盘序列；当前分析日
         只有在历史接口含 curr_date 当天收盘行时才直接返回，否则继续尝试
-        新浪全市场即时截面 ``stock_fund_flow_individual``。
+        同花顺即时快照 ``stock_fund_flow_individual``。
         """
         if not curr_date:
             return (
@@ -1315,7 +1316,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 f"（{'；'.join(errors)}）"
             )
 
-        # Source 3: 新浪全市场即时截面（历史接口尚无当日收盘行时）。
+        # Source 3: 同花顺即时快照（历史接口尚无当日收盘行时）。
         try:
             with AKSHARE_CALL_LOCK:
                 df = ak.stock_fund_flow_individual(symbol="即时")
@@ -1324,7 +1325,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
             if stock_df.empty:
                 return (
-                    f"【备用数据源：新浪】{symbol} 当日资金流向快照无记录"
+                    f"【数据获取失败】{symbol} 同花顺即时快照无记录"
                     f"（{'；'.join(errors)}）"
                 )
             row = stock_df.iloc[0]
@@ -1336,7 +1337,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 return "" if pd.isna(val) else str(val)
 
             return (
-                f"【备用数据源：新浪】{symbol} 当日主力资金净流向快照"
+                f"【备用数据源：同花顺即时快照】{symbol} 当日主力资金净流向快照"
                 f"（{curr_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
                 f"净额: {_v('净额')} | 流入资金: {_v('流入资金')} | "
                 f"流出资金: {_v('流出资金')} | 换手率: {_v('换手率')}"
@@ -1344,7 +1345,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         except Exception as exc:
             errors.append(f"stock_fund_flow_individual: {type(exc).__name__}")
 
-        return f"【数据获取失败】个股资金流向数据获取失败（东财/新浪历史/新浪即时均失败：{'；'.join(errors)}）"
+        return f"【数据获取失败】个股资金流向数据获取失败（东财/新浪历史/同花顺即时均失败：{'；'.join(errors)}）"
 
     def _fetch_sina_historical_fund_flow(
         self,
@@ -1359,9 +1360,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
         Direct requests call (akshare has no wrapper for this endpoint) with the
         required Referer/User-Agent and a 10s timeout. Rows are filtered to
         ``opendate <= curr_date`` (anti-lookahead unchanged) and the latest N
-        days are rendered EM-style. When ``require_curr_date`` is true, a prior
-        close is not enough: the caller must fall back to the current snapshot
-        path until the historical endpoint exposes the requested day's close.
+        days are rendered EM-style. Rows without a parseable ``netamount`` or
+        ``r0_net`` are discarded before date selection; numeric zero is valid.
+        When ``require_curr_date`` is true, a prior close is not enough: the
+        caller must fall back to the current snapshot path until the historical
+        endpoint exposes the requested day's close.
         Returns ``None`` when nothing usable remains on/before ``curr_date`` (or
         when the required current-day row is absent); raises on network/HTTP/parse
         failure so the caller records an explicit error.
@@ -1394,6 +1397,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
             try:
                 day_ts = pd.Timestamp(day)
             except Exception:
+                continue
+            if not any(
+                safe_float(row.get(field)) is not None
+                for field in _SINA_HIST_CORE_AMOUNT_FIELDS
+            ):
                 continue
             if pd.notna(day_ts) and day_ts.normalize() <= cutoff_ts:
                 kept.append(row)
