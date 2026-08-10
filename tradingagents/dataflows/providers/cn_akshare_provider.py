@@ -1,4 +1,5 @@
 import logging
+import math
 import re
 import time
 import threading
@@ -1252,7 +1253,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
         东财 ``stock_individual_fund_flow`` 对当前 IP 间歇不可达
         （RemoteDisconnected），失败时优先回退到新浪历史收盘序列；当前分析日
         只有在历史接口含 curr_date 当天收盘行时才直接返回，否则继续尝试
-        同花顺即时快照 ``stock_fund_flow_individual``。
+        同花顺即时资金流净额快照 ``stock_fund_flow_individual``；该快照的
+        ``净额`` 不是新浪历史 ``netamount``/``r0_net`` 同口径的主力序列。
         """
         if not curr_date:
             return (
@@ -1316,7 +1318,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 f"（{'；'.join(errors)}）"
             )
 
-        # Source 3: 同花顺即时快照（历史接口尚无当日收盘行时）。
+        # Source 3: 同花顺即时资金流净额快照（历史接口尚无当日收盘行时）。
         try:
             with AKSHARE_CALL_LOCK:
                 df = ak.stock_fund_flow_individual(symbol="即时")
@@ -1325,7 +1327,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
             if stock_df.empty:
                 return (
-                    f"【数据获取失败】{symbol} 同花顺即时快照无记录"
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照无记录"
                     f"（{'；'.join(errors)}）"
                 )
             row = stock_df.iloc[0]
@@ -1337,15 +1339,16 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 return "" if pd.isna(val) else str(val)
 
             return (
-                f"【备用数据源：同花顺即时快照】{symbol} 当日主力资金净流向快照"
+                f"【备用数据源：同花顺即时资金流净额快照】{symbol} 当日资金流净额快照"
                 f"（{curr_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
-                f"净额: {_v('净额')} | 流入资金: {_v('流入资金')} | "
-                f"流出资金: {_v('流出资金')} | 换手率: {_v('换手率')}"
+                f"资金净额: {_v('净额')} | 流入资金: {_v('流入资金')} | "
+                f"流出资金: {_v('流出资金')} | 换手率: {_v('换手率')}\n"
+                "（该快照不是新浪历史 netamount/r0_net 同口径主力序列）"
             )
         except Exception as exc:
             errors.append(f"stock_fund_flow_individual: {type(exc).__name__}")
 
-        return f"【数据获取失败】个股资金流向数据获取失败（东财/新浪历史/同花顺即时均失败：{'；'.join(errors)}）"
+        return f"【数据获取失败】个股资金流向数据获取失败（东财/新浪历史/同花顺即时资金流净额快照均失败：{'；'.join(errors)}）"
 
     def _fetch_sina_historical_fund_flow(
         self,
@@ -1360,8 +1363,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
         Direct requests call (akshare has no wrapper for this endpoint) with the
         required Referer/User-Agent and a 10s timeout. Rows are filtered to
         ``opendate <= curr_date`` (anti-lookahead unchanged) and the latest N
-        days are rendered EM-style. Rows without a parseable ``netamount`` or
-        ``r0_net`` are discarded before date selection; numeric zero is valid.
+        days are rendered EM-style. Rows without at least one finite
+        ``netamount`` or ``r0_net`` are discarded before date selection; numeric
+        zero is valid, while non-empty invalid values and infinities are not.
         When ``require_curr_date`` is true, a prior close is not enough: the
         caller must fall back to the current snapshot path until the historical
         endpoint exposes the requested day's close.
@@ -1398,10 +1402,20 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 day_ts = pd.Timestamp(day)
             except Exception:
                 continue
-            if not any(
-                safe_float(row.get(field)) is not None
-                for field in _SINA_HIST_CORE_AMOUNT_FIELDS
-            ):
+            core_amounts: list[float] = []
+            invalid_core_amount = False
+            for field in _SINA_HIST_CORE_AMOUNT_FIELDS:
+                raw_value = row.get(field)
+                if raw_value is None or (
+                    isinstance(raw_value, str) and not raw_value.strip()
+                ):
+                    continue
+                value = safe_float(raw_value)
+                if value is None or not math.isfinite(value):
+                    invalid_core_amount = True
+                    break
+                core_amounts.append(value)
+            if invalid_core_amount or not core_amounts:
                 continue
             if pd.notna(day_ts) and day_ts.normalize() <= cutoff_ts:
                 kept.append(row)
