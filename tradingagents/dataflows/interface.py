@@ -158,16 +158,10 @@ def _resolve_vendor_chain(method: str, configured_vendor: str) -> list[str]:
     return fallback
 
 
-# Methods whose historical coverage is not reproducible across the whole vendor
-# chain. Refuse at the router so no date-blind provider is hit.
-_HISTORICAL_NEAR_WINDOW_NEWS_METHODS = {
-    "get_news": "个股新闻源仅覆盖近期，历史日期不可用",
-}
-
-# Historical global news is a deliberately narrow route: only Investoday accepts
-# the request because it can query an explicit begin/end time window. Sina,
-# yfinance, and other live/current sources must never receive an as-of request.
+# Historical news must use providers that can query and filter an explicit
+# publication window. Live/current sources never receive a historical as-of.
 _HISTORICAL_NEAR_WINDOW_NEWS_PROVIDER_ALLOWLIST = {
+    "get_news": frozenset({"cn_akshare", "cn_investoday"}),
     "get_global_news": frozenset({"cn_investoday"}),
 }
 
@@ -272,19 +266,6 @@ def _analysis_date_for_method(method: str, args: tuple, kwargs: dict) -> str | N
     return None
 
 
-def _historical_near_window_news_refusal(
-    method: str, args: tuple, kwargs: dict
-) -> str | None:
-    """Return a fixed refusal for historical near-window news methods, else None."""
-    reason = _HISTORICAL_NEAR_WINDOW_NEWS_METHODS.get(method)
-    if not reason:
-        return None
-    analysis_date = _analysis_date_for_method(method, args, kwargs)
-    if not is_historical_analysis_date(analysis_date):
-        return None
-    return f"【数据获取失败】{reason}"
-
-
 def _historical_news_provider_allowlist(
     method: str, args: tuple, kwargs: dict
 ) -> set[str] | None:
@@ -298,8 +279,14 @@ def _historical_news_provider_allowlist(
     return set(configured)
 
 
-def _historical_global_news_failure() -> str:
+def _historical_news_failure(method: str) -> str:
     """Keep historical news failures explicit without exposing provider details."""
+    if method == "get_news":
+        return (
+            "【数据获取失败】历史个股新闻仅允许使用具备发布时间过滤能力的"
+            "东财历史新闻或今日投资接口；未获取到可验证数据，"
+            "不得回退到实时新闻源，本项不可用。"
+        )
     return (
         "【数据获取失败】历史宏观新闻仅允许使用今日投资历史接口；"
         "未获取到可验证数据（缺少 API Key、接口失败或返回结构异常），"
@@ -391,14 +378,6 @@ def route_to_vendor(method: str, *args, **kwargs):
         )
         return as_of_refusal
 
-    refusal = _historical_near_window_news_refusal(method, args, kwargs)
-    if refusal is not None:
-        _trace(
-            f"method={method} {args_summary} status=historical-refuse "
-            f"reason=near-window-news providers_hit=0"
-        )
-        return refusal
-
     for vendor in fallback_vendors:
         if peer_allowlist is not None and vendor not in peer_allowlist:
             _trace(
@@ -476,7 +455,7 @@ def route_to_vendor(method: str, *args, **kwargs):
                 # Provider returned normally — interpret typed vendor semantics.
                 if isinstance(result, VendorRefuse):
                     if historical_provider_allowlist is not None:
-                        return _historical_global_news_failure()
+                        return _historical_news_failure(method)
                     if result.allow_peers:
                         refusal_reason = result.to_prompt()
                         peer_allowlist = set(result.allow_peers)
@@ -493,7 +472,7 @@ def route_to_vendor(method: str, *args, **kwargs):
                     return result.to_prompt()
                 if isinstance(result, VendorEmpty):
                     if historical_provider_allowlist is not None:
-                        last_exc = RuntimeError("historical global news is empty")
+                        last_exc = RuntimeError("historical news is empty")
                         _trace(
                             f"method={method} {args_summary} vendor={vendor} "
                             "status=fallback reason=historical-empty"
@@ -517,7 +496,7 @@ def route_to_vendor(method: str, *args, **kwargs):
                         and not isinstance(result.payload, str)
                     ):
                         last_exc = RuntimeError(
-                            "historical global news returned malformed result"
+                            "historical news returned malformed result"
                         )
                         _trace(
                             f"method={method} {args_summary} vendor={vendor} "
@@ -526,7 +505,7 @@ def route_to_vendor(method: str, *args, **kwargs):
                         break
                     prompt = result.to_prompt()
                     if historical_provider_allowlist is not None and not prompt.strip():
-                        last_exc = RuntimeError("historical global news is empty")
+                        last_exc = RuntimeError("historical news is empty")
                         _trace(
                             f"method={method} {args_summary} vendor={vendor} "
                             "status=fallback reason=empty-result"
@@ -539,7 +518,7 @@ def route_to_vendor(method: str, *args, **kwargs):
                     and not isinstance(result, str)
                 ):
                     last_exc = RuntimeError(
-                        "historical global news returned malformed result"
+                        "historical news returned malformed result"
                     )
                     _trace(
                         f"method={method} {args_summary} vendor={vendor} "
@@ -547,7 +526,7 @@ def route_to_vendor(method: str, *args, **kwargs):
                     )
                     break
                 if historical_provider_allowlist is not None and not result.strip():
-                    last_exc = RuntimeError("historical global news is empty")
+                    last_exc = RuntimeError("historical news is empty")
                     _trace(
                         f"method={method} {args_summary} vendor={vendor} "
                         "status=fallback reason=empty-result"
@@ -559,9 +538,9 @@ def route_to_vendor(method: str, *args, **kwargs):
     if historical_provider_allowlist is not None:
         _trace(
             f"method={method} {args_summary} status=historical-failure "
-            "reason=no-verified-investoday-data"
+            "reason=no-verified-historical-news-data"
         )
-        return _historical_global_news_failure()
+        return _historical_news_failure(method)
     if refusal_reason is not None:
         _trace(f"method={method} {args_summary} status=refuse-sticky reason=no-peer-hit")
         return refusal_reason

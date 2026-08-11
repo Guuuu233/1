@@ -517,6 +517,39 @@ def cn_market_phase(now: datetime | None = None) -> str:
     return "post_close"
 
 
+def resolve_cn_analysis_date(
+    requested_date: str | None = None,
+    *,
+    explicit: bool = False,
+    now: datetime | None = None,
+) -> str:
+    """Resolve an analysis date without treating an unfinished day as closed data.
+
+    An explicitly supplied date is only normalized for weekends/holidays; a
+    trading-day request remains that date even during pre-open or intraday
+    analysis so the caller can report the requested day's data gap.  When no
+    date was supplied, the CN market phase determines the default: before the
+    close, use the latest completed trading day strictly before today; after
+    the close, use today's trading day.  Every result is sourced from the
+    trading calendar and never rounded forward.
+    """
+    now_dt = now or now_cn()
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=CN_TZ)
+    else:
+        now_dt = now_dt.astimezone(CN_TZ)
+
+    raw = str(requested_date or "").strip()
+    if explicit and raw:
+        return normalize_to_trading_day(raw)
+
+    today = _format_date(now_dt.date())
+    phase = cn_market_phase(now_dt)
+    if phase in {"pre_open", "in_session", "lunch_break"}:
+        return previous_cn_trading_day(today)
+    return normalize_to_trading_day(today)
+
+
 def cn_no_data_reason(date_str: str) -> str:
     if not is_cn_trading_day(date_str, allow_weekday_fallback=True):
         return "N/A：非交易日（A股休市）"

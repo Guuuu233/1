@@ -56,6 +56,7 @@ class InstrumentContext(TypedDict):
 
 class MarketContext(TypedDict):
     trade_date: Annotated[str, "Requested trade date"]
+    analysis_baseline_date: Annotated[str, "Analysis baseline date"]
     timezone: Annotated[str, "Market timezone"]
     market_country: Annotated[str, "Market country"]
     exchange: Annotated[str, "Exchange code"]
@@ -83,6 +84,8 @@ class WorkflowContext(TypedDict):
     context_version: Annotated[str, "Workflow context version"]
     request_source: Annotated[str, "Request origin such as api or chat"]
     selected_analysts: Annotated[list[str], "Requested analyst roster"]
+    analysis_baseline_date: Annotated[str, "Analysis baseline date"]
+    data_as_of: Annotated[str | None, "Confirmed data cutoff"]
 
 
 class InvestDebateState(TypedDict):

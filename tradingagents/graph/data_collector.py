@@ -14,6 +14,7 @@ import time
 import pandas as pd
 from stockstats import wrap
 import io
+import re
 
 from tradingagents.agents.utils.agent_utils import (
     get_stock_data,
@@ -366,6 +367,7 @@ def _unavailable_realtime_context(retrieved_at: Optional[str], error: str) -> Di
 def default_market_data_context() -> Dict[str, Any]:
     """Return a safe context when collection did not provide one."""
     return {
+        "analysis_baseline_date": None,
         "daily": {"as_of": None, "completeness": "unavailable"},
         "realtime": {
             "status": "unavailable",
@@ -375,6 +377,7 @@ def default_market_data_context() -> Dict[str, Any]:
             "error": "实时行情上下文不可用",
             "quote": None,
         },
+        "source_provenance": {},
         "data_failure_ledger": [],
     }
 
@@ -568,6 +571,58 @@ def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, str]]:
     return [entry for _rank, _source, entry in entries]
 
 
+_SOURCE_AS_OF_PATTERNS = (
+    r"数据日期[】：:]?\s*(20\d{2}-\d{2}-\d{2})",
+    r"最新数据日\s*(20\d{2}-\d{2}-\d{2})",
+    r"数据窗口：\s*20\d{2}-\d{2}-\d{2}\s*至\s*(20\d{2}-\d{2}-\d{2})",
+    r"截至(?:于|日期)?\s*(20\d{2}-\d{2}-\d{2})",
+    r"新闻（\s*20\d{2}-\d{2}-\d{2}\s*至\s*(20\d{2}-\d{2}-\d{2})",
+    r"(20\d{2}-\d{2}-\d{2})\s+涨停家数",
+)
+
+
+def _extract_source_as_of(value: Any, requested_as_of: str) -> Optional[str]:
+    """Extract an explicitly reported source date, never infer from retrieval time."""
+    if isinstance(value, dict):
+        for key in ("as_of", "quote_as_of", "data_as_of"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and re.search(r"20\d{2}-\d{2}-\d{2}", candidate):
+                return re.search(r"20\d{2}-\d{2}-\d{2}", candidate).group(0)
+        return None
+    text = value if isinstance(value, str) else str(value or "")
+    candidates: list[str] = []
+    for pattern in _SOURCE_AS_OF_PATTERNS:
+        for match in re.finditer(pattern, text):
+            candidates.extend(group for group in match.groups() if group)
+    dates = [item for item in candidates if item <= requested_as_of]
+    return max(dates) if dates else None
+
+
+def _build_source_provenance(
+    results: Dict[str, Any],
+    requested_as_of: str,
+    daily_as_of: Optional[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Persist per-source cutoff evidence beside the compact failure ledger."""
+    provenance: Dict[str, Dict[str, Any]] = {}
+    for source, value in results.items():
+        status = _classify_failure_value(value) or "available"
+        as_of = _extract_source_as_of(value, requested_as_of)
+        if source == "stock_data":
+            as_of = daily_as_of
+        entry: Dict[str, Any] = {
+            "requested_as_of": requested_as_of,
+            "as_of": as_of,
+            "status": status,
+        }
+        if status != "available":
+            entry["gap"] = f"【数据获取失败】{source}：{_compact_failure_reason(status)}"
+        elif as_of is None and source != "realtime":
+            entry["gap"] = f"【数据获取失败】{source}：未返回可验证数据日期"
+        provenance[str(source)] = entry
+    return provenance
+
+
 def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
     """Fetch all data sources in parallel.
 
@@ -644,6 +699,28 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
             "（缺列/非法日期/全部行无效/重复冲突），本项不可用。"
         )
     daily_context = _build_daily_context(df, trade_date)
+    source_provenance = _build_source_provenance(
+        results,
+        trade_date,
+        daily_context.get("as_of"),
+    )
+    ledger_sources = {
+        str(entry.get("source"))
+        for entry in data_failure_ledger
+        if isinstance(entry, dict)
+    }
+    for source in ("news", "global_news", "zt_pool", "hot_stocks"):
+        provenance = source_provenance.get(source) or {}
+        gap = provenance.get("gap")
+        if gap and source not in ledger_sources:
+            data_failure_ledger.append(
+                {
+                    "source": source,
+                    "status": "unavailable",
+                    "reason": "unverified as-of",
+                    "gap": gap,
+                }
+            )
     realtime_context = results.pop("realtime", None)
     if not isinstance(realtime_context, dict) or realtime_context.get("status") not in {
         "available",
@@ -655,8 +732,10 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
             "实时行情抓取未完成",
         )
     results["market_data_context"] = {
+        "analysis_baseline_date": trade_date,
         "daily": daily_context,
         "realtime": realtime_context,
+        "source_provenance": source_provenance,
         "data_failure_ledger": data_failure_ledger,
     }
 

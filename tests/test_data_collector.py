@@ -3,6 +3,7 @@ import threading
 
 from tradingagents.graph.data_collector import (
     DataCollector,
+    _build_source_provenance,
     _fetch_all,
     make_cache_key,
 )
@@ -10,6 +11,25 @@ from tradingagents.graph.data_collector import (
 
 def test_make_cache_key():
     assert make_cache_key("600519", "2026-03-12") == "600519_2026-03-12"
+
+
+def test_source_provenance_keeps_actual_as_of_and_explicit_gap():
+    results = {
+        "news": "## 600519 新闻（2026-08-05 至 2026-08-11）：",
+        "global_news": "【数据获取失败】历史宏观新闻不可用",
+        "zt_pool": "【数据获取失败】涨停板情绪池：无可验证数据日期",
+    }
+    provenance = _build_source_provenance(
+        results,
+        "2026-08-11",
+        daily_as_of="2026-08-11",
+    )
+
+    assert provenance["news"]["requested_as_of"] == "2026-08-11"
+    assert provenance["news"]["as_of"] == "2026-08-11"
+    assert provenance["global_news"]["status"] == "failed"
+    assert "gap" in provenance["global_news"]
+    assert provenance["zt_pool"]["status"] == "failed"
 
 
 def test_collect_populates_required_keys():

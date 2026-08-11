@@ -416,11 +416,25 @@ class TradingAgentsGraph:
 
     def _build_horizon_result(self, horizon: str, final_state: Dict[str, Any]) -> Dict[str, Any]:
         """Extract a compact result dict from a completed graph state."""
+        market_context = final_state.get("market_context", {})
+        trade_date = final_state.get("trade_date", "")
+        market_data_context = final_state.get("market_data_context", {})
+        daily_context = market_data_context.get("daily", {}) if isinstance(market_data_context, dict) else {}
+        failure_ledger = market_data_context.get("data_failure_ledger", []) if isinstance(market_data_context, dict) else []
+        data_gaps = [
+            str(entry.get("gap"))
+            for entry in failure_ledger
+            if isinstance(entry, dict) and entry.get("gap")
+        ]
         return {
             "horizon": horizon,
             "company_of_interest": final_state.get("company_of_interest", ""),
-            "trade_date": final_state.get("trade_date", ""),
-            "market_data_context": final_state.get("market_data_context", {}),
+            "trade_date": trade_date,
+            "analysis_baseline_date": trade_date,
+            "data_as_of": daily_context.get("as_of") or market_context.get("data_as_of"),
+            "data_gaps": data_gaps,
+            "market_context": market_context,
+            "market_data_context": market_data_context,
             "final_trade_decision": final_state.get("final_trade_decision", ""),
             "investment_plan": final_state.get("investment_plan", ""),
             "trader_investment_plan": final_state.get("trader_investment_plan", ""),

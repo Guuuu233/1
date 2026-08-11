@@ -31,6 +31,7 @@ MARKET_INDICATORS = [
 
 def _default_market_data_context() -> dict:
     return {
+        "analysis_baseline_date": None,
         "daily": {"as_of": None, "completeness": "unavailable"},
         "realtime": {
             "status": "unavailable",
@@ -40,17 +41,23 @@ def _default_market_data_context() -> dict:
             "error": "实时行情上下文不可用",
             "quote": None,
         },
+        "source_provenance": {},
     }
 
 
 def _format_market_data_context(context: dict) -> str:
+    baseline = context.get("analysis_baseline_date") or "不可用"
     daily = context.get("daily") or {}
     realtime = context.get("realtime") or {}
+    source_provenance = context.get("source_provenance") or {}
     daily_as_of = daily.get("as_of") or "不可用"
     daily_completeness = daily.get("completeness") or "unavailable"
     return (
+        f"【分析基准日】{baseline}\n"
         f"【完整日线】截至 {daily_as_of}，完整性：{daily_completeness}。"
         "以下 K 线和指标不含盘中实时快照。\n"
+        "【各数据源 as_of/缺口】\n"
+        f"{json.dumps(source_provenance, ensure_ascii=False, sort_keys=True)}\n"
         "【实时快照】\n"
         f"{json.dumps(realtime, ensure_ascii=False, sort_keys=True)}"
     )

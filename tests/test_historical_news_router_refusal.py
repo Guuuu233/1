@@ -1,4 +1,4 @@
-"""3b-hotfix: near-window news refused at route_to_vendor for historical dates."""
+"""Historical news routes only through providers with verifiable as-of windows."""
 
 from __future__ import annotations
 
@@ -9,9 +9,6 @@ import pytest
 
 from tradingagents.dataflows import interface as iface
 from tradingagents.dataflows.trade_calendar import cn_today_str, now_cn
-
-
-STOCK_REASON = "个股新闻源仅覆盖近期，历史日期不可用"
 
 
 @pytest.fixture
@@ -114,29 +111,29 @@ def test_global_news_historical_malformed_or_network_failure_is_explicit(
     ]
 
 
-def test_news_historical_refuses_with_zero_provider_hits(past_date, capsys):
-    provider = MagicMock()
-    provider.get_news.side_effect = AssertionError("provider must not be called")
+def test_news_historical_routes_only_to_verified_sources(past_date):
+    akshare = MagicMock()
+    akshare.get_news.return_value = "## 600519 历史新闻（2026-04-30 至 2026-05-14）："
+    investoday = MagicMock()
+    investoday.get_news.side_effect = AssertionError("must stop after verified hit")
+    yfinance = MagicMock()
+    yfinance.get_news.side_effect = AssertionError("live news must not receive historical as-of")
 
+    start_date = (now_cn().date() - timedelta(days=104)).isoformat()
     with patch.object(iface, "_registry") as reg:
         reg.list_names.return_value = ["cn_akshare", "cn_investoday", "yfinance"]
-        reg.get.return_value = provider
+        reg.get.side_effect = {
+            "cn_akshare": akshare,
+            "cn_investoday": investoday,
+            "yfinance": yfinance,
+        }.get
         with patch.object(iface, "get_vendor", return_value="cn_akshare,cn_investoday,yfinance"):
-            out = iface.route_to_vendor(
-                "get_news",
-                "600519",
-                (now_cn().date() - timedelta(days=104)).isoformat(),
-                past_date,
-            )
+            out = iface.route_to_vendor("get_news", "600519", start_date, past_date)
 
-    assert out.startswith("【数据获取失败】")
-    assert STOCK_REASON in out
-    assert "No news found" not in out
-    provider.get_news.assert_not_called()
-    reg.get.assert_not_called()
-    captured = capsys.readouterr().out
-    assert "status=historical-refuse" in captured
-    assert "providers_hit=0" in captured
+    assert "历史新闻" in out
+    akshare.get_news.assert_called_once_with("600519", start_date, past_date)
+    investoday.get_news.assert_not_called()
+    yfinance.get_news.assert_not_called()
 
 
 def test_global_news_today_still_routes_to_provider():
@@ -170,7 +167,7 @@ def test_news_today_still_routes_to_provider():
     provider.get_news.assert_called_once_with("600519", start, today)
 
 
-def test_news_kwarg_end_date_historical_refuses(past_date):
+def test_news_kwarg_end_date_historical_failure_is_explicit(past_date):
     provider = MagicMock()
     with patch.object(iface, "_registry") as reg:
         reg.list_names.return_value = ["cn_akshare"]
@@ -182,5 +179,6 @@ def test_news_kwarg_end_date_historical_refuses(past_date):
                 start_date="2026-01-01",
                 end_date=past_date,
             )
-    assert STOCK_REASON in out
-    provider.get_news.assert_not_called()
+    assert out.startswith("【数据获取失败】")
+    assert "历史个股新闻" in out
+    provider.get_news.assert_called_once()

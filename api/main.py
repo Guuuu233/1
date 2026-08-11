@@ -73,7 +73,7 @@ from tradingagents.agents.utils.prompt_injection import DEFAULT_PLACEMENT
 
 # 全局共享 DataCollector：同一 ticker+date 的数据只拉一次，所有 job 复用缓存
 _shared_data_collector = DataCollector()
-from tradingagents.dataflows.trade_calendar import cn_today_str
+from tradingagents.dataflows.trade_calendar import cn_today_str, now_cn
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.interface import route_to_vendor
 from tradingagents.graph.intent_parser import parse_intent as _parse_intent
@@ -119,39 +119,68 @@ def _report_version_stats() -> None:
 
 
 def _resolve_scheduled_trade_date(trade_date: str) -> str:
-    """Use the requested trading day, or fall back to the latest CN trading day."""
-    from tradingagents.dataflows.trade_calendar import normalize_to_trading_day
+    """Resolve scheduler defaults using the current CN market phase.
 
-    # Hard calendar path: never silently treat Mon-Fri as trading days.
-    return normalize_to_trading_day(trade_date)
+    Scheduled/manual triggers pass today's local date. Treat that value as an
+    omitted ordinary-analysis date so pre-open and intraday runs use the last
+    completed session; non-today dates retain their explicit date semantics.
+    """
+    today = cn_today_str()
+    explicit = bool(trade_date and trade_date != today)
+    return _normalize_analysis_trade_date(
+        trade_date if explicit else None,
+        explicit=explicit,
+    )
 
 
-def _normalize_analysis_trade_date(trade_date: Optional[str]) -> str:
-    """Normalize an ordinary-analysis as-of date to the latest CN trading day.
+def _normalize_analysis_trade_date(
+    trade_date: Optional[str],
+    *,
+    explicit: Optional[bool] = None,
+    now: Optional[datetime] = None,
+) -> str:
+    """Resolve an ordinary-analysis date against the CN calendar and session.
 
-    Mirrors the scheduled path (``_resolve_scheduled_trade_date``) so a
-    weekend/holiday request date rolls back to the nearest prior trading day
-    (never forward — prevents future-data leakage). A missing/empty date
-    defaults to today and is then snapped back to the latest trading day.
+    A missing/empty date is a default: during pre-open, lunch, or an active
+    session it resolves to the latest completed trading day, while post-close
+    it may resolve to today's trading day.  A non-empty date is explicit by
+    default and is only rolled back for a weekend/holiday; this preserves a
+    user's request for today's unfinished data so providers can report a gap
+    instead of silently substituting yesterday.
 
-    If the calendar cannot be loaded (or the request day is outside the usable
-    range), the raw value is preserved so existing degradation behavior is kept
-    and no new exception path is introduced.
+    If the calendar cannot be loaded, preserve the old degradation contract by
+    returning the supplied date or the current CN date without fabricating a
+    prior session.
     """
     from tradingagents.dataflows.trade_calendar import (
         TradeCalendarUnavailableError,
-        normalize_to_trading_day,
+        resolve_cn_analysis_date,
     )
 
-    raw = trade_date or cn_today_str()
+    raw = str(trade_date or "").strip()
+    if explicit is None:
+        explicit = bool(raw)
+    fallback = raw or cn_today_str()
     try:
-        return normalize_to_trading_day(raw)
+        return resolve_cn_analysis_date(
+            raw or None,
+            explicit=bool(explicit),
+            now=now,
+        )
     except TradeCalendarUnavailableError as exc:
-        logger.warning("Analysis trade_date calendar unavailable; keeping raw %r: %s", raw, exc)
-        return raw
+        logger.warning(
+            "Analysis trade_date calendar unavailable; keeping raw %r: %s",
+            fallback,
+            exc,
+        )
+        return fallback
     except Exception as exc:  # pragma: no cover - defensive: never break a request
-        logger.warning("Analysis trade_date normalization failed; keeping raw %r: %s", raw, exc)
-        return raw
+        logger.warning(
+            "Analysis trade_date normalization failed; keeping raw %r: %s",
+            fallback,
+            exc,
+        )
+        return fallback
 
 
 def _build_scheduled_analyze_request(
@@ -816,6 +845,9 @@ class UserContextInput(BaseModel):
 class AnalyzeRequest(UserContextInput):
     symbol: str = Field(default="", description="股票代码，如 600519.SH（当 query 包含代码时可省略）")
     trade_date: str = Field(default_factory=cn_today_str, description="交易日期 YYYY-MM-DD")
+    # ``None`` means infer from Pydantic's fields-set for internal callers;
+    # API/chat paths set this explicitly before resolving a default date.
+    trade_date_explicit: Optional[bool] = Field(default=None, exclude=True, repr=False)
     selected_analysts: List[str] = Field(
         default_factory=lambda: ["market", "social", "news", "fundamentals", "macro", "smart_money", "volume_price"]
     )
@@ -1545,13 +1577,27 @@ def _apply_user_context_to_request(request: "AnalyzeRequest", user_context: Dict
 
 
 def _build_result_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
+    market_context = final_state.get("market_context") or {}
+    market_data_context = final_state.get("market_data_context") or {}
+    daily_context = market_data_context.get("daily") or {}
+    failure_ledger = market_data_context.get("data_failure_ledger") or []
+    data_gaps = [
+        str(entry.get("gap"))
+        for entry in failure_ledger
+        if isinstance(entry, dict) and entry.get("gap")
+    ]
+    baseline = final_state.get("trade_date")
+    data_as_of = daily_context.get("as_of") or market_context.get("data_as_of")
     return {
         "symbol": final_state.get("company_of_interest"),
-        "trade_date": final_state.get("trade_date"),
+        "trade_date": baseline,
+        "analysis_baseline_date": baseline,
+        "data_as_of": data_as_of,
+        "data_gaps": data_gaps,
         "direction": None,
         "instrument_context": final_state.get("instrument_context"),
-        "market_context": final_state.get("market_context"),
-        "market_data_context": final_state.get("market_data_context"),
+        "market_context": market_context,
+        "market_data_context": market_data_context,
         "user_context": final_state.get("user_context"),
         "workflow_context": final_state.get("workflow_context"),
         "market_report": final_state.get("market_report"),
@@ -2168,11 +2214,19 @@ async def _run_job_inner(
     request_source: str = "api",
 ) -> None:
     job_start_t = time.time()
-    # DAV-98: one normalization at the job boundary covers every downstream
-    # consumer (report init, data collector, dual-horizon assembly). Idempotent
-    # for already-normalized scheduled runs; falls back to the raw date when
-    # the calendar is unavailable.
-    request.trade_date = _normalize_analysis_trade_date(request.trade_date)
+    # DAV-105: resolve defaults once more at the job boundary so every entry
+    # point shares the same CN session rule. The explicitness marker prevents a
+    # user-requested current date from being rewritten to the prior session.
+    explicit_date = request.trade_date_explicit
+    if explicit_date is None:
+        explicit_date = "trade_date" in request.model_fields_set and bool(
+            str(request.trade_date or "").strip()
+        )
+    request.trade_date = _normalize_analysis_trade_date(
+        request.trade_date if explicit_date else None,
+        explicit=explicit_date,
+    )
+    request.trade_date_explicit = explicit_date
     # Normalize for logic but keep original for display
     display_name = request.symbol
     normalized_symbol = _normalize_symbol(request.symbol)
@@ -2626,6 +2680,15 @@ async def _run_job_inner(
                 result = {
                     "symbol": ticker,
                     "trade_date": request.trade_date,
+                    "analysis_baseline_date": request.trade_date,
+                    "data_as_of": next(
+                        (
+                            horizon_results[horizon].get("data_as_of")
+                            for horizon in request.horizons
+                            if horizon_results[horizon].get("data_as_of")
+                        ),
+                        request.trade_date,
+                    ),
                     "mode": "dual_horizon",
                     "status": "partial" if horizon_errors else "completed",
                     "requested_horizons": list(request.horizons),
@@ -2730,6 +2793,9 @@ async def _run_job_inner(
             result = {
                 "symbol": ticker,
                 "trade_date": request.trade_date,
+                "analysis_baseline_date": request.trade_date,
+                "data_as_of": primary_r.get("data_as_of") or request.trade_date,
+                "data_gaps": list(primary_r.get("data_gaps") or []),
                 "mode": "dual_horizon",
                 "user_intent": user_intent,
                 "model_config_snapshot": model_snapshot,
@@ -3237,11 +3303,34 @@ def _original_question_for_extraction(text: str) -> str:
     return text[:match.start()].strip() if match else text
 
 
+def _extract_explicit_analysis_date(text: str) -> Optional[str]:
+    """Extract only dates stated by the user; never invent today's date."""
+    patterns = (
+        r"(?<!\d)(20\d{2})[-/](\d{1,2})[-/](\d{1,2})(?!\d)",
+        r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)",
+        r"(?<!\d)(20\d{2})年(\d{1,2})月(\d{1,2})日?",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        try:
+            return datetime(
+                int(match.group(1)), int(match.group(2)), int(match.group(3))
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    if re.search(r"(?:今天|今日)", text):
+        return cn_today_str()
+    if re.search(r"(?:昨天|昨日)", text):
+        return (now_cn().date() - timedelta(days=1)).strftime("%Y-%m-%d")
+    return None
+
+
 def _extract_symbol_and_date(text: str) -> tuple[Optional[str], Optional[str]]:
     text = _original_question_for_extraction(text)
-    # Date extraction (flexible boundaries)
-    date_match = re.search(r"\d{4}-\d{2}-\d{2}", text)
-    date = date_match.group(0) if date_match else None
+    date = _extract_explicit_analysis_date(text)
 
     # Priority 1: A-Share 6-digit code (even if stuck to Chinese characters)
     sym_match = re.search(r"(\d{6}(?:\.(?:SH|SZ|SS))?)", text, re.IGNORECASE)
@@ -3669,9 +3758,16 @@ async def analyze(
     request: AnalyzeRequest,
     current_user: UserDB = Depends(_require_api_user),
 ) -> AnalyzeResponse:
-    # Ordinary-analysis entry: normalize the as-of date to a trading day so
-    # weekend/holiday requests don't feed non-trading dates downstream (DAV-98).
-    request.trade_date = _normalize_analysis_trade_date(request.trade_date)
+    # Ordinary-analysis entry: resolve omitted dates with the current CN
+    # session, while preserving an explicitly requested trading day.
+    explicit_date = "trade_date" in request.model_fields_set and bool(
+        str(request.trade_date or "").strip()
+    )
+    request.trade_date = _normalize_analysis_trade_date(
+        request.trade_date if explicit_date else None,
+        explicit=explicit_date,
+    )
+    request.trade_date_explicit = explicit_date
     explicit_context = _extract_request_user_context(request)
 
     def _load_user_context() -> Dict[str, Any]:
@@ -3806,7 +3902,7 @@ async def _ai_extract_symbol_and_date_streaming(
 
 字段说明：
 - stock_name：用户提到的公司名称或股票代码原文（如"华盛天成"、"贵州茅台"、"600519"、"AAPL"）；美股直接填 ticker。
-- date：YYYY-MM-DD 格式。今天是 {today}，如未提及则填今天。
+- date：YYYY-MM-DD 格式。今天是 {today}；只有用户明确提到日期时才填写，否则填 null，不要推断今天。
 - horizons：分析周期。默认只选短线；若用户明确同时提到"短线与中线/短期和中期"，或同时提到 short and medium，必须返回 ["short", "medium"]；
   仅提到"中线/中期/几个月/季度/长期/趋势投资"→ ["medium"]；其他情况（含未提及）→ ["short"]。
 - focus_areas：用户关注的分析维度关键词列表，如 ["技术面", "资金面", "业绩"]，未提及则 []。
@@ -3820,7 +3916,7 @@ async def _ai_extract_symbol_and_date_streaming(
   * user_notes：仅保留重要但未能结构化归类的信息
 
 仅输出 JSON，不要任何其他文字：
-{{"stock_name": "...", "date": "YYYY-MM-DD", "horizons": ["short"], "focus_areas": [], "specific_questions": [], "user_context": {{}}}}
+{{"stock_name": "...", "date": null, "horizons": ["short"], "focus_areas": [], "specific_questions": [], "user_context": {{}}}}
 
 如果无法识别股票标的：{{"stock_name": null, "date": null, "horizons": ["short"], "focus_areas": [], "specific_questions": [], "user_context": {{}}}}
 
@@ -3845,7 +3941,9 @@ async def _ai_extract_symbol_and_date_streaming(
         if m:
             data = _json.loads(m.group(0))
             llm_name = (data.get("stock_name") or "").strip() or None
-            llm_date = data.get("date") or today
+            # The regex extractor is the source of truth for explicit dates;
+            # the LLM must not turn an omitted date into an implicit today.
+            llm_date = fast_date
             llm_horizons = data.get("horizons") or ["short"]
             llm_focus_areas = data.get("focus_areas") or []
             llm_specific_questions = data.get("specific_questions") or []
@@ -3856,14 +3954,14 @@ async def _ai_extract_symbol_and_date_streaming(
     if not llm_name:
         if fast_symbol:
             _log(f"[StockExtract] LLM 未返回 stock_name，使用 regex 兜底: {fast_symbol}")
-            return fast_symbol, fast_date or today, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
+            return fast_symbol, fast_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
         # LLM 挂掉(限流/模型下线/网络)且原文没有代码时，拿原文在本地股票名单里
         # 搜一次：_search_cn_stock_by_name 支持"名称是输入子串"的匹配，
         # "分析一下 飞沃科技" 可以不经 LLM 直接命中 301232.SZ
         local_code = await asyncio.to_thread(_search_cn_stock_by_name, extraction_text)
         if local_code:
             _log(f"[StockExtract] LLM 失败，本地名单从原文兜底命中: {local_code}")
-            return local_code, fast_date or today, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
+            return local_code, fast_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
         return None, None, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
 
     _log(f"[StockExtract] extracted name='{llm_name}', date={llm_date}, horizons={llm_horizons}")
@@ -3883,7 +3981,7 @@ async def _ai_extract_symbol_and_date_streaming(
     # 最后兜底：LLM 返回了名字但所有 resolver 都解析不出，且 regex 找到了清晰代码
     if fast_symbol:
         _log(f"[StockExtract] LLM 名 '{llm_name}' 无法解析为代码，使用 regex 兜底: {fast_symbol}")
-        return fast_symbol, llm_date or fast_date or today, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
+        return fast_symbol, llm_date or fast_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
 
     return None, llm_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
 
@@ -3922,7 +4020,7 @@ def _ai_extract_symbol_and_date(
 
 字段说明：
 - stock_name：用户提到的公司名称或股票代码原文（如"华盛天成"、"贵州茅台"、"600519"、"AAPL"）；美股直接填 ticker。
-- date：YYYY-MM-DD 格式。今天是 {today}，如未提及则填今天。
+- date：YYYY-MM-DD 格式。今天是 {today}；只有用户明确提到日期时才填写，否则填 null，不要推断今天。
 - horizons：分析周期。默认只选短线；若用户明确同时提到"短线与中线/短期和中期"，或同时提到 short and medium，必须返回 ["short", "medium"]；
   仅提到"中线/中期/几个月/季度/长期/趋势投资"→ ["medium"]；其他情况（含未提及）→ ["short"]。
 - focus_areas：用户关注的分析维度关键词列表，如 ["技术面", "资金面", "业绩"]，未提及则 []。
@@ -3936,7 +4034,7 @@ def _ai_extract_symbol_and_date(
   * user_notes：仅保留重要但未能结构化归类的信息
 
 仅输出 JSON，不要任何其他文字：
-{{"stock_name": "...", "date": "YYYY-MM-DD", "horizons": ["short"], "focus_areas": [], "specific_questions": [], "user_context": {{}}}}
+{{"stock_name": "...", "date": null, "horizons": ["short"], "focus_areas": [], "specific_questions": [], "user_context": {{}}}}
 
 如果无法识别股票标的：{{"stock_name": null, "date": null, "horizons": ["short"], "focus_areas": [], "specific_questions": [], "user_context": {{}}}}
 
@@ -3959,7 +4057,9 @@ def _ai_extract_symbol_and_date(
         if m:
             data = _json.loads(m.group(0))
             llm_name = (data.get("stock_name") or "").strip() or None
-            llm_date = data.get("date") or today
+            # The regex extractor is the source of truth for explicit dates;
+            # the LLM must not turn an omitted date into an implicit today.
+            llm_date = fast_date
             llm_horizons = data.get("horizons") or ["short"]
             llm_focus_areas = data.get("focus_areas") or []
             llm_specific_questions = data.get("specific_questions") or []
@@ -3970,12 +4070,12 @@ def _ai_extract_symbol_and_date(
     if not llm_name:
         if fast_symbol:
             _log(f"[StockExtract] LLM 未返回 stock_name，使用 regex 兜底: {fast_symbol}")
-            return fast_symbol, fast_date or today, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
+            return fast_symbol, fast_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
         # LLM 挂掉且原文没有代码时，拿原文在本地股票名单里搜一次（同流式版本）
         local_code = _search_cn_stock_by_name(extraction_text)
         if local_code:
             _log(f"[StockExtract] LLM 失败，本地名单从原文兜底命中: {local_code}")
-            return local_code, fast_date or today, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
+            return local_code, fast_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
         _log(f"[StockExtract] LLM returned no stock name for: '{text[:40]}'")
         return None, None, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
 
@@ -4005,7 +4105,7 @@ def _ai_extract_symbol_and_date(
     # 最后兜底：LLM 给了名字但所有 resolver 都解析不出，且 regex 找到了清晰代码
     if fast_symbol:
         _log(f"[StockExtract] LLM 名 '{llm_name}' 无法解析为代码，使用 regex 兜底: {fast_symbol}")
-        return fast_symbol, llm_date or fast_date or today, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
+        return fast_symbol, llm_date or fast_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
 
     _log(f"[StockExtract] Could not resolve '{llm_name}' to a stock code")
     return None, llm_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
@@ -4028,8 +4128,11 @@ async def chat_completions(
                 symbol, trade_date, horizons, focus_areas, specific_questions, inferred_user_context = \
                     await _ai_extract_symbol_and_date_streaming(text, config, job_id)
                 horizons = _normalize_analysis_horizons(horizons, query=text)
-                # DAV-98: snap a weekend/holiday as-of date to the nearest trading day.
-                trade_date = _normalize_analysis_trade_date(trade_date)
+                date_explicit = bool(str(trade_date or "").strip())
+                trade_date = _normalize_analysis_trade_date(
+                    trade_date if date_explicit else None,
+                    explicit=date_explicit,
+                )
 
                 if not symbol:
                     _emit_job_event(job_id, "job.failed", {
@@ -4061,6 +4164,7 @@ async def chat_completions(
                 analyze_req = AnalyzeRequest(
                     symbol=symbol,
                     trade_date=trade_date,
+                    trade_date_explicit=date_explicit,
                     selected_analysts=request.selected_analysts,
                     config_overrides=request.config_overrides,
                     dry_run=request.dry_run,
@@ -4114,8 +4218,11 @@ async def chat_completions(
     symbol, trade_date, horizons, focus_areas, specific_questions, inferred_user_context = \
         await asyncio.to_thread(_ai_extract_symbol_and_date, text, config)
     horizons = _normalize_analysis_horizons(horizons, query=text)
-    # DAV-98: snap a weekend/holiday as-of date to the nearest trading day.
-    trade_date = _normalize_analysis_trade_date(trade_date)
+    date_explicit = bool(str(trade_date or "").strip())
+    trade_date = _normalize_analysis_trade_date(
+        trade_date if date_explicit else None,
+        explicit=date_explicit,
+    )
 
     if not symbol:
         raise HTTPException(status_code=400, detail="抱歉，我没能从您的消息中识别出股票标的。请输入代码（如 600519.SH）或可识别的公司名称。")
@@ -4144,6 +4251,7 @@ async def chat_completions(
     analyze_req = AnalyzeRequest(
         symbol=symbol,
         trade_date=trade_date,
+        trade_date_explicit=date_explicit,
         selected_analysts=request.selected_analysts,
         config_overrides=request.config_overrides,
         dry_run=request.dry_run,

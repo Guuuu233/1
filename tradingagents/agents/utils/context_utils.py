@@ -115,6 +115,7 @@ def build_market_context(symbol: str, trade_date: str, now: datetime | None = No
     else:
         context = {
             "trade_date": trade_date,
+            "analysis_baseline_date": trade_date,
             "timezone": "UTC",
             "market_session": "unknown",
             "market_is_open": False,
@@ -215,8 +216,10 @@ def summarize_instrument_context(context: Mapping[str, Any] | None) -> str:
 
 def summarize_market_context(context: Mapping[str, Any] | None) -> str:
     ctx = context or {}
+    baseline = ctx.get("analysis_baseline_date") or ctx.get("trade_date", "—")
     return "\n".join(
         [
+            f"分析基准日：{baseline}",
             f"交易日期：{ctx.get('trade_date', '—')}",
             f"时区：{ctx.get('timezone', '—')}",
             f"市场状态：{ctx.get('market_session', '—')}",
@@ -291,6 +294,7 @@ def _build_cn_market_context(trade_date: str, now: datetime | None = None) -> di
     analysis_mode = _determine_cn_analysis_mode(trade_date, today, market_session)
     return {
         "trade_date": trade_date,
+        "analysis_baseline_date": trade_date,
         "timezone": "Asia/Shanghai",
         "market_session": market_session,
         "market_is_open": trade_date == today and market_session == "in_session",
@@ -317,6 +321,7 @@ def _build_us_market_context(trade_date: str, now: datetime | None = None) -> di
     analysis_mode = _determine_us_analysis_mode(trade_date, today, market_session)
     return {
         "trade_date": trade_date,
+        "analysis_baseline_date": trade_date,
         "timezone": "America/New_York",
         "market_session": market_session,
         "market_is_open": trade_date == today and market_session == "in_session",
@@ -380,7 +385,7 @@ def _cn_data_as_of(trade_date: str, today: str, market_session: str) -> str:
     if trade_date > today:
         return today
     if trade_date == today and market_session in {"pre_open", "in_session", "lunch_break"}:
-        return today
+        return previous_cn_trading_day(today, allow_weekday_fallback=True)
     return trade_date
 
 

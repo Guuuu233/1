@@ -2,12 +2,14 @@
 
 import asyncio
 from contextlib import ExitStack, nullcontext
+from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from api import main
+from tradingagents.dataflows import trade_calendar as tc
 
 
 _EMPTY_EXTRACTION = (
@@ -89,6 +91,13 @@ def test_extraction_preserves_explicit_a_share_and_us_tickers(extract, text, exp
 
 
 @pytest.mark.parametrize("extract", [_extract_sync, _extract_streaming])
+def test_extraction_does_not_infer_today_when_date_is_omitted(extract):
+    result, _ = extract("分析 600519 的短线机会")
+
+    assert result[1] is None
+
+
+@pytest.mark.parametrize("extract", [_extract_sync, _extract_streaming])
 def test_extraction_keeps_literal_requirements_marker_in_question_body(extract):
     text = "请解释 [分析要求] AAPL 在 2026-01-15 的走势"
 
@@ -123,9 +132,15 @@ def _chat_request(text: str, stream: bool):
     )
 
 
-async def _capture_chat_analyze_request(text: str, stream: bool):
+async def _capture_chat_analyze_request(
+    text: str,
+    stream: bool,
+    extraction_result=None,
+):
     run_job = AsyncMock()
-    extraction_result = ("600519.SH", "2026-01-15", ["short"], [], [], {})
+    extraction_result = extraction_result or (
+        "600519.SH", "2026-01-15", ["short"], [], [], {}
+    )
     background_tasks = []
 
     def track_task(coro):
@@ -164,3 +179,26 @@ def test_chat_preserves_full_text_for_query_and_pre_intent(stream):
 
     assert analyze_request.query == text
     assert analyze_request.user_intent["raw_query"] == text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_default_date_is_consistent_for_sync_and_streaming(stream):
+    dates = [date(2026, 8, 11), date(2026, 8, 12), date(2026, 8, 13)]
+    tc._TRADE_DATES_CACHE["dates"] = dates
+    tc._TRADE_DATES_CACHE["dates_set"] = set(dates)
+    tc._TRADE_DATES_CACHE["loaded_at"] = 1e18
+    extraction = ("600519.SH", None, ["short"], [], [], {})
+    frozen = datetime(2026, 8, 12, 3, 0, tzinfo=tc.CN_TZ)
+
+    with patch.object(tc, "now_cn", return_value=frozen):
+        analyze_request = asyncio.run(
+            _capture_chat_analyze_request(
+                "分析600519的短线机会",
+                stream,
+                extraction_result=extraction,
+            )
+        )
+
+    assert analyze_request.trade_date == "2026-08-11"
+    assert analyze_request.trade_date_explicit is False
+    tc.clear_cn_trade_date_cache()

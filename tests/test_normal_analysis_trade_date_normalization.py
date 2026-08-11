@@ -87,6 +87,50 @@ def test_normalize_none_defaults_to_latest_trading_day():
         assert main._normalize_analysis_trade_date("") == "2026-08-07"
 
 
+@pytest.mark.parametrize(
+    ("frozen", "expected"),
+    [
+        (datetime(2026, 8, 12, 3, 0, tzinfo=tc.CN_TZ), "2026-08-11"),
+        (datetime(2026, 8, 12, 10, 0, tzinfo=tc.CN_TZ), "2026-08-11"),
+        (datetime(2026, 8, 12, 12, 0, tzinfo=tc.CN_TZ), "2026-08-11"),
+        (datetime(2026, 8, 12, 16, 0, tzinfo=tc.CN_TZ), "2026-08-12"),
+    ],
+)
+def test_default_date_uses_latest_completed_session_by_market_phase(frozen, expected):
+    _seed_calendar(
+        [
+            "2026-08-07",
+            "2026-08-10",
+            "2026-08-11",
+            "2026-08-12",
+            "2026-08-13",
+        ]
+    )
+    with patch.object(tc, "now_cn", return_value=frozen):
+        assert main._normalize_analysis_trade_date(None) == expected
+
+
+def test_explicit_current_trading_date_is_not_rewritten_before_close():
+    _seed_calendar(["2026-08-11", "2026-08-12", "2026-08-13"])
+    frozen = datetime(2026, 8, 12, 3, 0, tzinfo=tc.CN_TZ)
+    with patch.object(tc, "now_cn", return_value=frozen):
+        assert (
+            main._normalize_analysis_trade_date(
+                "2026-08-12", explicit=True
+            )
+            == "2026-08-12"
+        )
+
+
+def test_scheduled_today_uses_same_default_resolution():
+    _seed_calendar(["2026-08-11", "2026-08-12", "2026-08-13"])
+    frozen = datetime(2026, 8, 12, 3, 0, tzinfo=tc.CN_TZ)
+    with patch.object(tc, "now_cn", return_value=frozen), patch.object(
+        main, "cn_today_str", return_value="2026-08-12"
+    ):
+        assert main._resolve_scheduled_trade_date("2026-08-12") == "2026-08-11"
+
+
 def test_normalize_never_rounds_forward():
     _seed_calendar(
         [
@@ -210,6 +254,24 @@ def test_analyze_endpoint_normalizes_weekend_trade_date():
     result = _wait_job(client, token, job_id)
     assert result["status"] == "completed"
     assert result["result"]["trade_date"] == "2026-08-07"
+
+
+def test_analyze_endpoint_default_uses_completed_session_before_close():
+    _seed_calendar(["2026-08-11", "2026-08-12", "2026-08-13"])
+    client = _get_client()
+    token = _auth_unique(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    frozen = datetime(2026, 8, 12, 3, 0, tzinfo=tc.CN_TZ)
+
+    with patch.object(tc, "now_cn", return_value=frozen):
+        r = client.post(
+            "/v1/analyze",
+            headers=headers,
+            json={"symbol": "600519.SH", "dry_run": True},
+        )
+    assert r.status_code == 200
+    result = _wait_job(client, token, r.json()["job_id"])
+    assert result["result"]["trade_date"] == "2026-08-11"
 
 
 def test_analyze_endpoint_keeps_trading_day_unchanged():

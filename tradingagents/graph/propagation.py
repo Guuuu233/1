@@ -60,6 +60,8 @@ class Propagator:
                 "context_version": "v1",
                 "request_source": request_source,
                 "selected_analysts": selected_analysts or [],
+                "analysis_baseline_date": str(trade_date),
+                "data_as_of": market_context.get("data_as_of"),
             },
             "investment_debate_state": InvestDebateState(
                 {
