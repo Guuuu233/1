@@ -197,6 +197,46 @@ def test_investoday_get_global_news_uses_macro_then_broad_fallback():
     assert "newsType" not in mock_get.call_args_list[1][1]["params"]
 
 
+def test_investoday_get_global_news_filters_future_rows_and_marks_window():
+    from tradingagents.dataflows.providers.cn_investoday_provider import CnInvestodayProvider
+
+    body = {
+        "code": 0,
+        "message": "success",
+        "data": [
+            {"date": "2026-08-12 09:00:00", "title": "未来新闻", "summary": "future"},
+            {"date": "2026-08-11 09:00:00", "title": "历史新闻", "summary": "in range"},
+        ],
+    }
+    provider = CnInvestodayProvider()
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_investoday_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ) as mock_get:
+        out = provider.get_global_news("2026-08-11", look_back_days=14, limit=5)
+
+    assert mock_get.call_count == 1
+    assert "来源：今日投资" in out
+    assert "数据窗口：2026-07-28 至 2026-08-11" in out
+    assert "历史新闻" in out
+    assert "未来新闻" not in out
+
+
+def test_investoday_get_global_news_rejects_non_list_payload():
+    from tradingagents.dataflows.providers.cn_investoday_provider import CnInvestodayProvider
+
+    body = {"code": 0, "message": "success", "data": {"unexpected": "shape"}}
+    provider = CnInvestodayProvider()
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_investoday_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ):
+        with pytest.raises(NotImplementedError, match="data 非列表"):
+            provider.get_global_news("2026-08-11", look_back_days=14, limit=5)
+
+
 def test_investoday_get_global_news_no_api_key():
     from tradingagents.dataflows.providers.cn_investoday_provider import CnInvestodayProvider
 

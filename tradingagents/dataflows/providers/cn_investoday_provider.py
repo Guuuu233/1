@@ -333,6 +333,8 @@ class CnInvestodayProvider(BaseMarketDataProvider):
         rows: list[Any],
         start_date: str,
         end_date: str,
+        *,
+        require_published_at: bool = False,
     ) -> list[dict[str, Any]]:
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
@@ -342,7 +344,8 @@ class CnInvestodayProvider(BaseMarketDataProvider):
                 continue
             dt = self._parse_news_datetime(raw.get("date"))
             if dt is None:
-                out.append(raw)
+                if not require_published_at:
+                    out.append(raw)
                 continue
             if start_dt <= dt < end_dt:
                 out.append(raw)
@@ -385,11 +388,12 @@ class CnInvestodayProvider(BaseMarketDataProvider):
     def get_global_news(
         self, curr_date: str, look_back_days: int = 7, limit: int = 50
     ) -> str:
-        """全市场新闻：优先宏观 ``newsType=1``，空则去掉类型重试。"""
+        """按明确时间窗口返回可验证的宏观新闻，禁止混入窗口外条目。"""
         api_key = self._require_api_key()
         end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
         start_dt = end_dt - timedelta(days=look_back_days)
-        begin_time = start_dt.strftime("%Y-%m-%d 00:00:00")
+        start_label = start_dt.strftime("%Y-%m-%d")
+        begin_time = f"{start_label} 00:00:00"
         end_time = f"{curr_date} 23:59:59"
         page_size = min(max(limit, 1), 500)
 
@@ -402,13 +406,16 @@ class CnInvestodayProvider(BaseMarketDataProvider):
             "pageSize": page_size,
         }
         payload = self._request_investoday(_NEWS_PATH, params_macro, api_key, base_url)
-        rows: list[Any] = []
+        rows: list[Any] | None = None
         if payload is not None:
             data = payload.get("data")
-            if isinstance(data, list):
-                rows = data
+            if not isinstance(data, list):
+                raise NotImplementedError(
+                    "cn_investoday 全市场新闻返回格式异常（data 非列表），请换用其它数据源。"
+                )
+            rows = data
 
-        if not rows:
+        if rows is None or not rows:
             params_broad: dict[str, Any] = {
                 "beginTime": begin_time,
                 "endTime": end_time,
@@ -427,14 +434,22 @@ class CnInvestodayProvider(BaseMarketDataProvider):
                 )
             rows = data2
 
-        start_label = start_dt.strftime("%Y-%m-%d")
-        if not rows:
-            return f"{curr_date} 未获取到全球市场新闻（{start_label} 至 {curr_date}）"
+        filtered = self._news_rows_in_range(
+            rows,
+            start_label,
+            curr_date,
+            require_published_at=True,
+        )
+        if not filtered:
+            raise NotImplementedError(
+                f"cn_investoday 全市场新闻在 {start_label} 至 {curr_date} 内无可验证发布时间的记录。"
+            )
 
-        parts: list[str] = [f"## 全球市场新闻（{start_label} 至 {curr_date}）：\n"]
-        for item in rows[:limit]:
-            if isinstance(item, dict):
-                parts.extend(self._format_news_item(item))
+        parts: list[str] = [
+            f"## 全球市场新闻（来源：今日投资；数据窗口：{start_label} 至 {curr_date}）：\n"
+        ]
+        for item in filtered[:limit]:
+            parts.extend(self._format_news_item(item))
         return "\n".join(parts).rstrip() + "\n"
 
     def get_stock_data(self, symbol: str, start_date: str, end_date: str) -> str:
