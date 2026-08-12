@@ -303,10 +303,10 @@ class CnInvestodayProvider(BaseMarketDataProvider):
         s = str(val).strip()
         if not s:
             return None
+        # Historical rows must carry a complete, unambiguous timestamp. A
+        # date-only value is not sufficient to prove the article cutoff.
         try:
-            if len(s) >= 19 and s[10] == " ":
-                return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
-            return datetime.strptime(s[:10], "%Y-%m-%d")
+            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
         except ValueError:
             return None
 

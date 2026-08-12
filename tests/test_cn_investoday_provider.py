@@ -159,6 +159,27 @@ def test_investoday_get_news_invalid_ticker():
     assert "无法解析证券代码" in out
 
 
+def test_investoday_get_news_rejects_malformed_mixed_timestamps():
+    from tradingagents.dataflows.providers.cn_investoday_provider import CnInvestodayProvider
+
+    body = {
+        "code": 0,
+        "message": "success",
+        "data": [
+            {"date": "2025-04-02 15:45:02", "title": "有效", "summary": "ok"},
+            {"date": "2025/04/03 15:45:02", "title": "格式错误", "summary": "bad"},
+        ],
+    }
+    provider = CnInvestodayProvider()
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_investoday_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ):
+        with pytest.raises(NotImplementedError, match="发布时间"):
+            provider.get_news("600519.SH", "2025-04-01", "2025-04-04")
+
+
 def test_investoday_get_news_filters_future_timestamps():
     from tradingagents.dataflows.providers.cn_investoday_provider import CnInvestodayProvider
 
@@ -181,6 +202,24 @@ def test_investoday_get_news_filters_future_timestamps():
     assert "有效" in out
     assert "未来" not in out
     assert "2025-04-02 15:45:02" in out
+
+
+def test_investoday_get_news_rejects_date_only_timestamps():
+    from tradingagents.dataflows.providers.cn_investoday_provider import CnInvestodayProvider
+
+    body = {
+        "code": 0,
+        "message": "success",
+        "data": [{"date": "2025-04-02", "title": "日期不完整", "summary": "bad"}],
+    }
+    provider = CnInvestodayProvider()
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_investoday_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ):
+        with pytest.raises(NotImplementedError, match="发布时间"):
+            provider.get_news("600519.SH", "2025-04-01", "2025-04-03")
 
 
 def test_investoday_get_news_rejects_missing_timestamps():
