@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -14,7 +15,7 @@ from tradingagents.dataflows.providers.cn_fuyao_provider import (
     CnFuyaoProvider,
     FuyaoApiError,
 )
-from tradingagents.dataflows.trade_calendar import CN_TZ
+from tradingagents.dataflows.trade_calendar import CN_TZ, DateDataUnavailable
 from tradingagents.dataflows.vendor_result import VendorEmpty, VendorFail, VendorRefuse
 
 FAST_POLICY = ProviderResourcePolicy(timeout_seconds=1.0, max_retries=0, max_concurrency=2)
@@ -423,6 +424,23 @@ def test_get_zt_pool_paginates_and_formats():
     page2_params = mock_get.call_args_list[1][1]["params"]
     assert page2_params["page"] == 2
     assert page2_params["date_ms"] == CnFuyaoProvider._date_to_ms("2026-08-04")
+
+
+def test_get_zt_pool_fallback_preserves_requested_and_actual_dates():
+    provider = CnFuyaoProvider()
+    with patch.object(provider, "_fetch_zt_pool_for_day", side_effect=[DateDataUnavailable("requested"), "涨停池（2026-08-03，同花顺 fuyao）：共 1 只"]), \
+         patch("tradingagents.dataflows.providers.cn_fuyao_provider.fetch_with_date_fallback") as fallback:
+        fallback.return_value = SimpleNamespace(
+            ok=True,
+            request_date="2026-08-04",
+            as_of="2026-08-03",
+            attempted=["2026-08-04", "2026-08-03"],
+            data="涨停池（2026-08-03，同花顺 fuyao）：共 1 只",
+        )
+        out = provider.get_zt_pool("2026-08-04")
+    assert "请求日期】2026-08-04" in out
+    assert "实际数据日期】2026-08-03" in out
+    assert "涨停池（2026-08-03" in out
 
 
 def test_get_zt_pool_missing_date_refuses():

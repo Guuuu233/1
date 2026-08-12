@@ -465,19 +465,34 @@ class CnInvestodayProvider(BaseMarketDataProvider):
                 )
             rows = data2
 
+        invalid_rows = [
+            item for item in rows
+            if isinstance(item, dict) and self._parse_news_datetime(item.get("date")) is None
+        ]
         filtered = self._news_rows_in_range(
             rows,
             start_label,
             curr_date,
             require_published_at=True,
         )
+        if invalid_rows:
+            raise NotImplementedError(
+                f"cn_investoday 全市场新闻包含 {len(invalid_rows)} 条缺失或无法解析的发布时间，"
+                "历史数据不可验证。"
+            )
         if not filtered:
             raise NotImplementedError(
                 f"cn_investoday 全市场新闻在 {start_label} 至 {curr_date} 内无可验证发布时间的记录。"
             )
 
+        latest_dt = max(
+            self._parse_news_datetime(item.get("date"))
+            for item in filtered
+            if self._parse_news_datetime(item.get("date")) is not None
+        )
         parts: list[str] = [
-            f"## 全球市场新闻（来源：今日投资；数据窗口：{start_label} 至 {curr_date}）：\n"
+            f"## 全球市场新闻（来源：今日投资；数据窗口：{start_label} 至 {curr_date}；"
+            f"最新发布时间：{latest_dt.strftime('%Y-%m-%d %H:%M:%S')}）：\n"
         ]
         for item in filtered[:limit]:
             parts.extend(self._format_news_item(item))

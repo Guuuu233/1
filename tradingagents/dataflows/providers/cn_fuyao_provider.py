@@ -642,7 +642,12 @@ class CnFuyaoProvider(BaseMarketDataProvider):
         result = fetch_with_date_fallback(_fetch_one, date, max_back=3)
         if not result.ok:
             return VendorFail(f"涨停板情绪池数据获取失败（同花顺 fuyao）：{result.error}")
-        return result.data
+        return (
+            f"【请求日期】{result.request_date}\n"
+            f"【实际数据日期】{result.as_of}\n"
+            f"【回退尝试】{','.join(result.attempted)}\n"
+            f"{result.data}"
+        )
 
     def get_lhb_detail(self, symbol: str, date: str) -> Any:
         """龙虎榜：``GET /api/a-share/special-data/dragon-tiger-list``（board_type=all）。

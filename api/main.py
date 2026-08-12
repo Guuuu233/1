@@ -902,8 +902,8 @@ class JobStatusResponse(BaseModel):
     created_at: str
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
-    symbol: str
-    trade_date: str
+    symbol: Optional[str] = None
+    trade_date: Optional[str] = None
     error: Optional[str] = None
     overtime: bool = False
     overtime_at: Optional[str] = None
@@ -4151,6 +4151,22 @@ async def chat_completions(
         job_id = uuid4().hex
 
         async def _extract_and_run():
+            now = _utcnow_iso()
+            _set_job(
+                job_id,
+                job_id=job_id,
+                user_id=current_user.id,
+                status="pending",
+                created_at=now,
+                started_at=None,
+                finished_at=None,
+                symbol=None,
+                trade_date=None,
+                error=None,
+                result=None,
+                decision=None,
+                request_source="chat",
+            )
             try:
                 symbol, trade_date, horizons, focus_areas, specific_questions, inferred_user_context = \
                     await _ai_extract_symbol_and_date_streaming(text, config, job_id)
@@ -4223,6 +4239,7 @@ async def chat_completions(
                     error=None,
                     result=None,
                     decision=None,
+                    request_source="chat",
                 )
                 _emit_job_event(
                     job_id,
@@ -4231,8 +4248,22 @@ async def chat_completions(
                 )
                 await _run_job(job_id, analyze_req, True, True, current_user.id, "chat")
             except Exception as exc:
+                err_msg = _humanize_analysis_error(str(exc))
                 _log(f"[chat] _extract_and_run failed: {exc}")
-                _emit_job_event(job_id, "job.failed", {"error": _humanize_analysis_error(str(exc))})
+                _set_job(
+                    job_id,
+                    status="failed",
+                    error=err_msg,
+                    finished_at=_utcnow_iso(),
+                    overtime=False,
+                    overtime_at=None,
+                )
+                try:
+                    with get_db_ctx() as db:
+                        report_service.mark_report_failed(db, job_id, err_msg)
+                except Exception:
+                    pass
+                _emit_job_event(job_id, "job.failed", {"job_id": job_id, "error": err_msg})
 
         _create_tracked_task(_extract_and_run())
         return StreamingResponse(

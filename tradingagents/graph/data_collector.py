@@ -575,6 +575,7 @@ _SOURCE_AS_OF_PATTERNS = (
     r"最新数据日\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"最新发布时间\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"【数据日期】\s*(20\d{2}-\d{2}-\d{2})",
+    r"实际数据日期\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"数据日期[】：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"日期\s*[：:]\s*(20\d{2}-\d{2}-\d{2})",
     r"龙虎榜明细[（(]\s*(20\d{2}-\d{2}-\d{2})",
@@ -619,6 +620,11 @@ def _build_source_provenance(
             "as_of": as_of,
             "status": status,
         }
+        if source == "stock_data" and as_of and as_of < requested_as_of:
+            entry["gap"] = (
+                f"【数据获取失败】stock_data：实际最新数据日 {as_of} "
+                f"早于请求日期 {requested_as_of}"
+            )
         if status != "available":
             entry["gap"] = f"【数据获取失败】{source}：{_compact_failure_reason(status)}"
         elif as_of is None and source != "realtime":

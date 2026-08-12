@@ -53,6 +53,16 @@ def test_source_provenance_does_not_infer_news_window_end_as_actual_date():
     assert "gap" in provenance["news"]
 
 
+def test_source_provenance_extracts_global_news_latest_publication_date():
+    provenance = _build_source_provenance(
+        {"global_news": "## 全球市场新闻（最新发布时间：2026-08-10 15:00:00）"},
+        "2026-08-11",
+        daily_as_of="2026-08-11",
+    )
+    assert provenance["global_news"]["as_of"] == "2026-08-10"
+    assert "gap" not in provenance["global_news"]
+
+
 def test_source_provenance_extracts_latest_publication_date():
     provenance = _build_source_provenance(
         {"news": "## 新闻（最新发布时间：2026-08-10 15:00:00）"},
@@ -177,6 +187,19 @@ def test_evict_clears_cache_and_refcount_but_retains_lock_then_refetches():
         result = collector.collect("600519", "2026-03-12")
     assert result["stock_data"] == "new"
     assert mock_fetch.call_count == 1
+
+
+def test_stale_daily_as_of_enters_provenance_gap():
+    from tradingagents.graph import data_collector
+
+    provenance = data_collector._build_source_provenance(
+        {"stock_data": "Date,Open,High,Low,Close,Volume\n2026-08-10,1,1,1,1,1"},
+        "2026-08-11",
+        daily_as_of="2026-08-10",
+    )
+    assert provenance["stock_data"]["requested_as_of"] == "2026-08-11"
+    assert provenance["stock_data"]["as_of"] == "2026-08-10"
+    assert "早于请求日期" in provenance["stock_data"]["gap"]
 
 
 def test_failed_stock_data_enters_ledger_and_gap():

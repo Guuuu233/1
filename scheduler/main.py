@@ -329,7 +329,9 @@ async def _run_scheduled_job(task: dict, trade_date: str):
             await heartbeat
         except asyncio.CancelledError:
             pass
-        get_job_store().delete_job(job_id)
+        # Keep the terminal job record queryable for the same retention window
+        # as ordinary jobs; callers need to inspect scheduled/manual failures.
+        # The in-memory JobStore owns TTL cleanup for terminal states.
 
 
 # ── Scheduler loop ───────────────────────────────────────────────────────────
