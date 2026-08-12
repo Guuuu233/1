@@ -182,6 +182,11 @@ def _normalize_analysis_trade_date(
         if not explicit:
             raise
         return fallback
+    except (TypeError, ValueError) as exc:
+        logger.warning("Analysis trade_date is invalid: %r: %s", raw, exc)
+        if explicit:
+            raise ValueError(f"分析日期无法解析：{raw!r}") from exc
+        raise
     except Exception as exc:  # pragma: no cover - defensive: never break a request
         logger.warning(
             "Analysis trade_date normalization failed for %s date: %s",
@@ -2237,10 +2242,13 @@ async def _run_job_inner(
         explicit_date = "trade_date" in request.model_fields_set and bool(
             str(request.trade_date or "").strip()
         )
-    request.trade_date = _normalize_analysis_trade_date(
-        request.trade_date if explicit_date else None,
-        explicit=explicit_date,
-    )
+    try:
+        request.trade_date = _normalize_analysis_trade_date(
+            request.trade_date if explicit_date else None,
+            explicit=explicit_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     request.trade_date_explicit = explicit_date
     # Normalize for logic but keep original for display
     display_name = request.symbol
@@ -3794,6 +3802,8 @@ async def analyze(
         )
     except TradeCalendarUnavailableError as exc:
         raise HTTPException(status_code=503, detail=f"交易日历不可用：{exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     request.trade_date_explicit = explicit_date
     explicit_context = _extract_request_user_context(request)
 
@@ -4172,10 +4182,13 @@ async def chat_completions(
                     await _ai_extract_symbol_and_date_streaming(text, config, job_id)
                 horizons = _normalize_analysis_horizons(horizons, query=text)
                 date_explicit = bool(str(trade_date or "").strip())
-                trade_date = _normalize_analysis_trade_date(
-                    trade_date if date_explicit else None,
-                    explicit=date_explicit,
-                )
+                try:
+                    trade_date = _normalize_analysis_trade_date(
+                        trade_date if date_explicit else None,
+                        explicit=date_explicit,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
 
                 if not symbol:
                     _emit_job_event(job_id, "job.failed", {
@@ -4284,6 +4297,8 @@ async def chat_completions(
         )
     except TradeCalendarUnavailableError as exc:
         raise HTTPException(status_code=503, detail=f"交易日历不可用：{exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if not symbol:
         raise HTTPException(status_code=400, detail="抱歉，我没能从您的消息中识别出股票标的。请输入代码（如 600519.SH）或可识别的公司名称。")

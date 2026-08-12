@@ -254,6 +254,36 @@ def _wait_job(client, token: str, job_id: str, timeout: float = 5.0) -> dict:
     return r2.json()
 
 
+def test_analyze_endpoint_rejects_explicit_invalid_trade_date():
+    client = _get_client()
+    token = _auth_unique(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    response = client.post(
+        "/v1/analyze",
+        headers=headers,
+        json={"symbol": "600519.SH", "trade_date": "not-a-date", "dry_run": True},
+    )
+    assert response.status_code == 400
+    assert "分析日期无法解析" in response.json()["detail"]
+
+
+def test_chat_completions_rejects_explicit_invalid_trade_date():
+    client = _get_client()
+    token = _auth_unique(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    with patch(
+        "api.main._ai_extract_symbol_and_date",
+        return_value=("600519.SH", "not-a-date", ["short"], [], [], {}),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            headers=headers,
+            json={"messages": [{"role": "user", "content": "分析600519"}], "stream": False},
+        )
+    assert response.status_code == 400
+    assert "分析日期无法解析" in response.json()["detail"]
+
+
 def test_analyze_endpoint_normalizes_weekend_trade_date():
     client = _get_client()
     token = _auth_unique(client)

@@ -11,6 +11,7 @@ from sqlalchemy.pool import StaticPool
 
 from api.database import Base, UserDB
 from api.services import scheduled_service
+from scheduler import main as scheduler_main
 
 
 @pytest.fixture
@@ -176,6 +177,24 @@ class TestPortfolioImportService:
         assert request.current_position == pytest.approx(500.0)
         assert request.average_cost == pytest.approx(1700.0)
         assert "持仓导入" in (request.user_notes or "")
+
+    def test_scheduled_job_keeps_calendar_failure_queryable(self, db):
+        from api.main import _get_job
+        from scheduler.main import _run_scheduled_job
+
+        item = scheduled_service.create_scheduled(db, "user-calendar", "300750.SZ", "short")
+        class FakeDbCtx:
+            def __enter__(self): return db
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                if exc_type is not None: db.rollback()
+
+        with patch("scheduler.main._resolve_scheduled_trade_date", side_effect=RuntimeError("calendar unavailable")), \
+             patch("scheduler.main.get_db_ctx", return_value=FakeDbCtx()), \
+             patch("tradingagents.dataflows.trade_calendar.is_cn_trading_day", return_value=True):
+            asyncio.run(scheduler_main._run_scheduled_job({"id": item["id"], "user_id": "user-calendar", "symbol": "300750.SZ", "horizon": "short", "job_id": "job-calendar"}, "2026-03-30"))
+
+        assert scheduled_service.get_scheduled(db, "user-calendar", item["id"])["last_run_status"] == "failed"
+        assert _get_job("job-calendar")["status"] == "failed"
 
     def test_scheduled_job_marks_failed_when_underlying_job_fails(self, db):
         from api.main import _set_job

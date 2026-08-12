@@ -349,7 +349,7 @@ class CnInvestodayProvider(BaseMarketDataProvider):
         out: list[dict[str, Any]] = []
         for raw in rows:
             if not isinstance(raw, dict):
-                continue
+                raise ValueError("新闻结果包含非对象记录，历史发布时间不可验证")
             dt = self._parse_news_datetime(raw.get("date"))
             if dt is None:
                 if require_published_at:

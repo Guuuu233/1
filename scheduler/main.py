@@ -260,7 +260,16 @@ async def _run_scheduled_analysis_once(
 
         await _send_scheduled_report_notifications(user_id, job_id, symbol)
     except Exception as e:
+        error_text = f"{type(e).__name__}: {e}"
         logger.error(f"[Scheduler] Failed {symbol}: {e}\n{traceback.format_exc()}")
+        get_job_store().set_job(
+            job_id,
+            status="failed",
+            error=error_text,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            overtime=False,
+            overtime_at=None,
+        )
         try:
             await asyncio.to_thread(_record_failure_sync)
         except Exception as db_exc:

@@ -307,6 +307,34 @@ def test_investoday_get_global_news_filters_future_rows_and_marks_window():
     assert "未来新闻" not in out
 
 
+def test_investoday_get_news_rejects_non_dict_rows():
+    from tradingagents.dataflows.providers.cn_investoday_provider import CnInvestodayProvider
+
+    body = {"code": 0, "message": "success", "data": [{"date": "2025-04-02 15:45:02", "title": "有效"}, "bad-row"]}
+    provider = CnInvestodayProvider()
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_investoday_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ):
+        with pytest.raises((ValueError, NotImplementedError), match="非对象|发布时间"):
+            provider.get_news("600519.SH", "2025-04-01", "2025-04-03")
+
+
+def test_investoday_get_global_news_rejects_non_dict_rows():
+    from tradingagents.dataflows.providers.cn_investoday_provider import CnInvestodayProvider
+
+    body = {"code": 0, "message": "success", "data": [{"date": "2026-08-11 09:00:00", "title": "有效"}, "bad-row"]}
+    provider = CnInvestodayProvider()
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_investoday_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ):
+        with pytest.raises((ValueError, NotImplementedError), match="非对象|发布时间"):
+            provider.get_global_news("2026-08-11", look_back_days=14, limit=5)
+
+
 def test_investoday_get_global_news_rejects_mixed_invalid_timestamps():
     from tradingagents.dataflows.providers.cn_investoday_provider import CnInvestodayProvider
 
