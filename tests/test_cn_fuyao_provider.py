@@ -419,6 +419,8 @@ def test_get_zt_pool_paginates_and_formats():
     assert "兆易创新" in out
     assert "平安银行" in out
     assert "2连板 1只" in out
+    assert "请求日期】2026-08-04" in out
+    assert "实际数据日期】2026-08-04" in out
     assert mock_get.call_count == 2
     # 第二页分页参数正确
     page2_params = mock_get.call_args_list[1][1]["params"]

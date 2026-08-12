@@ -632,7 +632,12 @@ class CnFuyaoProvider(BaseMarketDataProvider):
                 raise
 
         try:
-            return self._fetch_zt_pool_for_day(date)
+            data = self._fetch_zt_pool_for_day(date)
+            return (
+                f"【请求日期】{date}\n"
+                f"【实际数据日期】{date}\n"
+                f"{data}"
+            )
         except FuyaoApiError as exc:
             if exc.code not in (3001, 3002):
                 return self._map_api_error(exc)

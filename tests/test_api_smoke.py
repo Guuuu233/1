@@ -802,6 +802,31 @@ class TestScheduledBatchEndpoints:
         assert remaining.status_code == 200
         assert remaining.json()["items"] == []
 
+    def test_manual_trigger_calendar_failure_marks_job_failed(self):
+        from api import main as main_mod
+
+        item = self._create_scheduled("300750.SZ")
+        events = []
+
+        with patch.object(main_mod, "_emit_job_event", side_effect=lambda job_id, event, data: events.append((job_id, event, data))), \
+             patch("api.main.cn_today_str", return_value="2026-03-31"), \
+             patch("api.main._resolve_scheduled_trade_date", side_effect=["2026-03-31", RuntimeError("calendar unavailable")]):
+            response = self.client.post(
+                f"/v1/scheduled/{item['id']}/trigger",
+                headers=self.headers,
+            )
+
+        assert response.status_code == 200
+        job_id = response.json()["job_id"]
+        job = self.client.get(f"/v1/jobs/{job_id}", headers=self.headers)
+        assert job.status_code == 200
+        assert job.json()["status"] == "failed"
+        assert job.json()["error"] == "RuntimeError: calendar unavailable"
+        assert [(event_job_id, event) for event_job_id, event, _ in events] == [
+            (job_id, "job.queued"),
+            (job_id, "job.failed"),
+        ]
+
     def test_manual_trigger_endpoint_queues_single_scheduled_task(self):
         item = self._create_scheduled("300750.SZ")
         run_once = AsyncMock()
