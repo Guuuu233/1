@@ -366,6 +366,10 @@ def test_streaming_chat_emits_failure_when_calendar_is_unavailable():
     assert "event: job.failed" in response.text
     assert "交易日历不可用" in response.text
     assert "event: done" in response.text
+    job_id = response.text.split('"job_id": "', 1)[1].split('"', 1)[0]
+    status = client.get(f"/v1/jobs/{job_id}", headers=headers)
+    assert status.status_code == 200
+    assert status.json()["status"] == "failed"
 
 
 def test_chat_completions_normalizes_extracted_weekend_trade_date():
