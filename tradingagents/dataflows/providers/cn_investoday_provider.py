@@ -312,7 +312,15 @@ class CnInvestodayProvider(BaseMarketDataProvider):
 
     def _format_news_item(self, item: dict[str, Any]) -> list[str]:
         title = str(item.get("title", "No title")).strip() or "No title"
-        rows_out: list[str] = [f"### {title} (source: 今日投资)"]
+        published_at = self._parse_news_datetime(item.get("date"))
+        published_label = (
+            published_at.strftime("%Y-%m-%d %H:%M:%S")
+            if published_at is not None
+            else "未知"
+        )
+        rows_out: list[str] = [
+            f"### {title} [发布时间：{published_label}] (source: 今日投资)"
+        ]
         summary = str(item.get("summary", "")).strip()
         if summary and summary != "nan":
             rows_out.append(summary[:400])
@@ -344,8 +352,9 @@ class CnInvestodayProvider(BaseMarketDataProvider):
                 continue
             dt = self._parse_news_datetime(raw.get("date"))
             if dt is None:
-                if not require_published_at:
-                    out.append(raw)
+                if require_published_at:
+                    continue
+                out.append(raw)
                 continue
             if start_dt <= dt < end_dt:
                 out.append(raw)
@@ -376,11 +385,33 @@ class CnInvestodayProvider(BaseMarketDataProvider):
             raise NotImplementedError(
                 "cn_investoday 新闻接口返回格式异常（data 非列表），请换用其它数据源。"
             )
-        filtered = self._news_rows_in_range(data, start_date, end_date)
+        has_unparseable_date = any(
+            isinstance(item, dict)
+            and self._parse_news_datetime(item.get("date")) is None
+            for item in data
+        )
+        filtered = self._news_rows_in_range(
+            data,
+            start_date,
+            end_date,
+            require_published_at=True,
+        )
+        if has_unparseable_date:
+            raise NotImplementedError(
+                "cn_investoday 个股新闻包含缺失或无法解析的发布时间，历史数据不可验证。"
+            )
         if not filtered:
             return f"No news found for {ticker} between {start_date} and {end_date}"
 
-        parts: list[str] = [f"## {ticker} 新闻（{start_date} 至 {end_date}）：\n"]
+        parsed_dates = [
+            self._parse_news_datetime(item.get("date"))
+            for item in filtered
+        ]
+        latest_dt = max(dt for dt in parsed_dates if dt is not None)
+        parts: list[str] = [
+            f"## {ticker} 新闻（{start_date} 至 {end_date}；"
+            f"最新发布时间：{latest_dt.strftime('%Y-%m-%d %H:%M:%S')}）：\n"
+        ]
         for item in filtered[:20]:
             parts.extend(self._format_news_item(item))
         return "\n".join(parts).rstrip() + "\n"

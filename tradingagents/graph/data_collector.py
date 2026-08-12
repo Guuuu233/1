@@ -572,28 +572,31 @@ def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, str]]:
 
 
 _SOURCE_AS_OF_PATTERNS = (
+    r"最新数据日\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
+    r"最新发布时间\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
+    r"【数据日期】\s*(20\d{2}-\d{2}-\d{2})",
     r"数据日期[】：:]?\s*(20\d{2}-\d{2}-\d{2})",
-    r"最新数据日\s*(20\d{2}-\d{2}-\d{2})",
-    r"数据窗口：\s*20\d{2}-\d{2}-\d{2}\s*至\s*(20\d{2}-\d{2}-\d{2})",
-    r"截至(?:于|日期)?\s*(20\d{2}-\d{2}-\d{2})",
-    r"新闻（\s*20\d{2}-\d{2}-\d{2}\s*至\s*(20\d{2}-\d{2}-\d{2})",
+    r"日期\s*[：:]\s*(20\d{2}-\d{2}-\d{2})",
+    r"龙虎榜明细[（(]\s*(20\d{2}-\d{2}-\d{2})",
     r"(20\d{2}-\d{2}-\d{2})\s+涨停家数",
+    r"\[(20\d{2}-\d{2}-\d{2})(?:[ T]\d{2}:\d{2}(?::\d{2})?)?\]",
 )
 
 
 def _extract_source_as_of(value: Any, requested_as_of: str) -> Optional[str]:
-    """Extract an explicitly reported source date, never infer from retrieval time."""
+    """Extract the latest explicitly reported source date, excluding request windows."""
     if isinstance(value, dict):
         for key in ("as_of", "quote_as_of", "data_as_of"):
             candidate = value.get(key)
-            if isinstance(candidate, str) and re.search(r"20\d{2}-\d{2}-\d{2}", candidate):
-                return re.search(r"20\d{2}-\d{2}-\d{2}", candidate).group(0)
+            match = re.search(r"20\d{2}-\d{2}-\d{2}", str(candidate or ""))
+            if match and match.group(0) <= requested_as_of:
+                return match.group(0)
         return None
+
     text = value if isinstance(value, str) else str(value or "")
     candidates: list[str] = []
     for pattern in _SOURCE_AS_OF_PATTERNS:
-        for match in re.finditer(pattern, text):
-            candidates.extend(group for group in match.groups() if group)
+        candidates.extend(match.group(1) for match in re.finditer(pattern, text))
     dates = [item for item in candidates if item <= requested_as_of]
     return max(dates) if dates else None
 
@@ -698,6 +701,21 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
             f"【数据获取失败】{ticker} 在 {trade_date} 无有效完整日线数据"
             "（缺列/非法日期/全部行无效/重复冲突），本项不可用。"
         )
+        if not any(
+            isinstance(entry, dict) and entry.get("source") == "stock_data"
+            for entry in data_failure_ledger
+        ):
+            data_failure_ledger.append(
+                {
+                    "source": "stock_data",
+                    "status": "unavailable",
+                    "reason": "no valid completed daily bars",
+                    "gap": (
+                        f"【数据获取失败】stock_data：{ticker} 在 {trade_date} "
+                        "无有效完整日线数据"
+                    ),
+                }
+            )
     daily_context = _build_daily_context(df, trade_date)
     source_provenance = _build_source_provenance(
         results,
@@ -709,7 +727,7 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         for entry in data_failure_ledger
         if isinstance(entry, dict)
     }
-    for source in ("news", "global_news", "zt_pool", "hot_stocks"):
+    for source in ("stock_data", "news", "global_news", "zt_pool", "hot_stocks"):
         provenance = source_provenance.get(source) or {}
         gap = provenance.get("gap")
         if gap and source not in ledger_sources:

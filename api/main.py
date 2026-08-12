@@ -148,9 +148,9 @@ def _normalize_analysis_trade_date(
     user's request for today's unfinished data so providers can report a gap
     instead of silently substituting yesterday.
 
-    If the calendar cannot be loaded, preserve the old degradation contract by
-    returning the supplied date or the current CN date without fabricating a
-    prior session.
+    If the calendar cannot be loaded, explicit dates remain usable for the
+    caller's requested-date semantics. Omitted defaults fail closed and return
+    an explicit unavailable marker rather than selecting today's date.
     """
     from tradingagents.dataflows.trade_calendar import (
         TradeCalendarUnavailableError,
@@ -158,6 +158,8 @@ def _normalize_analysis_trade_date(
     )
 
     raw = str(trade_date or "").strip()
+    if raw.startswith("【数据获取失败】交易日历") and explicit is not True:
+        return raw
     if explicit is None:
         explicit = bool(raw)
     fallback = raw or cn_today_str()
@@ -169,17 +171,21 @@ def _normalize_analysis_trade_date(
         )
     except TradeCalendarUnavailableError as exc:
         logger.warning(
-            "Analysis trade_date calendar unavailable; keeping raw %r: %s",
-            fallback,
+            "Analysis trade_date calendar unavailable for %s date; %s",
+            "explicit" if explicit else "default",
             exc,
         )
+        if not explicit:
+            raise
         return fallback
     except Exception as exc:  # pragma: no cover - defensive: never break a request
         logger.warning(
-            "Analysis trade_date normalization failed; keeping raw %r: %s",
-            fallback,
+            "Analysis trade_date normalization failed for %s date: %s",
+            "explicit" if explicit else "default",
             exc,
         )
+        if not explicit:
+            raise
         return fallback
 
 

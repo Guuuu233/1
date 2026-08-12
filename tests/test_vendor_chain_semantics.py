@@ -222,6 +222,60 @@ def test_akshare_get_news_empty_is_vendor_empty():
     assert "No news found" in out.message
 
 
+def test_akshare_historical_news_requires_parseable_timestamps():
+    class _NoDateAk:
+        def stock_news_em(self, symbol):
+            return pd.DataFrame(
+                {
+                    "新闻标题": ["无时间"],
+                    "新闻内容": ["body"],
+                }
+            )
+
+    p = CnAkshareProvider()
+    p._ak = lambda: _NoDateAk()
+    out = p.get_news("600519", "2026-08-01", "2026-08-04")
+    assert isinstance(out, VendorFail)
+    assert "发布时间" in out.error
+
+
+def test_akshare_historical_news_filters_future_timestamps():
+    class _NewsAk:
+        def stock_news_em(self, symbol):
+            return pd.DataFrame(
+                {
+                    "发布时间": ["2026-08-04 12:00:00", "2026-08-05 12:00:00"],
+                    "新闻标题": ["kept", "future"],
+                    "新闻内容": ["y", "z"],
+                }
+            )
+
+    p = CnAkshareProvider()
+    p._ak = lambda: _NewsAk()
+    out = p.get_news("600519", "2026-08-01", "2026-08-04")
+    assert "kept" in out
+    assert "future" not in out
+    assert "2026-08-04 12:00:00" in out
+
+
+def test_akshare_historical_news_rejects_invalid_timestamps():
+    class _NewsAk:
+        def stock_news_em(self, symbol):
+            return pd.DataFrame(
+                {
+                    "发布时间": ["bad", "2026-08-04 12:00:00"],
+                    "新闻标题": ["invalid", "kept"],
+                    "新闻内容": ["x", "y"],
+                }
+            )
+
+    p = CnAkshareProvider()
+    p._ak = lambda: _NewsAk()
+    out = p.get_news("600519", "2026-08-01", "2026-08-04")
+    assert isinstance(out, VendorFail)
+    assert "发布时间" in out.error
+
+
 # ── Provider: yfinance typed semantics ────────────────────────────────
 
 

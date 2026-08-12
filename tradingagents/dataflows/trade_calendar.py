@@ -532,6 +532,10 @@ def resolve_cn_analysis_date(
     close, use the latest completed trading day strictly before today; after
     the close, use today's trading day.  Every result is sourced from the
     trading calendar and never rounded forward.
+
+    The omitted-date path is deliberately fail-closed. If both calendar
+    sources fail, this function raises instead of using a weekday heuristic or
+    today's date, because either fallback could select an unfinished session.
     """
     now_dt = now or now_cn()
     if now_dt.tzinfo is None:

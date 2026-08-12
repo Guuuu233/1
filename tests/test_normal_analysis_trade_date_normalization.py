@@ -145,19 +145,22 @@ def test_normalize_never_rounds_forward():
     assert out <= "2026-08-15"
 
 
-def test_normalize_calendar_unavailable_falls_back_to_raw():
+def test_normalize_calendar_unavailable_preserves_explicit_date():
     tc.clear_cn_trade_date_cache()
     with patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=_boom), \
          patch.object(tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=_boom):
-        assert main._normalize_analysis_trade_date("2026-08-09") == "2026-08-09"
+        assert main._normalize_analysis_trade_date(
+            "2026-08-09", explicit=True
+        ) == "2026-08-09"
 
 
-def test_normalize_calendar_unavailable_with_none_falls_back_to_today():
+def test_normalize_calendar_unavailable_with_none_fails_closed():
     tc.clear_cn_trade_date_cache()
     with patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=_boom), \
          patch.object(tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=_boom), \
          patch.object(tc, "now_cn", return_value=datetime(2026, 8, 9, 10, 0, tzinfo=tc.CN_TZ)):
-        assert main._normalize_analysis_trade_date(None) == "2026-08-09"
+        with pytest.raises(tc.TradeCalendarUnavailableError):
+            main._normalize_analysis_trade_date(None)
 
 
 # ── _run_job_inner defensive normalization ────────────────────────────

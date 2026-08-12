@@ -855,6 +855,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         return f"## Income Statement ({ticker})\n\n{table}"
 
     def get_news(self, ticker: str, start_date: str, end_date: str) -> str:
+        """Return only rows with parseable publication timestamps in the requested window."""
         with AKSHARE_CALL_LOCK:
             ak = self._ak()
             code = self._normalize_symbol(ticker)
@@ -863,37 +864,71 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 if df is None or df.empty:
                     return VendorEmpty(f"No news found for {ticker}")
 
-                date_col = "发布时间" if "发布时间" in df.columns else None
-                if date_col is not None:
-                    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-                    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-                    end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
-                    df = df[(df[date_col] >= start_dt) & (df[date_col] < end_dt)]
+                date_col = next(
+                    (
+                        name
+                        for name in (
+                            "发布时间",
+                            "published_at",
+                            "publishedAt",
+                            "发布时间",
+                            "date",
+                            "新闻时间",
+                        )
+                        if name in df.columns
+                    ),
+                    None,
+                )
+                if date_col is None:
+                    return VendorFail(
+                        f"{ticker} 新闻结果缺少可验证发布时间字段，历史日期不可用"
+                    )
 
+                parsed_dates = pd.to_datetime(
+                    df[date_col], errors="coerce", format="mixed"
+                )
+                if parsed_dates.isna().any():
+                    return VendorFail(
+                        f"{ticker} 新闻结果包含缺失或无法解析的发布时间，历史日期不可验证"
+                    )
+                df = df.copy()
+                df[date_col] = parsed_dates
+
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+                df = df[(df[date_col] >= start_dt) & (df[date_col] < end_dt)]
                 if df.empty:
                     return VendorEmpty(
                         f"No news found for {ticker} between {start_date} and {end_date}"
                     )
 
-                if date_col is not None:
-                    df = chronological(take_latest(df, date_col, 20), date_col)
-                else:
-                    df = df.head(20)
+                df = chronological(take_latest(df, date_col, 20), date_col)
+                latest_dt = pd.to_datetime(df[date_col], errors="coerce").max()
+                latest_label = (
+                    latest_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    if pd.notna(latest_dt)
+                    else end_date
+                )
 
                 rows = []
                 for _, row in df.iterrows():
+                    published_at = pd.to_datetime(row[date_col]).strftime("%Y-%m-%d %H:%M:%S")
                     title = str(row.get("新闻标题", row.get("标题", "No title")))
                     src = str(row.get("文章来源", row.get("来源", "Unknown")))
                     summary = str(row.get("新闻内容", row.get("内容", "")))
                     link = str(row.get("新闻链接", row.get("链接", "")))
-                    rows.append(f"### {title} (source: {src})")
+                    rows.append(f"### {title} [发布时间：{published_at}] (source: {src})")
                     if summary and summary != "nan":
                         rows.append(summary[:400])
                     if link and link != "nan":
                         rows.append(f"Link: {link}")
                     rows.append("")
 
-                return f"## {ticker} 新闻（{start_date} 至 {end_date}）：\n\n" + "\n".join(rows)
+                return (
+                    f"## {ticker} 新闻（{start_date} 至 {end_date}；"
+                    f"最新发布时间：{latest_label}）：\n\n"
+                    + "\n".join(rows)
+                )
             except Exception as exc:
                 raise NotImplementedError(
                     f"cn_akshare is temporarily unavailable for news: {exc}"
