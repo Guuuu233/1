@@ -145,19 +145,33 @@ def test_normalize_never_rounds_forward():
     assert out <= "2026-08-15"
 
 
-def test_normalize_calendar_unavailable_falls_back_to_raw():
+def test_normalize_calendar_unavailable_preserves_explicit_date():
     tc.clear_cn_trade_date_cache()
     with patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=_boom), \
          patch.object(tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=_boom):
-        assert main._normalize_analysis_trade_date("2026-08-09") == "2026-08-09"
+        assert main._normalize_analysis_trade_date(
+            "2026-08-09", explicit=True
+        ) == "2026-08-09"
 
 
-def test_normalize_calendar_unavailable_with_none_falls_back_to_today():
+def test_normalize_calendar_unavailable_with_none_fails_closed():
     tc.clear_cn_trade_date_cache()
     with patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=_boom), \
          patch.object(tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=_boom), \
          patch.object(tc, "now_cn", return_value=datetime(2026, 8, 9, 10, 0, tzinfo=tc.CN_TZ)):
-        assert main._normalize_analysis_trade_date(None) == "2026-08-09"
+        with pytest.raises(tc.TradeCalendarUnavailableError, match="交易日历不可用"):
+            main._normalize_analysis_trade_date(None)
+
+
+@pytest.mark.parametrize("hour", [8, 10, 12])
+def test_default_date_fails_closed_when_both_calendar_sources_are_unavailable(hour):
+    tc.clear_cn_trade_date_cache()
+    frozen = datetime(2026, 8, 12, hour, 0, tzinfo=tc.CN_TZ)
+    with patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=_boom), \
+         patch.object(tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=_boom), \
+         patch.object(tc, "now_cn", return_value=frozen):
+        with pytest.raises(tc.TradeCalendarUnavailableError):
+            main._normalize_analysis_trade_date(None)
 
 
 # ── _run_job_inner defensive normalization ────────────────────────────
@@ -288,6 +302,70 @@ def test_analyze_endpoint_keeps_trading_day_unchanged():
     result = _wait_job(client, token, job_id)
     assert result["status"] == "completed"
     assert result["result"]["trade_date"] == "2026-08-07"
+
+
+def test_analyze_endpoint_returns_503_when_calendar_is_unavailable():
+    tc.clear_cn_trade_date_cache()
+    client = _get_client()
+    token = _auth_unique(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    with patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=_boom), \
+         patch.object(tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=_boom), \
+         patch.object(tc, "now_cn", return_value=datetime(2026, 8, 12, 10, 0, tzinfo=tc.CN_TZ)):
+        response = client.post(
+            "/v1/analyze",
+            headers=headers,
+            json={"symbol": "600519.SH", "dry_run": True},
+        )
+    assert response.status_code == 503
+    assert "交易日历不可用" in response.json()["detail"]
+
+
+def test_chat_completions_returns_503_when_calendar_is_unavailable():
+    client = _get_client()
+    token = _auth_unique(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    with patch(
+        "api.main._ai_extract_symbol_and_date",
+        return_value=("600519.SH", None, ["short"], [], [], {}),
+    ), patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=_boom), \
+         patch.object(tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=_boom), \
+         patch.object(tc, "now_cn", return_value=datetime(2026, 8, 12, 10, 0, tzinfo=tc.CN_TZ)):
+        response = client.post(
+            "/v1/chat/completions",
+            headers=headers,
+            json={
+                "messages": [{"role": "user", "content": "分析600519"}],
+                "stream": False,
+            },
+        )
+    assert response.status_code == 503
+    assert "交易日历不可用" in response.json()["detail"]
+
+
+def test_streaming_chat_emits_failure_when_calendar_is_unavailable():
+    client = _get_client()
+    token = _auth_unique(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    with patch(
+        "api.main._ai_extract_symbol_and_date_streaming",
+        return_value=("600519.SH", None, ["short"], [], [], {}),
+    ), patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=_boom), \
+         patch.object(tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=_boom), \
+         patch.object(tc, "now_cn", return_value=datetime(2026, 8, 12, 10, 0, tzinfo=tc.CN_TZ)), \
+         patch.object(main, "_run_job", side_effect=AssertionError("calendar failure must stop before job run")):
+        response = client.post(
+            "/v1/chat/completions",
+            headers=headers,
+            json={
+                "messages": [{"role": "user", "content": "分析600519"}],
+                "stream": True,
+            },
+        )
+    assert response.status_code == 200
+    assert "event: job.failed" in response.text
+    assert "交易日历不可用" in response.text
+    assert "event: done" in response.text
 
 
 def test_chat_completions_normalizes_extracted_weekend_trade_date():

@@ -218,14 +218,17 @@ def test_dual_horizon_partial_failure_keeps_other_horizon_result_and_gaps():
         "【数据获取失败】short horizon 新闻接口超时",
         "模型补充：short 数据不完整",
     ]
-    assert result["data_gaps"] == short["data_gaps"]
+    assert result["data_gaps"] == short["data_gaps"] + [
+        "【数据获取失败】medium horizon：medium provider unavailable"
+    ]
     assert result["not_applicable"] is False
     assert result["falsification_conditions"] == ["条件：short 业绩不达预期"]
 
     assert len(saved_reports) == 1
     assert saved_reports[0]["result_data"]["medium_term"]["status"] == "failed"
+    assert saved_reports[0]["data_gaps"] == result["data_gaps"]
     assert saved_reports[0]["result_data"]["short_term"]["status"] == "completed"
-    assert saved_reports[0]["data_gaps"] == short["data_gaps"]
+    assert saved_reports[0]["data_gaps"] == result["data_gaps"]
     assert any('"status": "partial"' in chunk for chunk in chunks)
     assert any("agent.horizon_failed" in chunk for chunk in chunks)
 

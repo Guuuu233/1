@@ -412,6 +412,10 @@ class TradingAgentsGraph:
             "short_term": result,
             "medium_term": None,
             "user_intent": user_intent,
+            "analysis_baseline_date": trade_date,
+            "data_as_of": result.get("data_as_of"),
+            "data_gaps": list(result.get("data_gaps") or []),
+            "market_data_context": market_data_context,
         }
 
     def _build_horizon_result(self, horizon: str, final_state: Dict[str, Any]) -> Dict[str, Any]:
@@ -431,7 +435,7 @@ class TradingAgentsGraph:
             "company_of_interest": final_state.get("company_of_interest", ""),
             "trade_date": trade_date,
             "analysis_baseline_date": trade_date,
-            "data_as_of": daily_context.get("as_of") or market_context.get("data_as_of"),
+            "data_as_of": daily_context.get("as_of"),
             "data_gaps": data_gaps,
             "market_context": market_context,
             "market_data_context": market_data_context,

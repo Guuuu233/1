@@ -114,6 +114,30 @@ def test_normalize_hard_fails_when_calendar_unavailable():
 # ── 日历 fallback：akshare 失败 → fuyao 对照 → 缓存兜底 ───────────────
 
 
+@pytest.mark.parametrize("hour", [8, 10, 12])
+def test_resolve_default_fails_closed_when_both_calendars_fail(hour):
+    tc.clear_cn_trade_date_cache()
+    frozen = datetime(2026, 8, 12, hour, 0, tzinfo=tc.CN_TZ)
+    with patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=RuntimeError("ak down")), \
+         patch.object(tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=RuntimeError("fuyao down")):
+        with pytest.raises(tc.TradeCalendarUnavailableError):
+            tc.resolve_cn_analysis_date(None, now=frozen)
+
+
+def test_resolve_default_rejects_stale_cached_calendar_before_close():
+    _seed_calendar(["2026-07-20", "2026-07-21"])
+    frozen = datetime(2026, 8, 12, 10, 0, tzinfo=tc.CN_TZ)
+    with patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=RuntimeError("ak down")), \
+         patch.object(tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=RuntimeError("fuyao down")):
+        with pytest.raises(tc.TradeCalendarUnavailableError, match="早于请求日"):
+            tc.resolve_cn_analysis_date(None, now=frozen)
+
+
+def test_resolve_explicit_weekend_preserves_calendar_rollback():
+    _seed_calendar(["2026-08-07", "2026-08-10", "2026-08-11"])
+    assert tc.resolve_cn_analysis_date("2026-08-09", explicit=True) == "2026-08-07"
+
+
 def test_calendar_falls_back_to_fuyao_when_akshare_fails():
     """akshare 交易日历失败 → 用 fuyao 近一年日历作在线对照，并写入缓存。"""
     fuyao_dates = [date(2026, 8, 3), date(2026, 8, 4), date(2026, 8, 5)]

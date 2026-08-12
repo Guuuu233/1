@@ -205,8 +205,7 @@ async def _run_scheduled_analysis_once(
     symbol = task["symbol"]
     horizon = task.get("horizon") or "short"
 
-    actual_trade_date = _resolve_scheduled_trade_date(requested_trade_date)
-    _log(f"[Scheduler] {symbol} trade_date={actual_trade_date} (requested={requested_trade_date})")
+    actual_trade_date: Optional[str] = None
 
     set_scheduled_task_context(True)
 
@@ -239,6 +238,9 @@ async def _run_scheduled_analysis_once(
                 scheduled_service.record_manual_test_result(db, task_id, "failed")
 
     try:
+        actual_trade_date = _resolve_scheduled_trade_date(requested_trade_date)
+        _log(f"[Scheduler] {symbol} trade_date={actual_trade_date} (requested={requested_trade_date})")
+
         async with _concurrency_slot(job_id, symbol):
             req = await asyncio.to_thread(_build_request_sync)
 

@@ -14,6 +14,7 @@ from tradingagents.dataflows.trade_calendar import (
     now_cn,
     snapshot_historical_refusal,
 )
+from tradingagents.dataflows.vendor_result import result_to_prompt
 from tradingagents.dataflows.providers.cn_akshare_provider import CnAkshareProvider
 
 
@@ -119,8 +120,9 @@ def test_zt_pool_refuses_historical(provider):
     past = (now_cn().date() - timedelta(days=90)).isoformat()
     with patch.object(provider, "_ak", side_effect=AssertionError("must not call network")):
         out = provider.get_zt_pool(past)
-    assert SNAPSHOT_ONLY_REFUSAL in out
-    assert out.startswith("【数据获取失败】")
+    prompt = result_to_prompt(out)
+    assert SNAPSHOT_ONLY_REFUSAL in prompt
+    assert prompt.startswith("【数据获取失败】")
 
 
 def test_zt_pool_same_day_does_not_auto_refuse(provider):

@@ -73,7 +73,11 @@ from tradingagents.agents.utils.prompt_injection import DEFAULT_PLACEMENT
 
 # 全局共享 DataCollector：同一 ticker+date 的数据只拉一次，所有 job 复用缓存
 _shared_data_collector = DataCollector()
-from tradingagents.dataflows.trade_calendar import cn_today_str, now_cn
+from tradingagents.dataflows.trade_calendar import (
+    TradeCalendarUnavailableError,
+    cn_today_str,
+    now_cn,
+)
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.interface import route_to_vendor
 from tradingagents.graph.intent_parser import parse_intent as _parse_intent
@@ -148,9 +152,9 @@ def _normalize_analysis_trade_date(
     user's request for today's unfinished data so providers can report a gap
     instead of silently substituting yesterday.
 
-    If the calendar cannot be loaded, preserve the old degradation contract by
-    returning the supplied date or the current CN date without fabricating a
-    prior session.
+    If the calendar cannot be loaded, explicit dates remain usable for the
+    caller's requested-date semantics. Omitted defaults fail closed and return
+    an explicit unavailable marker rather than selecting today's date.
     """
     from tradingagents.dataflows.trade_calendar import (
         TradeCalendarUnavailableError,
@@ -158,6 +162,8 @@ def _normalize_analysis_trade_date(
     )
 
     raw = str(trade_date or "").strip()
+    if raw.startswith("【数据获取失败】交易日历") and explicit is not True:
+        return raw
     if explicit is None:
         explicit = bool(raw)
     fallback = raw or cn_today_str()
@@ -169,17 +175,21 @@ def _normalize_analysis_trade_date(
         )
     except TradeCalendarUnavailableError as exc:
         logger.warning(
-            "Analysis trade_date calendar unavailable; keeping raw %r: %s",
-            fallback,
+            "Analysis trade_date calendar unavailable for %s date; %s",
+            "explicit" if explicit else "default",
             exc,
         )
+        if not explicit:
+            raise
         return fallback
     except Exception as exc:  # pragma: no cover - defensive: never break a request
         logger.warning(
-            "Analysis trade_date normalization failed; keeping raw %r: %s",
-            fallback,
+            "Analysis trade_date normalization failed for %s date: %s",
+            "explicit" if explicit else "default",
             exc,
         )
+        if not explicit:
+            raise
         return fallback
 
 
@@ -238,10 +248,11 @@ async def _run_manual_trigger(
     symbol = task["symbol"]
     horizon = task.get("horizon") or "short"
 
-    actual_trade_date = _resolve_scheduled_trade_date(requested_trade_date)
-    _log(f"[Manual Trigger] {symbol} trade_date={actual_trade_date} (requested={requested_trade_date})")
+    actual_trade_date: Optional[str] = None
 
     try:
+        actual_trade_date = _resolve_scheduled_trade_date(requested_trade_date)
+        _log(f"[Manual Trigger] {symbol} trade_date={actual_trade_date} (requested={requested_trade_date})")
         with get_db_ctx() as db:
             scheduled_user_context = task.get("manual_user_context") or _build_imported_user_context(
                 db, user_id, symbol
@@ -1587,9 +1598,13 @@ def _build_result_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(entry, dict) and entry.get("gap")
     ]
     baseline = final_state.get("trade_date")
-    data_as_of = daily_context.get("as_of") or market_context.get("data_as_of")
+    # ``market_context.data_as_of`` is a conceptual session date, not proof
+    # that a completed daily bar was fetched.  Only normalized daily data can
+    # establish the report's actual data cutoff.
+    data_as_of = daily_context.get("as_of")
     return {
         "symbol": final_state.get("company_of_interest"),
+        "horizon": final_state.get("horizon", "short"),
         "trade_date": baseline,
         "analysis_baseline_date": baseline,
         "data_as_of": data_as_of,
@@ -2666,10 +2681,19 @@ async def _run_job_inner(
                 all_data_gaps: List[str] = []
                 seen_gaps: set[str] = set()
                 for horizon in request.horizons:
-                    for gap in horizon_results[horizon].get("data_gaps", []):
+                    horizon_payload = horizon_results[horizon]
+                    for gap in horizon_payload.get("data_gaps", []):
                         if gap not in seen_gaps:
                             seen_gaps.add(gap)
                             all_data_gaps.append(gap)
+                    if horizon_payload.get("status") == "failed":
+                        failure_gap = (
+                            f"【数据获取失败】{horizon} horizon："
+                            f"{horizon_payload.get('error') or '分析失败'}"
+                        )
+                        if failure_gap not in seen_gaps:
+                            seen_gaps.add(failure_gap)
+                            all_data_gaps.append(failure_gap)
                 horizon_metadata = report_service.aggregate_horizon_metadata(
                     (
                         (horizon, horizon_results[horizon])
@@ -2687,7 +2711,7 @@ async def _run_job_inner(
                             for horizon in request.horizons
                             if horizon_results[horizon].get("data_as_of")
                         ),
-                        request.trade_date,
+                        None,
                     ),
                     "mode": "dual_horizon",
                     "status": "partial" if horizon_errors else "completed",
@@ -2794,7 +2818,7 @@ async def _run_job_inner(
                 "symbol": ticker,
                 "trade_date": request.trade_date,
                 "analysis_baseline_date": request.trade_date,
-                "data_as_of": primary_r.get("data_as_of") or request.trade_date,
+                "data_as_of": primary_r.get("data_as_of"),
                 "data_gaps": list(primary_r.get("data_gaps") or []),
                 "mode": "dual_horizon",
                 "user_intent": user_intent,
@@ -3763,10 +3787,13 @@ async def analyze(
     explicit_date = "trade_date" in request.model_fields_set and bool(
         str(request.trade_date or "").strip()
     )
-    request.trade_date = _normalize_analysis_trade_date(
-        request.trade_date if explicit_date else None,
-        explicit=explicit_date,
-    )
+    try:
+        request.trade_date = _normalize_analysis_trade_date(
+            request.trade_date if explicit_date else None,
+            explicit=explicit_date,
+        )
+    except TradeCalendarUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=f"交易日历不可用：{exc}") from exc
     request.trade_date_explicit = explicit_date
     explicit_context = _extract_request_user_context(request)
 
@@ -4219,10 +4246,13 @@ async def chat_completions(
         await asyncio.to_thread(_ai_extract_symbol_and_date, text, config)
     horizons = _normalize_analysis_horizons(horizons, query=text)
     date_explicit = bool(str(trade_date or "").strip())
-    trade_date = _normalize_analysis_trade_date(
-        trade_date if date_explicit else None,
-        explicit=date_explicit,
-    )
+    try:
+        trade_date = _normalize_analysis_trade_date(
+            trade_date if date_explicit else None,
+            explicit=date_explicit,
+        )
+    except TradeCalendarUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=f"交易日历不可用：{exc}") from exc
 
     if not symbol:
         raise HTTPException(status_code=400, detail="抱歉，我没能从您的消息中识别出股票标的。请输入代码（如 600519.SH）或可识别的公司名称。")
@@ -6089,7 +6119,10 @@ async def trigger_scheduled_analyses_batch(
         raise HTTPException(400, "请至少选择 1 个定时任务")
 
     requested_trade_date = cn_today_str()
-    actual_trade_date = _resolve_scheduled_trade_date(requested_trade_date)
+    try:
+        actual_trade_date = _resolve_scheduled_trade_date(requested_trade_date)
+    except TradeCalendarUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=f"交易日历不可用：{exc}") from exc
     code_to_name = _get_reverse_stock_map()
     jobs: List[Dict[str, Any]] = []
     with_position_context = 0
@@ -6183,7 +6216,10 @@ async def trigger_scheduled_analysis_once(
         raise HTTPException(404, "未找到该定时任务")
 
     requested_trade_date = cn_today_str()
-    actual_trade_date = _resolve_scheduled_trade_date(requested_trade_date)
+    try:
+        actual_trade_date = _resolve_scheduled_trade_date(requested_trade_date)
+    except TradeCalendarUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=f"交易日历不可用：{exc}") from exc
     now = _utcnow_iso()
     job_id = uuid4().hex
 

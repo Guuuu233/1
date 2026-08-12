@@ -159,6 +159,51 @@ def test_investoday_get_news_invalid_ticker():
     assert "无法解析证券代码" in out
 
 
+def test_investoday_get_news_filters_future_timestamps():
+    from tradingagents.dataflows.providers.cn_investoday_provider import CnInvestodayProvider
+
+    body = {
+        "code": 0,
+        "message": "success",
+        "data": [
+            {"date": "2025-04-02 15:45:02", "title": "有效", "summary": "ok"},
+            {"date": "2025-04-04 15:45:02", "title": "未来", "summary": "future"},
+        ],
+    }
+    provider = CnInvestodayProvider()
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_investoday_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ):
+        out = provider.get_news("600519.SH", "2025-04-01", "2025-04-03")
+
+    assert "有效" in out
+    assert "未来" not in out
+    assert "2025-04-02 15:45:02" in out
+
+
+def test_investoday_get_news_rejects_missing_timestamps():
+    from tradingagents.dataflows.providers.cn_investoday_provider import CnInvestodayProvider
+
+    body = {
+        "code": 0,
+        "message": "success",
+        "data": [
+            {"date": "bad", "title": "无时间", "summary": "bad"},
+            {"date": "2025-04-02 15:45:02", "title": "有效", "summary": "ok"},
+        ],
+    }
+    provider = CnInvestodayProvider()
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_investoday_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ):
+        with pytest.raises(NotImplementedError, match="发布时间"):
+            provider.get_news("600519.SH", "2025-04-01", "2025-04-03")
+
+
 def test_investoday_get_news_empty_returns_message():
     from tradingagents.dataflows.providers.cn_investoday_provider import CnInvestodayProvider
 

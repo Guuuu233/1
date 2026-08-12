@@ -15,7 +15,7 @@ from tradingagents.dataflows.providers.cn_fuyao_provider import (
     FuyaoApiError,
 )
 from tradingagents.dataflows.trade_calendar import CN_TZ
-from tradingagents.dataflows.vendor_result import VendorEmpty, VendorFail
+from tradingagents.dataflows.vendor_result import VendorEmpty, VendorFail, VendorRefuse
 
 FAST_POLICY = ProviderResourcePolicy(timeout_seconds=1.0, max_retries=0, max_concurrency=2)
 
@@ -649,6 +649,29 @@ def test_route_fundamentals_fuyao_3001_falls_back_to_weak_source():
         "2026-08-05",
     )
     assert "cn_akshare" in out
+
+
+def test_route_zt_pool_falls_back_to_fuyao_when_akshare_refuses_historical():
+    akshare = _FakeProvider(
+        "cn_akshare",
+        lambda *a, **k: VendorRefuse(
+            "该数据源仅提供当前快照，无法用于历史日期分析，本项不可用",
+            allow_peers=("cn_fuyao",),
+        ),
+        method="get_zt_pool",
+    )
+    fuyao = _FakeProvider(
+        "cn_fuyao",
+        lambda *a, **k: "涨停池（2026-08-04，同花顺 fuyao）：共 3 只",
+        method="get_zt_pool",
+    )
+    out = _route(
+        {"cn_akshare": akshare, "cn_fuyao": fuyao},
+        "cn_akshare,cn_fuyao",
+        "get_zt_pool",
+        "2026-08-04",
+    )
+    assert "同花顺 fuyao" in out
 
 
 def test_route_zt_pool_falls_back_to_fuyao_when_akshare_vendor_fail():

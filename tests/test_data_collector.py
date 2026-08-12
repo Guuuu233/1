@@ -15,7 +15,7 @@ def test_make_cache_key():
 
 def test_source_provenance_keeps_actual_as_of_and_explicit_gap():
     results = {
-        "news": "## 600519 新闻（2026-08-05 至 2026-08-11）：",
+        "news": "## 600519 新闻（2026-08-05 至 2026-08-11；最新发布时间：2026-08-11 15:00:00）：",
         "global_news": "【数据获取失败】历史宏观新闻不可用",
         "zt_pool": "【数据获取失败】涨停板情绪池：无可验证数据日期",
     }
@@ -27,9 +27,39 @@ def test_source_provenance_keeps_actual_as_of_and_explicit_gap():
 
     assert provenance["news"]["requested_as_of"] == "2026-08-11"
     assert provenance["news"]["as_of"] == "2026-08-11"
+    assert "gap" not in provenance["news"]
     assert provenance["global_news"]["status"] == "failed"
     assert "gap" in provenance["global_news"]
     assert provenance["zt_pool"]["status"] == "failed"
+
+
+def test_source_provenance_uses_pool_actual_date_not_request_window():
+    provenance = _build_source_provenance(
+        {"zt_pool": "涨停池（2026-08-04，同花顺 fuyao）：共 2 只"},
+        "2026-08-11",
+        daily_as_of="2026-08-11",
+    )
+    assert provenance["zt_pool"]["as_of"] == "2026-08-04"
+    assert "gap" not in provenance["zt_pool"]
+
+
+def test_source_provenance_does_not_infer_news_window_end_as_actual_date():
+    provenance = _build_source_provenance(
+        {"news": "## 新闻（2026-08-05 至 2026-08-11）："},
+        "2026-08-11",
+        daily_as_of="2026-08-11",
+    )
+    assert provenance["news"]["as_of"] is None
+    assert "gap" in provenance["news"]
+
+
+def test_source_provenance_extracts_latest_publication_date():
+    provenance = _build_source_provenance(
+        {"news": "## 新闻（最新发布时间：2026-08-10 15:00:00）"},
+        "2026-08-11",
+        daily_as_of="2026-08-11",
+    )
+    assert provenance["news"]["as_of"] == "2026-08-10"
 
 
 def test_collect_populates_required_keys():
@@ -147,6 +177,20 @@ def test_evict_clears_cache_and_refcount_but_retains_lock_then_refetches():
         result = collector.collect("600519", "2026-03-12")
     assert result["stock_data"] == "new"
     assert mock_fetch.call_count == 1
+
+
+def test_failed_stock_data_enters_ledger_and_gap():
+    from tradingagents.graph import data_collector
+
+    with patch.object(data_collector, "_safe", return_value=""), \
+         patch.object(data_collector, "FETCH_ALL_TIMEOUT", 1):
+        result = data_collector._fetch_all("600519", "2026-08-11")
+
+    ledger = result["market_data_context"]["data_failure_ledger"]
+    stock_entries = [entry for entry in ledger if entry["source"] == "stock_data"]
+    assert stock_entries
+    assert "无有效完整日线数据" in stock_entries[0]["gap"]
+    assert result["market_data_context"]["source_provenance"]["stock_data"]["as_of"] is None
 
 
 def test_fetch_all_completes_executor_with_fast_tools():
