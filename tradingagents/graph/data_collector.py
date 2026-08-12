@@ -700,7 +700,9 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         out = df.copy()
         out["date"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
         provenance = _csv_comment_lines(raw_csv)
-        provenance.append(f"# as-of: {trade_date}")
+        actual_daily_as_of = pd.to_datetime(out["date"], errors="coerce").max().strftime("%Y-%m-%d")
+        provenance.append(f"# requested-as-of: {trade_date}")
+        provenance.append(f"# as-of: {actual_daily_as_of}")
         provenance.append("# normalized: sorted, deduped, date<=as-of, OHLCV columns")
         results["stock_data"] = "\n".join(provenance) + "\n" + out.to_csv(index=False)
     else:

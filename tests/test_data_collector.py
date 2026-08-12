@@ -189,6 +189,19 @@ def test_evict_clears_cache_and_refcount_but_retains_lock_then_refetches():
     assert mock_fetch.call_count == 1
 
 
+def test_normalized_daily_csv_separates_requested_and_actual_as_of():
+    from tradingagents.graph import data_collector
+
+    raw = "# vendor: fixture\nDate,Open,High,Low,Close,Volume\n2026-08-10,1,1,1,1,1\n"
+    with patch.object(data_collector, "_safe", return_value=raw), \
+         patch.object(data_collector, "FETCH_ALL_TIMEOUT", 1):
+        result = data_collector._fetch_all("600519", "2026-08-11")
+    csv = result["stock_data"]
+    assert "# requested-as-of: 2026-08-11" in csv
+    assert "# as-of: 2026-08-10" in csv
+    assert result["market_data_context"]["daily"]["as_of"] == "2026-08-10"
+
+
 def test_stale_daily_as_of_enters_provenance_gap():
     from tradingagents.graph import data_collector
 
