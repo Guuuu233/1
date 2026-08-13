@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import uuid
 from datetime import date, datetime, time, timezone
@@ -15,6 +16,8 @@ from zoneinfo import ZoneInfo
 import requests
 
 from .base import BaseMarketDataProvider
+from ..config import get_config
+from ..vendor_result import VendorFail, VendorRefuse
 
 CLS_LATEST_ENDPOINT = "https://www.cls.cn/api/cache"
 CLS_HISTORY_ENDPOINT = "https://www.cls.cn/v1/roll/get_roll_list"
@@ -30,7 +33,7 @@ class CnClsProvider(BaseMarketDataProvider):
         self,
         *,
         session: requests.Session | Any | None = None,
-        snapshot_dir: str | os.PathLike[str] = "results/cls_snapshots",
+        snapshot_dir: str | os.PathLike[str] | None = None,
         timeout_seconds: float = 15.0,
         max_retries: int = 1,
         max_pages: int = 80,
@@ -45,7 +48,12 @@ class CnClsProvider(BaseMarketDataProvider):
         if earliest_ctime is not None and earliest_ctime < 0:
             raise ValueError("earliest_ctime must be non-negative")
         self.session = session or requests.Session()
-        self.snapshot_dir = Path(snapshot_dir)
+        configured_results_dir = get_config().get("results_dir", "./results")
+        self.snapshot_dir = (
+            Path(snapshot_dir)
+            if snapshot_dir is not None
+            else Path(configured_results_dir) / "cls_snapshots"
+        )
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.max_pages = max_pages
@@ -97,9 +105,14 @@ class CnClsProvider(BaseMarketDataProvider):
         value = item.get("ctime", item.get("create_time", item.get("timestamp")))
         try:
             parsed = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
-        return int(parsed) if parsed >= 0 else None
+        if not math.isfinite(parsed) or parsed < 0 or parsed > 253402300799:
+            return None
+        try:
+            return int(parsed)
+        except (TypeError, ValueError, OverflowError):
+            return None
 
     @staticmethod
     def _sign(params: Mapping[str, Any]) -> str:
@@ -166,13 +179,17 @@ class CnClsProvider(BaseMarketDataProvider):
         ctime = self._item_ctime(item)
         if not cls_id or ctime is None:
             return None
+        try:
+            published_at = datetime.fromtimestamp(ctime, tz=ZoneInfo("Asia/Shanghai")).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
         content = self._text(item.get("content"))
         brief = self._text(item.get("brief"))
         source_url = self._text(item.get("source_url")) or self._text(item.get("shareurl"))
         return {
             "cls_id": cls_id,
             "ctime": ctime,
-            "published_at": datetime.fromtimestamp(ctime, tz=ZoneInfo("Asia/Shanghai")).isoformat(),
+            "published_at": published_at,
             "title": self._text(item.get("title")),
             "brief": brief,
             "content": content or brief,
@@ -225,7 +242,7 @@ class CnClsProvider(BaseMarketDataProvider):
     def _build_typed_gap(code: str, message: str, **details: Any) -> dict[str, Any]:
         return {"type": "coverage_gap", "code": code, "message": message, "details": details}
 
-    def get_global_news(self, curr_date: str, look_back_days: int = 7, limit: int = 50) -> str:
+    def get_global_news(self, curr_date: str, look_back_days: int = 7, limit: int = 50) -> str | VendorFail:
         """Return CLS latest for today, or auditable historical telegraphs."""
         analysis_ctime, analysis_iso = self._as_of(curr_date)
         is_today = datetime.fromtimestamp(analysis_ctime, tz=CLS_TZ).date() == datetime.now(CLS_TZ).date()
@@ -236,7 +253,7 @@ class CnClsProvider(BaseMarketDataProvider):
             )
             retrieved_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             if error:
-                return f"【数据获取失败】财联社最新路径失败：{error}"
+                return VendorFail(f"财联社最新路径失败：{error}")
             snapshot = self._write_page_snapshot(
                 run_id=uuid.uuid4().hex,
                 page=1,
@@ -248,6 +265,7 @@ class CnClsProvider(BaseMarketDataProvider):
             return self._format(latest[:limit], analysis_iso, False, None, snapshot)
 
         cursor = analysis_ctime + 1
+        lower_bound = analysis_ctime - max(0, int(look_back_days)) * 86400
         started_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         run_id = uuid.uuid4().hex
         pages: list[dict[str, Any]] = []
@@ -255,6 +273,11 @@ class CnClsProvider(BaseMarketDataProvider):
         errors: list[str] = []
         cursors: list[int] = []
         duplicate_ids: list[str] = []
+        accepted_count = 0
+        invalid_count = 0
+        valid_count = 0
+        records_received = 0
+        received_ctimes: list[int] = []
         previous_min: int | None = None
         coverage_complete = False
         stop_reason = "not_started"
@@ -275,15 +298,18 @@ class CnClsProvider(BaseMarketDataProvider):
                 gap = self._build_typed_gap("invalid_payload", "CLS historical payload has no roll_data", page=page)
                 stop_reason = "invalid_payload"
                 break
+            records_received += len(rows)
             if not rows:
                 coverage_complete = True
                 stop_reason = "server_history_boundary"
                 break
             page_items: list[dict[str, Any]] = []
-            page_ctimes: list[int] = []
+            raw_page_ctimes: list[int] = []
+            first_gap: dict[str, Any] | None = None
             for row_index, row in enumerate(rows):
                 item = self._normalize_item(row, requested_as_of=analysis_iso, retrieved_at=retrieved_at)
                 if item is None:
+                    invalid_count += 1
                     if not isinstance(row, Mapping):
                         gap_code = "invalid_record"
                         gap_message = "historical page contains a non-object record"
@@ -293,27 +319,43 @@ class CnClsProvider(BaseMarketDataProvider):
                     else:
                         gap_code = "missing_ctime"
                         gap_message = "historical record has no valid ctime"
-                    gap = self._build_typed_gap(
-                        gap_code,
-                        gap_message,
-                        page=page,
-                        row_index=row_index,
-                    )
-                    stop_reason = gap_code
-                    break
+                    if first_gap is None:
+                        first_gap = self._build_typed_gap(
+                            gap_code,
+                            gap_message,
+                            page=page,
+                            row_index=row_index,
+                        )
+                    continue
+                valid_count += 1
+                received_ctimes.append(item["ctime"])
+                raw_page_ctimes.append(item["ctime"])
                 if item["ctime"] > analysis_ctime:
-                    gap = self._build_typed_gap("future_record", "record exceeds analysis_as_of", page=page, cls_id=item["cls_id"], ctime=item["ctime"])
-                    stop_reason = "future_record"
-                    break
+                    if first_gap is None:
+                        first_gap = self._build_typed_gap(
+                            "future_record",
+                            "record exceeds analysis_as_of",
+                            page=page,
+                            cls_id=item["cls_id"],
+                            ctime=item["ctime"],
+                        )
+                    continue
+                if item["ctime"] < lower_bound:
+                    continue
+                if self.earliest_ctime is not None and item["ctime"] < self.earliest_ctime:
+                    continue
                 page_items.append(item)
-                page_ctimes.append(item["ctime"])
-            if gap:
+                accepted_count += 1
+            all_items.extend(page_items)
+            if first_gap is not None:
+                gap = first_gap
+                stop_reason = str(gap["code"])
                 break
-            if not page_ctimes:
+            if not raw_page_ctimes:
                 gap = self._build_typed_gap("missing_ctime", "page has no valid ctime")
                 stop_reason = "missing_ctime"
                 break
-            min_ctime = min(page_ctimes)
+            min_ctime = min(raw_page_ctimes)
             if previous_min is not None and min_ctime >= previous_min:
                 gap = self._build_typed_gap("cursor_not_decreasing", "historical cursor did not move older", previous_min=previous_min, min_ctime=min_ctime)
                 stop_reason = "cursor_not_decreasing"
@@ -322,7 +364,6 @@ class CnClsProvider(BaseMarketDataProvider):
                 gap = self._build_typed_gap("cursor_not_decreasing", "page minimum ctime is not older than cursor", cursor=cursor, min_ctime=min_ctime)
                 stop_reason = "cursor_not_decreasing"
                 break
-            all_items.extend(page_items)
             if self.earliest_ctime is not None and min_ctime <= self.earliest_ctime:
                 gap = self._build_typed_gap(
                     "earliest_boundary",
@@ -349,7 +390,9 @@ class CnClsProvider(BaseMarketDataProvider):
             "finished_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             "analysis_as_of": analysis_iso,
             "pages_requested": len(cursors),
-            "records_received": len(all_items),
+            "records_received": records_received,
+            "accepted_records": accepted_count,
+            "invalid_records": invalid_count,
             "unique_ids": len(unique_items),
             "min_ctime": min(all_ctimes) if all_ctimes else None,
             "max_ctime": max(all_ctimes) if all_ctimes else None,
@@ -363,6 +406,11 @@ class CnClsProvider(BaseMarketDataProvider):
             "gap": gap,
         }
         manifest_path = self._write_manifest(run_id=run_id, manifest=manifest)
+        if not coverage_complete:
+            return VendorFail(
+                f"CLS 历史覆盖不完整（{stop_reason}）；manifest={manifest_path}; "
+                "不得将部分集合视为完整历史。"
+            )
         return self._format(unique_items[:limit], analysis_iso, coverage_complete, gap, manifest_path)
 
     @staticmethod
@@ -400,10 +448,10 @@ class CnClsProvider(BaseMarketDataProvider):
     def get_income_statement(self, ticker: str, freq: str = "quarterly", curr_date: str = None) -> str:
         raise NotImplementedError("cn_cls only provides news")
 
-    def get_news(self, ticker: str, start_date: str, end_date: str) -> str:
-        return (
-            "【数据获取失败】cn_cls 仅提供全局财联社电报，"
-            "不支持按 ticker 查询个股新闻（unsupported），本项不可用。"
+    def get_news(self, ticker: str, start_date: str, end_date: str) -> VendorRefuse:
+        return VendorRefuse(
+            "cn_cls 仅提供全局财联社电报，不支持按 ticker 查询个股新闻（unsupported）。",
+            allow_peers=("cn_akshare", "cn_investoday"),
         )
 
     def get_insider_transactions(self, symbol: str, curr_date: str = None) -> str:

@@ -9,6 +9,7 @@ import pytest
 
 from tradingagents.dataflows import interface as iface
 from tradingagents.dataflows.trade_calendar import cn_today_str, now_cn
+from tradingagents.dataflows.vendor_result import VendorFail, VendorRefuse
 
 
 @pytest.fixture
@@ -134,6 +135,42 @@ def test_news_historical_routes_only_to_verified_sources(past_date):
     akshare.get_news.assert_called_once_with("600519", start_date, past_date)
     investoday.get_news.assert_not_called()
     yfinance.get_news.assert_not_called()
+
+
+def test_cn_cls_unsupported_stock_news_allows_peer_fallback():
+    cls = MagicMock()
+    cls.get_news.return_value = VendorRefuse(
+        "cn_cls unsupported ticker", allow_peers=("cn_akshare", "cn_investoday")
+    )
+    akshare = MagicMock()
+    akshare.get_news.return_value = "## verified stock news"
+    with patch.object(iface, "_registry") as reg:
+        reg.list_names.return_value = ["cn_cls", "cn_akshare", "cn_investoday"]
+        reg.get.side_effect = {"cn_cls": cls, "cn_akshare": akshare}.get
+        with patch.object(iface, "get_vendor", return_value="cn_cls,cn_akshare"):
+            out = iface.route_to_vendor(
+                "get_news", "600519", "2026-01-01", "2026-01-02"
+            )
+    assert out == "## verified stock news"
+    cls.get_news.assert_called_once()
+    akshare.get_news.assert_called_once()
+
+
+def test_cn_cls_historical_vendor_fail_is_not_success_hit(past_date):
+    cls = MagicMock()
+    cls.get_global_news.return_value = VendorFail("coverage incomplete")
+    investoday = MagicMock()
+    investoday.get_global_news.return_value = "## verified historical news"
+    with patch.object(iface, "_registry") as reg:
+        reg.list_names.return_value = ["cn_cls", "cn_investoday"]
+        reg.get.side_effect = {"cn_cls": cls, "cn_investoday": investoday}.get
+        with patch.object(iface, "get_vendor", return_value="cn_cls,cn_investoday"):
+            out = iface.route_to_vendor(
+                "get_global_news", past_date, look_back_days=7, limit=5
+            )
+    assert out == "## verified historical news"
+    cls.get_global_news.assert_called_once()
+    investoday.get_global_news.assert_called_once()
 
 
 def test_global_news_today_still_routes_to_provider():

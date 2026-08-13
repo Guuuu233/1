@@ -288,8 +288,8 @@ def _historical_news_failure(method: str) -> str:
             "不得回退到实时新闻源，本项不可用。"
         )
     return (
-        "【数据获取失败】历史宏观新闻仅允许使用今日投资历史接口；"
-        "未获取到可验证数据（缺少 API Key、接口失败或返回结构异常），"
+        "【数据获取失败】历史宏观新闻允许使用今日投资或财联社历史接口；"
+        "未获取到可验证数据（接口失败、覆盖不完整或返回结构异常），"
         "不得回退到实时新闻源，本项不可用。"
     )
 
@@ -454,8 +454,6 @@ def route_to_vendor(method: str, *args, **kwargs):
             else:
                 # Provider returned normally — interpret typed vendor semantics.
                 if isinstance(result, VendorRefuse):
-                    if historical_provider_allowlist is not None:
-                        return _historical_news_failure(method)
                     if result.allow_peers:
                         refusal_reason = result.to_prompt()
                         peer_allowlist = set(result.allow_peers)
@@ -465,6 +463,8 @@ def route_to_vendor(method: str, *args, **kwargs):
                             f"allow_peers={sorted(peer_allowlist)}"
                         )
                         break
+                    if historical_provider_allowlist is not None:
+                        return _historical_news_failure(method)
                     _trace(
                         f"method={method} {args_summary} vendor={vendor} "
                         "status=refuse reason=vendor-refuse"
@@ -546,6 +546,8 @@ def route_to_vendor(method: str, *args, **kwargs):
         return refusal_reason
     _trace(f"method={method} {args_summary} status=failed reason=no-available-vendor")
     if last_exc is not None:
+        if historical_provider_allowlist is not None:
+            return _historical_news_failure(method)
         raise RuntimeError(
             f"No available vendor for method '{method}'. "
             f"Configured chain: {fallback_vendors}. "
