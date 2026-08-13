@@ -102,6 +102,35 @@ def test_history_request_error_is_typed_gap(tmp_path: Path):
     assert "request_error" in out
 
 
+def test_earliest_boundary_is_incomplete_typed_gap(tmp_path: Path):
+    session = Session([
+        {"errno": 0, "data": {"roll_data": [item("old", 100), item("new", 101)]}},
+    ])
+    provider = CnClsProvider(session=session, snapshot_dir=tmp_path, earliest_ctime=100)
+    out = provider.get_global_news("1970-01-01T00:01:41+00:00")
+    assert "coverage_complete=false" in out
+    assert "earliest_boundary" in out
+
+
+def test_invalid_record_is_not_silently_skipped(tmp_path: Path):
+    session = Session([
+        {"errno": 0, "data": {"roll_data": [item("valid", 100), {"id": "missing-time"}]}},
+    ])
+    provider = CnClsProvider(session=session, snapshot_dir=tmp_path)
+    out = provider.get_global_news("1970-01-01T00:01:40+00:00")
+    assert "coverage_complete=false" in out
+    assert "missing_ctime" in out
+    manifest = json.loads(next(tmp_path.glob("*_manifest.json")).read_text(encoding="utf-8"))
+    assert manifest["records_received"] == 0
+
+
+def test_get_news_explicitly_rejects_unsupported_ticker_semantics(tmp_path: Path):
+    provider = CnClsProvider(snapshot_dir=tmp_path)
+    out = provider.get_news("600519", "1970-01-01", "1970-01-02")
+    assert "unsupported" in out
+    assert "全局" in out
+
+
 def test_normalized_timestamp_uses_shanghai_and_no_detail_url(tmp_path: Path):
     provider = CnClsProvider(snapshot_dir=tmp_path)
     normalized = provider._normalize_item(item("a", 0), requested_as_of="x", retrieved_at="y")

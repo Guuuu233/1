@@ -281,10 +281,26 @@ class CnClsProvider(BaseMarketDataProvider):
                 break
             page_items: list[dict[str, Any]] = []
             page_ctimes: list[int] = []
-            for row in rows:
+            for row_index, row in enumerate(rows):
                 item = self._normalize_item(row, requested_as_of=analysis_iso, retrieved_at=retrieved_at)
                 if item is None:
-                    continue
+                    if not isinstance(row, Mapping):
+                        gap_code = "invalid_record"
+                        gap_message = "historical page contains a non-object record"
+                    elif not self._item_id(row):
+                        gap_code = "missing_id"
+                        gap_message = "historical record has neither cls_id nor id"
+                    else:
+                        gap_code = "missing_ctime"
+                        gap_message = "historical record has no valid ctime"
+                    gap = self._build_typed_gap(
+                        gap_code,
+                        gap_message,
+                        page=page,
+                        row_index=row_index,
+                    )
+                    stop_reason = gap_code
+                    break
                 if item["ctime"] > analysis_ctime:
                     gap = self._build_typed_gap("future_record", "record exceeds analysis_as_of", page=page, cls_id=item["cls_id"], ctime=item["ctime"])
                     stop_reason = "future_record"
@@ -308,8 +324,13 @@ class CnClsProvider(BaseMarketDataProvider):
                 break
             all_items.extend(page_items)
             if self.earliest_ctime is not None and min_ctime <= self.earliest_ctime:
-                coverage_complete = True
-                stop_reason = "earliest_ctime_reached"
+                gap = self._build_typed_gap(
+                    "earliest_boundary",
+                    "configured earliest_ctime reached; older history is not covered",
+                    earliest_ctime=self.earliest_ctime,
+                    min_ctime=min_ctime,
+                )
+                stop_reason = "earliest_boundary"
                 break
             previous_min = min_ctime
             cursor = min_ctime + 1
@@ -380,7 +401,10 @@ class CnClsProvider(BaseMarketDataProvider):
         raise NotImplementedError("cn_cls only provides news")
 
     def get_news(self, ticker: str, start_date: str, end_date: str) -> str:
-        return self.get_global_news(end_date, look_back_days=max(0, (date.fromisoformat(end_date) - date.fromisoformat(start_date)).days), limit=50)
+        return (
+            "【数据获取失败】cn_cls 仅提供全局财联社电报，"
+            "不支持按 ticker 查询个股新闻（unsupported），本项不可用。"
+        )
 
     def get_insider_transactions(self, symbol: str, curr_date: str = None) -> str:
         raise NotImplementedError("cn_cls only provides news")
