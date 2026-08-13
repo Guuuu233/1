@@ -161,8 +161,8 @@ def _resolve_vendor_chain(method: str, configured_vendor: str) -> list[str]:
 # Historical news must use providers that can query and filter an explicit
 # publication window. Live/current sources never receive a historical as-of.
 _HISTORICAL_NEAR_WINDOW_NEWS_PROVIDER_ALLOWLIST = {
-    "get_news": frozenset({"cn_akshare", "cn_investoday"}),
-    "get_global_news": frozenset({"cn_investoday"}),
+    "get_news": frozenset({"cn_akshare", "cn_investoday", "cn_cls"}),
+    "get_global_news": frozenset({"cn_investoday", "cn_cls"}),
 }
 
 
