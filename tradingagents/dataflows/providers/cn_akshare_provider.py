@@ -1373,21 +1373,16 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 em_text = self._format_individual_fund_flow_em(
                     df, symbol, curr_date, cutoff
                 )
-                if em_text is not None:
-                    return self._augment_new_algorithm_sources(
-                        em_text,
-                        ak=ak,
-                        symbol=symbol,
-                        curr_date=curr_date,
-                        code=code,
-                        is_historical=is_historical,
-                    )
+                if em_text is not None and isinstance(getattr(em_text, "fund_flow_evidence", None), list) and getattr(em_text, "fund_flow_evidence", None):
+                    return em_text
+                errors.append("stock_individual_fund_flow: structured evidence unavailable")
                 errors.append("stock_individual_fund_flow: invalid or empty usable rows")
         except Exception as exc:
             errors.append(f"stock_individual_fund_flow: {type(exc).__name__}")
 
-        # Source 2.5: 新浪历史资金流。收盘行可覆盖当日分析；盘中尚无当日行时，
-        # 只有非历史日期才继续走即时快照，避免把前一交易日误报成今天数据。
+        # Source 2.5: Sina Web is legacy reference only. Keep the typed
+        # response for auditability, but it is never a successful main-force
+        # evidence result or direction source.
         try:
             hist_text = self._fetch_sina_historical_fund_flow(
                 symbol,
@@ -1396,7 +1391,18 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 require_curr_date=not is_historical,
             )
             if hist_text is not None:
-                return hist_text
+                metadata = dict(getattr(hist_text, "fund_flow_evidence_meta", {}) or {})
+                metadata.update({
+                    "legacy_web_algorithm": True,
+                    "legacy_web_reference_only": True,
+                    "direction_allowed": False,
+                    "reason": "新浪旧 Web 参考值，不驱动主力方向",
+                })
+                return FundFlowText(
+                    f"{hist_text}\n（新浪旧 Web 参考值：仅作降级参考，不驱动方向）",
+                    evidence=getattr(hist_text, "fund_flow_evidence", []),
+                    evidence_meta=metadata,
+                )
             if is_historical:
                 errors.append(
                     "sina historical fund flow: no rows on or before curr_date"
@@ -1409,10 +1415,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
             errors.append(f"sina historical fund flow: {type(exc).__name__}")
 
         if is_historical:
-            return (
-                f"【数据获取失败】个股资金流向东财与新浪历史接口均失败，"
-                f"历史日期 {curr_date} 下无法截断，{symbol} 本项不可用。"
-                f"（{'；'.join(errors)}）"
+            return build_provider_text(
+                f"【数据获取失败】历史日期 {curr_date} 新算法与新浪历史/legacy Web 资金流均不可用，"
+                f"{symbol} 本项不可用。（{'；'.join(errors)}）",
+                symbol=symbol,
+                requested_as_of=curr_date,
+                source="fund_flow_individual",
+                reason="historical new-algorithm evidence unavailable; legacy Web reference unavailable",
             )
 
         # Source 3: 同花顺即时资金流净额快照（历史接口尚无当日收盘行时）。
