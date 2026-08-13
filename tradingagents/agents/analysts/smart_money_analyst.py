@@ -87,13 +87,18 @@ def create_smart_money_analyst(llm, data_collector=None):
                 fund_flow_evidence["consensus"] = consensus
         evidence_text = json.dumps(fund_flow_evidence, ensure_ascii=False, sort_keys=True)
         consensus_instruction = consensus_prompt_instruction(consensus)
+        validation = (
+            fund_flow_evidence.get("validation", {})
+            if isinstance(fund_flow_evidence, dict)
+            else {}
+        )
         consensus_blocked = bool(
-            isinstance(consensus, dict)
-            and (
-                consensus.get("status") != "consensus"
-                or not consensus.get("direction_allowed")
-                or consensus.get("hard_guard", {}).get("blocked")
-            )
+            not isinstance(consensus, dict)
+            or consensus.get("status") != "consensus"
+            or not consensus.get("direction_allowed")
+            or consensus.get("hard_guard", {}).get("blocked")
+            or validation.get("status") in {"blocked", "mismatch"}
+            or validation.get("hard_guard", {}).get("blocked")
         )
         messages = [
             SystemMessage(content=(
@@ -194,6 +199,16 @@ def create_smart_money_analyst(llm, data_collector=None):
                 )
             if isinstance(market_data_context, dict):
                 market_data_context["fund_flow_evidence"] = fund_flow_evidence
+            consensus = fund_flow_evidence.get("consensus") or consensus
+            validation = fund_flow_evidence.get("validation", validation)
+            consensus_blocked = bool(
+                not isinstance(consensus, dict)
+                or consensus.get("status") != "consensus"
+                or not consensus.get("direction_allowed")
+                or consensus.get("hard_guard", {}).get("blocked")
+                or validation.get("status") in {"blocked", "mismatch"}
+                or validation.get("hard_guard", {}).get("blocked")
+            )
         if check_llm_output_degraded(full_content, "Smart Money Analyst"):
             full_content = "主力资金分析生成异常（输出退化），本项不可用"
         if consensus_blocked:
@@ -221,7 +236,10 @@ def create_smart_money_analyst(llm, data_collector=None):
             "fund_flow_consensus_guard": {
                 "blocked": consensus_blocked,
                 "direction_allowed": not consensus_blocked,
-                "reason": (consensus or {}).get("reason", "consensus unavailable"),
+                "reason": (
+                    (validation or {}).get("hard_guard", {}).get("reason")
+                    or (consensus or {}).get("reason", "consensus unavailable")
+                ),
             },
             "analyst_traces": [{
                 "agent": "smart_money_analyst",

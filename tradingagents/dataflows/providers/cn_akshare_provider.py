@@ -1720,12 +1720,20 @@ class CnAkshareProvider(BaseMarketDataProvider):
             )
             if not ths_records:
                 return value
+            # THS instant ``净额`` is total-net, while EM's value is r0_net;
+            # retain both raw sources but never place them in one consensus field.
             all_records = evidence + ths_records
             metadata["consensus"] = build_consensus_evidence(
-                all_records,
+                evidence,
                 symbol=symbol,
                 requested_as_of=curr_date,
                 field="r0_net",
+            )
+            metadata["total_net_consensus"] = build_consensus_evidence(
+                ths_records,
+                symbol=symbol,
+                requested_as_of=curr_date,
+                field="netamount",
             )
             metadata["new_algorithm_sources"] = [
                 "eastmoney_individual_fund_flow",

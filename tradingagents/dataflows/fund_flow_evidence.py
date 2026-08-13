@@ -110,14 +110,9 @@ def infer_algorithm_group(
     source: Any,
     algorithm_group: Any = None,
 ) -> str:
-    """Classify a source without allowing legacy Sina Web data into new consensus."""
-    explicit = str(algorithm_group or "").strip()
-    if explicit in {NEW_ALGORITHM_GROUP, "new_algorithm", "new"}:
-        return NEW_ALGORITHM_GROUP
-    if explicit in {LEGACY_WEB_ALGORITHM, "legacy_web", "legacy"}:
-        return LEGACY_WEB_ALGORITHM
-
+    """Classify source identity first; metadata cannot relabel legacy/new feeds."""
     label = _normalise_source_text(source)
+    source_group = UNKNOWN_ALGORITHM_GROUP
     if any(
         token in label
         for token in (
@@ -136,12 +131,19 @@ def infer_algorithm_group(
             "同花顺",
         )
     ):
+        source_group = NEW_ALGORITHM_GROUP
+    elif any(token in label for token in ("legacy", "web", "sina_historical")):
+        source_group = LEGACY_WEB_ALGORITHM
+    elif "historical" in label and "sina" in label:
+        source_group = LEGACY_WEB_ALGORITHM
+    elif label in {"sina", "sina_web", "sinafinance", "新浪", "新浪财经"}:
+        source_group = LEGACY_WEB_ALGORITHM
+    if source_group != UNKNOWN_ALGORITHM_GROUP:
+        return source_group
+    explicit = str(algorithm_group or "").strip()
+    if explicit in {NEW_ALGORITHM_GROUP, "new_algorithm", "new"}:
         return NEW_ALGORITHM_GROUP
-    if any(token in label for token in ("legacy", "web", "sina_historical")):
-        return LEGACY_WEB_ALGORITHM
-    if "historical" in label and "sina" in label:
-        return LEGACY_WEB_ALGORITHM
-    if label in {"sina", "sina_web", "sinafinance", "新浪", "新浪财经"}:
+    if explicit in {LEGACY_WEB_ALGORITHM, "legacy_web", "legacy"}:
         return LEGACY_WEB_ALGORITHM
     return UNKNOWN_ALGORITHM_GROUP
 
@@ -711,7 +713,7 @@ def _record_observations(record: Mapping[str, Any]) -> list[dict[str, Any]]:
         observations.append(
             {
                 "source": source,
-                "source_family": record.get("source_family") or source_family(source),
+                "source_family": source_family(source),
                 "algorithm_group": group,
                 "legacy_web_algorithm": group == LEGACY_WEB_ALGORITHM,
                 "symbol": symbol,
@@ -769,14 +771,17 @@ def _evaluate_observation_group(
         for item in observations
     ]
     by_source: dict[str, list[Decimal]] = {}
+    source_families: dict[str, set[str]] = {}
     for item in observations:
-        by_source.setdefault(item["source"], []).append(item["value"])
+        family = str(item.get("source_family") or source_family(item["source"]))
+        source_families.setdefault(family, set()).add(item["source"])
+        by_source.setdefault(family, []).append(item["value"])
     duplicate_source_conflict = any(
         len({value for value in values}) > 1 for values in by_source.values()
     )
     unique_values: list[tuple[str, Decimal]] = [
-        (source, values[0])
-        for source, values in by_source.items()
+        (family, values[0])
+        for family, values in by_source.items()
         if values
     ]
     if duplicate_source_conflict:
@@ -787,7 +792,9 @@ def _evaluate_observation_group(
             "reason": "同一来源在同一日期/窗口/字段返回互相冲突的值",
             "raw_values": raw_values,
             "source_count": len(unique_values),
-            "source_values": {source: _decimal_text(values[0]) for source, values in by_source.items()},
+            "source_family_count": len(source_families),
+            "source_families": {family: sorted(sources) for family, sources in source_families.items()},
+            "source_values": {family: _decimal_text(values[0]) for family, values in by_source.items()},
             "direction": "blocked",
             "direction_allowed": False,
         }
@@ -799,6 +806,8 @@ def _evaluate_observation_group(
             "reason": "新算法组有效且可比来源不足，无法形成共识",
             "raw_values": raw_values,
             "source_count": len(unique_values),
+            "source_family_count": len(source_families),
+            "source_families": {family: sorted(sources) for family, sources in source_families.items()},
             "source_values": {source: _decimal_text(value) for source, value in unique_values},
             "direction": "blocked",
             "direction_allowed": False,
@@ -870,6 +879,8 @@ def _evaluate_observation_group(
         "reason": "新算法组同字段、同日期/窗口已对齐并形成低离散度共识",
         "raw_values": raw_values,
         "source_count": len(unique_values),
+        "source_family_count": len(source_families),
+        "source_families": {family: sorted(sources) for family, sources in source_families.items()},
         "contributing_sources": [source for source, _ in working],
         "source_values": {source: _decimal_text(value) for source, value in unique_values},
         "median": _decimal_text(median),
@@ -1262,8 +1273,16 @@ def validate_model_summary(
                 }
             )
     status = "mismatch" if mismatches else ("matched" if model else "not_checked")
+    if structured.get("status") in {"data_conflict", "partial"}:
+        status = "blocked"
     return {
         "status": status,
+        "hard_guard": {
+            "blocked": status not in {"matched", "not_checked"},
+            "reason": "模型累计值与结构化 evidence 不一致或结构化窗口不可用"
+            if status == "blocked" or status == "mismatch"
+            else "no explicit model total",
+        },
         "structured": structured,
         "model": model,
         "mismatches": mismatches,
