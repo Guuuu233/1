@@ -21,6 +21,10 @@ def create_trader(llm, memory, custom_prompt: str = "", placement: Placement = D
         news_report = state["news_report"]
         fundamentals_report = state["fundamentals_report"]
         risk_feedback_state = state.get("risk_feedback_state", {})
+        fund_flow_guard = state.get("fund_flow_consensus_guard") or {"blocked": True, "direction_allowed": False}
+        if fund_flow_guard.get("blocked") or not fund_flow_guard.get("direction_allowed"):
+            blocked_plan = "资金流共识 guard 已阻断：不得生成方向性交易计划。"
+            return {"messages": [AIMessage(content=blocked_plan, name=name)], "trader_investment_plan": blocked_plan, "fund_flow_consensus_guard": fund_flow_guard, "sender": name}
 
         curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
         past_memories = memory.get_memories(curr_situation, n_matches=2)

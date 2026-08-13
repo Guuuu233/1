@@ -20,6 +20,17 @@ from tradingagents.agents.utils.debate_utils import (
 from .data_collector import default_market_data_context
 
 
+def default_fund_flow_consensus_guard() -> Dict[str, Any]:
+    """Return the serialized fail-closed fund-flow contract."""
+    return {
+        "blocked": True,
+        "direction_allowed": False,
+        "status": "not_checked",
+        "validation": {"status": "not_checked", "hard_guard": {"blocked": True}},
+        "reason": "fund-flow consensus not checked",
+    }
+
+
 class Propagator:
     """Handles state initialization and propagation through the graph."""
 
@@ -55,6 +66,7 @@ class Propagator:
             "instrument_context": instrument_context,
             "market_context": market_context,
             "market_data_context": market_data_context or default_market_data_context(),
+            "fund_flow_consensus_guard": default_fund_flow_consensus_guard(),
             "user_context": normalized_user_context,
             "workflow_context": {
                 "context_version": "v1",

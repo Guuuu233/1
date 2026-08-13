@@ -100,6 +100,15 @@ def create_smart_money_analyst(llm, data_collector=None):
             or validation.get("status") in {"blocked", "mismatch"}
             or validation.get("hard_guard", {}).get("blocked")
         )
+        consensus_guard = {
+            "blocked": consensus_blocked,
+            "direction_allowed": not consensus_blocked,
+            "status": consensus.get("status", "not_checked") if isinstance(consensus, dict) else "not_checked",
+            "consensus": consensus,
+            "validation": validation,
+            "reason": (validation or {}).get("hard_guard", {}).get("reason")
+            or (consensus or {}).get("reason", "fund-flow consensus unavailable"),
+        }
         messages = [
             SystemMessage(content=(
                 system_message
@@ -227,16 +236,15 @@ def create_smart_money_analyst(llm, data_collector=None):
             degraded=full_content.endswith("本项不可用"),
         )
         verdict, confidence = extract_verdict(full_content)
+        consensus_guard.update({
+            "blocked": consensus_blocked,
+            "direction_allowed": not consensus_blocked,
+            "validation": validation,
+            "consensus": consensus,
+        })
         return {
             "smart_money_report": full_content,
-            "fund_flow_consensus_guard": {
-                "blocked": consensus_blocked,
-                "direction_allowed": not consensus_blocked,
-                "reason": (
-                    (validation or {}).get("hard_guard", {}).get("reason")
-                    or (consensus or {}).get("reason", "consensus unavailable")
-                ),
-            },
+            "fund_flow_consensus_guard": consensus_guard,
             "analyst_traces": [{
                 "agent": "smart_money_analyst",
                 "horizon": horizon,

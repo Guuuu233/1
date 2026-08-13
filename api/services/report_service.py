@@ -444,12 +444,17 @@ def _validate_fund_flow_evidence(result_data: Dict[str, Any]) -> None:
                     if isinstance(item_context, dict) and isinstance(item_context.get("fund_flow_evidence"), dict):
                         contexts.append(item_context["fund_flow_evidence"])
     for context in contexts:
+        guard = context.get("consensus") or context.get("fund_flow_consensus_guard")
+        if isinstance(guard, dict) and guard.get("blocked") is False:
+            continue
         unit = context.get("unit")
         if unit is not None and unit != "亿元":
             raise ValueError("fund_flow_evidence unit must be 亿元")
         records = context.get("records")
         if records is not None and not isinstance(records, list):
             raise ValueError("fund_flow_evidence records must be an array")
+        if isinstance(context.get("manual_calibration_gap"), dict):
+            context.setdefault("provenance", []).append(context["manual_calibration_gap"])
         for record in records or []:
             if not isinstance(record, dict):
                 raise ValueError("fund_flow_evidence record must be an object")

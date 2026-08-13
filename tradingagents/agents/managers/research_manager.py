@@ -24,6 +24,11 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
         fundamentals_report = state["fundamentals_report"]
         smart_money_report = state.get("smart_money_report", "")
         volume_price_report = state.get("volume_price_report", "")
+        fund_flow_guard = state.get("fund_flow_consensus_guard") or {
+            "blocked": True,
+            "direction_allowed": False,
+            "status": "not_checked",
+        }
 
         investment_debate_state = state["investment_debate_state"]
         claims = investment_debate_state.get("claims", [])
@@ -62,6 +67,18 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
                 else "Macro/sector evidence summary: "
             )
             macro_evidence_line = f"{label}{macro_evidence_summary}"
+
+        if fund_flow_guard.get("blocked") or not fund_flow_guard.get("direction_allowed"):
+            blocked_plan = "资金流共识 guard 已阻断：不得输出增持、减持、吸筹或其他方向性投资计划。"
+            return {
+                "fund_flow_consensus_guard": fund_flow_guard,
+                "investment_plan": blocked_plan,
+                "investment_debate_state": {
+                    **investment_debate_state,
+                    "judge_decision": blocked_plan,
+                    "current_response": blocked_plan,
+                },
+            }
 
         injection_slots = build_injection_slots(custom_prompt, placement, role_key="research_manager")
         prompt = get_prompt("research_manager_prompt", config=get_config()).format(

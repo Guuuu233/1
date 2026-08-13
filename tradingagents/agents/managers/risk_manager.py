@@ -24,6 +24,19 @@ def create_risk_manager(llm, memory, custom_prompt: str = "", placement: Placeme
         sentiment_report = state["sentiment_report"]
         trader_plan = state["trader_investment_plan"]
         risk_feedback_state = state.get("risk_feedback_state", {})
+        fund_flow_guard = state.get("fund_flow_consensus_guard") or {"blocked": True, "direction_allowed": False}
+        if fund_flow_guard.get("blocked") or not fund_flow_guard.get("direction_allowed"):
+            blocked_decision = "资金流共识 guard 已阻断：风险计划不得批准增持、减持或吸筹方向。"
+            return {
+                "fund_flow_consensus_guard": fund_flow_guard,
+                "final_trade_decision": blocked_decision,
+                "risk_feedback_state": {
+                    **risk_feedback_state,
+                    "latest_risk_verdict": "blocked",
+                    "revision_reason": blocked_decision,
+                    "execution_preconditions": ["fund_flow_consensus_guard must be unblocked"],
+                },
+            }
 
         curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
         past_memories = memory.get_memories(curr_situation, n_matches=2)

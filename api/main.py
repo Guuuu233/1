@@ -1624,6 +1624,7 @@ def _build_result_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
         "analysis_baseline_date": baseline,
         "data_as_of": data_as_of,
         "data_gaps": data_gaps,
+        "fund_flow_consensus_guard": final_state.get("fund_flow_consensus_guard", {"blocked": True, "direction_allowed": False, "status": "not_checked"}),
         "direction": None,
         "instrument_context": final_state.get("instrument_context"),
         "market_context": market_context,
