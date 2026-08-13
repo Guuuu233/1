@@ -87,6 +87,14 @@ def create_smart_money_analyst(llm, data_collector=None):
                 fund_flow_evidence["consensus"] = consensus
         evidence_text = json.dumps(fund_flow_evidence, ensure_ascii=False, sort_keys=True)
         consensus_instruction = consensus_prompt_instruction(consensus)
+        consensus_blocked = bool(
+            isinstance(consensus, dict)
+            and (
+                consensus.get("status") != "consensus"
+                or not consensus.get("direction_allowed")
+                or consensus.get("hard_guard", {}).get("blocked")
+            )
+        )
         messages = [
             SystemMessage(content=(
                 system_message
@@ -188,6 +196,11 @@ def create_smart_money_analyst(llm, data_collector=None):
                 market_data_context["fund_flow_evidence"] = fund_flow_evidence
         if check_llm_output_degraded(full_content, "Smart Money Analyst"):
             full_content = "主力资金分析生成异常（输出退化），本项不可用"
+        if consensus_blocked:
+            full_content = (
+                "资金流新算法组共识不可用或存在口径冲突；已阻断增持、减持、吸筹方向摘要。"
+                "请保留各来源原值，待同一股票、日期、窗口、单位和字段可比后复核。"
+            )
         _elapsed = _time.monotonic() - _t0
         _meta = getattr(_last_chunk, "response_metadata", {}) or {}
         _usage = _meta.get("token_usage") or _meta.get("usage") or {}
@@ -205,6 +218,11 @@ def create_smart_money_analyst(llm, data_collector=None):
         verdict, confidence = extract_verdict(full_content)
         return {
             "smart_money_report": full_content,
+            "fund_flow_consensus_guard": {
+                "blocked": consensus_blocked,
+                "direction_allowed": not consensus_blocked,
+                "reason": (consensus or {}).get("reason", "consensus unavailable"),
+            },
             "analyst_traces": [{
                 "agent": "smart_money_analyst",
                 "horizon": horizon,

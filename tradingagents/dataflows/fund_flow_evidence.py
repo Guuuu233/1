@@ -328,6 +328,17 @@ def build_source_evidence(
             record[f"{component}_raw_unit"] = parsed_unit
             record.setdefault("components", {})[component] = _decimal_text(parsed)
             record.setdefault("component_semantics", {})[component] = _COMPONENT_SEMANTICS[component]
+        components = record.get("components", {})
+        if "r0_net" not in record and {"super_large_net", "large_net"}.issubset(components):
+            derived = (
+                decimal_value(components["super_large_net"]) or Decimal("0")
+            ) + (decimal_value(components["large_net"]) or Decimal("0"))
+            record["r0_net"] = _decimal_text(derived)
+            record["r0_net_raw"] = f"{record['super_large_net_raw']} + {record['large_net_raw']}"
+            record["r0_net_raw_unit"] = "亿元"
+            field_semantics["r0_net"] = _FIELD_SEMANTICS["r0_net"]
+            field_categories["r0_net"] = _FIELD_CATEGORIES["r0_net"]
+            record["derived_fields"] = {"r0_net": "super_large_net + large_net"}
         # Some feeds expose one canonical field/value pair instead of columns.
         explicit_field = row.get("field") or row.get("字段")
         if explicit_field and row.get("value") is not None:
@@ -601,6 +612,25 @@ def summarize_evidence(
             },
         }
     selected = usable[-window_days:] if len(usable) > window_days else usable
+    selected_dates = [str(record.get("date")) for record in selected]
+    if len(set(selected_dates)) != len(selected_dates) or any(
+        record.get("period_kind") == "five_day_cumulative" for record in selected
+    ):
+        return {
+            "window_days": window_days,
+            "record_count": len(selected),
+            "status": "data_conflict",
+            "data_conflict": True,
+            "reason": "累计值或重复日期不能按逐日记录相加",
+            "dates": selected_dates,
+            "netamount": None,
+            "r0_net": None,
+            "unit": "亿元",
+            "semantics": {
+                "netamount": _FIELD_SEMANTICS["netamount"],
+                "r0_net": _FIELD_SEMANTICS["r0_net"],
+            },
+        }
     netamount = _sum_field(selected, "netamount")
     r0_net = _sum_field(selected, "r0_net")
     status = "available" if len(selected) == window_days and netamount is not None and r0_net is not None else "partial"
@@ -818,7 +848,18 @@ def _evaluate_observation_group(
         }
 
     direction = "neutral"
-    if median > 0:
+    if field := observations[0].get("field"):
+        if field == "r0_out":
+            # r0_out is an amount flowing out: a positive consensus is outflow.
+            if median > 0:
+                direction = "outflow"
+            elif median < 0:
+                direction = "inflow"
+        elif median > 0:
+            direction = "inflow"
+        elif median < 0:
+            direction = "outflow"
+    elif median > 0:
         direction = "inflow"
     elif median < 0:
         direction = "outflow"
@@ -839,6 +880,138 @@ def _evaluate_observation_group(
         "consensus_value": _decimal_text(median),
         "direction": direction,
         "direction_allowed": True,
+    }
+
+
+def _direction_for_field(field: str, value: Decimal) -> str:
+    """Map a signed amount to a flow direction using the field's semantics."""
+    if field == "r0_out":
+        # r0_out is an outflow amount, unlike net fields where a negative value
+        # denotes outflow.
+        return "outflow" if value > 0 else "inflow" if value < 0 else "neutral"
+    return "inflow" if value > 0 else "outflow" if value < 0 else "neutral"
+
+
+def _aggregate_daily_field_results(
+    field: str,
+    grouped: list[tuple[tuple[Any, ...], list[dict[str, Any]]]],
+    *,
+    relative_dispersion_threshold: Decimal,
+    max_days: int = DEFAULT_WINDOW_DAYS,
+) -> dict[str, Any]:
+    """Consensus each date first, then aggregate the latest daily values."""
+    by_date: dict[str, list[tuple[tuple[Any, ...], list[dict[str, Any]]]]] = {}
+    for key, observations in grouped:
+        by_date.setdefault(str(key[1]), []).append((key, observations))
+    dates = sorted(by_date)[-max_days:]
+    daily_results: dict[str, Any] = {}
+    all_raw_values: list[dict[str, Any]] = []
+    for date in dates:
+        date_groups = by_date[date]
+        if len(date_groups) != 1:
+            daily_results[date] = {
+                "status": "data_conflict",
+                "data_conflict": True,
+                "reason_code": "incomparable_alignment",
+                "reason": "同一日期存在不同时间窗口、单位或字段记录，无法形成日共识",
+                "direction": "blocked",
+                "direction_allowed": False,
+                "raw_values": [
+                    {
+                        "source": item["source"],
+                        "value": item["value_text"],
+                        "date": item["date"],
+                        "period_kind": item["period_kind"],
+                        "time_window": item["time_window"],
+                        "field": item["field"],
+                    }
+                    for _, source_group in date_groups for item in source_group
+                ],
+            }
+        else:
+            daily_results[date] = _evaluate_observation_group(
+                date_groups[0][1],
+                relative_dispersion_threshold=relative_dispersion_threshold,
+            )
+        all_raw_values.extend(daily_results[date].get("raw_values", []))
+
+    if not daily_results:
+        return {
+            "status": "data_conflict",
+            "data_conflict": True,
+            "reason_code": "no_daily_observation",
+            "reason": "没有可用于日共识的记录",
+            "direction": "blocked",
+            "direction_allowed": False,
+            "daily_consensus": {},
+        }
+    blocked_dates = [date for date, result in daily_results.items() if result.get("status") != "consensus"]
+    if blocked_dates:
+        return {
+            "status": "data_conflict",
+            "data_conflict": True,
+            "reason_code": "daily_consensus_conflict",
+            "reason": "至少一个交易日的新算法组无法形成可解释共识",
+            "dates": dates,
+            "blocked_dates": blocked_dates,
+            "daily_consensus": daily_results,
+            "raw_values": all_raw_values,
+            "direction": "blocked",
+            "direction_allowed": False,
+        }
+
+    daily_values = [
+        decimal_value(result.get("consensus_value"))
+        for result in daily_results.values()
+    ]
+    if any(value is None for value in daily_values):
+        return {
+            "status": "data_conflict",
+            "data_conflict": True,
+            "reason_code": "daily_value_missing",
+            "reason": "日共识缺少可聚合的数值",
+            "dates": dates,
+            "daily_consensus": daily_results,
+            "raw_values": all_raw_values,
+            "direction": "blocked",
+            "direction_allowed": False,
+        }
+    aggregate = sum((value for value in daily_values if value is not None), Decimal("0"))
+    daily_mads = [
+        decimal_value(result.get("mad")) or Decimal("0")
+        for result in daily_results.values()
+    ]
+    aggregate_mad = _median(daily_mads) if daily_mads else Decimal("0")
+    relative = aggregate_mad if abs(aggregate) <= _EPSILON else aggregate_mad / abs(aggregate)
+    direction = _direction_for_field(field, aggregate)
+    return {
+        "status": "consensus",
+        "data_conflict": False,
+        "reason_code": "daily_consensus_then_window_aggregate",
+        "reason": "新算法组按交易日分别共识后聚合最新交易日窗口",
+        "dates": dates,
+        "window_days": len(dates),
+        "period_kind": "five_day_aggregate" if len(dates) > 1 else "daily_consensus",
+        "daily_consensus": daily_results,
+        "raw_values": all_raw_values,
+        "consensus_value": _decimal_text(aggregate),
+        "aggregate_value": _decimal_text(aggregate),
+        "median": _decimal_text(aggregate),
+        "mad": _decimal_text(aggregate_mad),
+        "relative_dispersion": _decimal_text(relative),
+        "relative_dispersion_threshold": _decimal_text(relative_dispersion_threshold),
+        "direction": direction,
+        "direction_allowed": True,
+        "contributing_sources": sorted({
+            source
+            for result in daily_results.values()
+            for source in result.get("contributing_sources", [])
+        }),
+        "outliers": [
+            item
+            for result in daily_results.values()
+            for item in result.get("outliers", [])
+        ],
     }
 
 
@@ -956,17 +1129,8 @@ def build_consensus_evidence(
         (item["source"], item["field"], item["date"], item["period_kind"], item["time_window"], item["unit"])
         for item in new_observations
     }
-    source_fields = {item["field"] for item in new_observations}
-    if len(source_fields) > 1 and field is None:
-        # Different official fields (for example ``netamount`` vs ``r0_net``)
-        # are retained separately but are never averaged into one direction.
-        base.update({
-            "reason_code": "incomparable_fields",
-            "reason": "新算法组来源混合主力与总净额字段，必须按字段分类分别对齐",
-            "field_results": {},
-        })
-        return base
-
+    # Different official fields (for example ``netamount`` vs ``r0_net``) are
+    # retained in separate field results and are never averaged together.
     grouped_by_field: dict[str, list[tuple[tuple[Any, ...], list[dict[str, Any]]]]] = {}
     for key, group in groups.items():
         grouped_by_field.setdefault(str(key[5]), []).append((key, group))
@@ -980,31 +1144,12 @@ def build_consensus_evidence(
     )
     field_results: dict[str, Any] = {}
     for field_name, field_groups in grouped_by_field.items():
-        if len(field_groups) != 1:
-            field_results[field_name] = {
-                "status": "data_conflict",
-                "data_conflict": True,
-                "reason_code": "incomparable_alignment",
-                "reason": "同一字段存在不同股票/日期/时间窗口/单位记录，无法对齐",
-                "raw_values": [
-                    {
-                        "source": item["source"],
-                        "value": item["value_text"],
-                        "date": item["date"],
-                        "period_kind": item["period_kind"],
-                        "time_window": item["time_window"],
-                        "field": item["field"],
-                    }
-                    for _, group in field_groups for item in group
-                ],
-                "direction": "blocked",
-                "direction_allowed": False,
-            }
-        else:
-            field_results[field_name] = _evaluate_observation_group(
-                field_groups[0][1],
-                relative_dispersion_threshold=relative_dispersion_threshold,
-            )
+        field_results[field_name] = _aggregate_daily_field_results(
+            field_name,
+            field_groups,
+            relative_dispersion_threshold=relative_dispersion_threshold,
+            max_days=DEFAULT_WINDOW_DAYS,
+        )
     selected = field_results[selected_field]
     base.update(selected)
     base["field"] = selected_field
@@ -1021,6 +1166,11 @@ def build_consensus_evidence(
         base["direction_allowed"] = False
         base["reason_code"] = "non_main_force_direction"
         base["reason"] = "仅形成非主力 r0 净额共识，不能替代主力口径方向"
+    base["hard_guard"] = {
+        "blocked": not bool(base.get("direction_allowed")) or base.get("status") != "consensus",
+        "direction_allowed": bool(base.get("direction_allowed")) and base.get("status") == "consensus",
+        "reason": base.get("reason") or "consensus available",
+    }
     if base.get("direction") == "outflow":
         base["direction_summary"] = "主力偏减持/大额资金偏流出"
     elif base.get("direction") == "inflow":

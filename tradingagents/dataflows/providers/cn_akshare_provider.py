@@ -1366,13 +1366,22 @@ class CnAkshareProvider(BaseMarketDataProvider):
             if df is None or df.empty:
                 errors.append("stock_individual_fund_flow: empty dataframe")
             else:
-                # _format_individual_fund_flow_em never returns None: it returns
-                # a formatted report or an explicit 【数据获取失败】 refusal (out of
-                # range / unparseable dates), and must not fall back to the
-                # same-day Sina snapshot for historical dates (lookahead risk).
-                return self._format_individual_fund_flow_em(
+                # Invalid or out-of-range Eastmoney data must not terminate the
+                # fallback chain. The formatter returns None for unusable data;
+                # valid records are rendered and returned immediately.
+                em_text = self._format_individual_fund_flow_em(
                     df, symbol, curr_date, cutoff
                 )
+                if em_text is not None:
+                    return self._augment_new_algorithm_sources(
+                        em_text,
+                        ak=ak,
+                        symbol=symbol,
+                        curr_date=curr_date,
+                        code=code,
+                        is_historical=is_historical,
+                    )
+                errors.append("stock_individual_fund_flow: invalid or empty usable rows")
         except Exception as exc:
             errors.append(f"stock_individual_fund_flow: {type(exc).__name__}")
 
@@ -1650,6 +1659,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
         )
         if not has_sub_orders:
             header += "\n（新浪历史接口未提供超大单/大单/中单/小单明细）"
+        consensus = build_consensus_evidence(
+            evidence,
+            symbol=symbol,
+            requested_as_of=curr_date,
+            field="r0_net",
+        )
         return FundFlowText(
             header,
             evidence=evidence,
@@ -1658,10 +1673,68 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 "requested_as_of": curr_date,
                 "retrieved_at": retrieved_at,
                 "source": "sina_historical",
+                "algorithm_group": "legacy_web_algorithm",
+                "source_family": "sina_web",
                 "unit": "亿元",
                 "status": "available" if len(evidence) >= _SINA_HIST_FUND_FLOW_SHOW else "partial",
+                "consensus": consensus,
             },
         )
+
+    def _augment_new_algorithm_sources(
+        self,
+        value: FundFlowText,
+        *,
+        ak,
+        symbol: str,
+        curr_date: str,
+        code: str,
+        is_historical: bool,
+    ) -> FundFlowText:
+        """Attach optional THS same-day evidence without changing EM fallback semantics."""
+        evidence = list(getattr(value, "fund_flow_evidence", []) or [])
+        metadata = dict(getattr(value, "fund_flow_evidence_meta", {}) or {})
+        if not evidence or is_historical:
+            return value
+        try:
+            with AKSHARE_CALL_LOCK:
+                snapshot = ak.stock_fund_flow_individual(symbol="即时")
+            if snapshot is None or snapshot.empty or "股票代码" not in snapshot.columns:
+                return value
+            matched = snapshot[snapshot["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
+            if matched.empty or "净额" not in matched.columns:
+                return value
+            ths_row = matched.iloc[0]
+            ths_records = build_ths_evidence(
+                [{
+                    "股票代码": code,
+                    "日期": curr_date,
+                    "净额": ths_row.get("净额"),
+                    "单位": "亿元",
+                    "period_kind": "realtime_single_day",
+                    "window": "1d",
+                }],
+                symbol=symbol,
+                requested_as_of=curr_date,
+                retrieved_at=self._sina_retrieved_at(),
+            )
+            if not ths_records:
+                return value
+            all_records = evidence + ths_records
+            metadata["consensus"] = build_consensus_evidence(
+                all_records,
+                symbol=symbol,
+                requested_as_of=curr_date,
+                field="r0_net",
+            )
+            metadata["new_algorithm_sources"] = [
+                "eastmoney_individual_fund_flow",
+                "ths_instant_snapshot",
+            ]
+            return FundFlowText(str(value), evidence=all_records, evidence_meta=metadata)
+        except Exception as exc:
+            metadata["consensus_source_warning"] = f"ths_instant_snapshot: {type(exc).__name__}"
+            return FundFlowText(str(value), evidence=evidence, evidence_meta=metadata)
 
     def _format_individual_fund_flow_em(
         self,
@@ -1669,7 +1742,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         symbol: str,
         curr_date: str,
         cutoff,
-    ) -> str:
+    ) -> str | None:
         """Format the Eastmoney per-day fund-flow series truncated to curr_date.
 
         Returns a formatted report string when usable records remain on or
@@ -1681,12 +1754,16 @@ class CnAkshareProvider(BaseMarketDataProvider):
         lookahead bias.  The caller therefore returns this value directly.
         """
         date_col = "日期" if "日期" in df.columns else None
-        if date_col is None:
-            return f"{symbol} 近期主力资金流向数据缺少日期列，无法判定最新记录。"
+        value_col = "主力净流入-净额" if "主力净流入-净额" in df.columns else None
+        if date_col is None or value_col is None:
+            return None
 
         dates = pd.to_datetime(df[date_col], errors="coerce")
-        df = df.loc[dates.notna()].copy()
-        df[date_col] = dates[dates.notna()]
+        values = pd.to_numeric(df[value_col], errors="coerce")
+        valid = dates.notna() & values.notna() & values.map(math.isfinite)
+        df = df.loc[valid].copy()
+        df[date_col] = dates[valid]
+        df[value_col] = values[valid]
         df = df[df[date_col] <= pd.Timestamp(cutoff)]
         if df.empty:
             return (
@@ -1696,7 +1773,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
 
         df_recent = chronological(take_latest(df, date_col, 5), date_col)
         if df_recent is None or df_recent.empty:
-            return f"{symbol} 近期主力资金流向数据日期不可解析。"
+            return None
         latest_day = pd.to_datetime(df_recent[date_col], errors="coerce").max()
         latest_str = latest_day.date().isoformat() if pd.notna(latest_day) else curr_date
         retrieved_at = self._sina_retrieved_at()
@@ -1705,6 +1782,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
             symbol=symbol,
             requested_as_of=curr_date,
             retrieved_at=retrieved_at,
+        )
+        consensus = build_consensus_evidence(
+            evidence,
+            symbol=symbol,
+            requested_as_of=curr_date,
+            field="r0_net",
         )
         return FundFlowText(
             (
@@ -1717,8 +1800,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 "requested_as_of": curr_date,
                 "retrieved_at": retrieved_at,
                 "source": "eastmoney_individual_fund_flow",
+                "algorithm_group": "new_algorithm_group",
+                "source_family": "eastmoney",
                 "unit": "亿元",
                 "status": "partial",
+                "consensus": consensus,
                 "reason": "东方财富来源仅提供主力净额；未将其等同于总净额 netamount",
             },
         )
