@@ -40,6 +40,7 @@ from ..fund_flow_evidence import (
     FundFlowText,
     build_consensus_evidence,
     build_em_evidence,
+    build_gap_meta,
     build_provider_text,
     build_sina_evidence,
     build_ths_evidence,
@@ -1694,16 +1695,48 @@ class CnAkshareProvider(BaseMarketDataProvider):
         """Attach optional THS same-day evidence without changing EM fallback semantics."""
         evidence = list(getattr(value, "fund_flow_evidence", []) or [])
         metadata = dict(getattr(value, "fund_flow_evidence_meta", {}) or {})
-        if not evidence or is_historical:
+        if not evidence:
+            metadata["manual_calibration_gap"] = build_gap_meta(
+                symbol=symbol,
+                requested_as_of=curr_date,
+                source="sina_app_manual_calibration",
+                status="blocked",
+                reason="新浪 App 无可验证公开接口，人工截图不能写入自动 evidence",
+                retrieved_at=self._sina_retrieved_at(),
+                algorithm_group="new_algorithm_group",
+                period_kind="realtime_single_day",
+            )
+            return FundFlowText(str(value), evidence=evidence, evidence_meta=metadata)
+        if is_historical:
             return value
         try:
             with AKSHARE_CALL_LOCK:
                 snapshot = ak.stock_fund_flow_individual(symbol="即时")
             if snapshot is None or snapshot.empty or "股票代码" not in snapshot.columns:
-                return value
+                metadata["manual_calibration_gap"] = build_gap_meta(
+                    symbol=symbol,
+                    requested_as_of=curr_date,
+                    source="sina_app_manual_calibration",
+                    status="blocked",
+                    reason="新浪 App 没有可验证公开资金流接口；截图仅作人工校准，未生成自动 evidence",
+                    retrieved_at=self._sina_retrieved_at(),
+                    algorithm_group="new_algorithm_group",
+                    period_kind="realtime_single_day",
+                )
+                return FundFlowText(str(value), evidence=evidence, evidence_meta=metadata)
             matched = snapshot[snapshot["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
             if matched.empty or "净额" not in matched.columns:
-                return value
+                metadata["manual_calibration_gap"] = build_gap_meta(
+                    symbol=symbol,
+                    requested_as_of=curr_date,
+                    source="sina_app_manual_calibration",
+                    status="blocked",
+                    reason="新浪 App 截图无法由可验证公开接口复现；未将人工截图写入自动共识",
+                    retrieved_at=self._sina_retrieved_at(),
+                    algorithm_group="new_algorithm_group",
+                    period_kind="realtime_single_day",
+                )
+                return FundFlowText(str(value), evidence=evidence, evidence_meta=metadata)
             ths_row = matched.iloc[0]
             ths_records = build_ths_evidence(
                 [{
@@ -1719,7 +1752,17 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 retrieved_at=self._sina_retrieved_at(),
             )
             if not ths_records:
-                return value
+                metadata["manual_calibration_gap"] = build_gap_meta(
+                    symbol=symbol,
+                    requested_as_of=curr_date,
+                    source="sina_app_manual_calibration",
+                    status="blocked",
+                    reason="同花顺快照未提供可比主力字段；新浪 App 截图仅作人工校准",
+                    retrieved_at=self._sina_retrieved_at(),
+                    algorithm_group="new_algorithm_group",
+                    period_kind="realtime_single_day",
+                )
+                return FundFlowText(str(value), evidence=evidence, evidence_meta=metadata)
             # THS instant ``净额`` is total-net, while EM's value is r0_net;
             # retain both raw sources but never place them in one consensus field.
             all_records = evidence + ths_records

@@ -142,10 +142,8 @@ def create_smart_money_analyst(llm, data_collector=None):
                     break
 
 
-                if tracker:
-
-
-                    tracker._emit_token("Smart Money Analyst", "smart_money_report", content)
+                # Hold all content until the structured guard is finalized.
+                # Directional SSE tokens must never precede a conflict/mismatch guard.
 
 
         except Exception as exc:
@@ -170,10 +168,8 @@ def create_smart_money_analyst(llm, data_collector=None):
                 full_content = res.content if hasattr(res, "content") else str(res)
 
 
-                if tracker:
-
-
-                    tracker._emit_token("Smart Money Analyst", "smart_money_report", full_content)
+                # Emit only after final validation below, so blocked analysis
+                # cannot leak directional content through the stream.
 
 
             except Exception as exc:

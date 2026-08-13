@@ -1,6 +1,7 @@
 """Structured fund-flow evidence, source alignment, and arithmetic checks."""
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import re
 from typing import Any, Iterable, Mapping
@@ -94,7 +95,10 @@ def decimal_value(value: Any) -> Decimal | None:
 def _decimal_text(value: Decimal | None) -> str | None:
     if value is None:
         return None
-    return format(value, "f")
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
 
 
 def _as_yi(value: Any) -> Decimal | None:
@@ -173,7 +177,7 @@ def _unit_name(unit: Any) -> str:
         "亿元": "亿元",
         "万亿": "万亿",
     }
-    return aliases.get(text, str(unit or "元").strip() or "元")
+    return aliases.get(text, str(unit or "").strip())
 
 
 def _amount_to_yi(value: Any, unit: Any = "元") -> tuple[Decimal | None, str]:
@@ -187,6 +191,8 @@ def _amount_to_yi(value: Any, unit: Any = "元") -> tuple[Decimal | None, str]:
         number = decimal_value(value)
         source_unit = _unit_name(unit)
     if number is None:
+        return None, source_unit
+    if not source_unit:
         return None, source_unit
     multiplier = {
         "元": Decimal("1") / YI,
@@ -243,8 +249,11 @@ def _normalise_date_text(value: Any) -> str | None:
     # Provider frames commonly stringify a date as ``YYYY-MM-DD 00:00:00``.
     # Keep the calendar date only so equivalent source rows align.
     if len(text) >= 10 and text[4] == "-" and text[7] == "-":
-        return text[:10]
-    return text
+        text = text[:10]
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return None
 
 
 def _date_value(row: Mapping[str, Any]) -> str | None:
@@ -401,12 +410,12 @@ def build_sina_app_evidence(
     symbol: str,
     requested_as_of: str,
     retrieved_at: str | None,
-    source: str = "sina_app",
+    source: str = "sina_app_manual_calibration",
     raw_unit: str = "元",
     period_kind: str = "realtime_single_day",
 ) -> list[dict[str, Any]]:
-    """Build evidence for the newer Sina App product, not the legacy Web feed."""
-    return build_source_evidence(
+    """Keep screenshot/manual App observations typed; never treat them as auto evidence."""
+    records = build_source_evidence(
         rows,
         symbol=symbol,
         requested_as_of=requested_as_of,
@@ -416,6 +425,11 @@ def build_sina_app_evidence(
         algorithm_group=NEW_ALGORITHM_GROUP,
         period_kind=period_kind,
     )
+    for record in records:
+        record["status"] = "manual_observation"
+        record["manual_calibration"] = True
+        record["automated_consensus_eligible"] = False
+    return records
 
 
 def build_em_evidence(
@@ -566,21 +580,96 @@ def _sum_field(records: Iterable[Mapping[str, Any]], field: str) -> Decimal | No
     return sum(usable, Decimal("0")) if usable else None
 
 
+def _normalise_summary_record(record: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Normalize raw amounts and dates before any cumulative arithmetic."""
+    date = _date_value(record)
+    if date is None:
+        return None, "unparseable_date"
+    normalized = dict(record)
+    normalized["date"] = date
+    normalized["period_kind"] = str(
+        record.get("period_kind") or record.get("window_kind") or record.get("period") or "historical_daily"
+    )
+    normalized["window"] = str(record.get("window") or record.get("time_window") or "1d")
+    for field in ("netamount", "r0_net", "r0_in", "r0_out", "r0"):
+        if field not in record or record.get(field) is None:
+            continue
+        raw_value = record.get(f"{field}_raw", record.get(field))
+        raw_unit = record.get(f"{field}_raw_unit", record.get("raw_unit", record.get("unit")))
+        amount, parsed_unit = _amount_to_yi(raw_value, raw_unit)
+        if amount is None:
+            return None, f"invalid_{field}_unit_or_amount"
+        normalized[field] = _decimal_text(amount)
+        normalized[f"{field}_raw_unit"] = parsed_unit
+    return normalized, None
+
+
+def _summary_conflict(
+    usable: list[dict[str, Any]],
+    *,
+    window_days: int,
+    reason: str,
+    invalid_records: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "window_days": window_days,
+        "record_count": len(usable),
+        "required_window_days": window_days,
+        "status": "data_conflict",
+        "data_conflict": True,
+        "reason": reason,
+        "invalid_records": list(invalid_records or []),
+        "dates": [str(record.get("date")) for record in usable],
+        "netamount": None,
+        "r0_net": None,
+        "unit": "亿元",
+        "semantics": {
+            "netamount": _FIELD_SEMANTICS["netamount"],
+            "r0_net": _FIELD_SEMANTICS["r0_net"],
+        },
+    }
+
+
 def summarize_evidence(
     records: Iterable[Mapping[str, Any]],
     *,
     window_days: int = DEFAULT_WINDOW_DAYS,
 ) -> dict[str, Any]:
     """Compute exact daily totals without mixing sources, units, or windows."""
-    usable = [
-        dict(record)
-        for record in records
-        if isinstance(record, Mapping) and record.get("status") == "available"
-    ]
+    usable: list[dict[str, Any]] = []
+    invalid_records: list[str] = []
+    for record in records:
+        if not isinstance(record, Mapping) or record.get("status") != "available":
+            continue
+        normalized, error = _normalise_summary_record(record)
+        if normalized is None:
+            invalid_records.append(error or "invalid_record")
+        else:
+            usable.append(normalized)
+    if invalid_records:
+        return _summary_conflict(
+            usable,
+            window_days=window_days,
+            reason="结构化 evidence 含无效日期、单位或金额，禁止累计",
+            invalid_records=invalid_records,
+        )
+    usable.sort(key=lambda record: str(record.get("date")))
     period_kinds = {str(record.get("period_kind")) for record in usable if record.get("period_kind")}
     windows = {str(record.get("window") or record.get("time_window")) for record in usable if record.get("window") or record.get("time_window")}
     source_ids = {str(record.get("source") or "") for record in usable}
     mixed_periods = len(period_kinds) > 1 or ("five_day_cumulative" in period_kinds and len(usable) > 1)
+    invalid_windows = [
+        record for record in usable
+        if str(record.get("window") or "1d") != "1d"
+        or str(record.get("period_kind")) in {"five_day_cumulative", "five_day_aggregate"}
+        or (str(record.get("period_kind")) == "realtime_single_day" and len(usable) > 1)
+    ]
+    if invalid_windows:
+        return _summary_conflict(
+            usable,
+            window_days=window_days,
+            reason="逐日累计窗口包含实时多日或累计 period/window，禁止跨区间相加",
+        )
     if len(source_ids) > 1:
         return {
             "window_days": window_days,
@@ -639,6 +728,7 @@ def summarize_evidence(
     return {
         "window_days": window_days,
         "record_count": len(selected),
+        "required_window_days": window_days,
         "status": status,
         "data_conflict": False,
         "dates": [str(record.get("date")) for record in selected],
@@ -1055,7 +1145,11 @@ def build_consensus_evidence(
         ]
 
     new_observations = [
-        item for item in observations if item["algorithm_group"] == NEW_ALGORITHM_GROUP
+        item
+        for item in observations
+        if item["algorithm_group"] == NEW_ALGORITHM_GROUP
+        and item["record"].get("automated_consensus_eligible", True)
+        and item["record"].get("status") == "available"
     ]
     legacy_observations = [
         item for item in observations if item["algorithm_group"] == LEGACY_WEB_ALGORITHM
