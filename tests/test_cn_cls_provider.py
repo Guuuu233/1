@@ -159,6 +159,31 @@ def test_invalid_numeric_ctime_is_typed_gap_and_manifest_persists(tmp_path: Path
     assert manifest["records_received"] == 1
 
 
+def test_manifest_errors_redact_sign_and_query_secrets(tmp_path: Path):
+    session = Session([OSError("https://example.test/path?sign=real-secret&token=tok-secret")])
+    provider = CnClsProvider(session=session, snapshot_dir=tmp_path, max_retries=0, max_pages=1)
+    out = provider.get_global_news("1970-01-01T00:01:40+00:00")
+    assert isinstance(out, VendorFail)
+    manifest = json.loads(next(tmp_path.glob("*_manifest.json")).read_text(encoding="utf-8"))
+    serialized = json.dumps(manifest, ensure_ascii=False)
+    assert "real-secret" not in serialized
+    assert "tok-secret" not in serialized
+    assert "[redacted]" in serialized
+
+
+def test_history_fetch_exception_still_writes_manifest(tmp_path: Path):
+    provider = CnClsProvider(session=Session([]), snapshot_dir=tmp_path)
+    provider._fetch_history_page = lambda cursor: (_ for _ in ()).throw(OverflowError("ctime=inf"))
+    out = provider.get_global_news("1970-01-01T00:01:40+00:00")
+    assert isinstance(out, VendorFail)
+    manifests = list(tmp_path.glob("*_manifest.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    assert manifest["coverage_complete"] is False
+    assert manifest["stop_reason"] == "request_error"
+    assert "ctime=inf" not in json.dumps(manifest, ensure_ascii=False)
+
+
 def test_normalized_timestamp_uses_shanghai_and_no_detail_url(tmp_path: Path):
     provider = CnClsProvider(snapshot_dir=tmp_path)
     normalized = provider._normalize_item(item("a", 0), requested_as_of="x", retrieved_at="y")

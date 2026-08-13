@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import uuid
 from datetime import date, datetime, time, timezone
 from pathlib import Path
@@ -121,9 +122,38 @@ class CnClsProvider(BaseMarketDataProvider):
 
     @staticmethod
     def _redacted_url(endpoint: str, params: Mapping[str, Any]) -> str:
-        safe = {str(k): "[redacted]" if str(k).lower() == "sign" else v for k, v in params.items()}
+        safe = {
+            str(k): "[redacted]" if str(k).lower() in {"sign", "token", "key", "apikey", "api_key"} else v
+            for k, v in params.items()
+        }
         parts = urlsplit(endpoint)
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(safe), ""))
+
+    @staticmethod
+    def _safe_error(error: Any) -> str:
+        text = str(error).replace("\n", " ").replace("\r", " ")
+        text = re.sub(
+            r"(?i)(https?://[^\s]+)",
+            lambda match: CnClsProvider._redact_url_text(match.group(1)),
+            text,
+        )
+        text = re.sub(
+            r"(?i)(\b(?:sign|token|api[_-]?key|key)\s*=\s*)([^&\s]+)",
+            r"\1[redacted]",
+            text,
+        )
+        text = re.sub(r"(?i)ctime\s*=\s*[^\s&]+", "ctime=[redacted]", text)
+        return text[:500]
+
+    @staticmethod
+    def _redact_url_text(value: str) -> str:
+        parts = urlsplit(value)
+        query = []
+        for key, val in __import__("urllib.parse", fromlist=["parse_qsl"]).parse_qsl(parts.query, keep_blank_values=True):
+            if key.lower() in {"sign", "token", "key", "apikey", "api_key"}:
+                val = "[redacted]"
+            query.append((key, val))
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
 
     @staticmethod
     def _roll_data(payload: Any) -> list[Any] | None:
@@ -144,11 +174,11 @@ class CnClsProvider(BaseMarketDataProvider):
                 response.raise_for_status()
                 payload = response.json()
                 if isinstance(payload, Mapping) and payload.get("errno") not in (None, 0, "0"):
-                    return None, f"CLS errno={payload.get('errno')}"
+                    return None, self._safe_error(f"CLS errno={payload.get('errno')}")
                 return payload, None
             except (requests.RequestException, OSError, ValueError, RuntimeError) as exc:
-                error = f"attempt={attempt + 1}: {type(exc).__name__}: {exc}"
-        return None, error or "CLS request failed"
+                error = f"attempt={attempt + 1}: {type(exc).__name__}: {self._safe_error(exc)}"
+        return None, self._safe_error(error or "CLS request failed")
 
     def _fetch_latest(self, *, analysis_ctime: int | None = None, requested_as_of: str = "") -> tuple[list[dict[str, Any]], Any, str | None, str | None]:
         params = {"app": "CailianpressWeb", "name": "telegraph", "os": "web", "sv": "8.7.9"}
@@ -253,7 +283,7 @@ class CnClsProvider(BaseMarketDataProvider):
             )
             retrieved_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             if error:
-                return VendorFail(f"财联社最新路径失败：{error}")
+                return VendorFail(f"财联社最新路径失败：{self._safe_error(error)}")
             snapshot = self._write_page_snapshot(
                 run_id=uuid.uuid4().hex,
                 page=1,
@@ -284,11 +314,24 @@ class CnClsProvider(BaseMarketDataProvider):
         gap: dict[str, Any] | None = None
         for page in range(1, self.max_pages + 1):
             cursors.append(cursor)
-            rows, raw_payload, params, page_error = self._fetch_history_page(cursor)
+            try:
+                rows, raw_payload, params, page_error = self._fetch_history_page(cursor)
+            except Exception as exc:
+                rows, raw_payload, params = None, None, {
+                    "app": "CailianpressWeb",
+                    "category": "announcement",
+                    "last_time": cursor,
+                    "os": "web",
+                    "refresh_type": 1,
+                    "rn": CLS_HISTORY_RN,
+                    "sv": "8.7.9",
+                    "sign": "[redacted]",
+                }
+                page_error = f"history fetch exception: {type(exc).__name__}: {self._safe_error(exc)}"
             request_url = self._redacted_url(CLS_HISTORY_ENDPOINT, params)
             retrieved_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             if page_error:
-                errors.append(page_error)
+                errors.append(self._safe_error(page_error))
                 gap = self._build_typed_gap("request_error", "CLS historical request failed", page=page, cursor=cursor)
                 stop_reason = "request_error"
                 break
