@@ -3,7 +3,11 @@ from tradingagents.agents.utils.context_utils import get_cn_stock_name
 import asyncio
 import json
 
-from tradingagents.dataflows.fund_flow_evidence import validate_model_summary
+from tradingagents.dataflows.fund_flow_evidence import (
+    build_consensus_evidence,
+    consensus_prompt_instruction,
+    validate_model_summary,
+)
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from tradingagents.dataflows.config import get_config
@@ -69,7 +73,20 @@ def create_smart_money_analyst(llm, data_collector=None):
             fund_flow, lhb, volume = results
             fund_flow_evidence = {}
 
+        consensus = {}
+        if isinstance(fund_flow_evidence, dict):
+            consensus = fund_flow_evidence.get("consensus") or {}
+        if not consensus and isinstance(fund_flow_evidence, dict):
+            records = fund_flow_evidence.get("records") or []
+            if records:
+                consensus = build_consensus_evidence(
+                    records,
+                    symbol=ticker,
+                    requested_as_of=current_date,
+                )
+                fund_flow_evidence["consensus"] = consensus
         evidence_text = json.dumps(fund_flow_evidence, ensure_ascii=False, sort_keys=True)
+        consensus_instruction = consensus_prompt_instruction(consensus)
         messages = [
             SystemMessage(content=(
                 system_message
@@ -81,6 +98,7 @@ def create_smart_money_analyst(llm, data_collector=None):
                 "不得将其视为新浪历史 netamount/r0_net 同口径的主力序列。\n\n"
                 f"【资金流数据（来源、日期与口径见数据）】\n{fund_flow}\n\n"
                 f"【资金流结构化 evidence（仅用于精确累计，不得从展示文本反推）】\n{evidence_text}\n\n"
+                f"【新算法组共识规则】\n{consensus_instruction}\n\n"
                 f"【龙虎榜数据】\n{lhb}\n\n"
                 f"【成交量指标(vwma)】\n{volume}"
             )),
@@ -160,6 +178,12 @@ def create_smart_money_analyst(llm, data_collector=None):
             fund_flow_evidence["validation"] = validate_model_summary(
                 fund_flow_evidence.get("records", []), full_content, window_days=5
             )
+            if not fund_flow_evidence.get("consensus"):
+                fund_flow_evidence["consensus"] = build_consensus_evidence(
+                    fund_flow_evidence.get("records", []),
+                    symbol=ticker,
+                    requested_as_of=current_date,
+                )
             if isinstance(market_data_context, dict):
                 market_data_context["fund_flow_evidence"] = fund_flow_evidence
         if check_llm_output_degraded(full_content, "Smart Money Analyst"):

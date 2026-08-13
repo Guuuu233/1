@@ -38,9 +38,11 @@ from ..vendor_result import (
 )
 from ..fund_flow_evidence import (
     FundFlowText,
+    build_consensus_evidence,
     build_em_evidence,
     build_provider_text,
     build_sina_evidence,
+    build_ths_evidence,
 )
 from ..financial_announce import (
     build_effective_announce_map,
@@ -1446,18 +1448,49 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 val = row[col]
                 return "" if pd.isna(val) else str(val)
 
-            return build_provider_text(
+            row_payload = {
+                "股票代码": code,
+                "日期": curr_date,
+                "净额": row.get("净额"),
+                "单位": "亿元",
+                "period_kind": "realtime_single_day",
+                "window": "1d",
+            }
+            evidence = build_ths_evidence(
+                [row_payload],
+                symbol=symbol,
+                requested_as_of=curr_date,
+                retrieved_at=self._sina_retrieved_at(),
+            )
+            consensus = build_consensus_evidence(
+                evidence,
+                symbol=symbol,
+                requested_as_of=curr_date,
+                field="netamount",
+            )
+            return FundFlowText(
                 (
                     f"【备用数据源：同花顺即时资金流净额快照】{symbol} 当日资金流净额快照"
                     f"（{curr_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
                     f"资金净额: {net_amount} | 流入资金: {_v('流入资金')} | "
                     f"流出资金: {_v('流出资金')} | 换手率: {_v('换手率')}\n"
-                    "（该快照不是新浪历史 netamount/r0_net 同口径主力序列）"
+                    "（该快照不是新浪历史 netamount/r0_net 同口径主力序列；"
+                    "属于同花顺新算法组总净额，仍不得视为 r0_net 主力序列）"
                 ),
-                symbol=symbol,
-                requested_as_of=curr_date,
-                source="ths_instant_snapshot",
-                reason="同花顺即时资金流净额与新浪 netamount/r0_net 口径不同，未生成可累计 evidence",
+                evidence=evidence,
+                evidence_meta={
+                    "symbol": symbol,
+                    "requested_as_of": curr_date,
+                    "retrieved_at": self._sina_retrieved_at(),
+                    "source": "ths_instant_snapshot",
+                    "source_family": "ths",
+                    "algorithm_group": "new_algorithm_group",
+                    "period_kind": "realtime_single_day",
+                    "unit": "亿元",
+                    "status": "available",
+                    "consensus": consensus,
+                    "reason": "同花顺即时资金流净额是总净额，未将其等同于新浪历史 r0_net 主力序列",
+                },
             )
         except Exception as exc:
             errors.append(f"stock_fund_flow_individual: {type(exc).__name__}")
