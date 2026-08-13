@@ -39,6 +39,11 @@ from tradingagents.agents.utils.agent_utils import (
     get_northbound_flow,
 )
 from tradingagents.dataflows.interface import route_to_vendor
+from tradingagents.dataflows.fund_flow_evidence import (
+    build_gap_meta,
+    build_provider_text,
+    summarize_evidence,
+)
 from tradingagents.dataflows.trade_calendar import (
     dedupe_daily_bars,
     is_historical_analysis_date,
@@ -368,6 +373,14 @@ def default_market_data_context() -> Dict[str, Any]:
     """Return a safe context when collection did not provide one."""
     return {
         "analysis_baseline_date": None,
+        "fund_flow_evidence": {
+            "status": "unavailable",
+            "unit": "亿元",
+            "records": [],
+            "summary": summarize_evidence([], window_days=5),
+            "validation": {"status": "not_checked", "mismatches": []},
+            "gap": "【数据获取失败】资金流 evidence：未返回结构化逐日记录",
+        },
         "daily": {"as_of": None, "completeness": "unavailable"},
         "realtime": {
             "status": "unavailable",
@@ -692,6 +705,42 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
 
     data_failure_ledger = _build_data_failure_ledger(results)
 
+    fund_flow_value = results.get("fund_flow_individual")
+    fund_flow_evidence = getattr(fund_flow_value, "fund_flow_evidence", None)
+    fund_flow_evidence_meta = getattr(fund_flow_value, "fund_flow_evidence_meta", None)
+    if isinstance(fund_flow_evidence, list) and fund_flow_evidence:
+        summary = summarize_evidence(fund_flow_evidence, window_days=5)
+        fund_flow_context = {
+            **dict(fund_flow_evidence_meta or {}),
+            "records": copy.deepcopy(fund_flow_evidence),
+            "summary": summary,
+            "validation": {"status": "not_checked", "mismatches": []},
+        }
+        if summary.get("status") == "available":
+            fund_flow_context["status"] = "available"
+        else:
+            fund_flow_context["status"] = "partial"
+    else:
+        fund_flow_context = build_gap_meta(
+            symbol=ticker,
+            requested_as_of=trade_date,
+            source="fund_flow_individual",
+            status="unavailable",
+            reason="未返回结构化逐日 netamount/r0_net evidence",
+        )
+        fund_flow_context.update({
+            "records": [],
+            "summary": summarize_evidence([], window_days=5),
+            "validation": {"status": "not_checked", "mismatches": []},
+        })
+        if not any(entry.get("source") == "fund_flow_individual" for entry in data_failure_ledger):
+            data_failure_ledger.append({
+                "source": "fund_flow_individual",
+                "status": "unavailable",
+                "reason": "structured evidence unavailable",
+                "gap": fund_flow_context["gap"],
+            })
+
     # ── Parse CSV once, reuse for indicators and VPA ──────────────────
     raw_csv = results.get("stock_data", "")
     df = _parse_csv_to_dataframe(raw_csv)
@@ -761,6 +810,7 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         )
     results["market_data_context"] = {
         "analysis_baseline_date": trade_date,
+        "fund_flow_evidence": fund_flow_context,
         "daily": daily_context,
         "realtime": realtime_context,
         "source_provenance": source_provenance,

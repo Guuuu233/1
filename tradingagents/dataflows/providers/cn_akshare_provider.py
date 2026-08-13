@@ -4,7 +4,8 @@ import re
 import time
 import threading
 import contextvars
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 from stockstats import wrap
@@ -34,6 +35,12 @@ from ..vendor_result import (
     VendorFail,
     VendorRefuse,
     result_to_prompt,
+)
+from ..fund_flow_evidence import (
+    FundFlowText,
+    build_em_evidence,
+    build_provider_text,
+    build_sina_evidence,
 )
 from ..financial_announce import (
     build_effective_announce_map,
@@ -178,12 +185,29 @@ _FUND_AMOUNT_TEXT_RE = re.compile(
 )
 
 
+def _sina_decimal(value) -> Decimal | None:
+    """Parse a finite provider amount without introducing binary-float error."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _sina_amount_yi_decimal(value) -> Decimal | None:
+    """Convert a raw-yuan Sina amount to exact 亿元."""
+    parsed = _sina_decimal(value)
+    return None if parsed is None else parsed / Decimal("100000000")
+
+
 def _sina_amount_yi(value) -> str:
     """Format a raw-yuan amount as 亿元 (2 dp); empty/invalid → ''."""
-    f = safe_float(value)
-    if f is None:
+    amount = _sina_amount_yi_decimal(value)
+    if amount is None:
         return ""
-    return f"{round(f / 1e8, 2):.2f}"
+    return f"{amount.quantize(Decimal('0.01')):.2f}"
 
 
 def _sina_ratio_pct(value) -> str:
@@ -1387,21 +1411,33 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 raise ValueError("empty dataframe")
             stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
             if stock_df.empty:
-                return (
+                return build_provider_text(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照无记录"
-                    f"（{'；'.join(errors)}）"
+                    f"（{'；'.join(errors)}）",
+                    symbol=symbol,
+                    requested_as_of=curr_date,
+                    source="ths_instant_snapshot",
+                    reason="同花顺即时资金流净额快照无记录；该源不提供新浪 netamount/r0_net evidence",
                 )
             row = stock_df.iloc[0]
             if "净额" not in stock_df.columns:
-                return (
+                return build_provider_text(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照缺少净额字段"
-                    f"（{'；'.join(errors)}）"
+                    f"（{'；'.join(errors)}）",
+                    symbol=symbol,
+                    requested_as_of=curr_date,
+                    source="ths_instant_snapshot",
+                    reason="同花顺即时资金流净额快照缺少净额字段；该源不提供新浪 netamount/r0_net evidence",
                 )
             net_amount = _usable_fund_amount_text(row["净额"])
             if net_amount is None:
-                return (
+                return build_provider_text(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照净额缺失或不可解析"
-                    f"（{'；'.join(errors)}）"
+                    f"（{'；'.join(errors)}）",
+                    symbol=symbol,
+                    requested_as_of=curr_date,
+                    source="ths_instant_snapshot",
+                    reason="同花顺即时资金流净额快照净额缺失或不可解析；该源不提供新浪 netamount/r0_net evidence",
                 )
 
             def _v(col: str) -> str:
@@ -1410,17 +1446,29 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 val = row[col]
                 return "" if pd.isna(val) else str(val)
 
-            return (
-                f"【备用数据源：同花顺即时资金流净额快照】{symbol} 当日资金流净额快照"
-                f"（{curr_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
-                f"资金净额: {net_amount} | 流入资金: {_v('流入资金')} | "
-                f"流出资金: {_v('流出资金')} | 换手率: {_v('换手率')}\n"
-                "（该快照不是新浪历史 netamount/r0_net 同口径主力序列）"
+            return build_provider_text(
+                (
+                    f"【备用数据源：同花顺即时资金流净额快照】{symbol} 当日资金流净额快照"
+                    f"（{curr_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
+                    f"资金净额: {net_amount} | 流入资金: {_v('流入资金')} | "
+                    f"流出资金: {_v('流出资金')} | 换手率: {_v('换手率')}\n"
+                    "（该快照不是新浪历史 netamount/r0_net 同口径主力序列）"
+                ),
+                symbol=symbol,
+                requested_as_of=curr_date,
+                source="ths_instant_snapshot",
+                reason="同花顺即时资金流净额与新浪 netamount/r0_net 口径不同，未生成可累计 evidence",
             )
         except Exception as exc:
             errors.append(f"stock_fund_flow_individual: {type(exc).__name__}")
 
-        return f"【数据获取失败】个股资金流向数据获取失败（东财/新浪历史/同花顺即时资金流净额快照均失败：{'；'.join(errors)}）"
+        return build_provider_text(
+            f"【数据获取失败】个股资金流向数据获取失败（东财/新浪历史/同花顺即时资金流净额快照均失败：{'；'.join(errors)}）",
+            symbol=symbol,
+            requested_as_of=curr_date,
+            source="fund_flow_individual",
+            reason="东财/新浪历史/同花顺即时资金流净额快照均失败",
+        )
 
     def _fetch_sina_historical_fund_flow(
         self,
@@ -1497,6 +1545,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
         kept.sort(key=lambda r: str(r.get("opendate", "")))
         return self._format_sina_historical_fund_flow(kept, symbol, curr_date)
 
+    def _sina_retrieved_at(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
     def _format_sina_historical_fund_flow(
         self, rows: list[dict], symbol: str, curr_date: str
     ) -> str | None:
@@ -1508,6 +1559,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
         """
         records: list[dict] = []
         has_sub_orders = False
+        retrieved_at = self._sina_retrieved_at()
+        evidence = build_sina_evidence(
+            rows,
+            symbol=symbol,
+            requested_as_of=curr_date,
+            retrieved_at=retrieved_at,
+        )
         for row in rows:
             date = str(row.get("opendate", "")).strip()
             if not date:
@@ -1559,7 +1617,18 @@ class CnAkshareProvider(BaseMarketDataProvider):
         )
         if not has_sub_orders:
             header += "\n（新浪历史接口未提供超大单/大单/中单/小单明细）"
-        return header
+        return FundFlowText(
+            header,
+            evidence=evidence,
+            evidence_meta={
+                "symbol": symbol,
+                "requested_as_of": curr_date,
+                "retrieved_at": retrieved_at,
+                "source": "sina_historical",
+                "unit": "亿元",
+                "status": "available" if len(evidence) >= _SINA_HIST_FUND_FLOW_SHOW else "partial",
+            },
+        )
 
     def _format_individual_fund_flow_em(
         self,
@@ -1597,9 +1666,28 @@ class CnAkshareProvider(BaseMarketDataProvider):
             return f"{symbol} 近期主力资金流向数据日期不可解析。"
         latest_day = pd.to_datetime(df_recent[date_col], errors="coerce").max()
         latest_str = latest_day.date().isoformat() if pd.notna(latest_day) else curr_date
-        return (
-            f"{symbol} 近5日主力资金净流向（截至于 {curr_date}，最新数据日 {latest_str}）：\n"
-            f"{df_recent.to_string(index=False)}"
+        retrieved_at = self._sina_retrieved_at()
+        evidence = build_em_evidence(
+            df_recent,
+            symbol=symbol,
+            requested_as_of=curr_date,
+            retrieved_at=retrieved_at,
+        )
+        return FundFlowText(
+            (
+                f"{symbol} 近5日主力资金净流向（截至于 {curr_date}，最新数据日 {latest_str}）：\n"
+                f"{df_recent.to_string(index=False)}"
+            ),
+            evidence=evidence,
+            evidence_meta={
+                "symbol": symbol,
+                "requested_as_of": curr_date,
+                "retrieved_at": retrieved_at,
+                "source": "eastmoney_individual_fund_flow",
+                "unit": "亿元",
+                "status": "partial",
+                "reason": "东方财富来源仅提供主力净额；未将其等同于总净额 netamount",
+            },
         )
 
     def get_lhb_detail(self, symbol: str, date: str) -> str:

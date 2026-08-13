@@ -1,6 +1,9 @@
 import logging
 from tradingagents.agents.utils.context_utils import get_cn_stock_name
 import asyncio
+import json
+
+from tradingagents.dataflows.fund_flow_evidence import validate_model_summary
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from tradingagents.dataflows.config import get_config
@@ -37,9 +40,16 @@ def create_smart_money_analyst(llm, data_collector=None):
         horizon_ctx = build_horizon_context(horizon, focus_areas, specific_questions, agent_type="smart_money")
 
         pool = data_collector.get(ticker, current_date) if data_collector else None
+        state_market_data_context = state.get("market_data_context")
 
         if pool is not None:
             fund_flow = pool.get("fund_flow_individual", "无数据")
+            pool_context = pool.get("market_data_context")
+            fund_flow_evidence = (
+                pool_context.get("fund_flow_evidence", {})
+                if isinstance(pool_context, dict)
+                else {}
+            )
             lhb = pool.get("lhb", "无数据")
             volume = pool.get("indicators", {}).get("vwma", "无数据")
         else:
@@ -57,7 +67,9 @@ def create_smart_money_analyst(llm, data_collector=None):
                 })
             )
             fund_flow, lhb, volume = results
+            fund_flow_evidence = {}
 
+        evidence_text = json.dumps(fund_flow_evidence, ensure_ascii=False, sort_keys=True)
         messages = [
             SystemMessage(content=(
                 system_message
@@ -68,6 +80,7 @@ def create_smart_money_analyst(llm, data_collector=None):
                 f"请分析 {ticker_display} 在 {current_date} 的资金流数据。若来源为同花顺即时资金流净额快照，"
                 "不得将其视为新浪历史 netamount/r0_net 同口径的主力序列。\n\n"
                 f"【资金流数据（来源、日期与口径见数据）】\n{fund_flow}\n\n"
+                f"【资金流结构化 evidence（仅用于精确累计，不得从展示文本反推）】\n{evidence_text}\n\n"
                 f"【龙虎榜数据】\n{lhb}\n\n"
                 f"【成交量指标(vwma)】\n{volume}"
             )),
@@ -138,6 +151,17 @@ def create_smart_money_analyst(llm, data_collector=None):
                 full_content = f"分析报告生成失败：{exc}"
 
         logger.debug("[Smart Money Analyst] DONE %s, report length=%s", ticker_display, len(full_content))
+        market_data_context = state_market_data_context
+        if not isinstance(market_data_context, dict) and isinstance(pool, dict):
+            market_data_context = pool.get("market_data_context")
+        if isinstance(market_data_context, dict):
+            fund_flow_evidence = market_data_context.get("fund_flow_evidence", fund_flow_evidence)
+        if isinstance(fund_flow_evidence, dict) and fund_flow_evidence.get("records"):
+            fund_flow_evidence["validation"] = validate_model_summary(
+                fund_flow_evidence.get("records", []), full_content, window_days=5
+            )
+            if isinstance(market_data_context, dict):
+                market_data_context["fund_flow_evidence"] = fund_flow_evidence
         if check_llm_output_degraded(full_content, "Smart Money Analyst"):
             full_content = "主力资金分析生成异常（输出退化），本项不可用"
         _elapsed = _time.monotonic() - _t0

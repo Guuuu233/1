@@ -421,6 +421,47 @@ def validate_report_machine_blocks(result_data: Optional[Dict[str, Any]]) -> Non
             _validate_report_machine_payload(payload, tag)
 
 
+def _validate_fund_flow_evidence(result_data: Dict[str, Any]) -> None:
+    """Validate serialized funding evidence and preserve mismatch markers."""
+    contexts: list[dict[str, Any]] = []
+    market_context = result_data.get("market_data_context")
+    if isinstance(market_context, dict):
+        if isinstance(market_context.get("fund_flow_evidence"), dict):
+            contexts.append(market_context["fund_flow_evidence"])
+        for nested in market_context.values():
+            if isinstance(nested, dict) and isinstance(nested.get("fund_flow_evidence"), dict):
+                contexts.append(nested["fund_flow_evidence"])
+    for key in ("short_term", "medium_term", "horizons"):
+        nested = result_data.get(key)
+        if isinstance(nested, dict):
+            if key == "horizons":
+                nested_items = nested.values()
+            else:
+                nested_items = (nested,)
+            for item in nested_items:
+                if isinstance(item, dict):
+                    item_context = item.get("market_data_context")
+                    if isinstance(item_context, dict) and isinstance(item_context.get("fund_flow_evidence"), dict):
+                        contexts.append(item_context["fund_flow_evidence"])
+    for context in contexts:
+        unit = context.get("unit")
+        if unit is not None and unit != "亿元":
+            raise ValueError("fund_flow_evidence unit must be 亿元")
+        records = context.get("records")
+        if records is not None and not isinstance(records, list):
+            raise ValueError("fund_flow_evidence records must be an array")
+        for record in records or []:
+            if not isinstance(record, dict):
+                raise ValueError("fund_flow_evidence record must be an object")
+            if record.get("unit") != "亿元":
+                raise ValueError("fund_flow_evidence record unit must be 亿元")
+            if "date" not in record or "source" not in record or "status" not in record:
+                raise ValueError("fund_flow_evidence record requires date, source, status")
+            if record.get("netamount") is not None and record.get("r0_net") is not None:
+                if record.get("netamount") == record.get("r0_net") and record.get("netamount_semantics") != record.get("r0_net_semantics"):
+                    raise ValueError("fund_flow_evidence netamount and r0_net semantics cannot be collapsed")
+
+
 def canonicalize_report_result_data(
     result_data: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
@@ -436,6 +477,7 @@ def canonicalize_report_result_data(
         raise ValueError("result_data must be an object")
 
     validate_report_machine_blocks(result_data)
+    _validate_fund_flow_evidence(result_data)
     canonical_data = dict(result_data)
     if "structured" not in canonical_data:
         return canonical_data
