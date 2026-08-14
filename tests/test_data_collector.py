@@ -1,12 +1,35 @@
 from unittest.mock import patch
 import threading
 
+from tradingagents.dataflows.fund_flow_evidence import FundFlowText
+from tradingagents.graph import data_collector
 from tradingagents.graph.data_collector import (
     DataCollector,
     _build_source_provenance,
     _fetch_all,
     make_cache_key,
 )
+
+
+def _run_fetch_all_with_fund_flow(value):
+    raw_csv = (
+        "# vendor: fixture\n"
+        "Date,Open,High,Low,Close,Volume\n"
+        "2026-08-10,1,1,1,1,1\n"
+        "2026-08-11,1,1,1,1,1\n"
+    )
+
+    def fake_safe(tool, _payload):
+        name = getattr(tool, "__name__", None) or getattr(tool, "name", "")
+        if name == "get_individual_fund_flow":
+            return value
+        if name == "get_stock_data":
+            return raw_csv
+        return ""
+
+    with patch.object(data_collector, "_safe", side_effect=fake_safe), \
+         patch.object(data_collector, "FETCH_ALL_TIMEOUT", 1):
+        return data_collector._fetch_all("600519", "2026-08-11")
 
 
 def test_make_cache_key():
@@ -236,3 +259,111 @@ def test_fetch_all_completes_executor_with_fast_tools():
 
     assert "stock_data" in result
     assert "market_data_context" in result
+
+
+def test_fetch_all_preserves_manual_calibration_gap_with_eastmoney_evidence():
+    manual_gap = {
+        "source": "sina_app_manual_calibration",
+        "status": "blocked",
+        "reason": "新浪 App 无已验证公开 endpoint，仅作人工校准",
+        "retrieved_at": "2026-08-11T01:02:03+00:00",
+        "as_of": "2026-08-10",
+        "requested_as_of": "2026-08-11",
+        "gap": "【数据获取失败】资金流 evidence：新浪 App 仅作人工校准",
+    }
+    fund_flow = FundFlowText(
+        "东方财富资金流（最新数据日：2026-08-10）",
+        evidence=[
+            {
+                "date": "2026-08-10",
+                "source": "eastmoney_individual_fund_flow",
+                "status": "available",
+                "unit": "亿元",
+                "period_kind": "historical_daily",
+                "window": "1d",
+                "netamount": "1.0",
+                "r0_net": "0.5",
+            }
+        ],
+        evidence_meta={
+            "source": "eastmoney_individual_fund_flow",
+            "source_family": "eastmoney",
+            "status": "available",
+            "requested_as_of": "2026-08-11",
+            "as_of": "2026-08-10",
+            "manual_calibration_gap": manual_gap,
+        },
+    )
+
+    result = _run_fetch_all_with_fund_flow(fund_flow)
+    context = result["market_data_context"]
+
+    assert context["fund_flow_evidence"]["manual_calibration_gap"] == manual_gap
+    provenance_gap = context["source_provenance"]["fund_flow_individual"]["manual_calibration_gap"]
+    assert provenance_gap["source"] == manual_gap["source"]
+    assert provenance_gap["status"] == manual_gap["status"]
+    assert provenance_gap["reason"] == manual_gap["reason"]
+    assert provenance_gap["as_of"] == manual_gap["as_of"]
+    assert provenance_gap["non_blocking"] is True
+    assert provenance_gap["blocking"] is False
+
+    ledger_gaps = [
+        entry
+        for entry in context["data_failure_ledger"]
+        if entry.get("kind") == "manual_calibration_gap"
+    ]
+    assert len(ledger_gaps) == 1
+    ledger_gap = ledger_gaps[0]
+    assert ledger_gap["source"] == manual_gap["source"]
+    assert ledger_gap["status"] == manual_gap["status"]
+    assert ledger_gap["reason"] == manual_gap["reason"]
+    assert ledger_gap["as_of"] == manual_gap["as_of"]
+    assert ledger_gap["non_blocking"] is True
+    assert ledger_gap["blocking"] is False
+
+    data_collector._attach_manual_calibration_gap(
+        context["fund_flow_evidence"],
+        context["source_provenance"],
+        context["data_failure_ledger"],
+        "fund_flow_individual",
+        manual_gap,
+    )
+    assert [
+        entry
+        for entry in context["data_failure_ledger"]
+        if entry.get("kind") == "manual_calibration_gap"
+    ] == ledger_gaps
+
+
+def test_fetch_all_does_not_add_manual_calibration_gap_without_provider_metadata():
+    fund_flow = FundFlowText(
+        "东方财富资金流（最新数据日：2026-08-10）",
+        evidence=[
+            {
+                "date": "2026-08-10",
+                "source": "eastmoney_individual_fund_flow",
+                "status": "available",
+                "unit": "亿元",
+                "period_kind": "historical_daily",
+                "window": "1d",
+                "netamount": "1.0",
+                "r0_net": "0.5",
+            }
+        ],
+        evidence_meta={
+            "source": "eastmoney_individual_fund_flow",
+            "source_family": "eastmoney",
+            "status": "available",
+            "requested_as_of": "2026-08-11",
+            "as_of": "2026-08-10",
+        },
+    )
+
+    context = _run_fetch_all_with_fund_flow(fund_flow)["market_data_context"]
+
+    assert "manual_calibration_gap" not in context["fund_flow_evidence"]
+    assert "manual_calibration_gap" not in context["source_provenance"]["fund_flow_individual"]
+    assert not any(
+        entry.get("kind") == "manual_calibration_gap"
+        for entry in context["data_failure_ledger"]
+    )
