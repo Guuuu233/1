@@ -6,6 +6,7 @@ import pytest
 from tradingagents.dataflows import trade_calendar
 from tradingagents.dataflows.fund_flow_evidence import (
     build_sina_evidence,
+    build_source_evidence,
     extract_model_totals,
     summarize_evidence,
     validate_model_summary,
@@ -87,6 +88,64 @@ def test_summarize_rejects_polluted_date_without_silent_sum():
     )
     summary = summarize_evidence(evidence)
 
+    assert summary["status"] == "data_conflict"
+    assert summary["netamount"] is None
+    assert summary["r0_net"] is None
+    assert summary["required_window_days"] == 5
+    assert summary["invalid_records"] == ["unparseable_date"]
+    assert "无效日期" in summary["reason"]
+
+
+@pytest.mark.parametrize("date_suffix", ["", " 00:00:00"])
+def test_source_evidence_preserves_valid_date_formats_and_five_day_sum(date_suffix):
+    rows = [
+        {**row, "opendate": f"{row['opendate']}{date_suffix}"}
+        for row in _002167_ROWS
+    ]
+    evidence = build_source_evidence(
+        rows,
+        symbol="002167.SZ",
+        requested_as_of="2026-08-13",
+        retrieved_at=None,
+        source="generic_historical",
+        raw_unit="元",
+        period_kind="historical_daily",
+    )
+
+    summary = summarize_evidence(evidence)
+
+    assert summary["status"] == "available"
+    assert summary["dates"] == [
+        "2026-08-07",
+        "2026-08-10",
+        "2026-08-11",
+        "2026-08-12",
+        "2026-08-13",
+    ]
+    assert summary["netamount"] == "-1.4590076561"
+    assert summary["r0_net"] == "1.5738695443"
+
+
+def test_source_evidence_rejects_polluted_date_without_requested_fallback():
+    rows = [dict(row) for row in _002167_ROWS]
+    rows[-1]["opendate"] = "2026-08-07garbage"
+    evidence = build_source_evidence(
+        rows,
+        symbol="002167.SZ",
+        requested_as_of="2026-08-13",
+        retrieved_at=None,
+        source="generic_historical",
+        raw_unit="元",
+        period_kind="historical_daily",
+    )
+
+    invalid_record = evidence[-1]
+    summary = summarize_evidence(evidence)
+
+    assert invalid_record["date"] is None
+    assert invalid_record["measurement_date"] is None
+    assert invalid_record["as_of"] is None
+    assert invalid_record["requested_as_of"] == "2026-08-13"
     assert summary["status"] == "data_conflict"
     assert summary["netamount"] is None
     assert summary["r0_net"] is None

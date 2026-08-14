@@ -62,6 +62,15 @@ _AMOUNT_RE = re.compile(
     r"(万亿|亿元|万元|亿|万|元)?\s*$"
 )
 _DATE_FORMATS = ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S")
+_DATE_KEYS = (
+    "measurement_date",
+    "date",
+    "日期",
+    "opendate",
+    "trade_date",
+    "交易日期",
+    "as_of",
+)
 
 
 class FundFlowText(str):
@@ -260,11 +269,16 @@ def _normalise_date_text(value: Any) -> str | None:
 
 
 def _date_value(row: Mapping[str, Any]) -> str | None:
-    for key in ("measurement_date", "date", "日期", "opendate", "trade_date", "交易日期", "as_of"):
+    values: list[str] = []
+    for key in _DATE_KEYS:
+        if key not in row or row.get(key) is None:
+            continue
         value = _normalise_date_text(row.get(key))
-        if value:
-            return value
-    return None
+        if value is None:
+            # A malformed explicit date must not be hidden by a later as_of value.
+            return None
+        values.append(value)
+    return values[0] if values else None
 
 
 def build_source_evidence(
@@ -290,7 +304,14 @@ def build_source_evidence(
     records: list[dict[str, Any]] = []
     for row in _iter_rows(rows):
         date = _date_value(row)
-        as_of = str(row.get("as_of") or date or requested_as_of).strip() or requested_as_of
+        has_explicit_date = any(
+            key in row and row.get(key) is not None for key in _DATE_KEYS
+        )
+        if has_explicit_date and date is None:
+            # Preserve the invalid-date signal; requested_as_of is not actual data.
+            as_of = None
+        else:
+            as_of = str(row.get("as_of") or date or requested_as_of).strip() or requested_as_of
         effective_period = _period_kind(row, source, period_kind)
         effective_window = str(
             row.get("time_window") or row.get("window") or window or
