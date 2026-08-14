@@ -1,5 +1,9 @@
+from datetime import date
 from decimal import Decimal
 
+import pytest
+
+from tradingagents.dataflows import trade_calendar
 from tradingagents.dataflows.fund_flow_evidence import (
     build_sina_evidence,
     extract_model_totals,
@@ -15,6 +19,26 @@ _002167_ROWS = [
     {"opendate": "2026-08-10", "netamount": "116209487.9800", "r0_net": "89672105.0500"},
     {"opendate": "2026-08-07", "netamount": "-74060079.7400", "r0_net": "-192457.4800"},
 ]
+
+
+@pytest.fixture(autouse=True)
+def _stub_trade_calendar(monkeypatch):
+    dates = [
+        date(2026, 8, 3),
+        date(2026, 8, 4),
+        date(2026, 8, 5),
+        date(2026, 8, 6),
+        date(2026, 8, 7),
+        date(2026, 8, 10),
+        date(2026, 8, 11),
+        date(2026, 8, 12),
+        date(2026, 8, 13),
+    ]
+    monkeypatch.setattr(
+        trade_calendar,
+        "require_cn_trade_dates",
+        lambda: (dates, set(dates)),
+    )
 
 
 def test_sina_evidence_preserves_semantics_sign_and_exact_yi_conversion():
@@ -50,6 +74,89 @@ def test_002167_five_day_sum_does_not_round_or_shift_decimal():
     assert summary["r0_net"] == "1.5738695443"
     assert Decimal(summary["netamount"]).quantize(Decimal("0.0001")) == Decimal("-1.4590")
     assert Decimal(summary["r0_net"]).quantize(Decimal("0.0001")) == Decimal("1.5739")
+
+
+def test_summarize_rejects_duplicate_dates_before_selecting_window():
+    evidence = build_sina_evidence(
+        _002167_ROWS,
+        symbol="002167.SZ",
+        requested_as_of="2026-08-13",
+        retrieved_at=None,
+    )
+    summary = summarize_evidence([*evidence, dict(evidence[0])])
+
+    assert summary["status"] == "data_conflict"
+    assert summary["netamount"] is None
+    assert summary["r0_net"] is None
+    assert summary["required_window_days"] == 5
+    assert summary["dates"].count("2026-08-13") == 2
+    assert "重复日期" in summary["reason"]
+
+
+def test_summarize_rejects_trading_day_gap_without_silent_sum():
+    rows = [row for row in _002167_ROWS if row["opendate"] != "2026-08-10"]
+    evidence = build_sina_evidence(
+        rows,
+        symbol="002167.SZ",
+        requested_as_of="2026-08-13",
+        retrieved_at=None,
+    )
+    summary = summarize_evidence(evidence)
+
+    assert summary["status"] == "data_conflict"
+    assert summary["netamount"] is None
+    assert summary["r0_net"] is None
+    assert summary["required_window_days"] == 5
+    assert summary["dates"] == ["2026-08-07", "2026-08-11", "2026-08-12", "2026-08-13"]
+    assert "断档" in summary["reason"]
+    assert summary["missing_dates"] == ["2026-08-10"]
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("period_kind", "five_day_cumulative"),
+        ("window", "5d"),
+        ("raw_unit", "亿元"),
+    ],
+)
+def test_summarize_rejects_daily_contract_mismatch(key, value):
+    evidence = build_sina_evidence(
+        _002167_ROWS,
+        symbol="002167.SZ",
+        requested_as_of="2026-08-13",
+        retrieved_at=None,
+    )
+    mutated = [dict(record) for record in evidence]
+    mutated[0][key] = value
+    if key == "window":
+        mutated[0]["time_window"] = value
+
+    summary = summarize_evidence(mutated)
+
+    assert summary["status"] == "data_conflict"
+    assert summary["netamount"] is None
+    assert summary["r0_net"] is None
+    assert summary["required_window_days"] == 5
+    assert summary["dates"]
+    assert "禁止累计" in summary["reason"]
+
+
+def test_summarize_marks_short_contiguous_window_partial_without_future_fill():
+    evidence = build_sina_evidence(
+        _002167_ROWS[:-1],
+        symbol="002167.SZ",
+        requested_as_of="2026-08-13",
+        retrieved_at=None,
+    )
+    summary = summarize_evidence(evidence)
+
+    assert summary["status"] == "partial"
+    assert summary["data_conflict"] is False
+    assert summary["record_count"] == 4
+    assert summary["required_window_days"] == 5
+    assert summary["reason"] == "记录少于完整累计窗口，未补齐缺失或未来交易日"
+    assert summary["dates"] == ["2026-08-10", "2026-08-11", "2026-08-12", "2026-08-13"]
 
 
 def test_model_summary_mismatch_is_explicit():
