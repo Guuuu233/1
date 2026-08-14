@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 import copy
 from datetime import datetime, timedelta, timezone
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 import json
 import os
 import threading
@@ -550,7 +550,55 @@ def _classify_failure_value(value: Any) -> Optional[str]:
     return None
 
 
-def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, str]]:
+def _extract_manual_calibration_gap(value: Any) -> Optional[Dict[str, Any]]:
+    """Read only an explicitly attached structured manual-calibration gap."""
+    metadata = getattr(value, "fund_flow_evidence_meta", None)
+    if not isinstance(metadata, Mapping):
+        return None
+    gap = metadata.get("manual_calibration_gap")
+    if not isinstance(gap, Mapping):
+        return None
+    return copy.deepcopy(dict(gap))
+
+
+def _manual_calibration_gap_entry(gap: Mapping[str, Any]) -> Dict[str, Any]:
+    """Keep the provider gap intact while marking it non-blocking."""
+    preserved = copy.deepcopy(dict(gap))
+    entry = copy.deepcopy(preserved)
+    entry["manual_calibration_gap"] = preserved
+    entry["gap_type"] = "manual_calibration_gap"
+    entry["blocking"] = False
+    entry["non_blocking"] = True
+    return entry
+
+
+def _append_manual_calibration_gap(
+    ledger: List[Dict[str, Any]], gap: Mapping[str, Any]
+) -> None:
+    """Append one structured manual gap without touching other ledger entries."""
+    entry = _manual_calibration_gap_entry(gap)
+    identity = (
+        entry.get("source"),
+        entry.get("status"),
+        entry.get("reason"),
+        entry.get("as_of"),
+    )
+    if any(
+        existing.get("gap_type") == "manual_calibration_gap"
+        and (
+            existing.get("source"),
+            existing.get("status"),
+            existing.get("reason"),
+            existing.get("as_of"),
+        ) == identity
+        for existing in ledger
+        if isinstance(existing, dict)
+    ):
+        return
+    ledger.append(entry)
+
+
+def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Build stable, serializable failure evidence for the report boundary."""
     if not isinstance(results, dict):
         return []
@@ -581,7 +629,12 @@ def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, str]]:
         )
 
     entries.sort(key=lambda item: (item[0], item[1]))
-    return [entry for _rank, _source, entry in entries]
+    ledger = [entry for _rank, _source, entry in entries]
+    for value in results.values():
+        manual_gap = _extract_manual_calibration_gap(value)
+        if manual_gap is not None:
+            _append_manual_calibration_gap(ledger, manual_gap)
+    return ledger
 
 
 _SOURCE_AS_OF_PATTERNS = (
@@ -642,6 +695,10 @@ def _build_source_provenance(
             entry["gap"] = f"【数据获取失败】{source}：{_compact_failure_reason(status)}"
         elif as_of is None and source != "realtime":
             entry["gap"] = f"【数据获取失败】{source}：未返回可验证数据日期"
+        if source == "fund_flow_individual":
+            manual_gap = _extract_manual_calibration_gap(value)
+            if manual_gap is not None:
+                entry["manual_calibration_gap"] = manual_gap
         provenance[str(source)] = entry
     return provenance
 
@@ -708,6 +765,7 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
     fund_flow_value = results.get("fund_flow_individual")
     fund_flow_evidence = getattr(fund_flow_value, "fund_flow_evidence", None)
     fund_flow_evidence_meta = getattr(fund_flow_value, "fund_flow_evidence_meta", None)
+    manual_calibration_gap = _extract_manual_calibration_gap(fund_flow_value)
     if isinstance(fund_flow_evidence, list) and fund_flow_evidence:
         summary = summarize_evidence(fund_flow_evidence, window_days=5)
         fund_flow_context = {
@@ -740,6 +798,8 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
                 "reason": "structured evidence unavailable",
                 "gap": fund_flow_context["gap"],
             })
+    if manual_calibration_gap is not None:
+        fund_flow_context["manual_calibration_gap"] = copy.deepcopy(manual_calibration_gap)
 
     # ── Parse CSV once, reuse for indicators and VPA ──────────────────
     raw_csv = results.get("stock_data", "")
