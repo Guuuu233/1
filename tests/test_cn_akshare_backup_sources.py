@@ -133,7 +133,9 @@ def test_individual_fund_flow_sina_refuses_historical_date():
     instant snapshot.
     """
     ak = MagicMock()
-    ak.stock_individual_fund_flow.side_effect = ConnectionError("RemoteDisconnected")
+    ak.stock_individual_fund_flow.return_value = pd.DataFrame(
+        {"日期": [cn_today_str()], "主力净流入-净额": ["not-a-number"]}
+    )
     ak.stock_fund_flow_individual.return_value = pd.DataFrame(
         {"股票代码": ["600519"], "净额": ["3.61亿"]}
     )
@@ -142,6 +144,12 @@ def test_individual_fund_flow_sina_refuses_historical_date():
     past = (pd.Timestamp(cn_today_str()) - timedelta(days=90)).strftime("%Y-%m-%d")
     with patch("requests.get", side_effect=ConnectionError("RemoteDisconnected")):
         out = p.get_individual_fund_flow("600519", curr_date=past)
+    meta = out.fund_flow_evidence_meta
+    required = (
+        "stock_individual_fund_flow: formatter failure:",
+        "sina historical fund flow: ConnectionError",
+    )
+    assert all(token in meta[field] for field in ("reason", "gap") for token in required)
     assert "历史日期" in out
     assert "不可用" in out
     assert "同花顺即时资金流净额快照" not in out
