@@ -1385,6 +1385,16 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 text,
             )
             text = re.sub(
+                r"(?i)\bauthorization\s+bearer\s+[^\s,;}}\]]+",
+                "[REDACTED]",
+                text,
+            )
+            text = re.sub(
+                r"(?i)\bbearer\s+[^\s,;}}\]]+",
+                "[REDACTED]",
+                text,
+            )
+            text = re.sub(
                 r'''(?i)[\"']?(?:authorization|auth)[\"']?\s*[:=]\s*[\"']?(?:bearer\s+)?[^,;}}]+''',
                 "[REDACTED]",
                 text,
@@ -1773,7 +1783,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     "THS row has no verifiable source date",
                 )
                 return _gap(
-                    f"{symbol} 同花顺即时资金流净额快照（来源日期缺失，"
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照（来源日期缺失，"
                     f"资金净额: {net_amount}；最新价 {row.get('最新价', '')}；"
                     f"涨跌幅 {row.get('涨跌幅', '')}（未形成可验证 evidence；"
                     "不是新浪历史 netamount/r0_net 同口径主力序列）"

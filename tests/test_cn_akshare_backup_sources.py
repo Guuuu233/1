@@ -223,6 +223,7 @@ def test_ths_missing_source_date_is_typed_gap_without_as_of():
         out = provider.get_individual_fund_flow("600519", curr_date=curr_date)
 
     meta = out.fund_flow_evidence_meta
+    assert "【数据获取失败】" in out
     assert "【备用数据源：同花顺即时资金流净额快照】" not in out
     assert not out.fund_flow_evidence
     assert meta["final_source"] == "unavailable_gap"
@@ -320,12 +321,15 @@ def test_nested_typed_gap_metadata_is_whitelisted_and_redacted():
             "source": "eastmoney_individual_fund_flow",
             "status": "unavailable",
             "reason": {
-                "detail": "cookie=secret-cookie",
-                "nested": {"Authorization": "Bearer secret-auth"},
+                "detail": (
+                    "Authorization Bearer secret-auth; Bearer secret-bare; "
+                    "cookie=secret-cookie token=secret-token key=secret-key"
+                ),
+                "nested": {"Authorization": "Bearer secret-nested"},
             },
             "gap": {
                 "url": "https://example.invalid/feed?token=secret-token&signature=secret-signature",
-                "detail": "api_key=secret-key",
+                "detail": "api_key=secret-api-key signature=secret-signature",
             },
             "date": curr_date,
             "as_of": curr_date,
@@ -346,9 +350,13 @@ def test_nested_typed_gap_metadata_is_whitelisted_and_redacted():
     for secret in (
         "secret-cookie",
         "secret-auth",
+        "secret-bare",
         "secret-token",
         "secret-signature",
         "secret-key",
+        "secret-api-key",
+        "secret-ths-cookie",
+        "secret-sina-token",
         "https://example.invalid",
     ):
         assert secret not in serialized
