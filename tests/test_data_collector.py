@@ -1,5 +1,8 @@
-from unittest.mock import patch
+import asyncio
+import json
 import threading
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from tradingagents.graph.data_collector import (
     DataCollector,
@@ -236,3 +239,173 @@ def test_fetch_all_completes_executor_with_fast_tools():
 
     assert "stock_data" in result
     assert "market_data_context" in result
+
+
+def test_empty_fund_flow_evidence_preserves_typed_metadata_and_ledger_reason():
+    from tradingagents.graph import data_collector
+    from tradingagents.dataflows.fund_flow_evidence import FundFlowText
+
+    typed_reason = (
+        "historical new-algorithm evidence unavailable; legacy Web reference unavailable；"
+        "stock_individual_fund_flow: formatter reason: 接口调用失败"
+    )
+    typed_gap = f"【数据获取失败】资金流 evidence：{typed_reason}"
+    fund_flow = FundFlowText(
+        "【数据获取失败】历史日期 2026-08-11 新算法与新浪历史/legacy Web 资金流均不可用，"
+        "600519 本项不可用。",
+        evidence=[],
+        evidence_meta={
+            "symbol": "600519",
+            "requested_as_of": "2026-08-11",
+            "source": "fund_flow_individual",
+            "source_family": "akshare",
+            "algorithm_group": "new_algorithm_group",
+            "unit": "亿元",
+            "status": "unavailable",
+            "reason": typed_reason,
+            "gap": typed_gap,
+            "attempted_sources": ["em", "sina_historical", "ths_instant_snapshot"],
+            "fallback_errors": [
+                "stock_individual_fund_flow: formatter reason: 接口调用失败",
+                "sina historical fund flow: no current-day close row",
+            ],
+            "em_typed_gap": {"status": "unavailable", "reason": "formatter failure detail"},
+            "final_source": "ths_instant_snapshot",
+        },
+    )
+
+    def _fake_safe(tool, payload):
+        if tool is data_collector.get_individual_fund_flow:
+            return fund_flow
+        return ""
+
+    with (
+        patch.object(data_collector, "_safe", side_effect=_fake_safe),
+        patch.object(data_collector, "FETCH_ALL_TIMEOUT", 1),
+    ):
+        result = data_collector._fetch_all("600519", "2026-08-11")
+
+    fund_flow_evidence = result["market_data_context"]["fund_flow_evidence"]
+    assert fund_flow_evidence["status"] == "unavailable"
+    assert fund_flow_evidence["reason"] == typed_reason
+    assert fund_flow_evidence["gap"] == typed_gap
+    assert fund_flow_evidence["source"] == "fund_flow_individual"
+    assert fund_flow_evidence["requested_as_of"] == "2026-08-11"
+    assert "未返回结构化逐日" not in fund_flow_evidence["reason"]
+    assert fund_flow_evidence["attempted_sources"] == [
+        "em", "sina_historical", "ths_instant_snapshot",
+    ]
+    assert fund_flow_evidence["fallback_errors"] == [
+        "stock_individual_fund_flow: formatter reason: 接口调用失败",
+        "sina historical fund flow: no current-day close row",
+    ]
+    assert fund_flow_evidence["em_typed_gap"] == {
+        "status": "unavailable", "reason": "formatter failure detail",
+    }
+    assert fund_flow_evidence["final_source"] == "ths_instant_snapshot"
+    assert fund_flow_evidence["records"] == []
+    assert fund_flow_evidence["validation"] == {"status": "not_checked", "mismatches": []}
+
+    ledger = result["market_data_context"]["data_failure_ledger"]
+    ff_entries = [entry for entry in ledger if entry.get("source") == "fund_flow_individual"]
+    assert len(ff_entries) == 1
+    assert ff_entries[0]["status"] == "unavailable"
+    assert ff_entries[0]["reason"] == typed_reason
+    assert ff_entries[0]["gap"] == typed_gap
+    assert "未返回结构化逐日" not in ff_entries[0]["reason"]
+    assert ff_entries[0]["attempted_sources"] == [
+        "em", "sina_historical", "ths_instant_snapshot",
+    ]
+    assert ff_entries[0]["fallback_errors"] == [
+        "stock_individual_fund_flow: formatter reason: 接口调用失败",
+        "sina historical fund flow: no current-day close row",
+    ]
+    assert ff_entries[0]["em_typed_gap"] == {
+        "status": "unavailable", "reason": "formatter failure detail",
+    }
+    assert ff_entries[0]["final_source"] == "ths_instant_snapshot"
+
+
+class _RecordingLLM:
+    def __init__(self):
+        self.messages = None
+
+    async def astream(self, messages):
+        self.messages = messages
+        yield SimpleNamespace(content="固定分析输出")
+
+
+def test_smart_money_no_collector_fallback_preserves_typed_evidence_metadata():
+    import tradingagents.agents.utils.agent_utils as agent_utils
+    from tradingagents.agents.analysts.smart_money_analyst import create_smart_money_analyst
+    from tradingagents.dataflows.fund_flow_evidence import FundFlowText
+
+    typed_reason = (
+        "historical new-algorithm evidence unavailable; legacy Web reference unavailable；"
+        "stock_individual_fund_flow: formatter reason: 接口调用失败"
+    )
+    typed_gap = f"【数据获取失败】资金流 evidence：{typed_reason}"
+    fund_flow = FundFlowText(
+        "【数据获取失败】历史日期 2026-08-10 新算法与新浪历史/legacy Web 资金流均不可用，"
+        "600519 本项不可用。",
+        evidence=[],
+        evidence_meta={
+            "symbol": "600519",
+            "requested_as_of": "2026-08-10",
+            "source": "fund_flow_individual",
+            "status": "unavailable",
+            "reason": typed_reason,
+            "gap": typed_gap,
+            "attempted_sources": ["em", "sina_historical", "ths_instant_snapshot"],
+            "fallback_errors": ["stock_individual_fund_flow: formatter reason: 接口调用失败"],
+            "em_typed_gap": {"status": "unavailable", "reason": "formatter failure detail"},
+            "final_source": "ths_instant_snapshot",
+        },
+    )
+
+    llm = _RecordingLLM()
+    module = __import__(
+        "tradingagents.agents.analysts.smart_money_analyst",
+        fromlist=["smart_money_analyst"],
+    )
+    state = {
+        "trade_date": "2026-08-10",
+        "company_of_interest": "600519",
+        "user_intent": {"focus_areas": [], "specific_questions": []},
+    }
+
+    fund_flow_tool = SimpleNamespace(invoke=lambda payload: fund_flow)
+    lhb_tool = SimpleNamespace(invoke=lambda payload: "无龙虎榜数据")
+    indicator_tool = SimpleNamespace(invoke=lambda payload: "100")
+
+    with (
+        patch.object(module, "get_cn_stock_name", return_value="测试股票"),
+        patch.object(module, "get_config", return_value={}),
+        patch.object(module, "get_prompt", return_value="固定系统提示"),
+        patch.object(module, "build_horizon_context", return_value="固定上下文"),
+        patch.object(module, "log_llm_call"),
+        patch.object(agent_utils, "get_individual_fund_flow", fund_flow_tool),
+        patch.object(agent_utils, "get_lhb_detail", lhb_tool),
+        patch.object(agent_utils, "get_indicators", indicator_tool),
+    ):
+        result = asyncio.run(create_smart_money_analyst(llm, None)(state))
+
+    assert "smart_money_report" in result
+    human_prompt = llm.messages[1].content
+    marker = "【资金流结构化 evidence（仅用于精确累计，不得从展示文本反推）】"
+    evidence_block = human_prompt.split(marker, 1)[1]
+    evidence_json = evidence_block.split("\n\n【新算法组共识规则】", 1)[0].strip()
+    evidence = json.loads(evidence_json)
+
+    assert evidence["status"] == "unavailable"
+    assert evidence["reason"] == typed_reason
+    assert evidence["gap"] == typed_gap
+    assert "未返回结构化逐日" not in evidence["reason"]
+    assert evidence["attempted_sources"] == ["em", "sina_historical", "ths_instant_snapshot"]
+    assert evidence["fallback_errors"] == [
+        "stock_individual_fund_flow: formatter reason: 接口调用失败",
+    ]
+    assert evidence["em_typed_gap"] == {
+        "status": "unavailable", "reason": "formatter failure detail",
+    }
+    assert evidence["final_source"] == "ths_instant_snapshot"
