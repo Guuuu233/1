@@ -125,6 +125,35 @@ def test_individual_fund_flow_nonempty_invalid_em_falls_back_with_typed_ths_evid
     ak.stock_fund_flow_individual.assert_called_once_with(symbol="即时")
 
 
+def test_individual_fund_flow_invalid_em_and_sina_failure_preserve_typed_gap():
+    curr_date = cn_today_str()
+    em_df = pd.DataFrame(
+        {
+            "日期": [curr_date],
+            "主力净流入-净额": ["not-a-number"],
+        }
+    )
+    ths_df = pd.DataFrame(
+        {
+            "股票代码": ["000001"],
+            "净额": ["3.61亿"],
+        }
+    )
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.return_value = em_df
+    ak.stock_fund_flow_individual.return_value = ths_df
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+    with patch("requests.get", side_effect=ConnectionError("Sina history unavailable")):
+        out = p.get_individual_fund_flow("600519", curr_date=curr_date)
+
+    meta = out.fund_flow_evidence_meta
+    assert meta["status"] == "unavailable"
+    for field in ("reason", "gap"):
+        assert "stock_individual_fund_flow: formatter failure:" in meta[field]
+        assert "sina historical fund flow: ConnectionError" in meta[field]
+
+
 def test_individual_fund_flow_sina_refuses_historical_date():
     """Historical date: the THS instant snapshot must never leak (anti-lookahead).
 
