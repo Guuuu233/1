@@ -89,7 +89,7 @@ def test_individual_fund_flow_falls_back_to_ths_when_em_fails():
     assert "600519" in out
 
 
-def test_individual_fund_flow_nonempty_invalid_em_falls_back_with_typed_ths_evidence():
+def test_individual_fund_flow_nonempty_invalid_em_preserves_typed_gap_metadata():
     curr_date = cn_today_str()
     em_df = pd.DataFrame(
         {
@@ -99,7 +99,7 @@ def test_individual_fund_flow_nonempty_invalid_em_falls_back_with_typed_ths_evid
     )
     ths_df = pd.DataFrame(
         {
-            "股票代码": ["600519"],
+            "股票代码": ["000001"],
             "股票简称": ["贵州茅台"],
             "最新价": [1358.98],
             "涨跌幅": ["0.62%"],
@@ -117,11 +117,16 @@ def test_individual_fund_flow_nonempty_invalid_em_falls_back_with_typed_ths_evid
     with patch("requests.get", side_effect=ConnectionError("Sina history unavailable")):
         out = p.get_individual_fund_flow("600519", curr_date=curr_date)
 
-    assert "同花顺即时资金流净额快照" in out
-    assert out.fund_flow_evidence
-    assert out.fund_flow_evidence[0]["source"] == "ths_instant_snapshot"
-    assert out.fund_flow_evidence_meta["source"] == "ths_instant_snapshot"
-    assert out.fund_flow_evidence_meta["status"] == "available"
+    meta = out.fund_flow_evidence_meta
+    required = (
+        "stock_individual_fund_flow: formatter failure",
+        "sina historical fund flow:",
+    )
+    assert all(
+        token in meta[field]
+        for field in ("reason", "gap")
+        for token in required
+    )
     ak.stock_fund_flow_individual.assert_called_once_with(symbol="即时")
 
 
