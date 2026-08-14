@@ -1704,17 +1704,39 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 val = row[col]
                 return "" if pd.isna(val) else str(val)
 
-            snapshot_as_of = None
+            source_date = None
             for date_col in ("日期", "数据日期", "交易日期", "date", "as_of"):
                 parsed_date = parse_yyyymmdd(row.get(date_col))
                 if parsed_date is not None:
-                    snapshot_as_of = parsed_date.isoformat()
+                    source_date = parsed_date
                     break
-            # The 即时 endpoint is only eligible for the current Shanghai day;
-            # do not claim a future request date as a measured source date.
-            if snapshot_as_of is None and curr_date == cn_today_str():
-                snapshot_as_of = curr_date
-            evidence_date = snapshot_as_of or "未知"
+            if source_date is None:
+                reason = "missing or invalid source date"
+                _record_attempt(ths_source, "unavailable", reason)
+                errors.append(f"stock_fund_flow_individual: {reason}")
+                return _failure_response(
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照缺少有效来源日期"
+                    f"（{'；'.join(errors)}）",
+                    source=ths_source,
+                    reason=_gap_reason(
+                        "同花顺即时资金流净额快照缺少有效来源日期；"
+                        "不能用请求日期冒充实际数据日期"
+                    ),
+                )
+            snapshot_as_of = source_date.isoformat()
+            if source_date > cutoff:
+                reason = "source date after curr_date"
+                _record_attempt(ths_source, "unavailable", reason)
+                errors.append(f"stock_fund_flow_individual: {reason}")
+                return _failure_response(
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照来源日期"
+                    f"{snapshot_as_of} 晚于请求日期 {curr_date}（{'；'.join(errors)}）",
+                    source=ths_source,
+                    reason=_gap_reason(
+                        "同花顺即时资金流净额快照来源日期晚于 curr_date，拒绝前视数据"
+                    ),
+                )
+            evidence_date = snapshot_as_of
             retrieved_at = self._sina_retrieved_at()
             row_payload = {
                 "股票代码": code,
