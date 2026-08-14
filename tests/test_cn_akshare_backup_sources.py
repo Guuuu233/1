@@ -323,6 +323,7 @@ def test_nested_typed_gap_metadata_is_whitelisted_and_redacted():
             "reason": {
                 "detail": (
                     "Authorization Bearer secret-auth; Bearer secret-bare; "
+                    "Bearer: secret-colon; Bearer=secret-equal; "
                     "cookie=secret-cookie token=secret-token key=secret-key"
                 ),
                 "nested": {"Authorization": "Bearer secret-nested"},
@@ -351,6 +352,8 @@ def test_nested_typed_gap_metadata_is_whitelisted_and_redacted():
         "secret-cookie",
         "secret-auth",
         "secret-bare",
+        "secret-colon",
+        "secret-equal",
         "secret-token",
         "secret-signature",
         "secret-key",

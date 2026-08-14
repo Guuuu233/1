@@ -1385,12 +1385,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 text,
             )
             text = re.sub(
-                r"(?i)\bauthorization\s+bearer\s+[^\s,;}}\]]+",
+                r"(?i)\bauthorization\s+bearer(?:\s*[:=]\s*|\s+)[^\s,;}}\]]+",
                 "[REDACTED]",
                 text,
             )
             text = re.sub(
-                r"(?i)\bbearer\s+[^\s,;}}\]]+",
+                r"(?i)\bbearer(?:\s*[:=]\s*|\s+)[^\s,;}}\]]+",
                 "[REDACTED]",
                 text,
             )
