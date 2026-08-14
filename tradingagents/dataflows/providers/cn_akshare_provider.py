@@ -1346,10 +1346,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
         if not isinstance(evidence, list) or not evidence:
             metadata = getattr(result, "fund_flow_evidence_meta", {}) or {}
             metadata_reason = metadata.get("reason") if isinstance(metadata, dict) else None
-            return (
-                "structured evidence unavailable"
-                + (f": {metadata_reason}" if metadata_reason else "")
-            )
+            gap_text = str(result).strip()
+            details = ["structured evidence unavailable"]
+            if gap_text:
+                details.append(gap_text)
+            if metadata_reason:
+                details.append(str(metadata_reason))
+            return ": ".join(details)
 
         for index, record in enumerate(evidence):
             if not isinstance(record, dict):
