@@ -577,7 +577,12 @@ def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, Any]]:
                     or f"【数据获取失败】{source_name}：{_compact_failure_reason(status)}"
                 ),
             }
-            for key in ("attempted_sources", "fallback_errors", "final_source"):
+            for key in (
+                "attempted_sources",
+                "fallback_errors",
+                "em_typed_gap",
+                "final_source",
+            ):
                 if key in structured_meta:
                     entry[key] = copy.deepcopy(structured_meta[key])
             entries.append(
@@ -625,8 +630,73 @@ _SOURCE_AS_OF_PATTERNS = (
 )
 
 
+_TYPED_FUND_FLOW_FAILURE_STATUSES = {
+    "failed",
+    "timeout",
+    "unavailable",
+    "refused",
+    "error",
+}
+
+
+def _extract_typed_fund_flow_as_of(
+    value: Any,
+    requested_as_of: str,
+) -> Optional[str]:
+    """Extract a verifiable date from structured fund-flow evidence/meta."""
+    metadata = getattr(value, "fund_flow_evidence_meta", None)
+    evidence = getattr(value, "fund_flow_evidence", None)
+    has_typed_fields = isinstance(metadata, dict) or isinstance(evidence, list)
+    if not has_typed_fields:
+        return None
+
+    metadata_status = str(
+        metadata.get("status") if isinstance(metadata, dict) else ""
+    ).strip().lower()
+    if metadata_status in _TYPED_FUND_FLOW_FAILURE_STATUSES:
+        return None
+
+    def _candidate(raw_value: Any) -> Optional[str]:
+        match = re.search(r"20\d{2}-\d{2}-\d{2}", str(raw_value or ""))
+        if not match:
+            return None
+        try:
+            candidate = datetime.strptime(match.group(0), "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            return None
+        return candidate if candidate <= requested_as_of else None
+
+    dates: list[str] = []
+    if isinstance(metadata, dict):
+        for key in ("as_of", "data_as_of", "quote_as_of"):
+            date = _candidate(metadata.get(key))
+            if date:
+                dates.append(date)
+    if isinstance(evidence, list):
+        for record in evidence:
+            if not isinstance(record, dict):
+                continue
+            record_status = str(record.get("status") or "").strip().lower()
+            if record_status in _TYPED_FUND_FLOW_FAILURE_STATUSES:
+                continue
+            for key in ("as_of", "date", "measurement_date"):
+                date = _candidate(record.get(key))
+                if date:
+                    dates.append(date)
+    return max(dates) if dates else None
+
+
 def _extract_source_as_of(value: Any, requested_as_of: str) -> Optional[str]:
     """Extract the latest explicitly reported source date, excluding request windows."""
+    typed_as_of = _extract_typed_fund_flow_as_of(value, requested_as_of)
+    if typed_as_of:
+        return typed_as_of
+    if (
+        isinstance(getattr(value, "fund_flow_evidence_meta", None), dict)
+        or isinstance(getattr(value, "fund_flow_evidence", None), list)
+    ):
+        return None
+
     if isinstance(value, dict):
         for key in ("as_of", "quote_as_of", "data_as_of"):
             candidate = value.get(key)
@@ -662,7 +732,12 @@ def _build_source_provenance(
         }
         structured_meta = getattr(value, "fund_flow_evidence_meta", None)
         if source == "fund_flow_individual" and isinstance(structured_meta, dict):
-            for key in ("attempted_sources", "fallback_errors", "final_source"):
+            for key in (
+                "attempted_sources",
+                "fallback_errors",
+                "em_typed_gap",
+                "final_source",
+            ):
                 if key in structured_meta:
                     entry[key] = copy.deepcopy(structured_meta[key])
         if source == "stock_data" and as_of and as_of < requested_as_of:

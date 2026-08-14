@@ -114,6 +114,12 @@ def test_individual_fund_flow_rejects_invalid_em_evidence_before_sina_fallback()
     assert "新浪 fallback" in out
     assert "fake Eastmoney hit" not in out
     ak.stock_fund_flow_individual.assert_not_called()
+    assert out.fund_flow_evidence_meta["em_typed_gap"] == {
+        "source": "eastmoney_individual_fund_flow",
+        "status": "unavailable",
+        "reason": "structured evidence row 0 lacks finite r0_net",
+        "gap": "【数据获取失败】资金流 evidence：structured evidence row 0 lacks finite r0_net",
+    }
 
 
 def test_typed_em_gap_to_sina_success_keeps_fallback_provenance():
@@ -153,6 +159,12 @@ def test_typed_em_gap_to_sina_success_keeps_fallback_provenance():
     }
     assert metadata["attempted_sources"][-1]["source"] == "sina_historical"
     assert metadata["fallback_errors"] == [metadata["attempted_sources"][0]]
+    assert metadata["em_typed_gap"] == {
+        "source": "eastmoney_individual_fund_flow",
+        "status": "unavailable",
+        "reason": "no finite r0_net rows on or before curr_date",
+        "gap": "【数据获取失败】资金流 evidence：no finite r0_net rows on or before curr_date",
+    }
 
 
 def test_typed_em_gap_to_ths_success_keeps_fallback_provenance():
@@ -195,6 +207,12 @@ def test_typed_em_gap_to_ths_success_keeps_fallback_provenance():
         "no finite r0_net rows on or before curr_date"
     )
     assert metadata["fallback_errors"] == metadata["attempted_sources"][:2]
+    assert metadata["em_typed_gap"] == {
+        "source": "eastmoney_individual_fund_flow",
+        "status": "unavailable",
+        "reason": "no finite r0_net rows on or before curr_date",
+        "gap": "【数据获取失败】资金流 evidence：no finite r0_net rows on or before curr_date",
+    }
     assert "资金净额: 3.61亿" in out
 
 

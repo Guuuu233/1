@@ -1,6 +1,11 @@
 from unittest.mock import patch
 import threading
 
+from tradingagents.dataflows.fund_flow_evidence import (
+    FundFlowText,
+    build_sina_evidence,
+    build_ths_evidence,
+)
 from tradingagents.graph.data_collector import (
     DataCollector,
     _build_source_provenance,
@@ -263,6 +268,180 @@ def test_fund_flow_gap_provenance_keeps_attempt_chain_in_ledger():
         daily_as_of=None,
     )
     assert provenance["fund_flow_individual"]["fallback_errors"] == attempted_sources
+
+
+def _fetch_all_with_fund_flow(flow, trade_date):
+    raw_csv = (
+        "# vendor: fixture\n"
+        "Date,Open,High,Low,Close,Volume\n"
+        f"{trade_date},1,1,1,1,1\n"
+    )
+
+    def fake_safe(tool, _payload):
+        name = getattr(tool, "name", getattr(tool, "__name__", ""))
+        if name == "get_stock_data":
+            return raw_csv
+        if name == "get_individual_fund_flow":
+            return flow
+        return ""
+
+    with patch(
+        "tradingagents.graph.data_collector._safe",
+        side_effect=fake_safe,
+    ), patch("tradingagents.graph.data_collector.FETCH_ALL_TIMEOUT", 1):
+        return _fetch_all("600519", trade_date)
+
+
+def test_fetch_all_sina_fallback_keeps_typed_gap_and_provenance():
+    requested = "2026-08-13"
+    evidence = build_sina_evidence(
+        [
+            {
+                "opendate": "2026-08-12",
+                "netamount": "120000000",
+                "r0_net": "80000000",
+            }
+        ],
+        symbol="600519",
+        requested_as_of=requested,
+        retrieved_at="2026-08-13T12:00:00+00:00",
+    )
+    flow = FundFlowText(
+        "【备用数据源：新浪历史/收盘数据】600519 近1日主力资金净流向"
+        "（截至于 2026-08-13，最新数据日 2026-08-12，单位：亿元）",
+        evidence=evidence,
+        evidence_meta={
+            "source": "sina_historical",
+            "status": "available",
+            "requested_as_of": requested,
+            "attempted_sources": [
+                {
+                    "source": "eastmoney_individual_fund_flow",
+                    "status": "unavailable",
+                    "reason": "no finite r0_net rows on or before curr_date",
+                },
+                {
+                    "source": "sina_historical",
+                    "status": "available",
+                    "reason": "structured evidence available",
+                },
+            ],
+            "fallback_errors": [
+                {
+                    "source": "eastmoney_individual_fund_flow",
+                    "status": "unavailable",
+                    "reason": "no finite r0_net rows on or before curr_date",
+                },
+            ],
+            "em_typed_gap": {
+                "source": "eastmoney_individual_fund_flow",
+                "status": "unavailable",
+                "reason": "no finite r0_net rows on or before curr_date",
+                "gap": "【数据获取失败】资金流 evidence：no finite r0_net rows on or before curr_date",
+            },
+            "final_source": "sina_historical",
+        },
+    )
+
+    result = _fetch_all_with_fund_flow(flow, requested)
+    context = result["market_data_context"]
+    provenance = context["source_provenance"]["fund_flow_individual"]
+
+    assert context["fund_flow_evidence"]["records"] == evidence
+    assert context["fund_flow_evidence"]["em_typed_gap"]["source"] == (
+        "eastmoney_individual_fund_flow"
+    )
+    assert provenance["requested_as_of"] == requested
+    assert provenance["as_of"] == "2026-08-12"
+    assert provenance["final_source"] == "sina_historical"
+    assert provenance["em_typed_gap"]["status"] == "unavailable"
+    assert "gap" not in provenance
+    assert not any(
+        entry.get("source") == "fund_flow_individual"
+        for entry in context["data_failure_ledger"]
+    )
+
+
+def test_fetch_all_ths_fallback_uses_typed_as_of_without_failure_gap():
+    requested = "2026-08-14"
+    evidence = build_ths_evidence(
+        [
+            {
+                "股票代码": "600519",
+                "日期": requested,
+                "净额": "3.61",
+                "单位": "亿元",
+                "period_kind": "realtime_single_day",
+                "window": "1d",
+            }
+        ],
+        symbol="600519",
+        requested_as_of=requested,
+        retrieved_at="2026-08-14T08:00:00+00:00",
+    )
+    flow = FundFlowText(
+        "【备用数据源：同花顺即时资金流净额快照】600519 "
+        f"当日资金流净额快照（{requested}，最新价 1700.00，涨跌幅 1.23%）：\n"
+        "资金净额: 3.61亿",
+        evidence=evidence,
+        evidence_meta={
+            "source": "ths_instant_snapshot",
+            "status": "available",
+            "requested_as_of": requested,
+            "attempted_sources": [
+                {
+                    "source": "eastmoney_individual_fund_flow",
+                    "status": "unavailable",
+                    "reason": "no finite r0_net rows on or before curr_date",
+                },
+                {
+                    "source": "sina_historical",
+                    "status": "unavailable",
+                    "reason": "no current-day close row",
+                },
+                {
+                    "source": "ths_instant_snapshot",
+                    "status": "available",
+                    "reason": "snapshot available",
+                },
+            ],
+            "fallback_errors": [
+                {
+                    "source": "eastmoney_individual_fund_flow",
+                    "status": "unavailable",
+                    "reason": "no finite r0_net rows on or before curr_date",
+                },
+                {
+                    "source": "sina_historical",
+                    "status": "unavailable",
+                    "reason": "no current-day close row",
+                },
+            ],
+            "em_typed_gap": {
+                "source": "eastmoney_individual_fund_flow",
+                "status": "unavailable",
+                "reason": "no finite r0_net rows on or before curr_date",
+                "gap": "【数据获取失败】资金流 evidence：no finite r0_net rows on or before curr_date",
+            },
+            "final_source": "ths_instant_snapshot",
+        },
+    )
+
+    result = _fetch_all_with_fund_flow(flow, requested)
+    context = result["market_data_context"]
+    provenance = context["source_provenance"]["fund_flow_individual"]
+
+    assert "同花顺即时资金流净额快照" in result["fund_flow_individual"]
+    assert context["fund_flow_evidence"]["records"] == evidence
+    assert provenance["requested_as_of"] == requested
+    assert provenance["as_of"] == requested
+    assert provenance["final_source"] == "ths_instant_snapshot"
+    assert provenance["em_typed_gap"]["source"] == "eastmoney_individual_fund_flow"
+    assert "gap" not in provenance
+    assert not any(
+        entry.get("source") == "fund_flow_individual"
+        for entry in context["data_failure_ledger"]
+    )
 
 
 def test_fetch_all_completes_executor_with_fast_tools():

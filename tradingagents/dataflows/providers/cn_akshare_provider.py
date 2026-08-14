@@ -188,12 +188,61 @@ _FUND_AMOUNT_TEXT_RE = re.compile(
 )
 
 
+def _redact_fund_flow_audit_text(value, fallback: str) -> str:
+    """Keep short audit reasons while dropping provider payloads and traces."""
+    text = str(value or "").strip()
+    if not text or "\n" in text or len(text) > 160:
+        return fallback
+    return text
+
+
+def _build_em_typed_gap(
+    result,
+    computed_reason: str,
+    *,
+    default_status: str = "unavailable",
+) -> dict:
+    """Keep a redacted, structured Eastmoney gap beside fallback attempts."""
+    metadata = getattr(result, "fund_flow_evidence_meta", {}) or {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    safe_computed_reason = _redact_fund_flow_audit_text(
+        computed_reason,
+        "structured evidence unavailable",
+    )
+    reason = _redact_fund_flow_audit_text(
+        metadata.get("reason"),
+        safe_computed_reason,
+    )
+    gap = _redact_fund_flow_audit_text(
+        metadata.get("gap"),
+        f"【数据获取失败】资金流 evidence：{reason}",
+    )
+    status = str(metadata.get("status") or default_status).strip().lower()
+    if status not in {
+        "available",
+        "partial",
+        "unavailable",
+        "failed",
+        "timeout",
+        "refused",
+        "error",
+    }:
+        status = "unavailable"
+    return {
+        "source": "eastmoney_individual_fund_flow",
+        "status": status,
+        "reason": reason,
+        "gap": gap,
+    }
+
+
 def _merge_fund_flow_attempt_meta(
     metadata: dict,
     attempted_sources: list[dict],
     fallback_errors: list[dict],
     *,
     final_source: str | None = None,
+    em_typed_gap: dict | None = None,
 ) -> dict:
     """Attach redacted fallback provenance without changing evidence semantics."""
     merged = dict(metadata or {})
@@ -201,6 +250,8 @@ def _merge_fund_flow_attempt_meta(
     merged["fallback_errors"] = [dict(item) for item in fallback_errors]
     if final_source:
         merged["final_source"] = final_source
+    if em_typed_gap is not None:
+        merged["em_typed_gap"] = dict(em_typed_gap)
     return merged
 
 
@@ -1400,6 +1451,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         attempted_sources: list[dict] = []
         fallback_errors: list[dict] = []
         errors: list[str] = []
+        em_typed_gap: dict | None = None
 
         def _record_attempt(source: str, status: str, reason: str) -> None:
             safe_reason = str(reason or "unspecified failure").strip()
@@ -1424,14 +1476,10 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     response.fund_flow_evidence_meta,
                     attempted_sources,
                     fallback_errors,
+                    em_typed_gap=em_typed_gap,
                 )
             )
             return response
-
-        def _em_failure_reason(result, fallback: str) -> str:
-            metadata = getattr(result, "fund_flow_evidence_meta", {}) or {}
-            reason = metadata.get("reason") if isinstance(metadata, dict) else None
-            return str(reason).strip() if reason else fallback
 
         if not curr_date:
             return _failure_response(
@@ -1461,6 +1509,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 df = ak.stock_individual_fund_flow(stock=code, market=market)
             if df is None or df.empty:
                 reason = "empty dataframe"
+                em_typed_gap = _build_em_typed_gap(None, reason)
                 _record_attempt(em_source, "unavailable", reason)
                 errors.append(f"stock_individual_fund_flow: {reason}")
             else:
@@ -1491,14 +1540,17 @@ class CnAkshareProvider(BaseMarketDataProvider):
                         attempted_sources=attempted_sources,
                         fallback_errors=fallback_errors,
                     )
-                em_reason = _em_failure_reason(
-                    em_text,
-                    "structured evidence unavailable",
-                )
+                em_typed_gap = _build_em_typed_gap(em_text, em_failure)
+                em_reason = em_typed_gap["reason"]
                 _record_attempt(em_source, "unavailable", em_reason)
                 errors.append(f"stock_individual_fund_flow: {em_reason}")
         except Exception as exc:
             reason = type(exc).__name__
+            em_typed_gap = _build_em_typed_gap(
+                None,
+                reason,
+                default_status="failed",
+            )
             _record_attempt(em_source, "failed", reason)
             errors.append(f"stock_individual_fund_flow: {reason}")
 
@@ -1528,6 +1580,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     attempted_sources,
                     fallback_errors,
                     final_source=sina_source,
+                    em_typed_gap=em_typed_gap,
                 )
                 return FundFlowText(
                     f"{hist_text}\n（新浪旧 Web 参考值：仅作降级参考，不驱动方向）",
@@ -1644,6 +1697,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 attempted_sources,
                 fallback_errors,
                 final_source=ths_source,
+                em_typed_gap=em_typed_gap,
             )
             return FundFlowText(
                 (
