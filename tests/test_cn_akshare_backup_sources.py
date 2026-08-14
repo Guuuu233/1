@@ -14,6 +14,7 @@ falls back to an alternative source inside the provider:
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
@@ -122,7 +123,75 @@ def test_individual_fund_flow_nonempty_invalid_em_falls_back_with_typed_ths_evid
     assert out.fund_flow_evidence[0]["source"] == "ths_instant_snapshot"
     assert out.fund_flow_evidence_meta["source"] == "ths_instant_snapshot"
     assert out.fund_flow_evidence_meta["status"] == "available"
+    meta = out.fund_flow_evidence_meta
+    assert [item["source"] for item in meta["attempted_sources"]] == [
+        "eastmoney_individual_fund_flow",
+        "sina_historical",
+        "ths_instant_snapshot",
+    ]
+    assert [item["status"] for item in meta["attempted_sources"]] == [
+        "failed",
+        "failed",
+        "success",
+    ]
+    assert meta["final_source"] == "ths_instant_snapshot"
+    assert meta["em_typed_gap"]["source"] == "eastmoney_individual_fund_flow"
+    assert meta["em_typed_gap"]["status"] == "unavailable"
+    assert [item["source"] for item in meta["fallback_errors"]] == [
+        "eastmoney_individual_fund_flow",
+        "sina_historical",
+    ]
     ak.stock_fund_flow_individual.assert_called_once_with(symbol="即时")
+
+
+def test_individual_fund_flow_all_failures_keep_typed_gap_and_redact_errors():
+    curr_date = cn_today_str()
+    em_df = pd.DataFrame(
+        {
+            "日期": [curr_date],
+            "主力净流入-净额": ["not-a-number"],
+        }
+    )
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.return_value = em_df
+    ak.stock_fund_flow_individual.side_effect = RuntimeError(
+        "cookie=secret-cookie-value"
+    )
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+    with patch(
+        "requests.get",
+        side_effect=ConnectionError(
+            "https://example.invalid/feed?token=secret-token"
+        ),
+    ):
+        out = p.get_individual_fund_flow("600519", curr_date=curr_date)
+
+    meta = out.fund_flow_evidence_meta
+    assert "【数据获取失败】" in out
+    assert [item["source"] for item in meta["attempted_sources"]] == [
+        "eastmoney_individual_fund_flow",
+        "sina_historical",
+        "ths_instant_snapshot",
+    ]
+    assert all(item["status"] == "failed" for item in meta["attempted_sources"])
+    assert meta["final_source"] == "unavailable_gap"
+    assert meta["em_typed_gap"]["source"] == "eastmoney_individual_fund_flow"
+    assert meta["em_typed_gap"]["status"] == "unavailable"
+    assert [item["source"] for item in meta["fallback_errors"]] == [
+        "eastmoney_individual_fund_flow",
+        "sina_historical",
+        "ths_instant_snapshot",
+    ]
+    assert [item["error_type"] for item in meta["fallback_errors"]] == [
+        "formatter_failure",
+        "ConnectionError",
+        "RuntimeError",
+    ]
+    serialized = json.dumps(meta, ensure_ascii=False)
+    assert "secret-cookie-value" not in serialized
+    assert "secret-token" not in serialized
+    assert "https://example.invalid" not in serialized
 
 
 def test_individual_fund_flow_sina_refuses_historical_date():

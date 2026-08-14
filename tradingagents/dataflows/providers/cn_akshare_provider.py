@@ -187,6 +187,11 @@ _FUND_AMOUNT_TEXT_RE = re.compile(
     r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*(?:万亿|亿元|万元|亿|万)?$"
 )
 
+_FUND_FLOW_SOURCE_EM = "eastmoney_individual_fund_flow"
+_FUND_FLOW_SOURCE_SINA = "sina_historical"
+_FUND_FLOW_SOURCE_THS = "ths_instant_snapshot"
+_FUND_FLOW_SOURCE_UNAVAILABLE = "unavailable_gap"
+
 
 def _sina_decimal(value) -> Decimal | None:
     """Parse a finite provider amount without introducing binary-float error."""
@@ -1344,25 +1349,117 @@ class CnAkshareProvider(BaseMarketDataProvider):
         ``净额`` 不是新浪历史 ``netamount``/``r0_net`` 同口径的主力序列；
         匹配目标行后必须先验证 ``净额`` 可用，带单位文本会原样保留。
         """
-        if not curr_date:
-            return (
-                f"【数据获取失败】个股资金流向缺少 curr_date，无法做日期截断，"
-                f"{symbol} 本项不可用。"
-            )
-        cutoff = parse_yyyymmdd(curr_date)
-        if cutoff is None:
-            return f"【数据获取失败】个股资金流向 curr_date 无法解析：{curr_date!r}"
+        attempted_sources: list[dict[str, str]] = []
+        fallback_errors: list[dict[str, str]] = []
+        error_texts: list[str] = []
+        em_typed_gap: dict[str, object] | None = None
 
-        ak = self._ak()
-        code = self._normalize_symbol(symbol)
-        errors: list[str] = []
-        is_historical = is_historical_analysis_date(curr_date)
+        def _redact_reason(reason: object) -> str:
+            text = str(reason or "").replace("\n", " ").strip()
+            text = re.sub(r"https?://\S+", "[redacted_url]", text)
+            text = re.sub(
+                r"(?i)\b(token|cookie|signature|sign|api[_-]?key|authorization|secret|password)\b\s*[:=]\s*\S+",
+                r"\1=[REDACTED]",
+                text,
+            )
+            return text[:240] or "unspecified provider failure"
+
+        def _record_success(source: str) -> None:
+            attempted_sources.append({"source": source, "status": "success"})
+
+        def _record_failure(
+            source: str,
+            provider: str,
+            error_type: str,
+            reason: object,
+        ) -> None:
+            safe_reason = _redact_reason(reason)
+            attempted_sources.append({
+                "source": source,
+                "status": "failed",
+                "reason": safe_reason,
+            })
+            fallback_errors.append({
+                "source": source,
+                "error_type": error_type,
+                "reason": safe_reason,
+            })
+            display_type = {
+                "empty_dataframe": "empty dataframe",
+                "formatter_failure": "formatter failure",
+                "no_current_day_close_row": "no current-day close row",
+                "no_rows_on_or_before_curr_date": "no rows on or before curr_date",
+            }.get(error_type, error_type)
+            display = f"{provider}: {display_type}"
+            if error_type in {
+                "formatter_failure",
+                "no_current_day_close_row",
+                "no_rows_on_or_before_curr_date",
+                "no_matching_row",
+                "missing_net_amount",
+                "invalid_net_amount",
+            }:
+                display = f"{display}: {safe_reason}"
+            error_texts.append(display)
+
+        def _with_chain(value: object, final_source: str) -> FundFlowText:
+            evidence = list(getattr(value, "fund_flow_evidence", []) or [])
+            metadata = dict(getattr(value, "fund_flow_evidence_meta", {}) or {})
+            metadata["attempted_sources"] = [dict(item) for item in attempted_sources]
+            metadata["fallback_errors"] = [dict(item) for item in fallback_errors]
+            metadata["final_source"] = final_source
+            if em_typed_gap is not None:
+                metadata["em_typed_gap"] = dict(em_typed_gap)
+            return FundFlowText(
+                str(value), evidence=evidence, evidence_meta=metadata
+            )
+
+        def _gap(text: str, reason: str) -> FundFlowText:
+            return _with_chain(
+                build_provider_text(
+                    text,
+                    symbol=symbol,
+                    requested_as_of=curr_date or "",
+                    source="fund_flow_individual",
+                    reason=reason,
+                ),
+                _FUND_FLOW_SOURCE_UNAVAILABLE,
+            )
 
         def _gap_reason(base_reason: str) -> str:
             return (
-                f"{base_reason}；{'；'.join(errors)}"
-                if errors
+                f"{base_reason}；{'；'.join(error_texts)}"
+                if error_texts
                 else base_reason
+            )
+
+        if not curr_date:
+            return _gap(
+                f"【数据获取失败】个股资金流向缺少 curr_date，无法做日期截断，"
+                f"{symbol} 本项不可用。",
+                "missing curr_date; date truncation is required",
+            )
+        cutoff = parse_yyyymmdd(curr_date)
+        if cutoff is None:
+            return _gap(
+                f"【数据获取失败】个股资金流向 curr_date 无法解析：{curr_date!r}",
+                "curr_date is not parseable",
+            )
+
+        code = self._normalize_symbol(symbol)
+        is_historical = is_historical_analysis_date(curr_date)
+        try:
+            ak = self._ak()
+        except Exception as exc:
+            fallback_errors.append({
+                "source": "provider_setup",
+                "error_type": type(exc).__name__,
+                "reason": "akshare provider initialization failed",
+            })
+            error_texts.append(f"provider setup: {type(exc).__name__}")
+            return _gap(
+                f"【数据获取失败】个股资金流向 provider 初始化失败：{symbol} 本项不可用。",
+                _gap_reason("fund-flow provider setup unavailable"),
             )
 
         # Source 1: 东财（近 120 交易日逐日序列，可按 curr_date 截断）
@@ -1372,28 +1469,80 @@ class CnAkshareProvider(BaseMarketDataProvider):
             with AKSHARE_CALL_LOCK:
                 df = ak.stock_individual_fund_flow(stock=code, market=market)
             if df is None or df.empty:
-                errors.append("stock_individual_fund_flow: empty dataframe")
+                em_gap_reason = "stock_individual_fund_flow: empty dataframe"
+                em_typed_gap = build_gap_meta(
+                    symbol=symbol,
+                    requested_as_of=curr_date,
+                    source=_FUND_FLOW_SOURCE_EM,
+                    status="unavailable",
+                    reason=em_gap_reason,
+                    retrieved_at=self._sina_retrieved_at(),
+                    algorithm_group="new_algorithm_group",
+                    period_kind="historical_daily",
+                )
+                _record_failure(
+                    _FUND_FLOW_SOURCE_EM,
+                    "stock_individual_fund_flow",
+                    "empty_dataframe",
+                    "provider returned an empty dataframe",
+                )
             else:
                 # Invalid or out-of-range Eastmoney data must not terminate the
-                # fallback chain. Only formatted text with evidence is a success;
-                # retain any formatter failure detail for the final typed gap.
+                # fallback chain. Preserve its typed gap before trying backups.
                 em_text = self._format_individual_fund_flow_em(
                     df, symbol, curr_date, cutoff
                 )
                 em_evidence = getattr(em_text, "fund_flow_evidence", None)
                 if em_text is not None and isinstance(em_evidence, list) and em_evidence:
-                    return em_text
+                    _record_success(_FUND_FLOW_SOURCE_EM)
+                    return _with_chain(em_text, _FUND_FLOW_SOURCE_EM)
                 em_meta = getattr(em_text, "fund_flow_evidence_meta", None) or {}
-                if em_meta.get("reason"):
-                    errors.append(
-                        f"stock_individual_fund_flow: formatter reason: {em_meta['reason']}"
+                em_detail = _redact_reason(
+                    em_meta.get("reason")
+                    if isinstance(em_meta, dict) and em_meta.get("reason")
+                    else em_text or "structured evidence unavailable"
+                )
+                em_gap_reason = (
+                    "stock_individual_fund_flow: formatter failure: "
+                    f"{em_detail}"
+                )
+                if isinstance(em_meta, dict) and em_meta:
+                    em_typed_gap = dict(em_meta)
+                else:
+                    em_typed_gap = build_gap_meta(
+                        symbol=symbol,
+                        requested_as_of=curr_date,
+                        source=_FUND_FLOW_SOURCE_EM,
+                        status="unavailable",
+                        reason=em_gap_reason,
+                        retrieved_at=self._sina_retrieved_at(),
+                        algorithm_group="new_algorithm_group",
+                        period_kind="historical_daily",
                     )
-                if em_text:
-                    errors.append(f"stock_individual_fund_flow: formatter failure: {em_text}")
-                errors.append("stock_individual_fund_flow: structured evidence unavailable")
-                errors.append("stock_individual_fund_flow: invalid or empty usable rows")
+                _record_failure(
+                    _FUND_FLOW_SOURCE_EM,
+                    "stock_individual_fund_flow",
+                    "formatter_failure",
+                    em_detail,
+                )
         except Exception as exc:
-            errors.append(f"stock_individual_fund_flow: {type(exc).__name__}")
+            em_gap_reason = f"stock_individual_fund_flow: {type(exc).__name__}"
+            em_typed_gap = build_gap_meta(
+                symbol=symbol,
+                requested_as_of=curr_date,
+                source=_FUND_FLOW_SOURCE_EM,
+                status="unavailable",
+                reason=em_gap_reason,
+                retrieved_at=self._sina_retrieved_at(),
+                algorithm_group="new_algorithm_group",
+                period_kind="historical_daily",
+            )
+            _record_failure(
+                _FUND_FLOW_SOURCE_EM,
+                "stock_individual_fund_flow",
+                type(exc).__name__,
+                "provider call failed",
+            )
 
         # Source 2.5: Sina Web is legacy reference only. Keep the typed
         # response for auditability, but it is never a successful main-force
@@ -1406,6 +1555,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 require_curr_date=not is_historical,
             )
             if hist_text is not None:
+                _record_success(_FUND_FLOW_SOURCE_SINA)
                 metadata = dict(getattr(hist_text, "fund_flow_evidence_meta", {}) or {})
                 metadata.update({
                     "legacy_web_algorithm": True,
@@ -1413,30 +1563,41 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     "direction_allowed": False,
                     "reason": "新浪旧 Web 参考值，不驱动主力方向",
                 })
-                return FundFlowText(
-                    f"{hist_text}\n（新浪旧 Web 参考值：仅作降级参考，不驱动方向）",
-                    evidence=getattr(hist_text, "fund_flow_evidence", []),
-                    evidence_meta=metadata,
+                return _with_chain(
+                    FundFlowText(
+                        f"{hist_text}\n（新浪旧 Web 参考值：仅作降级参考，不驱动方向）",
+                        evidence=getattr(hist_text, "fund_flow_evidence", []),
+                        evidence_meta=metadata,
+                    ),
+                    _FUND_FLOW_SOURCE_SINA,
                 )
             if is_historical:
-                errors.append(
-                    "sina historical fund flow: no rows on or before curr_date"
+                _record_failure(
+                    _FUND_FLOW_SOURCE_SINA,
+                    "sina historical fund flow",
+                    "no_rows_on_or_before_curr_date",
+                    "no rows on or before curr_date",
                 )
             else:
-                errors.append(
-                    "sina historical fund flow: no current-day close row"
+                _record_failure(
+                    _FUND_FLOW_SOURCE_SINA,
+                    "sina historical fund flow",
+                    "no_current_day_close_row",
+                    "no current-day close row",
                 )
         except Exception as exc:
-            errors.append(f"sina historical fund flow: {type(exc).__name__}")
+            _record_failure(
+                _FUND_FLOW_SOURCE_SINA,
+                "sina historical fund flow",
+                type(exc).__name__,
+                "historical endpoint call failed",
+            )
 
         if is_historical:
-            return build_provider_text(
+            return _gap(
                 f"【数据获取失败】历史日期 {curr_date} 新算法与新浪历史/legacy Web 资金流均不可用，"
-                f"{symbol} 本项不可用。（{'；'.join(errors)}）",
-                symbol=symbol,
-                requested_as_of=curr_date,
-                source="fund_flow_individual",
-                reason=_gap_reason(
+                f"{symbol} 本项不可用。（{'；'.join(error_texts)}）",
+                _gap_reason(
                     "historical new-algorithm evidence unavailable; legacy Web reference unavailable"
                 ),
             )
@@ -1446,40 +1607,61 @@ class CnAkshareProvider(BaseMarketDataProvider):
             with AKSHARE_CALL_LOCK:
                 df = ak.stock_fund_flow_individual(symbol="即时")
             if df is None or df.empty:
-                raise ValueError("empty dataframe")
+                _record_failure(
+                    _FUND_FLOW_SOURCE_THS,
+                    "stock_fund_flow_individual",
+                    "empty_dataframe",
+                    "provider returned an empty dataframe",
+                )
+                return _gap(
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照为空"
+                    f"（{'；'.join(error_texts)}）",
+                    _gap_reason(
+                        "同花顺即时资金流净额快照为空；该源不提供新浪 netamount/r0_net evidence"
+                    ),
+                )
             stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
             if stock_df.empty:
-                return build_provider_text(
+                _record_failure(
+                    _FUND_FLOW_SOURCE_THS,
+                    "stock_fund_flow_individual",
+                    "no_matching_row",
+                    "no matching stock row",
+                )
+                return _gap(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照无记录"
-                    f"（{'；'.join(errors)}）",
-                    symbol=symbol,
-                    requested_as_of=curr_date,
-                    source="ths_instant_snapshot",
-                    reason=_gap_reason(
+                    f"（{'；'.join(error_texts)}）",
+                    _gap_reason(
                         "同花顺即时资金流净额快照无记录；该源不提供新浪 netamount/r0_net evidence"
                     ),
                 )
             row = stock_df.iloc[0]
             if "净额" not in stock_df.columns:
-                return build_provider_text(
+                _record_failure(
+                    _FUND_FLOW_SOURCE_THS,
+                    "stock_fund_flow_individual",
+                    "missing_net_amount",
+                    "matched row is missing 净额",
+                )
+                return _gap(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照缺少净额字段"
-                    f"（{'；'.join(errors)}）",
-                    symbol=symbol,
-                    requested_as_of=curr_date,
-                    source="ths_instant_snapshot",
-                    reason=_gap_reason(
+                    f"（{'；'.join(error_texts)}）",
+                    _gap_reason(
                         "同花顺即时资金流净额快照缺少净额字段；该源不提供新浪 netamount/r0_net evidence"
                     ),
                 )
             net_amount = _usable_fund_amount_text(row["净额"])
             if net_amount is None:
-                return build_provider_text(
+                _record_failure(
+                    _FUND_FLOW_SOURCE_THS,
+                    "stock_fund_flow_individual",
+                    "invalid_net_amount",
+                    "matched 净额 is missing or unparseable",
+                )
+                return _gap(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照净额缺失或不可解析"
-                    f"（{'；'.join(errors)}）",
-                    symbol=symbol,
-                    requested_as_of=curr_date,
-                    source="ths_instant_snapshot",
-                    reason=_gap_reason(
+                    f"（{'；'.join(error_texts)}）",
+                    _gap_reason(
                         "同花顺即时资金流净额快照净额缺失或不可解析；该源不提供新浪 netamount/r0_net evidence"
                     ),
                 )
@@ -1490,6 +1672,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 val = row[col]
                 return "" if pd.isna(val) else str(val)
 
+            retrieved_at = self._sina_retrieved_at()
             row_payload = {
                 "股票代码": code,
                 "日期": curr_date,
@@ -1502,7 +1685,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 [row_payload],
                 symbol=symbol,
                 requested_as_of=curr_date,
-                retrieved_at=self._sina_retrieved_at(),
+                retrieved_at=retrieved_at,
             )
             consensus = build_consensus_evidence(
                 evidence,
@@ -1510,42 +1693,46 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 requested_as_of=curr_date,
                 field="netamount",
             )
-            return FundFlowText(
-                (
-                    f"【备用数据源：同花顺即时资金流净额快照】{symbol} 当日资金流净额快照"
-                    f"（{curr_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
-                    f"资金净额: {net_amount} | 流入资金: {_v('流入资金')} | "
-                    f"流出资金: {_v('流出资金')} | 换手率: {_v('换手率')}\n"
-                    "（该快照不是新浪历史 netamount/r0_net 同口径主力序列；"
-                    "属于同花顺新算法组总净额，仍不得视为 r0_net 主力序列）"
+            _record_success(_FUND_FLOW_SOURCE_THS)
+            return _with_chain(
+                FundFlowText(
+                    (
+                        f"【备用数据源：同花顺即时资金流净额快照】{symbol} 当日资金流净额快照"
+                        f"（{curr_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
+                        f"资金净额: {net_amount} | 流入资金: {_v('流入资金')} | "
+                        f"流出资金: {_v('流出资金')} | 换手率: {_v('换手率')}\n"
+                        "（该快照不是新浪历史 netamount/r0_net 同口径主力序列；"
+                        "属于同花顺新算法组总净额，仍不得视为 r0_net 主力序列）"
+                    ),
+                    evidence=evidence,
+                    evidence_meta={
+                        "symbol": symbol,
+                        "requested_as_of": curr_date,
+                        "retrieved_at": retrieved_at,
+                        "source": _FUND_FLOW_SOURCE_THS,
+                        "source_family": "ths",
+                        "algorithm_group": "new_algorithm_group",
+                        "period_kind": "realtime_single_day",
+                        "unit": "亿元",
+                        "status": "available",
+                        "consensus": consensus,
+                        "reason": "同花顺即时资金流净额是总净额，未将其等同于新浪历史 r0_net 主力序列",
+                    },
                 ),
-                evidence=evidence,
-                evidence_meta={
-                    "symbol": symbol,
-                    "requested_as_of": curr_date,
-                    "retrieved_at": self._sina_retrieved_at(),
-                    "source": "ths_instant_snapshot",
-                    "source_family": "ths",
-                    "algorithm_group": "new_algorithm_group",
-                    "period_kind": "realtime_single_day",
-                    "unit": "亿元",
-                    "status": "available",
-                    "consensus": consensus,
-                    "reason": "同花顺即时资金流净额是总净额，未将其等同于新浪历史 r0_net 主力序列",
-                },
+                _FUND_FLOW_SOURCE_THS,
             )
         except Exception as exc:
-            errors.append(f"stock_fund_flow_individual: {type(exc).__name__}")
+            _record_failure(
+                _FUND_FLOW_SOURCE_THS,
+                "stock_fund_flow_individual",
+                type(exc).__name__,
+                "provider call or formatter failed",
+            )
 
-        gap_reason = "东财/新浪历史/同花顺即时资金流净额快照均失败"
-        if errors:
-            gap_reason = f"{gap_reason}；{'；'.join(errors)}"
-        return build_provider_text(
-            f"【数据获取失败】个股资金流向数据获取失败（东财/新浪历史/同花顺即时资金流净额快照均失败：{'；'.join(errors)}）",
-            symbol=symbol,
-            requested_as_of=curr_date,
-            source="fund_flow_individual",
-            reason=gap_reason,
+        final_errors = "；".join(error_texts) or "no provider attempts"
+        return _gap(
+            f"【数据获取失败】个股资金流向数据获取失败（东财/新浪历史/同花顺即时资金流净额快照均失败：{final_errors}）",
+            _gap_reason("东财/新浪历史/同花顺即时资金流净额快照均失败"),
         )
 
     def _fetch_sina_historical_fund_flow(
