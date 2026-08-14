@@ -6,6 +6,8 @@ from decimal import Decimal, InvalidOperation
 import re
 from typing import Any, Iterable, Mapping
 
+from .trade_calendar import TradeCalendarUnavailableError, trading_days_back
+
 
 YI = Decimal("100000000")
 DEFAULT_WINDOW_DAYS = 5
@@ -580,28 +582,164 @@ def _sum_field(records: Iterable[Mapping[str, Any]], field: str) -> Decimal | No
     return sum(usable, Decimal("0")) if usable else None
 
 
+def _normalise_summary_period(value: Any) -> str:
+    text = str(value).strip().lower()
+    text = re.sub(r"[\s-]+", "_", text)
+    aliases = {
+        "1d": "historical_daily",
+        "1day": "historical_daily",
+        "daily": "historical_daily",
+        "historical_day": "historical_daily",
+        "real_time": "realtime_single_day",
+        "realtime": "realtime_single_day",
+        "realtime_1d": "realtime_single_day",
+        "consensus_daily": "daily_consensus",
+    }
+    return aliases.get(text, text)
+
+
+def _normalise_summary_window(value: Any) -> str:
+    text = str(value).strip().lower()
+    text = re.sub(r"\s+", "", text)
+    if text in {"1", "1d", "1day", "daily", "day", "1日", "逐日"}:
+        return "1d"
+    match = re.fullmatch(r"(\d+)(?:d|day|days|日)", text)
+    if match:
+        return f"{int(match.group(1))}d"
+    return text
+
+
+def _summary_alias_values(
+    record: Mapping[str, Any],
+    keys: tuple[str, ...],
+    normalizer: Any,
+) -> list[str]:
+    values: list[str] = []
+    for key in keys:
+        value = record.get(key)
+        if value is None or not str(value).strip():
+            continue
+        values.append(normalizer(value))
+    return values
+
+
+def _summary_period_is_daily(period: str) -> bool:
+    if period in {"historical_daily", "daily_consensus", "realtime_single_day"}:
+        return True
+    if any(
+        marker in period
+        for marker in ("cumulative", "aggregate", "weekly", "monthly", "multi_day", "five_day")
+    ):
+        return False
+    if re.fullmatch(r"(?:[2-9]|[1-9]\d+)d", period):
+        return False
+    return True
+
+
 def _normalise_summary_record(record: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
-    """Normalize raw amounts and dates before any cumulative arithmetic."""
+    """Normalize dates, amounts, and all cumulative-window metadata."""
     date = _date_value(record)
     if date is None:
         return None, "unparseable_date"
+
+    period_values = _summary_alias_values(
+        record,
+        ("period_kind", "window_kind", "period"),
+        _normalise_summary_period,
+    )
+    if len(set(period_values)) > 1:
+        return None, "inconsistent_period_kind"
+    period_kind = period_values[0] if period_values else "historical_daily"
+
+    window_values = _summary_alias_values(
+        record,
+        ("window", "time_window"),
+        _normalise_summary_window,
+    )
+    if len(set(window_values)) > 1:
+        return None, "inconsistent_window"
+    window = window_values[0] if window_values else "1d"
+
     normalized = dict(record)
     normalized["date"] = date
-    normalized["period_kind"] = str(
-        record.get("period_kind") or record.get("window_kind") or record.get("period") or "historical_daily"
-    )
-    normalized["window"] = str(record.get("window") or record.get("time_window") or "1d")
+    normalized["period_kind"] = period_kind
+    normalized["window"] = window
+    normalized["time_window"] = window
+    normalized["raw_unit"] = _unit_name(record.get("raw_unit") or record.get("unit") or "亿元")
     for field in ("netamount", "r0_net", "r0_in", "r0_out", "r0"):
         if field not in record or record.get(field) is None:
             continue
         raw_value = record.get(f"{field}_raw", record.get(field))
-        raw_unit = record.get(f"{field}_raw_unit", record.get("raw_unit", record.get("unit")))
+        raw_unit = (
+            record.get(f"{field}_raw_unit")
+            or record.get("raw_unit")
+            or record.get("unit")
+            or "亿元"
+        )
         amount, parsed_unit = _amount_to_yi(raw_value, raw_unit)
         if amount is None:
             return None, f"invalid_{field}_unit_or_amount"
         normalized[field] = _decimal_text(amount)
         normalized[f"{field}_raw_unit"] = parsed_unit
     return normalized, None
+
+
+def _summary_partial(
+    records: list[dict[str, Any]],
+    *,
+    window_days: int,
+    reason: str,
+) -> dict[str, Any]:
+    netamount = _sum_field(records, "netamount")
+    r0_net = _sum_field(records, "r0_net")
+    return {
+        "window_days": window_days,
+        "record_count": len(records),
+        "required_window_days": window_days,
+        "status": "partial",
+        "data_conflict": False,
+        "reason": reason,
+        "dates": [str(record.get("date")) for record in records],
+        "netamount": _decimal_text(netamount),
+        "r0_net": _decimal_text(r0_net),
+        "unit": "亿元",
+        "windows": sorted(
+            {
+                str(record.get("window") or record.get("time_window"))
+                for record in records
+                if record.get("window") or record.get("time_window")
+            }
+        ),
+        "semantics": {
+            "netamount": _FIELD_SEMANTICS["netamount"],
+            "r0_net": _FIELD_SEMANTICS["r0_net"],
+        },
+    }
+
+
+def _validate_trading_window(
+    records: list[dict[str, Any]],
+    *,
+    window_days: int,
+) -> str | None:
+    """Return a refusal reason when dates are not a verified CN trading window."""
+    if len(records) != window_days:
+        return None
+    selected_dates = [str(record.get("date")) for record in records]
+    try:
+        expected_dates = [
+            _normalise_date_text(value)
+            for value in trading_days_back(selected_dates[-1], window_days)
+        ]
+    except TradeCalendarUnavailableError:
+        return "交易日历不可用，无法安全核验累计窗口"
+    except Exception:
+        return "交易日历核验失败，无法安全核验累计窗口"
+    if any(value is None for value in expected_dates):
+        return "交易日历返回无效日期，无法安全核验累计窗口"
+    if sorted(expected_dates) != selected_dates:
+        return "累计窗口缺少交易日或包含非交易日断档，禁止累计"
+    return None
 
 
 def _summary_conflict(
@@ -636,6 +774,14 @@ def summarize_evidence(
     window_days: int = DEFAULT_WINDOW_DAYS,
 ) -> dict[str, Any]:
     """Compute exact daily totals without mixing sources, units, or windows."""
+    if isinstance(window_days, bool) or not isinstance(window_days, int) or window_days <= 0:
+        safe_window_days = window_days if isinstance(window_days, int) else DEFAULT_WINDOW_DAYS
+        return _summary_conflict(
+            [],
+            window_days=safe_window_days,
+            reason="required_window_days 必须是正整数，禁止累计",
+        )
+
     usable: list[dict[str, Any]] = []
     invalid_records: list[str] = []
     for record in records:
@@ -650,86 +796,96 @@ def summarize_evidence(
         return _summary_conflict(
             usable,
             window_days=window_days,
-            reason="结构化 evidence 含无效日期、单位或金额，禁止累计",
+            reason="结构化 evidence 含无效日期、单位、金额或 period/window 口径，禁止累计",
             invalid_records=invalid_records,
         )
+
     usable.sort(key=lambda record: str(record.get("date")))
+    all_dates = [str(record.get("date")) for record in usable]
+    if len(set(all_dates)) != len(all_dates):
+        return _summary_conflict(
+            usable,
+            window_days=window_days,
+            reason="全量记录存在重复日期，禁止累计",
+        )
+
     period_kinds = {str(record.get("period_kind")) for record in usable if record.get("period_kind")}
-    windows = {str(record.get("window") or record.get("time_window")) for record in usable if record.get("window") or record.get("time_window")}
+    windows = {
+        str(record.get("window") or record.get("time_window"))
+        for record in usable
+        if record.get("window") or record.get("time_window")
+    }
     source_ids = {str(record.get("source") or "") for record in usable}
-    mixed_periods = len(period_kinds) > 1 or ("five_day_cumulative" in period_kinds and len(usable) > 1)
+    mixed_periods = len(period_kinds) > 1
     invalid_windows = [
-        record for record in usable
-        if str(record.get("window") or "1d") != "1d"
-        or str(record.get("period_kind")) in {"five_day_cumulative", "five_day_aggregate"}
+        record
+        for record in usable
+        if not _summary_period_is_daily(str(record.get("period_kind") or "historical_daily"))
+        or str(record.get("window") or "1d") != "1d"
         or (str(record.get("period_kind")) == "realtime_single_day" and len(usable) > 1)
     ]
     if invalid_windows:
         return _summary_conflict(
             usable,
             window_days=window_days,
-            reason="逐日累计窗口包含实时多日或累计 period/window，禁止跨区间相加",
+            reason="逐日累计窗口包含实时多日或非逐日 period/window，禁止跨区间相加",
+        )
+    if len(windows) > 1:
+        return _summary_conflict(
+            usable,
+            window_days=window_days,
+            reason="records mix window/time_window 口径，禁止累计",
         )
     if len(source_ids) > 1:
-        return {
-            "window_days": window_days,
-            "record_count": len(usable),
-            "status": "data_conflict",
-            "data_conflict": True,
-            "reason": "多来源记录不能直接相加，必须先按字段/日期/窗口做新算法组共识",
-            "dates": [str(record.get("date")) for record in usable],
-            "netamount": None,
-            "r0_net": None,
-            "unit": "亿元",
-            "semantics": {
-                "netamount": _FIELD_SEMANTICS["netamount"],
-                "r0_net": _FIELD_SEMANTICS["r0_net"],
-            },
-        }
+        return _summary_conflict(
+            usable,
+            window_days=window_days,
+            reason="多来源记录不能直接相加，必须先按字段/日期/窗口做新算法组共识",
+        )
     if mixed_periods:
-        return {
-            "window_days": window_days,
-            "record_count": len(usable),
-            "status": "data_conflict",
-            "data_conflict": True,
-            "reason": "records mix real-time, historical-daily, or cumulative windows",
-            "dates": [str(record.get("date")) for record in usable],
-            "netamount": None,
-            "r0_net": None,
-            "unit": "亿元",
-            "semantics": {
-                "netamount": _FIELD_SEMANTICS["netamount"],
-                "r0_net": _FIELD_SEMANTICS["r0_net"],
-            },
-        }
+        return _summary_conflict(
+            usable,
+            window_days=window_days,
+            reason="records mix real-time, historical-daily, or cumulative windows",
+        )
+
+    raw_units = {str(record.get("raw_unit") or "") for record in usable}
+    if len(raw_units) > 1:
+        return _summary_conflict(
+            usable,
+            window_days=window_days,
+            reason="记录 raw_unit 不一致，禁止跨单位累计",
+        )
+
     selected = usable[-window_days:] if len(usable) > window_days else usable
-    selected_dates = [str(record.get("date")) for record in selected]
-    if len(set(selected_dates)) != len(selected_dates) or any(
-        record.get("period_kind") == "five_day_cumulative" for record in selected
-    ):
-        return {
-            "window_days": window_days,
-            "record_count": len(selected),
-            "status": "data_conflict",
-            "data_conflict": True,
-            "reason": "累计值或重复日期不能按逐日记录相加",
-            "dates": selected_dates,
-            "netamount": None,
-            "r0_net": None,
-            "unit": "亿元",
-            "semantics": {
-                "netamount": _FIELD_SEMANTICS["netamount"],
-                "r0_net": _FIELD_SEMANTICS["r0_net"],
-            },
-        }
+    if len(selected) < window_days:
+        return _summary_partial(
+            selected,
+            window_days=window_days,
+            reason="累计窗口记录不足，无法完成完整交易日窗口",
+        )
+
+    calendar_reason = _validate_trading_window(selected, window_days=window_days)
+    if calendar_reason:
+        return _summary_conflict(
+            selected,
+            window_days=window_days,
+            reason=calendar_reason,
+        )
+
     netamount = _sum_field(selected, "netamount")
     r0_net = _sum_field(selected, "r0_net")
-    status = "available" if len(selected) == window_days and netamount is not None and r0_net is not None else "partial"
+    if netamount is None or r0_net is None:
+        return _summary_partial(
+            selected,
+            window_days=window_days,
+            reason="累计窗口缺少可用的逐日 netamount 或 r0_net，禁止标记为 available",
+        )
     return {
         "window_days": window_days,
         "record_count": len(selected),
         "required_window_days": window_days,
-        "status": status,
+        "status": "available",
         "data_conflict": False,
         "dates": [str(record.get("date")) for record in selected],
         "netamount": _decimal_text(netamount),
