@@ -1358,6 +1358,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
         errors: list[str] = []
         is_historical = is_historical_analysis_date(curr_date)
 
+        def _gap_reason(base_reason: str) -> str:
+            return (
+                f"{base_reason}；{'；'.join(errors)}"
+                if errors
+                else base_reason
+            )
+
         # Source 1: 东财（近 120 交易日逐日序列，可按 curr_date 截断）
         try:
             # 沪市：以 5、6、9 开头；其余为深市
@@ -1429,7 +1436,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 symbol=symbol,
                 requested_as_of=curr_date,
                 source="fund_flow_individual",
-                reason="historical new-algorithm evidence unavailable; legacy Web reference unavailable",
+                reason=_gap_reason(
+                    "historical new-algorithm evidence unavailable; legacy Web reference unavailable"
+                ),
             )
 
         # Source 3: 同花顺即时资金流净额快照（历史接口尚无当日收盘行时）。
@@ -1446,7 +1455,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     symbol=symbol,
                     requested_as_of=curr_date,
                     source="ths_instant_snapshot",
-                    reason="同花顺即时资金流净额快照无记录；该源不提供新浪 netamount/r0_net evidence",
+                    reason=_gap_reason(
+                        "同花顺即时资金流净额快照无记录；该源不提供新浪 netamount/r0_net evidence"
+                    ),
                 )
             row = stock_df.iloc[0]
             if "净额" not in stock_df.columns:
@@ -1456,7 +1467,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     symbol=symbol,
                     requested_as_of=curr_date,
                     source="ths_instant_snapshot",
-                    reason="同花顺即时资金流净额快照缺少净额字段；该源不提供新浪 netamount/r0_net evidence",
+                    reason=_gap_reason(
+                        "同花顺即时资金流净额快照缺少净额字段；该源不提供新浪 netamount/r0_net evidence"
+                    ),
                 )
             net_amount = _usable_fund_amount_text(row["净额"])
             if net_amount is None:
@@ -1466,7 +1479,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     symbol=symbol,
                     requested_as_of=curr_date,
                     source="ths_instant_snapshot",
-                    reason="同花顺即时资金流净额快照净额缺失或不可解析；该源不提供新浪 netamount/r0_net evidence",
+                    reason=_gap_reason(
+                        "同花顺即时资金流净额快照净额缺失或不可解析；该源不提供新浪 netamount/r0_net evidence"
+                    ),
                 )
 
             def _v(col: str) -> str:
