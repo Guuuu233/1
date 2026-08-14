@@ -550,7 +550,7 @@ def _classify_failure_value(value: Any) -> Optional[str]:
     return None
 
 
-def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, str]]:
+def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Build stable, serializable failure evidence for the report boundary."""
     if not isinstance(results, dict):
         return []
@@ -616,6 +616,99 @@ def _extract_source_as_of(value: Any, requested_as_of: str) -> Optional[str]:
     return max(dates) if dates else None
 
 
+_MANUAL_CALIBRATION_GAP_KEY = "manual_calibration_gap"
+_MANUAL_CALIBRATION_GAP_ANNOTATIONS = frozenset({
+    "kind",
+    "blocking",
+    "non_blocking",
+    "manual_calibration",
+    "automated_consensus_eligible",
+})
+
+
+def _get_manual_calibration_gap(value: Any) -> Optional[Dict[str, Any]]:
+    """Read only provider-attached manual calibration metadata."""
+    metadata = getattr(value, "fund_flow_evidence_meta", None)
+    if not isinstance(metadata, dict):
+        return None
+    gap = metadata.get(_MANUAL_CALIBRATION_GAP_KEY)
+    if not isinstance(gap, dict) or not gap:
+        return None
+    return copy.deepcopy(gap)
+
+
+def _manual_calibration_gap_key(gap: Any) -> str:
+    """Build a stable identity while ignoring retrieval-time churn."""
+    if not isinstance(gap, dict):
+        return ""
+    comparable = {
+        str(key): value
+        for key, value in gap.items()
+        if key not in _MANUAL_CALIBRATION_GAP_ANNOTATIONS and key != "retrieved_at"
+    }
+    return json.dumps(comparable, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _annotate_manual_calibration_gap(gap: Dict[str, Any]) -> Dict[str, Any]:
+    """Mark a preserved provider gap without changing its failure status."""
+    annotated = copy.deepcopy(gap)
+    annotated.update({
+        "kind": _MANUAL_CALIBRATION_GAP_KEY,
+        "blocking": False,
+        "non_blocking": True,
+        "manual_calibration": True,
+        "automated_consensus_eligible": False,
+    })
+    return annotated
+
+
+def _attach_manual_calibration_gap(
+    fund_flow_context: Dict[str, Any],
+    source_provenance: Dict[str, Dict[str, Any]],
+    data_failure_ledger: List[Dict[str, Any]],
+    source: str,
+    gap: Dict[str, Any],
+) -> None:
+    """Expose a provider gap in every collector audit surface exactly once."""
+    if not isinstance(gap, dict) or not gap:
+        return
+
+    raw_gap = copy.deepcopy(gap)
+    annotated_gap = _annotate_manual_calibration_gap(raw_gap)
+    fund_flow_context.setdefault(_MANUAL_CALIBRATION_GAP_KEY, raw_gap)
+    fund_flow_context[f"{_MANUAL_CALIBRATION_GAP_KEY}_non_blocking"] = True
+    fund_flow_context[f"{_MANUAL_CALIBRATION_GAP_KEY}_blocking"] = False
+
+    provenance_entry = source_provenance.setdefault(source, {})
+    existing_gap = provenance_entry.get(_MANUAL_CALIBRATION_GAP_KEY)
+    if not isinstance(existing_gap, dict):
+        provenance_entry[_MANUAL_CALIBRATION_GAP_KEY] = annotated_gap
+    elif _manual_calibration_gap_key(existing_gap) != _manual_calibration_gap_key(raw_gap):
+        gaps = provenance_entry.setdefault(f"{_MANUAL_CALIBRATION_GAP_KEY}s", [])
+        if not any(
+            isinstance(item, dict)
+            and _manual_calibration_gap_key(item) == _manual_calibration_gap_key(raw_gap)
+            for item in gaps
+        ):
+            gaps.append(annotated_gap)
+    provenance_entry[f"{_MANUAL_CALIBRATION_GAP_KEY}_non_blocking"] = True
+    provenance_entry[f"{_MANUAL_CALIBRATION_GAP_KEY}_blocking"] = False
+
+    gap_key = _manual_calibration_gap_key(raw_gap)
+    for entry in data_failure_ledger:
+        if not isinstance(entry, dict):
+            continue
+        existing = entry.get(_MANUAL_CALIBRATION_GAP_KEY)
+        if not isinstance(existing, dict) and entry.get("kind") == _MANUAL_CALIBRATION_GAP_KEY:
+            existing = entry
+        if isinstance(existing, dict) and _manual_calibration_gap_key(existing) == gap_key:
+            return
+
+    ledger_entry = copy.deepcopy(annotated_gap)
+    ledger_entry[_MANUAL_CALIBRATION_GAP_KEY] = annotated_gap
+    data_failure_ledger.append(ledger_entry)
+
+
 def _build_source_provenance(
     results: Dict[str, Any],
     requested_as_of: str,
@@ -642,6 +735,11 @@ def _build_source_provenance(
             entry["gap"] = f"【数据获取失败】{source}：{_compact_failure_reason(status)}"
         elif as_of is None and source != "realtime":
             entry["gap"] = f"【数据获取失败】{source}：未返回可验证数据日期"
+        manual_gap = _get_manual_calibration_gap(value)
+        if manual_gap is not None:
+            entry[_MANUAL_CALIBRATION_GAP_KEY] = _annotate_manual_calibration_gap(manual_gap)
+            entry[f"{_MANUAL_CALIBRATION_GAP_KEY}_non_blocking"] = True
+            entry[f"{_MANUAL_CALIBRATION_GAP_KEY}_blocking"] = False
         provenance[str(source)] = entry
     return provenance
 
@@ -708,10 +806,15 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
     fund_flow_value = results.get("fund_flow_individual")
     fund_flow_evidence = getattr(fund_flow_value, "fund_flow_evidence", None)
     fund_flow_evidence_meta = getattr(fund_flow_value, "fund_flow_evidence_meta", None)
+    if not isinstance(fund_flow_evidence_meta, dict):
+        fund_flow_evidence_meta = {}
+    else:
+        fund_flow_evidence_meta = copy.deepcopy(fund_flow_evidence_meta)
+    manual_calibration_gap = _get_manual_calibration_gap(fund_flow_value)
     if isinstance(fund_flow_evidence, list) and fund_flow_evidence:
         summary = summarize_evidence(fund_flow_evidence, window_days=5)
         fund_flow_context = {
-            **dict(fund_flow_evidence_meta or {}),
+            **fund_flow_evidence_meta,
             "records": copy.deepcopy(fund_flow_evidence),
             "summary": summary,
             "validation": {"status": "not_checked", "mismatches": []},
@@ -721,24 +824,28 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         else:
             fund_flow_context["status"] = "partial"
     else:
-        fund_flow_context = build_gap_meta(
+        generic_fund_flow_gap = build_gap_meta(
             symbol=ticker,
             requested_as_of=trade_date,
             source="fund_flow_individual",
             status="unavailable",
             reason="未返回结构化逐日 netamount/r0_net evidence",
         )
-        fund_flow_context.update({
+        fund_flow_context = {
+            **generic_fund_flow_gap,
+            **fund_flow_evidence_meta,
             "records": [],
             "summary": summarize_evidence([], window_days=5),
             "validation": {"status": "not_checked", "mismatches": []},
-        })
+            # Metadata can explain a gap, but no evidence means this is not a success.
+            "status": "unavailable",
+        }
         if not any(entry.get("source") == "fund_flow_individual" for entry in data_failure_ledger):
             data_failure_ledger.append({
                 "source": "fund_flow_individual",
                 "status": "unavailable",
                 "reason": "structured evidence unavailable",
-                "gap": fund_flow_context["gap"],
+                "gap": generic_fund_flow_gap["gap"],
             })
 
     # ── Parse CSV once, reuse for indicators and VPA ──────────────────
@@ -780,6 +887,14 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         trade_date,
         daily_context.get("as_of"),
     )
+    if manual_calibration_gap is not None:
+        _attach_manual_calibration_gap(
+            fund_flow_context,
+            source_provenance,
+            data_failure_ledger,
+            "fund_flow_individual",
+            manual_calibration_gap,
+        )
     ledger_sources = {
         str(entry.get("source"))
         for entry in data_failure_ledger
