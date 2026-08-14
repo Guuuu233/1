@@ -550,16 +550,43 @@ def _classify_failure_value(value: Any) -> Optional[str]:
     return None
 
 
-def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, str]]:
+def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Build stable, serializable failure evidence for the report boundary."""
     if not isinstance(results, dict):
         return []
 
-    entries: list[tuple[int, str, Dict[str, str]]] = []
+    entries: list[tuple[int, str, Dict[str, Any]]] = []
     source_rank = {source: index for index, source in enumerate(_DATA_FAILURE_SOURCE_ORDER)}
     for source, value in results.items():
         source_name = str(source).strip()
         if not source_name:
+            continue
+        structured_meta = getattr(value, "fund_flow_evidence_meta", None)
+        if isinstance(structured_meta, dict) and str(
+            structured_meta.get("status") or ""
+        ).lower() in {"failed", "timeout", "unavailable", "refused", "error"}:
+            status = str(structured_meta.get("status")).lower()
+            entry: Dict[str, Any] = {
+                "source": source_name,
+                "status": status,
+                "reason": str(
+                    structured_meta.get("reason") or _compact_failure_reason(status)
+                ),
+                "gap": str(
+                    structured_meta.get("gap")
+                    or f"【数据获取失败】{source_name}：{_compact_failure_reason(status)}"
+                ),
+            }
+            for key in ("attempted_sources", "fallback_errors", "final_source"):
+                if key in structured_meta:
+                    entry[key] = copy.deepcopy(structured_meta[key])
+            entries.append(
+                (
+                    source_rank.get(source_name, len(_DATA_FAILURE_SOURCE_ORDER)),
+                    source_name,
+                    entry,
+                )
+            )
             continue
         classified = _classify_failure_value(value)
         if classified is None:
@@ -633,6 +660,11 @@ def _build_source_provenance(
             "as_of": as_of,
             "status": status,
         }
+        structured_meta = getattr(value, "fund_flow_evidence_meta", None)
+        if source == "fund_flow_individual" and isinstance(structured_meta, dict):
+            for key in ("attempted_sources", "fallback_errors", "final_source"):
+                if key in structured_meta:
+                    entry[key] = copy.deepcopy(structured_meta[key])
         if source == "stock_data" and as_of and as_of < requested_as_of:
             entry["gap"] = (
                 f"【数据获取失败】stock_data：实际最新数据日 {as_of} "
@@ -721,13 +753,16 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         else:
             fund_flow_context["status"] = "partial"
     else:
-        fund_flow_context = build_gap_meta(
-            symbol=ticker,
-            requested_as_of=trade_date,
-            source="fund_flow_individual",
-            status="unavailable",
-            reason="未返回结构化逐日 netamount/r0_net evidence",
-        )
+        if isinstance(fund_flow_evidence_meta, dict) and fund_flow_evidence_meta:
+            fund_flow_context = copy.deepcopy(fund_flow_evidence_meta)
+        else:
+            fund_flow_context = build_gap_meta(
+                symbol=ticker,
+                requested_as_of=trade_date,
+                source="fund_flow_individual",
+                status="unavailable",
+                reason="未返回结构化逐日 netamount/r0_net evidence",
+            )
         fund_flow_context.update({
             "records": [],
             "summary": summarize_evidence([], window_days=5),

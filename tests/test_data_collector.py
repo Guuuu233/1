@@ -229,6 +229,42 @@ def test_failed_stock_data_enters_ledger_and_gap():
     assert result["market_data_context"]["source_provenance"]["stock_data"]["as_of"] is None
 
 
+def test_fund_flow_gap_provenance_keeps_attempt_chain_in_ledger():
+    from tradingagents.dataflows.fund_flow_evidence import FundFlowText
+    from tradingagents.graph import data_collector
+
+    attempted_sources = [
+        {
+            "source": "eastmoney_individual_fund_flow",
+            "status": "unavailable",
+            "reason": "typed gap",
+        },
+        {"source": "sina_historical", "status": "failed", "reason": "ConnectionError"},
+    ]
+    value = FundFlowText(
+        "fund flow unavailable",
+        evidence_meta={
+            "source": "fund_flow_individual",
+            "status": "unavailable",
+            "reason": "all fallbacks unavailable",
+            "gap": "fund flow gap",
+            "attempted_sources": attempted_sources,
+            "fallback_errors": attempted_sources,
+        },
+    )
+
+    ledger = data_collector._build_data_failure_ledger(
+        {"fund_flow_individual": value}
+    )
+    assert ledger[0]["attempted_sources"] == attempted_sources
+    provenance = data_collector._build_source_provenance(
+        {"fund_flow_individual": value},
+        "2026-08-11",
+        daily_as_of=None,
+    )
+    assert provenance["fund_flow_individual"]["fallback_errors"] == attempted_sources
+
+
 def test_fetch_all_completes_executor_with_fast_tools():
     with patch("tradingagents.graph.data_collector._safe", return_value=""), \
          patch("tradingagents.graph.data_collector.FETCH_ALL_TIMEOUT", 1):

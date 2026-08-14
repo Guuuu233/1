@@ -188,6 +188,22 @@ _FUND_AMOUNT_TEXT_RE = re.compile(
 )
 
 
+def _merge_fund_flow_attempt_meta(
+    metadata: dict,
+    attempted_sources: list[dict],
+    fallback_errors: list[dict],
+    *,
+    final_source: str | None = None,
+) -> dict:
+    """Attach redacted fallback provenance without changing evidence semantics."""
+    merged = dict(metadata or {})
+    merged["attempted_sources"] = [dict(item) for item in attempted_sources]
+    merged["fallback_errors"] = [dict(item) for item in fallback_errors]
+    if final_source:
+        merged["final_source"] = final_source
+    return merged
+
+
 def _sina_decimal(value) -> Decimal | None:
     """Parse a finite provider amount without introducing binary-float error."""
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -1381,28 +1397,72 @@ class CnAkshareProvider(BaseMarketDataProvider):
         ``净额`` 不是新浪历史 ``netamount``/``r0_net`` 同口径的主力序列；
         匹配目标行后必须先验证 ``净额`` 可用，带单位文本会原样保留。
         """
+        attempted_sources: list[dict] = []
+        fallback_errors: list[dict] = []
+        errors: list[str] = []
+
+        def _record_attempt(source: str, status: str, reason: str) -> None:
+            safe_reason = str(reason or "unspecified failure").strip()
+            # Never copy provider payloads or exception messages into audit metadata.
+            if "\n" in safe_reason or len(safe_reason) > 160:
+                safe_reason = "structured evidence unavailable"
+            entry = {"source": source, "status": status, "reason": safe_reason}
+            attempted_sources.append(entry)
+            if status not in {"available", "partial"}:
+                fallback_errors.append(dict(entry))
+
+        def _failure_response(text: str, *, source: str, reason: str) -> FundFlowText:
+            response = build_provider_text(
+                text,
+                symbol=symbol,
+                requested_as_of=curr_date or "",
+                source=source,
+                reason=reason,
+            )
+            response.fund_flow_evidence_meta.update(
+                _merge_fund_flow_attempt_meta(
+                    response.fund_flow_evidence_meta,
+                    attempted_sources,
+                    fallback_errors,
+                )
+            )
+            return response
+
+        def _em_failure_reason(result, fallback: str) -> str:
+            metadata = getattr(result, "fund_flow_evidence_meta", {}) or {}
+            reason = metadata.get("reason") if isinstance(metadata, dict) else None
+            return str(reason).strip() if reason else fallback
+
         if not curr_date:
-            return (
+            return _failure_response(
                 f"【数据获取失败】个股资金流向缺少 curr_date，无法做日期截断，"
-                f"{symbol} 本项不可用。"
+                f"{symbol} 本项不可用。",
+                source="fund_flow_individual",
+                reason="missing curr_date",
             )
         cutoff = parse_yyyymmdd(curr_date)
         if cutoff is None:
-            return f"【数据获取失败】个股资金流向 curr_date 无法解析：{curr_date!r}"
+            return _failure_response(
+                f"【数据获取失败】个股资金流向 curr_date 无法解析：{curr_date!r}",
+                source="fund_flow_individual",
+                reason="curr_date is not parseable",
+            )
 
         ak = self._ak()
         code = self._normalize_symbol(symbol)
-        errors: list[str] = []
         is_historical = is_historical_analysis_date(curr_date)
 
         # Source 1: 东财（近 120 交易日逐日序列，可按 curr_date 截断）
+        em_source = "eastmoney_individual_fund_flow"
         try:
             # 沪市：以 5、6、9 开头；其余为深市
             market = "sh" if code[:1] in ("5", "6", "9") else "sz"
             with AKSHARE_CALL_LOCK:
                 df = ak.stock_individual_fund_flow(stock=code, market=market)
             if df is None or df.empty:
-                errors.append("stock_individual_fund_flow: empty dataframe")
+                reason = "empty dataframe"
+                _record_attempt(em_source, "unavailable", reason)
+                errors.append(f"stock_individual_fund_flow: {reason}")
             else:
                 # Invalid or out-of-range Eastmoney data must not terminate the
                 # fallback chain. Only validated structured evidence is allowed
@@ -1412,6 +1472,15 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 )
                 em_failure = self._em_fund_flow_failure_reason(em_text, cutoff)
                 if em_failure is None:
+                    em_metadata = dict(
+                        getattr(em_text, "fund_flow_evidence_meta", {}) or {}
+                    )
+                    em_status = str(em_metadata.get("status") or "available")
+                    _record_attempt(
+                        em_source,
+                        em_status,
+                        em_metadata.get("reason") or "structured evidence available",
+                    )
                     return self._augment_new_algorithm_sources(
                         em_text,
                         ak=ak,
@@ -1419,14 +1488,24 @@ class CnAkshareProvider(BaseMarketDataProvider):
                         curr_date=curr_date,
                         code=code,
                         is_historical=is_historical,
+                        attempted_sources=attempted_sources,
+                        fallback_errors=fallback_errors,
                     )
-                errors.append(f"stock_individual_fund_flow: {em_failure}")
+                em_reason = _em_failure_reason(
+                    em_text,
+                    "structured evidence unavailable",
+                )
+                _record_attempt(em_source, "unavailable", em_reason)
+                errors.append(f"stock_individual_fund_flow: {em_reason}")
         except Exception as exc:
-            errors.append(f"stock_individual_fund_flow: {type(exc).__name__}")
+            reason = type(exc).__name__
+            _record_attempt(em_source, "failed", reason)
+            errors.append(f"stock_individual_fund_flow: {reason}")
 
         # Source 2.5: Sina Web is legacy reference only. Keep the typed
         # response for auditability, but it is never a successful main-force
         # evidence result or direction source.
+        sina_source = "sina_historical"
         try:
             hist_text = self._fetch_sina_historical_fund_flow(
                 symbol,
@@ -1442,66 +1521,81 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     "direction_allowed": False,
                     "reason": "新浪旧 Web 参考值，不驱动主力方向",
                 })
+                sina_status = str(metadata.get("status") or "available")
+                _record_attempt(sina_source, sina_status, metadata["reason"])
+                metadata = _merge_fund_flow_attempt_meta(
+                    metadata,
+                    attempted_sources,
+                    fallback_errors,
+                    final_source=sina_source,
+                )
                 return FundFlowText(
                     f"{hist_text}\n（新浪旧 Web 参考值：仅作降级参考，不驱动方向）",
                     evidence=getattr(hist_text, "fund_flow_evidence", []),
                     evidence_meta=metadata,
                 )
             if is_historical:
-                errors.append(
-                    "sina historical fund flow: no rows on or before curr_date"
-                )
+                reason = "no rows on or before curr_date"
             else:
-                errors.append(
-                    "sina historical fund flow: no current-day close row"
-                )
+                reason = "no current-day close row"
+            _record_attempt(sina_source, "unavailable", reason)
+            errors.append(f"sina historical fund flow: {reason}")
         except Exception as exc:
-            errors.append(f"sina historical fund flow: {type(exc).__name__}")
+            reason = type(exc).__name__
+            _record_attempt(sina_source, "failed", reason)
+            errors.append(f"sina historical fund flow: {reason}")
 
         if is_historical:
-            return build_provider_text(
+            return _failure_response(
                 f"【数据获取失败】历史日期 {curr_date} 新算法与新浪历史/legacy Web 资金流均不可用，"
                 f"{symbol} 本项不可用。（{'；'.join(errors)}）",
-                symbol=symbol,
-                requested_as_of=curr_date,
                 source="fund_flow_individual",
                 reason="historical new-algorithm evidence unavailable; legacy Web reference unavailable",
             )
 
         # Source 3: 同花顺即时资金流净额快照（历史接口尚无当日收盘行时）。
+        ths_source = "ths_instant_snapshot"
         try:
             with AKSHARE_CALL_LOCK:
                 df = ak.stock_fund_flow_individual(symbol="即时")
             if df is None or df.empty:
-                raise ValueError("empty dataframe")
-            stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
-            if stock_df.empty:
-                return build_provider_text(
+                reason = "empty dataframe"
+                _record_attempt(ths_source, "unavailable", reason)
+                errors.append(f"stock_fund_flow_individual: {reason}")
+                return _failure_response(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照无记录"
                     f"（{'；'.join(errors)}）",
-                    symbol=symbol,
-                    requested_as_of=curr_date,
-                    source="ths_instant_snapshot",
+                    source=ths_source,
+                    reason="同花顺即时资金流净额快照无记录；该源不提供新浪 netamount/r0_net evidence",
+                )
+            stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
+            if stock_df.empty:
+                reason = "no matching stock row"
+                _record_attempt(ths_source, "unavailable", reason)
+                return _failure_response(
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照无记录"
+                    f"（{'；'.join(errors)}）",
+                    source=ths_source,
                     reason="同花顺即时资金流净额快照无记录；该源不提供新浪 netamount/r0_net evidence",
                 )
             row = stock_df.iloc[0]
             if "净额" not in stock_df.columns:
-                return build_provider_text(
+                reason = "missing netamount field"
+                _record_attempt(ths_source, "unavailable", reason)
+                return _failure_response(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照缺少净额字段"
                     f"（{'；'.join(errors)}）",
-                    symbol=symbol,
-                    requested_as_of=curr_date,
-                    source="ths_instant_snapshot",
+                    source=ths_source,
                     reason="同花顺即时资金流净额快照缺少净额字段；该源不提供新浪 netamount/r0_net evidence",
                 )
             net_amount = _usable_fund_amount_text(row["净额"])
             if net_amount is None:
-                return build_provider_text(
+                reason = "invalid netamount value"
+                _record_attempt(ths_source, "unavailable", reason)
+                return _failure_response(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照净额缺失或不可解析"
                     f"（{'；'.join(errors)}）",
-                    symbol=symbol,
-                    requested_as_of=curr_date,
-                    source="ths_instant_snapshot",
+                    source=ths_source,
                     reason="同花顺即时资金流净额快照净额缺失或不可解析；该源不提供新浪 netamount/r0_net evidence",
                 )
 
@@ -1531,6 +1625,26 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 requested_as_of=curr_date,
                 field="netamount",
             )
+            ths_metadata = {
+                "symbol": symbol,
+                "requested_as_of": curr_date,
+                "retrieved_at": self._sina_retrieved_at(),
+                "source": ths_source,
+                "source_family": "ths",
+                "algorithm_group": "new_algorithm_group",
+                "period_kind": "realtime_single_day",
+                "unit": "亿元",
+                "status": "available",
+                "consensus": consensus,
+                "reason": "同花顺即时资金流净额是总净额，未将其等同于新浪历史 r0_net 主力序列",
+            }
+            _record_attempt(ths_source, "available", ths_metadata["reason"])
+            ths_metadata = _merge_fund_flow_attempt_meta(
+                ths_metadata,
+                attempted_sources,
+                fallback_errors,
+                final_source=ths_source,
+            )
             return FundFlowText(
                 (
                     f"【备用数据源：同花顺即时资金流净额快照】{symbol} 当日资金流净额快照"
@@ -1541,27 +1655,15 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     "属于同花顺新算法组总净额，仍不得视为 r0_net 主力序列）"
                 ),
                 evidence=evidence,
-                evidence_meta={
-                    "symbol": symbol,
-                    "requested_as_of": curr_date,
-                    "retrieved_at": self._sina_retrieved_at(),
-                    "source": "ths_instant_snapshot",
-                    "source_family": "ths",
-                    "algorithm_group": "new_algorithm_group",
-                    "period_kind": "realtime_single_day",
-                    "unit": "亿元",
-                    "status": "available",
-                    "consensus": consensus,
-                    "reason": "同花顺即时资金流净额是总净额，未将其等同于新浪历史 r0_net 主力序列",
-                },
+                evidence_meta=ths_metadata,
             )
         except Exception as exc:
-            errors.append(f"stock_fund_flow_individual: {type(exc).__name__}")
+            reason = type(exc).__name__
+            _record_attempt(ths_source, "failed", reason)
+            errors.append(f"stock_fund_flow_individual: {reason}")
 
-        return build_provider_text(
+        return _failure_response(
             f"【数据获取失败】个股资金流向数据获取失败（东财/新浪历史/同花顺即时资金流净额快照均失败：{'；'.join(errors)}）",
-            symbol=symbol,
-            requested_as_of=curr_date,
             source="fund_flow_individual",
             reason="东财/新浪历史/同花顺即时资金流净额快照均失败",
         )
@@ -1744,10 +1846,32 @@ class CnAkshareProvider(BaseMarketDataProvider):
         curr_date: str,
         code: str,
         is_historical: bool,
+        attempted_sources: list[dict] | None = None,
+        fallback_errors: list[dict] | None = None,
     ) -> FundFlowText:
         """Attach optional THS same-day evidence without changing EM fallback semantics."""
         evidence = list(getattr(value, "fund_flow_evidence", []) or [])
         metadata = dict(getattr(value, "fund_flow_evidence_meta", {}) or {})
+        attempted_sources = [dict(item) for item in (attempted_sources or [])]
+        fallback_errors = [dict(item) for item in (fallback_errors or [])]
+        em_source = str(metadata.get("source") or "eastmoney_individual_fund_flow")
+        metadata = _merge_fund_flow_attempt_meta(
+            metadata,
+            attempted_sources,
+            fallback_errors,
+            final_source=em_source,
+        )
+
+        def _append_optional_attempt(status: str, reason: str) -> None:
+            entry = {
+                "source": "ths_instant_snapshot",
+                "status": status,
+                "reason": reason,
+            }
+            attempted_sources.append(entry)
+            if status not in {"available", "partial"}:
+                fallback_errors.append(dict(entry))
+
         if not evidence:
             metadata["manual_calibration_gap"] = build_gap_meta(
                 symbol=symbol,
@@ -1761,11 +1885,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
             )
             return FundFlowText(str(value), evidence=evidence, evidence_meta=metadata)
         if is_historical:
-            return value
+            return FundFlowText(str(value), evidence=evidence, evidence_meta=metadata)
         try:
             with AKSHARE_CALL_LOCK:
                 snapshot = ak.stock_fund_flow_individual(symbol="即时")
             if snapshot is None or snapshot.empty or "股票代码" not in snapshot.columns:
+                _append_optional_attempt("unavailable", "snapshot unavailable")
                 metadata["manual_calibration_gap"] = build_gap_meta(
                     symbol=symbol,
                     requested_as_of=curr_date,
@@ -1776,9 +1901,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     algorithm_group="new_algorithm_group",
                     period_kind="realtime_single_day",
                 )
+                metadata = _merge_fund_flow_attempt_meta(
+                    metadata, attempted_sources, fallback_errors, final_source=em_source
+                )
                 return FundFlowText(str(value), evidence=evidence, evidence_meta=metadata)
             matched = snapshot[snapshot["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
             if matched.empty or "净额" not in matched.columns:
+                _append_optional_attempt("unavailable", "matching total-net snapshot unavailable")
                 metadata["manual_calibration_gap"] = build_gap_meta(
                     symbol=symbol,
                     requested_as_of=curr_date,
@@ -1788,6 +1917,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     retrieved_at=self._sina_retrieved_at(),
                     algorithm_group="new_algorithm_group",
                     period_kind="realtime_single_day",
+                )
+                metadata = _merge_fund_flow_attempt_meta(
+                    metadata, attempted_sources, fallback_errors, final_source=em_source
                 )
                 return FundFlowText(str(value), evidence=evidence, evidence_meta=metadata)
             ths_row = matched.iloc[0]
@@ -1805,6 +1937,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 retrieved_at=self._sina_retrieved_at(),
             )
             if not ths_records:
+                _append_optional_attempt("unavailable", "snapshot lacked a usable amount")
                 metadata["manual_calibration_gap"] = build_gap_meta(
                     symbol=symbol,
                     requested_as_of=curr_date,
@@ -1814,6 +1947,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     retrieved_at=self._sina_retrieved_at(),
                     algorithm_group="new_algorithm_group",
                     period_kind="realtime_single_day",
+                )
+                metadata = _merge_fund_flow_attempt_meta(
+                    metadata, attempted_sources, fallback_errors, final_source=em_source
                 )
                 return FundFlowText(str(value), evidence=evidence, evidence_meta=metadata)
             # THS instant ``净额`` is total-net, while EM's value is r0_net;
@@ -1835,9 +1971,21 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 "eastmoney_individual_fund_flow",
                 "ths_instant_snapshot",
             ]
+            _append_optional_attempt(
+                "available",
+                "optional total-net snapshot attached",
+            )
+            metadata = _merge_fund_flow_attempt_meta(
+                metadata, attempted_sources, fallback_errors, final_source=em_source
+            )
             return FundFlowText(str(value), evidence=all_records, evidence_meta=metadata)
         except Exception as exc:
-            metadata["consensus_source_warning"] = f"ths_instant_snapshot: {type(exc).__name__}"
+            reason = type(exc).__name__
+            _append_optional_attempt("failed", reason)
+            metadata["consensus_source_warning"] = f"ths_instant_snapshot: {reason}"
+            metadata = _merge_fund_flow_attempt_meta(
+                metadata, attempted_sources, fallback_errors, final_source=em_source
+            )
             return FundFlowText(str(value), evidence=evidence, evidence_meta=metadata)
 
     def _format_individual_fund_flow_em(
