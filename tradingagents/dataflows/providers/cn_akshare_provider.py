@@ -194,6 +194,7 @@ def _merge_fund_flow_attempt_meta(
     fallback_errors: list[dict],
     *,
     final_source: str | None = None,
+    em_typed_gap: dict | None = None,
 ) -> dict:
     """Attach redacted fallback provenance without changing evidence semantics."""
     merged = dict(metadata or {})
@@ -201,6 +202,8 @@ def _merge_fund_flow_attempt_meta(
     merged["fallback_errors"] = [dict(item) for item in fallback_errors]
     if final_source:
         merged["final_source"] = final_source
+    if em_typed_gap is not None:
+        merged["em_typed_gap"] = dict(em_typed_gap)
     return merged
 
 
@@ -1400,16 +1403,34 @@ class CnAkshareProvider(BaseMarketDataProvider):
         attempted_sources: list[dict] = []
         fallback_errors: list[dict] = []
         errors: list[str] = []
+        em_typed_gap: dict | None = None
 
-        def _record_attempt(source: str, status: str, reason: str) -> None:
+        def _safe_reason(reason: str) -> str:
             safe_reason = str(reason or "unspecified failure").strip()
             # Never copy provider payloads or exception messages into audit metadata.
             if "\n" in safe_reason or len(safe_reason) > 160:
                 safe_reason = "structured evidence unavailable"
-            entry = {"source": source, "status": status, "reason": safe_reason}
+            return safe_reason
+
+        def _record_attempt(source: str, status: str, reason: str) -> None:
+            entry = {
+                "source": source,
+                "status": status,
+                "reason": _safe_reason(reason),
+            }
             attempted_sources.append(entry)
             if status not in {"available", "partial"}:
                 fallback_errors.append(dict(entry))
+
+        def _em_gap_meta(reason: str) -> dict:
+            return build_gap_meta(
+                symbol=symbol,
+                requested_as_of=curr_date or "",
+                source="eastmoney_individual_fund_flow",
+                status="unavailable",
+                reason=_safe_reason(reason),
+                retrieved_at=self._sina_retrieved_at(),
+            )
 
         def _failure_response(text: str, *, source: str, reason: str) -> FundFlowText:
             response = build_provider_text(
@@ -1424,6 +1445,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     response.fund_flow_evidence_meta,
                     attempted_sources,
                     fallback_errors,
+                    em_typed_gap=em_typed_gap,
                 )
             )
             return response
@@ -1462,6 +1484,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             if df is None or df.empty:
                 reason = "empty dataframe"
                 _record_attempt(em_source, "unavailable", reason)
+                em_typed_gap = _em_gap_meta(reason)
                 errors.append(f"stock_individual_fund_flow: {reason}")
             else:
                 # Invalid or out-of-range Eastmoney data must not terminate the
@@ -1491,15 +1514,16 @@ class CnAkshareProvider(BaseMarketDataProvider):
                         attempted_sources=attempted_sources,
                         fallback_errors=fallback_errors,
                     )
-                em_reason = _em_failure_reason(
-                    em_text,
-                    "structured evidence unavailable",
-                )
+                em_reason = _em_failure_reason(em_text, em_failure)
                 _record_attempt(em_source, "unavailable", em_reason)
-                errors.append(f"stock_individual_fund_flow: {em_reason}")
+                em_typed_gap = _em_gap_meta(em_reason)
+                # Prompt-facing error keeps the fuller gap text (e.g. the
+                # ~120-trading-day range note) while audit metadata stays compact.
+                errors.append(f"stock_individual_fund_flow: {em_failure}")
         except Exception as exc:
             reason = type(exc).__name__
             _record_attempt(em_source, "failed", reason)
+            em_typed_gap = _em_gap_meta(reason)
             errors.append(f"stock_individual_fund_flow: {reason}")
 
         # Source 2.5: Sina Web is legacy reference only. Keep the typed
@@ -1528,6 +1552,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     attempted_sources,
                     fallback_errors,
                     final_source=sina_source,
+                    em_typed_gap=em_typed_gap,
                 )
                 return FundFlowText(
                     f"{hist_text}\n（新浪旧 Web 参考值：仅作降级参考，不驱动方向）",
@@ -1644,11 +1669,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 attempted_sources,
                 fallback_errors,
                 final_source=ths_source,
+                em_typed_gap=em_typed_gap,
             )
             return FundFlowText(
                 (
                     f"【备用数据源：同花顺即时资金流净额快照】{symbol} 当日资金流净额快照"
-                    f"（{curr_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
+                    f"（数据日期：{curr_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
                     f"资金净额: {net_amount} | 流入资金: {_v('流入资金')} | "
                     f"流出资金: {_v('流出资金')} | 换手率: {_v('换手率')}\n"
                     "（该快照不是新浪历史 netamount/r0_net 同口径主力序列；"

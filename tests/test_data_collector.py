@@ -265,6 +265,28 @@ def test_fund_flow_gap_provenance_keeps_attempt_chain_in_ledger():
     assert provenance["fund_flow_individual"]["fallback_errors"] == attempted_sources
 
 
+def test_fund_flow_ths_snapshot_text_exposes_data_date_for_provenance():
+    """THS fallback success must not be reported as an unverified as-of gap."""
+    from tradingagents.dataflows.fund_flow_evidence import FundFlowText
+    from tradingagents.graph import data_collector
+
+    value = FundFlowText(
+        "【备用数据源：同花顺即时资金流净额快照】600519 当日资金流净额快照"
+        "（数据日期：2026-08-11，最新价 1358.98，涨跌幅 0.62%）：\n"
+        "资金净额: 3.61亿\n",
+        evidence=[{"date": "2026-08-11", "r0_net": "1.0"}],
+        evidence_meta={"source": "ths_instant_snapshot", "status": "available"},
+    )
+    provenance = data_collector._build_source_provenance(
+        {"fund_flow_individual": value},
+        "2026-08-11",
+        daily_as_of=None,
+    )
+    assert provenance["fund_flow_individual"]["as_of"] == "2026-08-11"
+    assert provenance["fund_flow_individual"]["status"] == "available"
+    assert "gap" not in provenance["fund_flow_individual"]
+
+
 def test_fetch_all_completes_executor_with_fast_tools():
     with patch("tradingagents.graph.data_collector._safe", return_value=""), \
          patch("tradingagents.graph.data_collector.FETCH_ALL_TIMEOUT", 1):

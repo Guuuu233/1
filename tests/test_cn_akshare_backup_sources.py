@@ -114,6 +114,18 @@ def test_individual_fund_flow_rejects_invalid_em_evidence_before_sina_fallback()
     assert "新浪 fallback" in out
     assert "fake Eastmoney hit" not in out
     ak.stock_fund_flow_individual.assert_not_called()
+    metadata = out.fund_flow_evidence_meta
+    assert metadata["attempted_sources"][0] == {
+        "source": "eastmoney_individual_fund_flow",
+        "status": "unavailable",
+        "reason": "structured evidence row 0 lacks finite r0_net",
+    }
+    assert metadata["em_typed_gap"]["source"] == "eastmoney_individual_fund_flow"
+    assert metadata["em_typed_gap"]["status"] == "unavailable"
+    assert metadata["em_typed_gap"]["reason"] == (
+        "structured evidence row 0 lacks finite r0_net"
+    )
+    assert "【数据获取失败】" in metadata["em_typed_gap"]["gap"]
 
 
 def test_typed_em_gap_to_sina_success_keeps_fallback_provenance():
@@ -153,6 +165,12 @@ def test_typed_em_gap_to_sina_success_keeps_fallback_provenance():
     }
     assert metadata["attempted_sources"][-1]["source"] == "sina_historical"
     assert metadata["fallback_errors"] == [metadata["attempted_sources"][0]]
+    assert metadata["em_typed_gap"]["source"] == "eastmoney_individual_fund_flow"
+    assert metadata["em_typed_gap"]["status"] == "unavailable"
+    assert metadata["em_typed_gap"]["reason"] == (
+        "no finite r0_net rows on or before curr_date"
+    )
+    assert "【数据获取失败】" in metadata["em_typed_gap"]["gap"]
 
 
 def test_typed_em_gap_to_ths_success_keeps_fallback_provenance():
@@ -195,7 +213,13 @@ def test_typed_em_gap_to_ths_success_keeps_fallback_provenance():
         "no finite r0_net rows on or before curr_date"
     )
     assert metadata["fallback_errors"] == metadata["attempted_sources"][:2]
+    assert metadata["em_typed_gap"]["source"] == "eastmoney_individual_fund_flow"
+    assert metadata["em_typed_gap"]["status"] == "unavailable"
+    assert metadata["em_typed_gap"]["reason"] == (
+        "no finite r0_net rows on or before curr_date"
+    )
     assert "资金净额: 3.61亿" in out
+    assert f"数据日期：{today}" in out
 
 
 def test_format_em_out_of_range_returns_typed_gap():
