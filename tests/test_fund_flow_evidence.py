@@ -76,6 +76,25 @@ def test_002167_five_day_sum_does_not_round_or_shift_decimal():
     assert Decimal(summary["r0_net"]).quantize(Decimal("0.0001")) == Decimal("1.5739")
 
 
+def test_summarize_rejects_polluted_date_without_silent_sum():
+    rows = [dict(row) for row in _002167_ROWS]
+    rows[-1]["opendate"] = "2026-08-07garbage"
+    evidence = build_sina_evidence(
+        rows,
+        symbol="002167.SZ",
+        requested_as_of="2026-08-13",
+        retrieved_at=None,
+    )
+    summary = summarize_evidence(evidence)
+
+    assert summary["status"] == "data_conflict"
+    assert summary["netamount"] is None
+    assert summary["r0_net"] is None
+    assert summary["required_window_days"] == 5
+    assert summary["invalid_records"] == ["unparseable_date"]
+    assert "无效日期" in summary["reason"]
+
+
 def test_summarize_rejects_duplicate_dates_before_selecting_window():
     evidence = build_sina_evidence(
         _002167_ROWS,

@@ -61,6 +61,7 @@ _AMOUNT_RE = re.compile(
     r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*"
     r"(万亿|亿元|万元|亿|万|元)?\s*$"
 )
+_DATE_FORMATS = ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S")
 
 
 class FundFlowText(str):
@@ -247,13 +248,15 @@ def _normalise_date_text(value: Any) -> str | None:
     if not text:
         return None
     # Provider frames commonly stringify a date as ``YYYY-MM-DD 00:00:00``.
-    # Keep the calendar date only so equivalent source rows align.
-    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
-        text = text[:10]
-    try:
-        return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
-    except ValueError:
-        return None
+    # Accept only complete, round-trippable formats; never discard a suffix.
+    for date_format in _DATE_FORMATS:
+        try:
+            parsed = datetime.strptime(text, date_format)
+        except ValueError:
+            continue
+        if parsed.strftime(date_format) == text:
+            return parsed.date().isoformat()
+    return None
 
 
 def _date_value(row: Mapping[str, Any]) -> str | None:
