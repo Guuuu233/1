@@ -89,6 +89,42 @@ def test_individual_fund_flow_falls_back_to_ths_when_em_fails():
     assert "600519" in out
 
 
+def test_individual_fund_flow_nonempty_invalid_em_falls_back_with_typed_ths_evidence():
+    curr_date = cn_today_str()
+    em_df = pd.DataFrame(
+        {
+            "日期": [curr_date],
+            "主力净流入-净额": ["not-a-number"],
+        }
+    )
+    ths_df = pd.DataFrame(
+        {
+            "股票代码": ["600519"],
+            "股票简称": ["贵州茅台"],
+            "最新价": [1358.98],
+            "涨跌幅": ["0.62%"],
+            "流入资金": ["26.30亿"],
+            "流出资金": ["22.69亿"],
+            "净额": ["3.61亿"],
+            "换手率": ["0.29%"],
+        }
+    )
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.return_value = em_df
+    ak.stock_fund_flow_individual.return_value = ths_df
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+    with patch("requests.get", side_effect=ConnectionError("Sina history unavailable")):
+        out = p.get_individual_fund_flow("600519", curr_date=curr_date)
+
+    assert "同花顺即时资金流净额快照" in out
+    assert out.fund_flow_evidence
+    assert out.fund_flow_evidence[0]["source"] == "ths_instant_snapshot"
+    assert out.fund_flow_evidence_meta["source"] == "ths_instant_snapshot"
+    assert out.fund_flow_evidence_meta["status"] == "available"
+    ak.stock_fund_flow_individual.assert_called_once_with(symbol="即时")
+
+
 def test_individual_fund_flow_sina_refuses_historical_date():
     """Historical date: the THS instant snapshot must never leak (anti-lookahead).
 
@@ -97,7 +133,9 @@ def test_individual_fund_flow_sina_refuses_historical_date():
     instant snapshot.
     """
     ak = MagicMock()
-    ak.stock_individual_fund_flow.side_effect = ConnectionError("RemoteDisconnected")
+    ak.stock_individual_fund_flow.return_value = pd.DataFrame(
+        {"日期": [cn_today_str()], "主力净流入-净额": ["not-a-number"]}
+    )
     ak.stock_fund_flow_individual.return_value = pd.DataFrame(
         {"股票代码": ["600519"], "净额": ["3.61亿"]}
     )
@@ -106,6 +144,12 @@ def test_individual_fund_flow_sina_refuses_historical_date():
     past = (pd.Timestamp(cn_today_str()) - timedelta(days=90)).strftime("%Y-%m-%d")
     with patch("requests.get", side_effect=ConnectionError("RemoteDisconnected")):
         out = p.get_individual_fund_flow("600519", curr_date=past)
+    meta = out.fund_flow_evidence_meta
+    required = (
+        "stock_individual_fund_flow: formatter failure:",
+        "sina historical fund flow: ConnectionError",
+    )
+    assert all(token in meta[field] for field in ("reason", "gap") for token in required)
     assert "历史日期" in out
     assert "不可用" in out
     assert "同花顺即时资金流净额快照" not in out

@@ -1358,6 +1358,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
         errors: list[str] = []
         is_historical = is_historical_analysis_date(curr_date)
 
+        def _gap_reason(base_reason: str) -> str:
+            return (
+                f"{base_reason}；{'；'.join(errors)}"
+                if errors
+                else base_reason
+            )
+
         # Source 1: 东财（近 120 交易日逐日序列，可按 curr_date 截断）
         try:
             # 沪市：以 5、6、9 开头；其余为深市
@@ -1368,13 +1375,21 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 errors.append("stock_individual_fund_flow: empty dataframe")
             else:
                 # Invalid or out-of-range Eastmoney data must not terminate the
-                # fallback chain. The formatter returns None for unusable data;
-                # valid records are rendered and returned immediately.
+                # fallback chain. Only formatted text with evidence is a success;
+                # retain any formatter failure detail for the final typed gap.
                 em_text = self._format_individual_fund_flow_em(
                     df, symbol, curr_date, cutoff
                 )
-                if em_text is not None and isinstance(getattr(em_text, "fund_flow_evidence", None), list) and getattr(em_text, "fund_flow_evidence", None):
+                em_evidence = getattr(em_text, "fund_flow_evidence", None)
+                if em_text is not None and isinstance(em_evidence, list) and em_evidence:
                     return em_text
+                em_meta = getattr(em_text, "fund_flow_evidence_meta", None) or {}
+                if em_meta.get("reason"):
+                    errors.append(
+                        f"stock_individual_fund_flow: formatter reason: {em_meta['reason']}"
+                    )
+                if em_text:
+                    errors.append(f"stock_individual_fund_flow: formatter failure: {em_text}")
                 errors.append("stock_individual_fund_flow: structured evidence unavailable")
                 errors.append("stock_individual_fund_flow: invalid or empty usable rows")
         except Exception as exc:
@@ -1421,7 +1436,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 symbol=symbol,
                 requested_as_of=curr_date,
                 source="fund_flow_individual",
-                reason="historical new-algorithm evidence unavailable; legacy Web reference unavailable",
+                reason=_gap_reason(
+                    "historical new-algorithm evidence unavailable; legacy Web reference unavailable"
+                ),
             )
 
         # Source 3: 同花顺即时资金流净额快照（历史接口尚无当日收盘行时）。
@@ -1438,7 +1455,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     symbol=symbol,
                     requested_as_of=curr_date,
                     source="ths_instant_snapshot",
-                    reason="同花顺即时资金流净额快照无记录；该源不提供新浪 netamount/r0_net evidence",
+                    reason=_gap_reason(
+                        "同花顺即时资金流净额快照无记录；该源不提供新浪 netamount/r0_net evidence"
+                    ),
                 )
             row = stock_df.iloc[0]
             if "净额" not in stock_df.columns:
@@ -1448,7 +1467,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     symbol=symbol,
                     requested_as_of=curr_date,
                     source="ths_instant_snapshot",
-                    reason="同花顺即时资金流净额快照缺少净额字段；该源不提供新浪 netamount/r0_net evidence",
+                    reason=_gap_reason(
+                        "同花顺即时资金流净额快照缺少净额字段；该源不提供新浪 netamount/r0_net evidence"
+                    ),
                 )
             net_amount = _usable_fund_amount_text(row["净额"])
             if net_amount is None:
@@ -1458,7 +1479,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     symbol=symbol,
                     requested_as_of=curr_date,
                     source="ths_instant_snapshot",
-                    reason="同花顺即时资金流净额快照净额缺失或不可解析；该源不提供新浪 netamount/r0_net evidence",
+                    reason=_gap_reason(
+                        "同花顺即时资金流净额快照净额缺失或不可解析；该源不提供新浪 netamount/r0_net evidence"
+                    ),
                 )
 
             def _v(col: str) -> str:
@@ -1514,12 +1537,15 @@ class CnAkshareProvider(BaseMarketDataProvider):
         except Exception as exc:
             errors.append(f"stock_fund_flow_individual: {type(exc).__name__}")
 
+        gap_reason = "东财/新浪历史/同花顺即时资金流净额快照均失败"
+        if errors:
+            gap_reason = f"{gap_reason}；{'；'.join(errors)}"
         return build_provider_text(
             f"【数据获取失败】个股资金流向数据获取失败（东财/新浪历史/同花顺即时资金流净额快照均失败：{'；'.join(errors)}）",
             symbol=symbol,
             requested_as_of=curr_date,
             source="fund_flow_individual",
-            reason="东财/新浪历史/同花顺即时资金流净额快照均失败",
+            reason=gap_reason,
         )
 
     def _fetch_sina_historical_fund_flow(
@@ -1805,13 +1831,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
     ) -> str | None:
         """Format the Eastmoney per-day fund-flow series truncated to curr_date.
 
-        Returns a formatted report string when usable records remain on or
-        before ``curr_date``.  When nothing usable remains (``curr_date`` is
-        outside the ~120-trading-day window or dates are unparseable), it
-        returns an explicit 【数据获取失败】 refusal string instead — it never
-        returns ``None`` and never falls back to a same-day snapshot, so a
-        historical-date query is surfaced as a refusal rather than risking
-        lookahead bias.  The caller therefore returns this value directly.
+        Returns evidence-bearing ``FundFlowText`` only when usable records
+        remain on or before ``curr_date``.  When nothing usable remains
+        (``curr_date`` is outside the ~120-trading-day window or dates/amounts
+        are unusable), it may return an ordinary failure string or ``None``;
+        the caller must keep the failure detail and continue its fallback chain.
         """
         date_col = "日期" if "日期" in df.columns else None
         value_col = "主力净流入-净额" if "主力净流入-净额" in df.columns else None
