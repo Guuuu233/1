@@ -294,7 +294,11 @@ def test_fetch_all_propagates_manual_calibration_gap_to_ledger_and_provenance():
 
     provenance = context["source_provenance"]["fund_flow_individual"]
     assert provenance["status"] == "available"
-    assert provenance["manual_calibration_gap"] == manual_gap
+    provenance_gap = provenance["manual_calibration_gap"]
+    assert {key: provenance_gap[key] for key in manual_gap} == manual_gap
+    assert provenance_gap["gap_type"] == "manual_calibration_gap"
+    assert provenance_gap["blocking"] is False
+    assert provenance_gap["non_blocking"] is True
 
     manual_entries = [
         entry

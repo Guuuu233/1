@@ -698,7 +698,13 @@ def _build_source_provenance(
         if source == "fund_flow_individual":
             manual_gap = _extract_manual_calibration_gap(value)
             if manual_gap is not None:
-                entry["manual_calibration_gap"] = manual_gap
+                provenance_gap = copy.deepcopy(manual_gap)
+                provenance_gap.update({
+                    "gap_type": "manual_calibration_gap",
+                    "blocking": False,
+                    "non_blocking": True,
+                })
+                entry["manual_calibration_gap"] = provenance_gap
         provenance[str(source)] = entry
     return provenance
 
