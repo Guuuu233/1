@@ -116,6 +116,88 @@ def test_individual_fund_flow_rejects_invalid_em_evidence_before_sina_fallback()
     ak.stock_fund_flow_individual.assert_not_called()
 
 
+def test_typed_em_gap_to_sina_success_keeps_fallback_provenance():
+    today = cn_today_str()
+    em_gap = FundFlowText(
+        "东财 typed gap",
+        evidence=[],
+        evidence_meta={
+            "source": "eastmoney_individual_fund_flow",
+            "status": "unavailable",
+            "reason": "no finite r0_net rows on or before curr_date",
+        },
+    )
+    sina = FundFlowText(
+        "新浪 fallback",
+        evidence=[{"date": today, "r0_net": "1.0"}],
+        evidence_meta={
+            "source": "sina_historical",
+            "status": "available",
+        },
+    )
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.return_value = pd.DataFrame({"raw": [1]})
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+    with patch.object(p, "_format_individual_fund_flow_em", return_value=em_gap), \
+         patch.object(p, "_fetch_sina_historical_fund_flow", return_value=sina):
+        out = p.get_individual_fund_flow("600519", curr_date=today)
+
+    metadata = out.fund_flow_evidence_meta
+    assert metadata["source"] == "sina_historical"
+    assert metadata["final_source"] == "sina_historical"
+    assert metadata["attempted_sources"][0] == {
+        "source": "eastmoney_individual_fund_flow",
+        "status": "unavailable",
+        "reason": "no finite r0_net rows on or before curr_date",
+    }
+    assert metadata["attempted_sources"][-1]["source"] == "sina_historical"
+    assert metadata["fallback_errors"] == [metadata["attempted_sources"][0]]
+
+
+def test_typed_em_gap_to_ths_success_keeps_fallback_provenance():
+    today = cn_today_str()
+    em_gap = FundFlowText(
+        "东财 typed gap",
+        evidence=[],
+        evidence_meta={
+            "source": "eastmoney_individual_fund_flow",
+            "status": "unavailable",
+            "reason": "no finite r0_net rows on or before curr_date",
+        },
+    )
+    ths_df = pd.DataFrame(
+        {
+            "股票代码": ["600519"],
+            "净额": ["3.61亿"],
+            "最新价": ["1358.98"],
+            "涨跌幅": ["0.62%"],
+        }
+    )
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.return_value = pd.DataFrame({"raw": [1]})
+    ak.stock_fund_flow_individual.return_value = ths_df
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+    with patch.object(p, "_format_individual_fund_flow_em", return_value=em_gap), \
+         patch.object(p, "_fetch_sina_historical_fund_flow", return_value=None):
+        out = p.get_individual_fund_flow("600519", curr_date=today)
+
+    metadata = out.fund_flow_evidence_meta
+    assert metadata["source"] == "ths_instant_snapshot"
+    assert metadata["final_source"] == "ths_instant_snapshot"
+    assert [item["source"] for item in metadata["attempted_sources"]] == [
+        "eastmoney_individual_fund_flow",
+        "sina_historical",
+        "ths_instant_snapshot",
+    ]
+    assert metadata["attempted_sources"][0]["reason"] == (
+        "no finite r0_net rows on or before curr_date"
+    )
+    assert metadata["fallback_errors"] == metadata["attempted_sources"][:2]
+    assert "资金净额: 3.61亿" in out
+
+
 def test_format_em_out_of_range_returns_typed_gap():
     provider = CnAkshareProvider()
     cutoff = pd.Timestamp("2026-01-01").date()
