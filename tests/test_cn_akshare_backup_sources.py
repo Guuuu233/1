@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
+from tradingagents.dataflows.fund_flow_evidence import FundFlowText
 from tradingagents.dataflows.providers.cn_akshare_provider import CnAkshareProvider
 from tradingagents.dataflows.trade_calendar import cn_today_str
 
@@ -87,6 +88,50 @@ def test_individual_fund_flow_falls_back_to_ths_when_em_fails():
     assert "资金净额: 3.61亿" in out
     assert "不是新浪历史 netamount/r0_net 同口径主力序列" in out
     assert "600519" in out
+
+
+def test_individual_fund_flow_rejects_invalid_em_evidence_before_sina_fallback():
+    """Non-finite structured EM evidence must not stop the source chain."""
+    today = cn_today_str()
+    invalid_em = FundFlowText(
+        "fake Eastmoney hit",
+        evidence=[{"date": today, "r0_net": "not-a-number"}],
+    )
+    sina = FundFlowText(
+        "新浪 fallback",
+        evidence=[{"date": today, "r0_net": "1.0"}],
+    )
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.return_value = pd.DataFrame(
+        {"日期": [today], "主力净流入-净额": [1.0]}
+    )
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+    with patch.object(p, "_format_individual_fund_flow_em", return_value=invalid_em), \
+         patch.object(p, "_fetch_sina_historical_fund_flow", return_value=sina):
+        out = p.get_individual_fund_flow("600519", curr_date=today)
+
+    assert "新浪 fallback" in out
+    assert "fake Eastmoney hit" not in out
+    ak.stock_fund_flow_individual.assert_not_called()
+
+
+def test_format_em_out_of_range_returns_typed_gap():
+    provider = CnAkshareProvider()
+    cutoff = pd.Timestamp("2026-01-01").date()
+    out = provider._format_individual_fund_flow_em(
+        pd.DataFrame(
+            {"日期": ["2026-08-13"], "主力净流入-净额": [1.0]}
+        ),
+        "600519",
+        "2026-01-01",
+        cutoff,
+    )
+
+    assert isinstance(out, FundFlowText)
+    assert out.fund_flow_evidence == []
+    assert out.fund_flow_evidence_meta["status"] == "unavailable"
+    assert "超出可得范围" in out
 
 
 def test_individual_fund_flow_sina_refuses_historical_date():

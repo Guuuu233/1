@@ -1334,6 +1334,40 @@ class CnAkshareProvider(BaseMarketDataProvider):
             )
         return f"板块资金流向排名（共{total}个板块，前10名）：\n{result}"
 
+    @staticmethod
+    def _em_fund_flow_failure_reason(result, cutoff) -> str | None:
+        """Explain why an Eastmoney result cannot end the fallback chain."""
+        if not isinstance(result, FundFlowText):
+            if isinstance(result, str) and result.strip():
+                return f"untyped formatter result: {result.strip()}"
+            return "formatter returned no typed result"
+
+        evidence = getattr(result, "fund_flow_evidence", None)
+        if not isinstance(evidence, list) or not evidence:
+            metadata = getattr(result, "fund_flow_evidence_meta", {}) or {}
+            metadata_reason = metadata.get("reason") if isinstance(metadata, dict) else None
+            return (
+                "structured evidence unavailable"
+                + (f": {metadata_reason}" if metadata_reason else "")
+            )
+
+        for index, record in enumerate(evidence):
+            if not isinstance(record, dict):
+                return f"structured evidence row {index} is not a mapping"
+            evidence_date = parse_yyyymmdd(
+                record.get("measurement_date") or record.get("date")
+            )
+            if evidence_date is None:
+                return f"structured evidence row {index} has no valid date"
+            if evidence_date > cutoff:
+                return f"structured evidence row {index} is after curr_date"
+            if "status" in record and record.get("status") != "available":
+                return f"structured evidence row {index} status={record.get('status')!r}"
+            amount = safe_float(record.get("r0_net"))
+            if amount is None or not math.isfinite(amount):
+                return f"structured evidence row {index} lacks finite r0_net"
+        return None
+
     def get_individual_fund_flow(self, symbol: str, curr_date: str = None) -> str:
         """获取个股近期主力资金净流向，并按 curr_date 截断。
 
@@ -1368,15 +1402,22 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 errors.append("stock_individual_fund_flow: empty dataframe")
             else:
                 # Invalid or out-of-range Eastmoney data must not terminate the
-                # fallback chain. The formatter returns None for unusable data;
-                # valid records are rendered and returned immediately.
+                # fallback chain. Only validated structured evidence is allowed
+                # to return (and then retain the normal THS/App augmentation).
                 em_text = self._format_individual_fund_flow_em(
                     df, symbol, curr_date, cutoff
                 )
-                if em_text is not None and isinstance(getattr(em_text, "fund_flow_evidence", None), list) and getattr(em_text, "fund_flow_evidence", None):
-                    return em_text
-                errors.append("stock_individual_fund_flow: structured evidence unavailable")
-                errors.append("stock_individual_fund_flow: invalid or empty usable rows")
+                em_failure = self._em_fund_flow_failure_reason(em_text, cutoff)
+                if em_failure is None:
+                    return self._augment_new_algorithm_sources(
+                        em_text,
+                        ak=ak,
+                        symbol=symbol,
+                        curr_date=curr_date,
+                        code=code,
+                        is_historical=is_historical,
+                    )
+                errors.append(f"stock_individual_fund_flow: {em_failure}")
         except Exception as exc:
             errors.append(f"stock_individual_fund_flow: {type(exc).__name__}")
 
@@ -1805,18 +1846,23 @@ class CnAkshareProvider(BaseMarketDataProvider):
     ) -> str | None:
         """Format the Eastmoney per-day fund-flow series truncated to curr_date.
 
-        Returns a formatted report string when usable records remain on or
-        before ``curr_date``.  When nothing usable remains (``curr_date`` is
-        outside the ~120-trading-day window or dates are unparseable), it
-        returns an explicit 【数据获取失败】 refusal string instead — it never
-        returns ``None`` and never falls back to a same-day snapshot, so a
-        historical-date query is surfaced as a refusal rather than risking
-        lookahead bias.  The caller therefore returns this value directly.
+        A usable result is a ``FundFlowText`` carrying non-empty structured
+        ``r0_net`` evidence.  Missing fields, invalid dates, and out-of-range
+        rows return a typed evidence-gap result so the caller can continue to
+        the applicable Sina/THS fallback instead of treating refusal text as a
+        successful hit.
         """
         date_col = "日期" if "日期" in df.columns else None
         value_col = "主力净流入-净额" if "主力净流入-净额" in df.columns else None
         if date_col is None or value_col is None:
-            return None
+            return build_provider_text(
+                f"【数据获取失败】东财资金流结果缺少 日期/主力净流入-净额 字段，"
+                f"{symbol} 本项不可用。",
+                symbol=symbol,
+                requested_as_of=curr_date,
+                source="eastmoney_individual_fund_flow",
+                reason="missing date or r0_net field",
+            )
 
         dates = pd.to_datetime(df[date_col], errors="coerce")
         values = pd.to_numeric(df[value_col], errors="coerce")
@@ -1826,14 +1872,25 @@ class CnAkshareProvider(BaseMarketDataProvider):
         df[value_col] = values[valid]
         df = df[df[date_col] <= pd.Timestamp(cutoff)]
         if df.empty:
-            return (
+            return build_provider_text(
                 f"【数据获取失败】资金流数据仅覆盖最近约 120 个交易日，"
-                f"{curr_date} 超出可得范围，{symbol} 本项不可用。"
+                f"{curr_date} 超出可得范围，{symbol} 本项不可用。",
+                symbol=symbol,
+                requested_as_of=curr_date,
+                source="eastmoney_individual_fund_flow",
+                reason="no finite r0_net rows on or before curr_date",
             )
 
         df_recent = chronological(take_latest(df, date_col, 5), date_col)
         if df_recent is None or df_recent.empty:
-            return None
+            return build_provider_text(
+                f"【数据获取失败】东财资金流结果在日期截断后无可用记录，"
+                f"{curr_date} 下 {symbol} 本项不可用。",
+                symbol=symbol,
+                requested_as_of=curr_date,
+                source="eastmoney_individual_fund_flow",
+                reason="no rows after recent-window selection",
+            )
         latest_day = pd.to_datetime(df_recent[date_col], errors="coerce").max()
         latest_str = latest_day.date().isoformat() if pd.notna(latest_day) else curr_date
         retrieved_at = self._sina_retrieved_at()
@@ -1843,6 +1900,15 @@ class CnAkshareProvider(BaseMarketDataProvider):
             requested_as_of=curr_date,
             retrieved_at=retrieved_at,
         )
+        if not evidence:
+            return build_provider_text(
+                f"【数据获取失败】东财资金流结果在日期截断后无可用结构化 evidence，"
+                f"{curr_date} 下 {symbol} 本项不可用。",
+                symbol=symbol,
+                requested_as_of=curr_date,
+                source="eastmoney_individual_fund_flow",
+                reason="structured evidence empty after date truncation",
+            )
         consensus = build_consensus_evidence(
             evidence,
             symbol=symbol,
