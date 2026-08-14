@@ -292,7 +292,14 @@ class CnClsProvider(BaseMarketDataProvider):
                 request_url=request_url or CLS_LATEST_ENDPOINT,
                 retrieved_at=retrieved_at,
             )
-            return self._format(latest[:limit], analysis_iso, False, None, snapshot)
+            return self._format(
+                latest[:limit],
+                analysis_iso,
+                False,
+                None,
+                snapshot,
+                look_back_days=look_back_days,
+            )
 
         cursor = analysis_ctime + 1
         lower_bound = analysis_ctime - max(0, int(look_back_days)) * 86400
@@ -457,8 +464,29 @@ class CnClsProvider(BaseMarketDataProvider):
         return self._format(unique_items[:limit], analysis_iso, coverage_complete, gap, manifest_path)
 
     @staticmethod
-    def _format(items: list[dict[str, Any]], analysis_as_of: str, coverage_complete: bool, gap: dict[str, Any] | None, artifact_path: str | None) -> str:
-        output = [f"## 财联社电报（来源：财联社；analysis_as_of={analysis_as_of}；coverage_complete={str(coverage_complete).lower()}）"]
+    def _format(
+        items: list[dict[str, Any]],
+        analysis_as_of: str,
+        coverage_complete: bool,
+        gap: dict[str, Any] | None,
+        artifact_path: str | None,
+        *,
+        look_back_days: int | None = None,
+    ) -> str:
+        if not coverage_complete:
+            mode = "live/near-window 最新缓存，仅供近实时使用"
+            window_note = (
+                f"；look_back_days={look_back_days} 未被视为完整历史回溯"
+                if look_back_days is not None
+                else ""
+            )
+        else:
+            mode = "历史分页集合"
+            window_note = ""
+        output = [
+            f"## 财联社电报（来源：财联社；{mode}；analysis_as_of={analysis_as_of}；"
+            f"coverage_complete={str(coverage_complete).lower()}{window_note}）"
+        ]
         if gap:
             output.append(f"数据缺口（{gap['code']}）：{gap['message']}")
         if artifact_path:
