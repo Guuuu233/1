@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 import copy
 from datetime import datetime, timedelta, timezone
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 import json
 import os
 import threading
@@ -550,17 +550,103 @@ def _classify_failure_value(value: Any) -> Optional[str]:
     return None
 
 
-def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, str]]:
+_FAILURE_STATUSES = {"failed", "timeout", "unavailable", "refused", "error"}
+_LEDGER_META_KEYS = ("attempted_sources", "fallback_errors", "em_typed_gap", "final_source")
+
+
+def _typed_evidence_meta(value: Any) -> Optional[Dict[str, Any]]:
+    """Return structured evidence metadata when the value carries it (FundFlowText).
+
+    Only typed metadata is trusted; never infer evidence from display text.
+    """
+    meta = getattr(value, "fund_flow_evidence_meta", None)
+    return meta if isinstance(meta, dict) else None
+
+
+def _extract_manual_calibration_gap(value: Any) -> Optional[Dict[str, Any]]:
+    """Read only an explicitly attached structured manual-calibration gap."""
+    metadata = getattr(value, "fund_flow_evidence_meta", None)
+    if not isinstance(metadata, Mapping):
+        return None
+    gap = metadata.get("manual_calibration_gap")
+    if not isinstance(gap, Mapping):
+        return None
+    return copy.deepcopy(dict(gap))
+
+
+def _manual_calibration_gap_entry(gap: Mapping[str, Any]) -> Dict[str, Any]:
+    """Keep the provider gap intact while marking it non-blocking."""
+    preserved = copy.deepcopy(dict(gap))
+    entry = copy.deepcopy(preserved)
+    entry["manual_calibration_gap"] = preserved
+    entry["gap_type"] = "manual_calibration_gap"
+    entry["blocking"] = False
+    entry["non_blocking"] = True
+    return entry
+
+
+def _append_manual_calibration_gap(
+    ledger: List[Dict[str, Any]], gap: Mapping[str, Any]
+) -> None:
+    """Append one structured manual gap without touching other ledger entries."""
+    entry = _manual_calibration_gap_entry(gap)
+    identity = (
+        entry.get("source"),
+        entry.get("status"),
+        entry.get("reason"),
+        entry.get("as_of"),
+    )
+    if any(
+        existing.get("gap_type") == "manual_calibration_gap"
+        and (
+            existing.get("source"),
+            existing.get("status"),
+            existing.get("reason"),
+            existing.get("as_of"),
+        ) == identity
+        for existing in ledger
+        if isinstance(existing, dict)
+    ):
+        return
+    ledger.append(entry)
+
+
+def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Build stable, serializable failure evidence for the report boundary."""
     if not isinstance(results, dict):
         return []
 
-    entries: list[tuple[int, str, Dict[str, str]]] = []
+    entries: list[tuple[int, str, Dict[str, Any]]] = []
     source_rank = {source: index for index, source in enumerate(_DATA_FAILURE_SOURCE_ORDER)}
     for source, value in results.items():
         source_name = str(source).strip()
         if not source_name:
             continue
+
+        typed_meta = _typed_evidence_meta(value)
+        if typed_meta is not None:
+            typed_status = str(typed_meta.get("status") or "").strip().lower()
+            if typed_status not in _FAILURE_STATUSES:
+                continue
+            reason = str(typed_meta.get("reason") or _compact_failure_reason(typed_status))
+            entry: Dict[str, Any] = {
+                "source": source_name,
+                "status": typed_status,
+                "reason": reason,
+                "gap": str(typed_meta.get("gap") or f"【数据获取失败】{source_name}：{reason}"),
+            }
+            for key in _LEDGER_META_KEYS:
+                if key in typed_meta:
+                    entry[key] = copy.deepcopy(typed_meta[key])
+            entries.append(
+                (
+                    source_rank.get(source_name, len(_DATA_FAILURE_SOURCE_ORDER)),
+                    source_name,
+                    entry,
+                )
+            )
+            continue
+
         classified = _classify_failure_value(value)
         if classified is None:
             continue
@@ -581,7 +667,12 @@ def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, str]]:
         )
 
     entries.sort(key=lambda item: (item[0], item[1]))
-    return [entry for _rank, _source, entry in entries]
+    ledger = [entry for _rank, _source, entry in entries]
+    for value in results.values():
+        manual_gap = _extract_manual_calibration_gap(value)
+        if manual_gap is not None:
+            _append_manual_calibration_gap(ledger, manual_gap)
+    return ledger
 
 
 _SOURCE_AS_OF_PATTERNS = (
@@ -642,6 +733,16 @@ def _build_source_provenance(
             entry["gap"] = f"【数据获取失败】{source}：{_compact_failure_reason(status)}"
         elif as_of is None and source != "realtime":
             entry["gap"] = f"【数据获取失败】{source}：未返回可验证数据日期"
+        if source == "fund_flow_individual":
+            manual_gap = _extract_manual_calibration_gap(value)
+            if manual_gap is not None:
+                provenance_gap = copy.deepcopy(manual_gap)
+                provenance_gap.update({
+                    "gap_type": "manual_calibration_gap",
+                    "blocking": False,
+                    "non_blocking": True,
+                })
+                entry["manual_calibration_gap"] = provenance_gap
         provenance[str(source)] = entry
     return provenance
 
@@ -708,6 +809,7 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
     fund_flow_value = results.get("fund_flow_individual")
     fund_flow_evidence = getattr(fund_flow_value, "fund_flow_evidence", None)
     fund_flow_evidence_meta = getattr(fund_flow_value, "fund_flow_evidence_meta", None)
+    manual_calibration_gap = _extract_manual_calibration_gap(fund_flow_value)
     if isinstance(fund_flow_evidence, list) and fund_flow_evidence:
         summary = summarize_evidence(fund_flow_evidence, window_days=5)
         fund_flow_context = {
@@ -721,25 +823,36 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         else:
             fund_flow_context["status"] = "partial"
     else:
-        fund_flow_context = build_gap_meta(
-            symbol=ticker,
-            requested_as_of=trade_date,
-            source="fund_flow_individual",
-            status="unavailable",
-            reason="未返回结构化逐日 netamount/r0_net evidence",
-        )
+        typed_meta = _typed_evidence_meta(fund_flow_value)
+        if isinstance(typed_meta, dict) and typed_meta:
+            fund_flow_context = copy.deepcopy(typed_meta)
+        else:
+            fund_flow_context = build_gap_meta(
+                symbol=ticker,
+                requested_as_of=trade_date,
+                source="fund_flow_individual",
+                status="unavailable",
+                reason="未返回结构化逐日 netamount/r0_net evidence",
+            )
         fund_flow_context.update({
             "records": [],
             "summary": summarize_evidence([], window_days=5),
             "validation": {"status": "not_checked", "mismatches": []},
         })
         if not any(entry.get("source") == "fund_flow_individual" for entry in data_failure_ledger):
-            data_failure_ledger.append({
+            ledger_entry: Dict[str, Any] = {
                 "source": "fund_flow_individual",
-                "status": "unavailable",
-                "reason": "structured evidence unavailable",
-                "gap": fund_flow_context["gap"],
-            })
+                "status": fund_flow_context.get("status") or "unavailable",
+                "reason": fund_flow_context.get("reason") or "structured evidence unavailable",
+                "gap": fund_flow_context.get("gap")
+                or f"【数据获取失败】fund_flow_individual：结构化 evidence 不可用",
+            }
+            for key in _LEDGER_META_KEYS:
+                if key in fund_flow_context:
+                    ledger_entry[key] = copy.deepcopy(fund_flow_context[key])
+            data_failure_ledger.append(ledger_entry)
+    if manual_calibration_gap is not None:
+        fund_flow_context["manual_calibration_gap"] = copy.deepcopy(manual_calibration_gap)
 
     # ── Parse CSV once, reuse for indicators and VPA ──────────────────
     raw_csv = results.get("stock_data", "")

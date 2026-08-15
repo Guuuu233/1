@@ -1,6 +1,7 @@
 import logging
 from tradingagents.agents.utils.context_utils import get_cn_stock_name
 import asyncio
+import copy
 import json
 
 from tradingagents.dataflows.fund_flow_evidence import (
@@ -72,6 +73,9 @@ def create_smart_money_analyst(llm, data_collector=None):
             )
             fund_flow, lhb, volume = results
             fund_flow_evidence = {}
+            fund_flow_meta = getattr(fund_flow, "fund_flow_evidence_meta", None)
+            if isinstance(fund_flow_meta, dict):
+                fund_flow_evidence = copy.deepcopy(fund_flow_meta)
 
         consensus = {}
         if isinstance(fund_flow_evidence, dict):

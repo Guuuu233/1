@@ -102,6 +102,7 @@ class _CurrentDaySnapshotProvider(CnAkshareProvider):
         self._snapshot_error = snapshot_error
         self._row = row if row is not None else {
             "股票代码": "600519",
+            "日期": cn_today_str(),
             "最新价": "1700.00",
             "涨跌幅": "1.23",
             "净额": "5.60亿",
