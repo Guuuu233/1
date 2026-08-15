@@ -14,11 +14,13 @@ falls back to an alternative source inside the provider:
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
+from tradingagents.dataflows.fund_flow_evidence import FundFlowText
 from tradingagents.dataflows.providers.cn_akshare_provider import CnAkshareProvider
 from tradingagents.dataflows.trade_calendar import cn_today_str
 
@@ -63,12 +65,11 @@ def test_board_fund_flow_em_success_keeps_primary_format():
 
 
 def test_individual_fund_flow_falls_back_to_ths_when_em_fails():
-    curr_date = cn_today_str()
     sina_df = pd.DataFrame(
         {
             "股票代码": ["600519", "000001"],
-            "日期": [curr_date, curr_date],
             "股票简称": ["贵州茅台", "平安银行"],
+            "日期": [cn_today_str(), cn_today_str()],
             "最新价": [1358.98, 11.0],
             "涨跌幅": ["0.62%", "-0.5%"],
             "流入资金": ["26.30亿", "1.0亿"],
@@ -83,7 +84,7 @@ def test_individual_fund_flow_falls_back_to_ths_when_em_fails():
     p = CnAkshareProvider()
     p._ak = lambda: ak
     with patch("requests.get", side_effect=ConnectionError("Sina history unavailable")):
-        out = p.get_individual_fund_flow("600519", curr_date=curr_date)
+        out = p.get_individual_fund_flow("600519", curr_date=cn_today_str())
     assert "同花顺即时资金流净额快照" in out
     assert "新浪历史/收盘数据" not in out
     assert "资金净额: 3.61亿" in out
@@ -123,237 +124,277 @@ def test_individual_fund_flow_nonempty_invalid_em_falls_back_with_typed_ths_evid
     assert "同花顺即时资金流净额快照" in out
     assert out.fund_flow_evidence
     assert out.fund_flow_evidence[0]["source"] == "ths_instant_snapshot"
-    assert out.fund_flow_evidence_meta["source"] == "ths_instant_snapshot"
-    assert out.fund_flow_evidence_meta["status"] == "available"
-    ak.stock_fund_flow_individual.assert_called_once_with(symbol="即时")
-
-
-def test_individual_fund_flow_typed_em_gap_to_ths_preserves_attempt_chain():
-    curr_date = cn_today_str()
-    em_df = pd.DataFrame(
-        {
-            "日期": [curr_date],
-            "主力净流入-净额": ["not-a-number"],
-        }
-    )
-    ths_df = pd.DataFrame(
-        {
-            "股票代码": ["600519"],
-            "日期": [curr_date],
-            "最新价": [1358.98],
-            "涨跌幅": ["0.62%"],
-            "流入资金": ["26.30亿"],
-            "流出资金": ["22.69亿"],
-            "净额": ["3.61亿"],
-            "换手率": ["0.29%"],
-        }
-    )
-    ak = MagicMock()
-    ak.stock_individual_fund_flow.return_value = em_df
-    ak.stock_fund_flow_individual.return_value = ths_df
-    p = CnAkshareProvider()
-    p._ak = lambda: ak
-    with patch("requests.get", side_effect=ConnectionError("Sina history unavailable")):
-        out = p.get_individual_fund_flow("600519", curr_date=curr_date)
-
-    metadata = out.fund_flow_evidence_meta
-    assert metadata["requested_as_of"] == curr_date
-    assert metadata["as_of"] == curr_date
-    assert metadata["status"] == "available"
-    assert metadata["final_source"] == "ths_instant_snapshot"
-    assert metadata["attempted_sources"] == [
-        {
-            "source": "eastmoney_individual_fund_flow",
-            "status": "unavailable",
-            "reason": "no finite r0_net rows on or before curr_date",
-        },
-        {
-            "source": "sina_historical",
-            "status": "failed",
-            "reason": "ConnectionError",
-        },
-        {
-            "source": "ths_instant_snapshot",
-            "status": "available",
-            "reason": "同花顺即时资金流净额是总净额，未将其等同于新浪历史 r0_net 主力序列",
-        },
-    ]
-    assert metadata["fallback_errors"] == metadata["attempted_sources"][:2]
-    assert metadata["em_typed_gap"] == {
-        "symbol": "600519",
-        "requested_as_of": curr_date,
-        "source": "eastmoney_individual_fund_flow",
-        "source_family": "eastmoney",
-        "algorithm_group": "new_algorithm_group",
-        "source_group": "new_algorithm_group",
-        "legacy_web_algorithm": False,
-        "period_kind": "historical_daily",
-        "unit": "亿元",
-        "status": "unavailable",
-        "reason": "no finite r0_net rows on or before curr_date",
-        "gap": "【数据获取失败】资金流 evidence：no finite r0_net rows on or before curr_date",
-        "retrieved_at": metadata["em_typed_gap"]["retrieved_at"],
-        "as_of": None,
-    }
-    assert metadata["em_typed_gap"]["retrieved_at"]
+    assert out.fund_flow_evidence[0]["date"] == curr_date
     assert out.fund_flow_evidence[0]["netamount"] == "3.61"
     assert "r0_net" not in out.fund_flow_evidence[0]
-
-
-def test_individual_fund_flow_ths_missing_source_date_is_not_fabricated():
-    curr_date = cn_today_str()
-    em_df = pd.DataFrame(
-        {
-            "日期": [curr_date],
-            "主力净流入-净额": ["not-a-number"],
-        }
-    )
-    ths_df = pd.DataFrame(
-        {
-            "股票代码": ["600519"],
-            "净额": ["3.61亿"],
-        }
-    )
-    ak = MagicMock()
-    ak.stock_individual_fund_flow.return_value = em_df
-    ak.stock_fund_flow_individual.return_value = ths_df
-    p = CnAkshareProvider()
-    p._ak = lambda: ak
-    with patch("requests.get", side_effect=ConnectionError("Sina history unavailable")):
-        out = p.get_individual_fund_flow("600519", curr_date=curr_date)
-
-    metadata = out.fund_flow_evidence_meta
-    assert metadata["source"] == "ths_instant_snapshot"
-    assert metadata["status"] == "unavailable"
-    assert metadata["requested_as_of"] == curr_date
-    assert metadata["as_of"] is None
-    assert metadata["final_source"] is None
-    assert out.fund_flow_evidence == []
-    assert metadata["attempted_sources"][-1] == {
-        "source": "ths_instant_snapshot",
-        "status": "unavailable",
-        "reason": "missing or invalid source date",
-    }
-    assert metadata["fallback_errors"] == metadata["attempted_sources"]
-    assert metadata["em_typed_gap"]["reason"] == (
-        "no finite r0_net rows on or before curr_date"
-    )
-    assert "不能用请求日期冒充实际数据日期" in metadata["reason"]
-
-
-def test_individual_fund_flow_ths_future_source_date_is_rejected():
-    curr_date = cn_today_str()
-    future_date = (pd.Timestamp(curr_date) + timedelta(days=1)).strftime("%Y-%m-%d")
-    em_df = pd.DataFrame(
-        {
-            "日期": [curr_date],
-            "主力净流入-净额": ["not-a-number"],
-        }
-    )
-    ths_df = pd.DataFrame(
-        {
-            "股票代码": ["600519"],
-            "日期": [future_date],
-            "净额": ["3.61亿"],
-        }
-    )
-    ak = MagicMock()
-    ak.stock_individual_fund_flow.return_value = em_df
-    ak.stock_fund_flow_individual.return_value = ths_df
-    p = CnAkshareProvider()
-    p._ak = lambda: ak
-    with patch("requests.get", side_effect=ConnectionError("Sina history unavailable")):
-        out = p.get_individual_fund_flow("600519", curr_date=curr_date)
-
-    metadata = out.fund_flow_evidence_meta
-    assert metadata["source"] == "ths_instant_snapshot"
-    assert metadata["status"] == "unavailable"
-    assert metadata["requested_as_of"] == curr_date
-    assert metadata["as_of"] is None
-    assert metadata["final_source"] is None
-    assert out.fund_flow_evidence == []
-    assert metadata["attempted_sources"][-1] == {
-        "source": "ths_instant_snapshot",
-        "status": "unavailable",
-        "reason": "source date after curr_date",
-    }
-    assert metadata["fallback_errors"] == metadata["attempted_sources"]
-    assert metadata["em_typed_gap"]["reason"] == (
-        "no finite r0_net rows on or before curr_date"
-    )
-    assert future_date in str(out)
-    assert "拒绝前视数据" in metadata["reason"]
-
-
-def test_individual_fund_flow_all_sources_failed_retains_typed_failures():
-    curr_date = cn_today_str()
-    ak = MagicMock()
-    ak.stock_individual_fund_flow.side_effect = ConnectionError(
-        "https://vendor.invalid?sign=secret&token=secret"
-    )
-    ak.stock_fund_flow_individual.side_effect = TimeoutError("provider timeout")
-    p = CnAkshareProvider()
-    p._ak = lambda: ak
-    with patch("requests.get", side_effect=ConnectionError("Sina ?key=secret")):
-        out = p.get_individual_fund_flow("600519", curr_date=curr_date)
-
-    metadata = out.fund_flow_evidence_meta
-    assert metadata["requested_as_of"] == curr_date
-    assert metadata["as_of"] is None
-    assert metadata["status"] == "unavailable"
-    assert metadata["final_source"] is None
-    assert [item["source"] for item in metadata["attempted_sources"]] == [
+    assert out.fund_flow_evidence_meta["source"] == "ths_instant_snapshot"
+    assert out.fund_flow_evidence_meta["status"] == "available"
+    meta = out.fund_flow_evidence_meta
+    assert [item["source"] for item in meta["attempted_sources"]] == [
         "eastmoney_individual_fund_flow",
         "sina_historical",
         "ths_instant_snapshot",
     ]
-    assert [item["status"] for item in metadata["attempted_sources"]] == [
+    assert [item["status"] for item in meta["attempted_sources"]] == [
         "failed",
         "failed",
-        "failed",
+        "success",
     ]
-    assert metadata["fallback_errors"] == metadata["attempted_sources"]
-    assert metadata["em_typed_gap"]["reason"] == "ConnectionError"
-    assert "secret" not in repr(metadata)
-    for token in (
-        "stock_individual_fund_flow: ConnectionError",
-        "sina historical fund flow: ConnectionError",
-        "stock_fund_flow_individual: TimeoutError",
-    ):
-        assert token in metadata["reason"]
+    assert meta["final_source"] == "ths_instant_snapshot"
+    assert meta["em_typed_gap"]["source"] == "eastmoney_individual_fund_flow"
+    assert meta["em_typed_gap"]["status"] == "unavailable"
+    assert [item["source"] for item in meta["fallback_errors"]] == [
+        "eastmoney_individual_fund_flow",
+        "sina_historical",
+    ]
+    ak.stock_fund_flow_individual.assert_called_once_with(symbol="即时")
 
 
-def test_individual_fund_flow_em_success_has_no_fallback_errors():
+def test_individual_fund_flow_em_success_does_not_try_fallbacks():
     curr_date = cn_today_str()
-    previous_date = (pd.Timestamp(curr_date) - timedelta(days=1)).strftime("%Y-%m-%d")
     em_df = pd.DataFrame(
         {
-            "日期": [previous_date, curr_date],
-            "主力净流入-净额": [100000000, -200000000],
+            "日期": [curr_date],
+            "主力净流入-净额": [100000000],
         }
     )
     ak = MagicMock()
     ak.stock_individual_fund_flow.return_value = em_df
+    provider = CnAkshareProvider()
+    provider._ak = lambda: ak
+
+    out = provider.get_individual_fund_flow("600519", curr_date=curr_date)
+
+    meta = out.fund_flow_evidence_meta
+    assert meta["final_source"] == "eastmoney_individual_fund_flow"
+    assert meta["fallback_errors"] == []
+    assert meta["attempted_sources"] == [
+        {"source": "eastmoney_individual_fund_flow", "status": "success"}
+    ]
+    assert out.fund_flow_evidence
+    ak.stock_fund_flow_individual.assert_not_called()
+
+
+def test_individual_fund_flow_all_failures_keep_typed_gap_and_redact_errors():
+    curr_date = cn_today_str()
+    em_df = pd.DataFrame(
+        {
+            "日期": [curr_date],
+            "主力净流入-净额": ["not-a-number"],
+        }
+    )
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.return_value = em_df
+    ak.stock_fund_flow_individual.side_effect = RuntimeError(
+        "cookie=secret-cookie-value"
+    )
     p = CnAkshareProvider()
     p._ak = lambda: ak
+    with patch(
+        "requests.get",
+        side_effect=ConnectionError(
+            "https://example.invalid/feed?token=secret-token"
+        ),
+    ):
+        out = p.get_individual_fund_flow("600519", curr_date=curr_date)
 
-    out = p.get_individual_fund_flow("600519", curr_date=curr_date)
+    meta = out.fund_flow_evidence_meta
+    assert "【数据获取失败】" in out
+    assert [item["source"] for item in meta["attempted_sources"]] == [
+        "eastmoney_individual_fund_flow",
+        "sina_historical",
+        "ths_instant_snapshot",
+    ]
+    assert all(item["status"] == "failed" for item in meta["attempted_sources"])
+    assert meta["final_source"] == "unavailable_gap"
+    assert meta["em_typed_gap"]["source"] == "eastmoney_individual_fund_flow"
+    assert meta["em_typed_gap"]["status"] == "unavailable"
+    assert [item["source"] for item in meta["fallback_errors"]] == [
+        "eastmoney_individual_fund_flow",
+        "sina_historical",
+        "ths_instant_snapshot",
+    ]
+    assert [item["error_type"] for item in meta["fallback_errors"]] == [
+        "formatter_failure",
+        "ConnectionError",
+        "RuntimeError",
+    ]
+    serialized = json.dumps(meta, ensure_ascii=False)
+    assert "secret-cookie-value" not in serialized
+    assert "secret-token" not in serialized
+    assert "https://example.invalid" not in serialized
 
-    metadata = out.fund_flow_evidence_meta
-    assert metadata["requested_as_of"] == curr_date
-    assert metadata["as_of"] == curr_date
-    assert metadata["status"] == "partial"
-    assert metadata["final_source"] == "eastmoney_individual_fund_flow"
-    assert metadata["attempted_sources"] == [
+
+def test_ths_missing_source_date_is_typed_gap_without_as_of():
+    curr_date = cn_today_str()
+    em_df = pd.DataFrame(
         {
-            "source": "eastmoney_individual_fund_flow",
-            "status": "partial",
-            "reason": "东方财富来源仅提供主力净额；未将其等同于总净额 netamount",
+            "日期": [curr_date],
+            "主力净流入-净额": ["not-a-number"],
+        }
+    )
+    ths_df = pd.DataFrame(
+        {
+            "股票代码": ["600519"],
+            "净额": ["3.61亿"],
+        }
+    )
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.return_value = em_df
+    ak.stock_fund_flow_individual.return_value = ths_df
+    provider = CnAkshareProvider()
+    provider._ak = lambda: ak
+    with patch("requests.get", side_effect=ConnectionError("Sina unavailable")):
+        out = provider.get_individual_fund_flow("600519", curr_date=curr_date)
+
+    meta = out.fund_flow_evidence_meta
+    assert "【数据获取失败】" in out
+    assert "【备用数据源：同花顺即时资金流净额快照】" not in out
+    assert not out.fund_flow_evidence
+    assert meta["final_source"] == "unavailable_gap"
+    assert meta["as_of"] is None
+    assert meta["attempted_sources"][-1]["source"] == "ths_instant_snapshot"
+    assert meta["attempted_sources"][-1]["status"] == "failed"
+    assert meta["fallback_errors"][-1]["error_type"] == "missing_source_date"
+
+
+def test_ths_future_source_date_is_rejected():
+    curr_date = cn_today_str()
+    future_source_date = (
+        pd.Timestamp(curr_date) + timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+    em_df = pd.DataFrame(
+        {
+            "日期": [curr_date],
+            "主力净流入-净额": ["not-a-number"],
+        }
+    )
+    ths_df = pd.DataFrame(
+        {
+            "股票代码": ["600519"],
+            "日期": [future_source_date],
+            "净额": ["3.61亿"],
+        }
+    )
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.return_value = em_df
+    ak.stock_fund_flow_individual.return_value = ths_df
+    provider = CnAkshareProvider()
+    provider._ak = lambda: ak
+    with patch("requests.get", side_effect=ConnectionError("Sina unavailable")):
+        out = provider.get_individual_fund_flow("600519", curr_date=curr_date)
+
+    meta = out.fund_flow_evidence_meta
+    assert "【备用数据源：同花顺即时资金流净额快照】" not in out
+    assert not out.fund_flow_evidence
+    assert meta["final_source"] == "unavailable_gap"
+    assert meta["as_of"] is None
+    assert meta["fallback_errors"][-1]["error_type"] == "future_source_date"
+    assert future_source_date in meta["fallback_errors"][-1]["reason"]
+
+
+def test_future_analysis_date_fails_closed_before_provider_calls():
+    curr_date = cn_today_str()
+    future_date = (pd.Timestamp(curr_date) + timedelta(days=1)).strftime("%Y-%m-%d")
+    provider = CnAkshareProvider()
+    provider._ak = lambda: (_ for _ in ()).throw(
+        AssertionError("provider must not be contacted for a future analysis date")
+    )
+
+    out = provider.get_individual_fund_flow("600519", curr_date=future_date)
+
+    meta = out.fund_flow_evidence_meta
+    assert "【数据获取失败】" in out
+    assert not out.fund_flow_evidence
+    assert meta["final_source"] == "unavailable_gap"
+    assert meta["as_of"] is None
+    assert meta["attempted_sources"] == [
+        {
+            "source": "analysis_date_guard",
+            "status": "failed",
+            "reason": "analysis date is in the future",
         }
     ]
-    assert metadata["fallback_errors"] == []
-    assert metadata["em_typed_gap"] is None
-    assert ak.stock_fund_flow_individual.call_count == 0
+    assert meta["fallback_errors"] == [
+        {
+            "source": "analysis_date_guard",
+            "error_type": "future_analysis_date",
+            "reason": "analysis date is in the future",
+        }
+    ]
+
+
+def test_nested_typed_gap_metadata_is_whitelisted_and_redacted():
+    curr_date = cn_today_str()
+    em_df = pd.DataFrame(
+        {
+            "日期": [curr_date],
+            "主力净流入-净额": ["not-a-number"],
+        }
+    )
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.return_value = em_df
+    ak.stock_fund_flow_individual.side_effect = RuntimeError(
+        "cookie=secret-ths-cookie"
+    )
+    provider = CnAkshareProvider()
+    provider._ak = lambda: ak
+    provider._format_individual_fund_flow_em = lambda *args: FundFlowText(
+        "typed gap",
+        evidence=[],
+        evidence_meta={
+            "source": "eastmoney_individual_fund_flow",
+            "status": "unavailable",
+            "reason": {
+                "detail": (
+                    "Authorization Bearer secret-auth; Bearer secret-bare; "
+                    "Bearer: secret-colon; Bearer=secret-equal; "
+                    "cookie=secret-cookie token=secret-token key=secret-key"
+                ),
+                "nested": {"Authorization": "Bearer secret-nested"},
+            },
+            "gap": {
+                "url": "https://example.invalid/feed?token=secret-token&signature=secret-signature",
+                "detail": "api_key=secret-api-key signature=secret-signature",
+            },
+            "date": curr_date,
+            "as_of": curr_date,
+            "untrusted_metadata": "must be dropped",
+        },
+    )
+    with patch(
+        "requests.get",
+        side_effect=ConnectionError(
+            "https://example.invalid/feed?token=secret-sina-token"
+        ),
+    ):
+        out = provider.get_individual_fund_flow("600519", curr_date=curr_date)
+
+    meta = out.fund_flow_evidence_meta
+    typed_gap = meta["em_typed_gap"]
+    serialized = json.dumps(meta, ensure_ascii=False)
+    for secret in (
+        "secret-cookie",
+        "secret-auth",
+        "secret-bare",
+        "secret-colon",
+        "secret-equal",
+        "secret-token",
+        "secret-signature",
+        "secret-key",
+        "secret-api-key",
+        "secret-ths-cookie",
+        "secret-sina-token",
+        "https://example.invalid",
+    ):
+        assert secret not in serialized
+    assert "untrusted_metadata" not in typed_gap
+    assert "date" not in typed_gap
+    assert typed_gap["as_of"] is None
+    assert all(
+        "untrusted_metadata" not in item
+        for item in meta["fallback_errors"]
+    )
 
 
 def test_individual_fund_flow_sina_refuses_historical_date():

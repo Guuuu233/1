@@ -1,9 +1,11 @@
+import json
 import logging
 import math
 import re
 import time
 import threading
 import contextvars
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -21,6 +23,7 @@ from ..trade_calendar import (
     fetch_with_date_fallback,
     is_historical_analysis_date,
     snapshot_historical_refusal,
+    unavailable_analysis_date_reason,
 )
 from ..utils import (
     chronological,
@@ -186,65 +189,30 @@ _SINA_HIST_CORE_AMOUNT_FIELDS = ("netamount", "r0_net")
 _FUND_AMOUNT_TEXT_RE = re.compile(
     r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*(?:万亿|亿元|万元|亿|万)?$"
 )
-_FUND_FLOW_SECRET_RE = re.compile(
-    r"(?i)([?&](?:sign|token|key|api[_-]?key|apikey|access[_-]?token|secret)=)"
-    r"[^&\s]+"
+
+_FUND_FLOW_SOURCE_EM = "eastmoney_individual_fund_flow"
+_FUND_FLOW_SOURCE_SINA = "sina_historical"
+_FUND_FLOW_SOURCE_THS = "ths_instant_snapshot"
+_FUND_FLOW_SOURCE_UNAVAILABLE = "unavailable_gap"
+_FUND_FLOW_SOURCE_DATE_GUARD = "analysis_date_guard"
+_FUND_FLOW_GAP_DETAIL_KEYS = frozenset(
+    {
+        "code",
+        "detail",
+        "error_type",
+        "gap",
+        "message",
+        "provider",
+        "reason",
+        "source",
+        "status",
+        "type",
+        "url",
+    }
 )
-_FUND_FLOW_INLINE_SECRET_RE = re.compile(
-    r"(?i)(\b(?:sign|token|key|api[_-]?key|apikey|access[_-]?token|secret)\b"
-    r"\s*[:=]\s*)([^,;\s&}}]+)"
+_FUND_FLOW_SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(?:cookie|token|key|api[_-]?key|authorization|signature|sign|sig|auth|secret|password|credential|session)"
 )
-
-
-def _redact_fund_flow_reason(reason: object) -> str:
-    """Redact credential-like query values before retaining provider details."""
-    text = str(reason or "unspecified failure").strip()
-    text = _FUND_FLOW_SECRET_RE.sub(r"\1[REDACTED]", text)
-    return _FUND_FLOW_INLINE_SECRET_RE.sub(r"\1[REDACTED]", text)
-
-
-def _safe_fund_flow_attempt_reason(reason: object) -> str:
-    """Keep fallback audit reasons short, typed, and free of payloads."""
-    text = _redact_fund_flow_reason(reason)
-    if "\n" in text or len(text) > 160:
-        return "structured evidence unavailable"
-    return text
-
-
-def _fund_flow_evidence_as_of(evidence) -> str | None:
-    """Return the latest source date without falling back to requested_as_of."""
-    dates = []
-    for record in evidence or []:
-        if not isinstance(record, dict):
-            continue
-        for key in ("as_of", "measurement_date", "date"):
-            parsed = parse_yyyymmdd(record.get(key))
-            if parsed is not None:
-                dates.append(parsed)
-                break
-    return max(dates).isoformat() if dates else None
-
-
-def _merge_fund_flow_attempt_meta(
-    metadata: dict | None,
-    attempted_sources: list[dict],
-    fallback_errors: list[dict],
-    *,
-    final_source: str | None = None,
-    em_typed_gap: dict | None = None,
-    as_of: str | None = None,
-) -> dict:
-    """Attach redacted fallback provenance without changing evidence semantics."""
-    merged = dict(metadata or {})
-    merged["attempted_sources"] = [dict(item) for item in attempted_sources]
-    merged["fallback_errors"] = [dict(item) for item in fallback_errors]
-    merged["em_typed_gap"] = (
-        dict(em_typed_gap) if isinstance(em_typed_gap, dict) else em_typed_gap
-    )
-    merged["final_source"] = final_source
-    if as_of is not None or "as_of" not in merged:
-        merged["as_of"] = as_of
-    return merged
 
 
 def _sina_decimal(value) -> Decimal | None:
@@ -1393,39 +1361,6 @@ class CnAkshareProvider(BaseMarketDataProvider):
             )
         return f"板块资金流向排名（共{total}个板块，前10名）：\n{result}"
 
-    @staticmethod
-    def _em_fund_flow_failure_reason(result, cutoff) -> str | None:
-        """Explain why an Eastmoney result cannot end the fallback chain."""
-        if not isinstance(result, FundFlowText):
-            if isinstance(result, str) and result.strip():
-                return f"untyped formatter result: {_safe_fund_flow_attempt_reason(result)}"
-            return "formatter returned no typed result"
-
-        evidence = getattr(result, "fund_flow_evidence", None)
-        if not isinstance(evidence, list) or not evidence:
-            metadata = getattr(result, "fund_flow_evidence_meta", {}) or {}
-            metadata_reason = metadata.get("reason") if isinstance(metadata, dict) else None
-            return _safe_fund_flow_attempt_reason(
-                metadata_reason or "structured evidence unavailable"
-            )
-
-        for index, record in enumerate(evidence):
-            if not isinstance(record, dict):
-                return f"structured evidence row {index} is not a mapping"
-            evidence_date = parse_yyyymmdd(
-                record.get("measurement_date") or record.get("date")
-            )
-            if evidence_date is None:
-                return f"structured evidence row {index} has no valid date"
-            if evidence_date > cutoff:
-                return f"structured evidence row {index} is after curr_date"
-            if record.get("status") not in (None, "available"):
-                return f"structured evidence row {index} status={record.get('status')!r}"
-            amount = safe_float(record.get("r0_net"))
-            if amount is None or not math.isfinite(amount):
-                return f"structured evidence row {index} lacks finite r0_net"
-        return None
-
     def get_individual_fund_flow(self, symbol: str, curr_date: str = None) -> str:
         """获取个股近期主力资金净流向，并按 curr_date 截断。
 
@@ -1434,152 +1369,291 @@ class CnAkshareProvider(BaseMarketDataProvider):
         只有在历史接口含 curr_date 当天收盘行时才直接返回，否则继续尝试
         同花顺即时资金流净额快照 ``stock_fund_flow_individual``；该快照的
         ``净额`` 不是新浪历史 ``netamount``/``r0_net`` 同口径的主力序列；
-        匹配目标行后必须先验证 ``净额`` 可用，带单位文本会原样保留。
+        匹配目标行后必须先验证 ``净额`` 与真实来源日期可用，带单位文本会原样保留。
         """
-        attempted_sources: list[dict] = []
-        fallback_errors: list[dict] = []
-        errors: list[str] = []
-        em_typed_gap: dict | None = None
+        attempted_sources: list[dict[str, str]] = []
+        fallback_errors: list[dict[str, str]] = []
+        error_texts: list[str] = []
+        em_typed_gap: dict[str, object] | None = None
 
-        def _record_attempt(source: str, status: str, reason: object) -> None:
-            entry = {
-                "source": source,
-                "status": status,
-                "reason": _safe_fund_flow_attempt_reason(reason),
-            }
-            attempted_sources.append(entry)
-            if status not in {"available", "partial"}:
-                fallback_errors.append(dict(entry))
-
-        def _decorate(value, *, final_source: str | None) -> FundFlowText:
-            evidence = list(getattr(value, "fund_flow_evidence", []) or [])
-            metadata = dict(getattr(value, "fund_flow_evidence_meta", {}) or {})
-            as_of = (
-                metadata.get("as_of")
-                if "as_of" in metadata
-                else _fund_flow_evidence_as_of(evidence)
-            )
-            metadata = _merge_fund_flow_attempt_meta(
-                metadata,
-                attempted_sources,
-                fallback_errors,
-                final_source=final_source,
-                em_typed_gap=em_typed_gap,
-                as_of=as_of,
-            )
-            return FundFlowText(
-                str(value),
-                evidence=evidence,
-                evidence_meta=metadata,
-            )
-
-        def _failure_response(text: str, *, source: str, reason: object) -> FundFlowText:
-            response = build_provider_text(
+        def _redact_text(reason: object) -> str:
+            text = str(reason or "").replace("\n", " ").strip()
+            text = re.sub(r"https?://[^\s\"'<>]+", "[redacted_url]", text)
+            text = re.sub(
+                r"(?i)[?&](?:token|cookie|key|signature|sign|sig|api[_-]?key|authorization|auth|secret|password)=[^&#\s\"'<>]+",
+                "[redacted_query]",
                 text,
-                symbol=symbol,
-                requested_as_of=curr_date or "",
-                source=source,
-                reason=_redact_fund_flow_reason(reason),
             )
-            return _decorate(response, final_source=None)
+            text = re.sub(
+                r"(?i)\bauthorization\s+bearer(?:\s*[:=]\s*|\s+)[^\s,;}}\]]+",
+                "[REDACTED]",
+                text,
+            )
+            text = re.sub(
+                r"(?i)\bbearer(?:\s*[:=]\s*|\s+)[^\s,;}}\]]+",
+                "[REDACTED]",
+                text,
+            )
+            text = re.sub(
+                r'''(?i)[\"']?(?:authorization|auth)[\"']?\s*[:=]\s*[\"']?(?:bearer\s+)?[^,;}}]+''',
+                "[REDACTED]",
+                text,
+            )
+            text = re.sub(
+                r'''(?i)[\"']?(?:cookie|token|key|signature|sign|sig|api[_-]?key|secret|password)[\"']?\s*[:=]\s*[\"']?\S+''',
+                "[REDACTED]",
+                text,
+            )
+            return text[:240] or "unspecified provider failure"
 
-        def _em_gap_meta(reason: object) -> dict:
-            return build_gap_meta(
+        def _sanitize_gap_value(value: object, *, key: str | None = None, depth: int = 0):
+            if key and _FUND_FLOW_SENSITIVE_KEY_RE.search(key):
+                return None
+            if depth > 3:
+                return "[truncated]"
+            if isinstance(value, Mapping):
+                cleaned = {}
+                for raw_key, raw_value in value.items():
+                    nested_key = str(raw_key)
+                    if _FUND_FLOW_SENSITIVE_KEY_RE.search(nested_key):
+                        continue
+                    if nested_key not in _FUND_FLOW_GAP_DETAIL_KEYS:
+                        continue
+                    sanitized = _sanitize_gap_value(
+                        raw_value,
+                        key=nested_key,
+                        depth=depth + 1,
+                    )
+                    if sanitized is not None:
+                        cleaned[nested_key] = sanitized
+                return cleaned
+            if isinstance(value, (list, tuple)):
+                return [
+                    sanitized
+                    for item in value[:16]
+                    if (sanitized := _sanitize_gap_value(item, depth=depth + 1)) is not None
+                ]
+            if isinstance(value, str):
+                return _redact_text(value)
+            if value is None or isinstance(value, (bool, int, float)):
+                return value
+            return _redact_text(value)
+
+        def _redact_reason(reason: object) -> str:
+            sanitized = _sanitize_gap_value(reason)
+            if isinstance(sanitized, str):
+                return sanitized
+            try:
+                text = json.dumps(sanitized, ensure_ascii=False, sort_keys=True)
+            except (TypeError, ValueError):
+                text = str(sanitized)
+            return _redact_text(text)
+
+        def _build_em_typed_gap(em_meta: object, fallback_reason: object) -> dict[str, object]:
+            safe_reason = _redact_reason(fallback_reason)
+            typed_gap = build_gap_meta(
                 symbol=symbol,
-                requested_as_of=curr_date or "",
-                source="eastmoney_individual_fund_flow",
+                requested_as_of=curr_date,
+                source=_FUND_FLOW_SOURCE_EM,
                 status="unavailable",
-                reason=_safe_fund_flow_attempt_reason(reason),
+                reason=safe_reason,
                 retrieved_at=self._sina_retrieved_at(),
                 algorithm_group="new_algorithm_group",
                 period_kind="historical_daily",
             )
+            if isinstance(em_meta, Mapping):
+                if em_meta.get("reason") is not None:
+                    typed_gap["reason"] = _redact_reason(em_meta["reason"])
+                if em_meta.get("gap") is not None:
+                    typed_gap["gap"] = _redact_reason(em_meta["gap"])
+            # A typed gap never has a verifiable measurement date.
+            typed_gap["as_of"] = None
+            return typed_gap
 
-        if not curr_date:
-            return _failure_response(
-                f"【数据获取失败】个股资金流向缺少 curr_date，无法做日期截断，"
-                f"{symbol} 本项不可用。",
-                source="fund_flow_individual",
-                reason="missing curr_date",
-            )
-        cutoff = parse_yyyymmdd(curr_date)
-        if cutoff is None:
-            return _failure_response(
-                f"【数据获取失败】个股资金流向 curr_date 无法解析：{curr_date!r}",
-                source="fund_flow_individual",
-                reason="curr_date is not parseable",
+        def _record_success(source: str) -> None:
+            attempted_sources.append({"source": source, "status": "success"})
+
+        def _record_failure(
+            source: str,
+            provider: str,
+            error_type: str,
+            reason: object,
+        ) -> None:
+            safe_reason = _redact_reason(reason)
+            attempted_sources.append({
+                "source": source,
+                "status": "failed",
+                "reason": safe_reason,
+            })
+            fallback_errors.append({
+                "source": source,
+                "error_type": error_type,
+                "reason": safe_reason,
+            })
+            display_type = {
+                "empty_dataframe": "empty dataframe",
+                "formatter_failure": "formatter failure",
+                "no_current_day_close_row": "no current-day close row",
+                "no_rows_on_or_before_curr_date": "no rows on or before curr_date",
+            }.get(error_type, error_type)
+            display = f"{provider}: {display_type}"
+            if error_type in {
+                "formatter_failure",
+                "no_current_day_close_row",
+                "no_rows_on_or_before_curr_date",
+                "no_matching_row",
+                "missing_net_amount",
+                "invalid_net_amount",
+            }:
+                display = f"{display}: {safe_reason}"
+            error_texts.append(display)
+
+        def _with_chain(value: object, final_source: str) -> FundFlowText:
+            evidence = list(getattr(value, "fund_flow_evidence", []) or [])
+            metadata = dict(getattr(value, "fund_flow_evidence_meta", {}) or {})
+            metadata["attempted_sources"] = [dict(item) for item in attempted_sources]
+            metadata["fallback_errors"] = [dict(item) for item in fallback_errors]
+            metadata["final_source"] = final_source
+            if em_typed_gap is not None:
+                metadata["em_typed_gap"] = dict(em_typed_gap)
+            return FundFlowText(
+                str(value), evidence=evidence, evidence_meta=metadata
             )
 
-        ak = self._ak()
-        code = self._normalize_symbol(symbol)
-        is_historical = is_historical_analysis_date(curr_date)
+        def _gap(text: str, reason: str) -> FundFlowText:
+            return _with_chain(
+                build_provider_text(
+                    text,
+                    symbol=symbol,
+                    requested_as_of=curr_date or "",
+                    source="fund_flow_individual",
+                    reason=reason,
+                ),
+                _FUND_FLOW_SOURCE_UNAVAILABLE,
+            )
 
         def _gap_reason(base_reason: str) -> str:
             return (
-                f"{base_reason}；{'；'.join(errors)}"
-                if errors
+                f"{base_reason}；{'；'.join(error_texts)}"
+                if error_texts
                 else base_reason
             )
 
+        def _ths_source_date(row):
+            saw_date_value = False
+            for column in (
+                "日期",
+                "date",
+                "measurement_date",
+                "交易日期",
+                "trade_date",
+                "opendate",
+            ):
+                if column not in row:
+                    continue
+                raw_value = row.get(column)
+                if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
+                    continue
+                saw_date_value = True
+                parsed = parse_yyyymmdd(raw_value)
+                if parsed is not None:
+                    return parsed, None
+            return None, "invalid_source_date" if saw_date_value else "missing_source_date"
+
+        if not curr_date:
+            return _gap(
+                f"【数据获取失败】个股资金流向缺少 curr_date，无法做日期截断，"
+                f"{symbol} 本项不可用。",
+                "missing curr_date; date truncation is required",
+            )
+        cutoff = parse_yyyymmdd(curr_date)
+        if cutoff is None:
+            return _gap(
+                f"【数据获取失败】个股资金流向 curr_date 无法解析：{curr_date!r}",
+                "curr_date is not parseable",
+            )
+
+        analysis_date_error = unavailable_analysis_date_reason(curr_date)
+        if analysis_date_error:
+            _record_failure(
+                _FUND_FLOW_SOURCE_DATE_GUARD,
+                "analysis date",
+                "future_analysis_date",
+                "analysis date is in the future",
+            )
+            return _gap(analysis_date_error, "analysis date is in the future")
+
+        code = self._normalize_symbol(symbol)
+        is_historical = is_historical_analysis_date(curr_date)
+        try:
+            ak = self._ak()
+        except Exception as exc:
+            fallback_errors.append({
+                "source": "provider_setup",
+                "error_type": type(exc).__name__,
+                "reason": "akshare provider initialization failed",
+            })
+            error_texts.append(f"provider setup: {type(exc).__name__}")
+            return _gap(
+                f"【数据获取失败】个股资金流向 provider 初始化失败：{symbol} 本项不可用。",
+                _gap_reason("fund-flow provider setup unavailable"),
+            )
+
         # Source 1: 东财（近 120 交易日逐日序列，可按 curr_date 截断）
-        em_source = "eastmoney_individual_fund_flow"
         try:
             # 沪市：以 5、6、9 开头；其余为深市
             market = "sh" if code[:1] in ("5", "6", "9") else "sz"
             with AKSHARE_CALL_LOCK:
                 df = ak.stock_individual_fund_flow(stock=code, market=market)
             if df is None or df.empty:
-                reason = "empty dataframe"
-                _record_attempt(em_source, "unavailable", reason)
-                em_typed_gap = _em_gap_meta(reason)
-                errors.append(f"stock_individual_fund_flow: {reason}")
+                em_gap_reason = "stock_individual_fund_flow: empty dataframe"
+                em_typed_gap = _build_em_typed_gap(None, em_gap_reason)
+                _record_failure(
+                    _FUND_FLOW_SOURCE_EM,
+                    "stock_individual_fund_flow",
+                    "empty_dataframe",
+                    "provider returned an empty dataframe",
+                )
             else:
                 # Invalid or out-of-range Eastmoney data must not terminate the
-                # fallback chain. Only formatted text with evidence is a success;
-                # retain any formatter failure detail for the final typed gap.
+                # fallback chain. Preserve its typed gap before trying backups.
                 em_text = self._format_individual_fund_flow_em(
                     df, symbol, curr_date, cutoff
                 )
-                em_failure = self._em_fund_flow_failure_reason(em_text, cutoff)
-                if em_failure is None:
-                    em_metadata = dict(
-                        getattr(em_text, "fund_flow_evidence_meta", {}) or {}
-                    )
-                    _record_attempt(
-                        em_source,
-                        str(em_metadata.get("status") or "available"),
-                        em_metadata.get("reason") or "structured evidence available",
-                    )
-                    return _decorate(em_text, final_source=em_source)
-
-                em_metadata = getattr(em_text, "fund_flow_evidence_meta", {}) or {}
-                if isinstance(em_metadata, dict) and em_metadata.get("reason"):
-                    errors.append(
-                        "stock_individual_fund_flow: formatter reason: "
-                        f"{_redact_fund_flow_reason(em_metadata['reason'])}"
-                    )
-                if em_text:
-                    errors.append(
-                        "stock_individual_fund_flow: formatter failure: "
-                        f"{_redact_fund_flow_reason(em_text)}"
-                    )
-                errors.append("stock_individual_fund_flow: structured evidence unavailable")
-                errors.append("stock_individual_fund_flow: invalid or empty usable rows")
-                errors.append(f"stock_individual_fund_flow: {em_failure}")
-                _record_attempt(em_source, "unavailable", em_failure)
-                em_typed_gap = _em_gap_meta(em_failure)
+                em_evidence = getattr(em_text, "fund_flow_evidence", None)
+                if em_text is not None and isinstance(em_evidence, list) and em_evidence:
+                    _record_success(_FUND_FLOW_SOURCE_EM)
+                    return _with_chain(em_text, _FUND_FLOW_SOURCE_EM)
+                em_meta = getattr(em_text, "fund_flow_evidence_meta", None) or {}
+                em_detail = _redact_reason(
+                    em_meta.get("reason")
+                    if isinstance(em_meta, dict) and em_meta.get("reason")
+                    else em_text or "structured evidence unavailable"
+                )
+                em_gap_reason = (
+                    "stock_individual_fund_flow: formatter failure: "
+                    f"{em_detail}"
+                )
+                em_typed_gap = _build_em_typed_gap(em_meta, em_gap_reason)
+                _record_failure(
+                    _FUND_FLOW_SOURCE_EM,
+                    "stock_individual_fund_flow",
+                    "formatter_failure",
+                    em_detail,
+                )
         except Exception as exc:
-            # A failed call is one attempt, but never retain the exception text;
-            # type names are enough for a redacted audit trail.
-            reason = type(exc).__name__
-            _record_attempt(em_source, "failed", reason)
-            em_typed_gap = _em_gap_meta(reason)
-            errors.append(f"stock_individual_fund_flow: {reason}")
+            em_gap_reason = f"stock_individual_fund_flow: {type(exc).__name__}"
+            em_typed_gap = _build_em_typed_gap(None, em_gap_reason)
+            _record_failure(
+                _FUND_FLOW_SOURCE_EM,
+                "stock_individual_fund_flow",
+                type(exc).__name__,
+                "provider call failed",
+            )
 
         # Source 2.5: Sina Web is legacy reference only. Keep the typed
         # response for auditability, but it is never a successful main-force
         # evidence result or direction source.
-        sina_source = "sina_historical"
         try:
             hist_text = self._fetch_sina_historical_fund_flow(
                 symbol,
@@ -1588,6 +1662,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 require_curr_date=not is_historical,
             )
             if hist_text is not None:
+                _record_success(_FUND_FLOW_SOURCE_SINA)
                 metadata = dict(getattr(hist_text, "fund_flow_evidence_meta", {}) or {})
                 metadata.update({
                     "legacy_web_algorithm": True,
@@ -1595,106 +1670,154 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     "direction_allowed": False,
                     "reason": "新浪旧 Web 参考值，不驱动主力方向",
                 })
-                sina_status = str(metadata.get("status") or "available")
-                _record_attempt(
-                    sina_source,
-                    sina_status,
-                    metadata.get("reason") or "legacy reference available",
-                )
-                return _decorate(
+                return _with_chain(
                     FundFlowText(
                         f"{hist_text}\n（新浪旧 Web 参考值：仅作降级参考，不驱动方向）",
                         evidence=getattr(hist_text, "fund_flow_evidence", []),
                         evidence_meta=metadata,
                     ),
-                    final_source=sina_source,
+                    _FUND_FLOW_SOURCE_SINA,
                 )
             if is_historical:
-                reason = "no rows on or before curr_date"
-                errors.append(f"sina historical fund flow: {reason}")
+                _record_failure(
+                    _FUND_FLOW_SOURCE_SINA,
+                    "sina historical fund flow",
+                    "no_rows_on_or_before_curr_date",
+                    "no rows on or before curr_date",
+                )
             else:
-                reason = "no current-day close row"
-                errors.append(f"sina historical fund flow: {reason}")
-            _record_attempt(sina_source, "unavailable", reason)
+                _record_failure(
+                    _FUND_FLOW_SOURCE_SINA,
+                    "sina historical fund flow",
+                    "no_current_day_close_row",
+                    "no current-day close row",
+                )
         except Exception as exc:
-            reason = type(exc).__name__
-            _record_attempt(sina_source, "failed", reason)
-            errors.append(f"sina historical fund flow: {reason}")
+            _record_failure(
+                _FUND_FLOW_SOURCE_SINA,
+                "sina historical fund flow",
+                type(exc).__name__,
+                "historical endpoint call failed",
+            )
 
         if is_historical:
-            return _failure_response(
+            return _gap(
                 f"【数据获取失败】历史日期 {curr_date} 新算法与新浪历史/legacy Web 资金流均不可用，"
-                f"{symbol} 本项不可用。（{'；'.join(errors)}）",
-                source="fund_flow_individual",
-                reason=_gap_reason(
+                f"{symbol} 本项不可用。（{'；'.join(error_texts)}）",
+                _gap_reason(
                     "historical new-algorithm evidence unavailable; legacy Web reference unavailable"
                 ),
             )
 
         # Source 3: 同花顺即时资金流净额快照（历史接口尚无当日收盘行时）。
-        ths_source = "ths_instant_snapshot"
         try:
             with AKSHARE_CALL_LOCK:
                 df = ak.stock_fund_flow_individual(symbol="即时")
             if df is None or df.empty:
-                reason = "empty dataframe"
-                _record_attempt(ths_source, "unavailable", reason)
-                errors.append(f"stock_fund_flow_individual: {reason}")
-                return _failure_response(
-                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照无记录"
-                    f"（{'；'.join(errors)}）",
-                    source=ths_source,
-                    reason=_gap_reason(
-                        "同花顺即时资金流净额快照无记录；该源不提供新浪 netamount/r0_net evidence"
-                    ),
+                _record_failure(
+                    _FUND_FLOW_SOURCE_THS,
+                    "stock_fund_flow_individual",
+                    "empty_dataframe",
+                    "provider returned an empty dataframe",
                 )
-            if "股票代码" not in df.columns:
-                reason = "missing stock code field"
-                _record_attempt(ths_source, "unavailable", reason)
-                errors.append(f"stock_fund_flow_individual: {reason}")
-                return _failure_response(
-                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照缺少股票代码字段"
-                    f"（{'；'.join(errors)}）",
-                    source=ths_source,
-                    reason=_gap_reason(reason),
+                return _gap(
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照为空"
+                    f"（{'；'.join(error_texts)}）",
+                    _gap_reason(
+                        "同花顺即时资金流净额快照为空；该源不提供新浪 netamount/r0_net evidence"
+                    ),
                 )
             stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
             if stock_df.empty:
-                reason = "no matching stock row"
-                _record_attempt(ths_source, "unavailable", reason)
-                errors.append(f"stock_fund_flow_individual: {reason}")
-                return _failure_response(
+                _record_failure(
+                    _FUND_FLOW_SOURCE_THS,
+                    "stock_fund_flow_individual",
+                    "no_matching_row",
+                    "no matching stock row",
+                )
+                return _gap(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照无记录"
-                    f"（{'；'.join(errors)}）",
-                    source=ths_source,
-                    reason=_gap_reason(
+                    f"（{'；'.join(error_texts)}）",
+                    _gap_reason(
                         "同花顺即时资金流净额快照无记录；该源不提供新浪 netamount/r0_net evidence"
                     ),
                 )
             row = stock_df.iloc[0]
             if "净额" not in stock_df.columns:
-                reason = "missing netamount field"
-                _record_attempt(ths_source, "unavailable", reason)
-                errors.append(f"stock_fund_flow_individual: {reason}")
-                return _failure_response(
+                _record_failure(
+                    _FUND_FLOW_SOURCE_THS,
+                    "stock_fund_flow_individual",
+                    "missing_net_amount",
+                    "matched row is missing 净额",
+                )
+                return _gap(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照缺少净额字段"
-                    f"（{'；'.join(errors)}）",
-                    source=ths_source,
-                    reason=_gap_reason(
+                    f"（{'；'.join(error_texts)}）",
+                    _gap_reason(
                         "同花顺即时资金流净额快照缺少净额字段；该源不提供新浪 netamount/r0_net evidence"
                     ),
                 )
             net_amount = _usable_fund_amount_text(row["净额"])
             if net_amount is None:
-                reason = "invalid netamount value"
-                _record_attempt(ths_source, "unavailable", reason)
-                errors.append(f"stock_fund_flow_individual: {reason}")
-                return _failure_response(
+                _record_failure(
+                    _FUND_FLOW_SOURCE_THS,
+                    "stock_fund_flow_individual",
+                    "invalid_net_amount",
+                    "matched 净额 is missing or unparseable",
+                )
+                return _gap(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照净额缺失或不可解析"
-                    f"（{'；'.join(errors)}）",
-                    source=ths_source,
-                    reason=_gap_reason(
+                    f"（{'；'.join(error_texts)}）",
+                    _gap_reason(
                         "同花顺即时资金流净额快照净额缺失或不可解析；该源不提供新浪 netamount/r0_net evidence"
+                    ),
+                )
+
+            source_date, source_date_error = _ths_source_date(row)
+            today = parse_yyyymmdd(cn_today_str())
+            if source_date is None:
+                _record_failure(
+                    _FUND_FLOW_SOURCE_THS,
+                    "stock_fund_flow_individual",
+                    source_date_error or "invalid_source_date",
+                    "THS row has no verifiable source date",
+                )
+                return _gap(
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照（来源日期缺失，"
+                    f"资金净额: {net_amount}；最新价 {row.get('最新价', '')}；"
+                    f"涨跌幅 {row.get('涨跌幅', '')}（未形成可验证 evidence；"
+                    "不是新浪历史 netamount/r0_net 同口径主力序列）"
+                    f"（{'；'.join(error_texts)}）",
+                    _gap_reason(
+                        "THS source date is missing or unparseable; no as-of was assigned"
+                    ),
+                )
+            if source_date > cutoff or (today is not None and source_date > today):
+                _record_failure(
+                    _FUND_FLOW_SOURCE_THS,
+                    "stock_fund_flow_individual",
+                    "future_source_date",
+                    f"THS source date {source_date.isoformat()} is after the allowed cutoff",
+                )
+                return _gap(
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照来源日期超出允许范围"
+                    f"（{'；'.join(error_texts)}）",
+                    _gap_reason(
+                        "THS source date is after the analysis cutoff or current date"
+                    ),
+                )
+            if source_date != cutoff:
+                _record_failure(
+                    _FUND_FLOW_SOURCE_THS,
+                    "stock_fund_flow_individual",
+                    "source_date_out_of_range",
+                    f"THS source date {source_date.isoformat()} does not match requested cutoff {curr_date}",
+                )
+                return _gap(
+                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照来源日期不匹配分析日期"
+                    f"（{'；'.join(error_texts)}）",
+                    _gap_reason(
+                        "THS source date is outside the requested realtime as-of range"
                     ),
                 )
 
@@ -1704,44 +1827,10 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 val = row[col]
                 return "" if pd.isna(val) else str(val)
 
-            source_date = None
-            for date_col in ("日期", "数据日期", "交易日期", "date", "as_of"):
-                parsed_date = parse_yyyymmdd(row.get(date_col))
-                if parsed_date is not None:
-                    source_date = parsed_date
-                    break
-            if source_date is None:
-                reason = "missing or invalid source date"
-                _record_attempt(ths_source, "unavailable", reason)
-                errors.append(f"stock_fund_flow_individual: {reason}")
-                return _failure_response(
-                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照缺少有效来源日期"
-                    f"（{'；'.join(errors)}）",
-                    source=ths_source,
-                    reason=_gap_reason(
-                        "同花顺即时资金流净额快照缺少有效来源日期；"
-                        "不能用请求日期冒充实际数据日期"
-                    ),
-                )
-            snapshot_as_of = source_date.isoformat()
-            if source_date > cutoff:
-                reason = "source date after curr_date"
-                _record_attempt(ths_source, "unavailable", reason)
-                errors.append(f"stock_fund_flow_individual: {reason}")
-                return _failure_response(
-                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照来源日期"
-                    f"{snapshot_as_of} 晚于请求日期 {curr_date}（{'；'.join(errors)}）",
-                    source=ths_source,
-                    reason=_gap_reason(
-                        "同花顺即时资金流净额快照来源日期晚于 curr_date，拒绝前视数据"
-                    ),
-                )
-            evidence_date = snapshot_as_of
             retrieved_at = self._sina_retrieved_at()
             row_payload = {
                 "股票代码": code,
-                "日期": snapshot_as_of,
-                "as_of": snapshot_as_of,
+                "日期": source_date.isoformat(),
                 "净额": row.get("净额"),
                 "单位": "亿元",
                 "period_kind": "realtime_single_day",
@@ -1753,61 +1842,52 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 requested_as_of=curr_date,
                 retrieved_at=retrieved_at,
             )
-            if snapshot_as_of is None:
-                # The snapshot has no source date; do not let the evidence
-                # builder's requested-date fallback become a fabricated as_of.
-                for record in evidence:
-                    record["date"] = None
-                    record["measurement_date"] = None
-                    record["as_of"] = None
             consensus = build_consensus_evidence(
                 evidence,
                 symbol=symbol,
                 requested_as_of=curr_date,
                 field="netamount",
             )
-            ths_metadata = {
-                "symbol": symbol,
-                "requested_as_of": curr_date,
-                "retrieved_at": retrieved_at,
-                "as_of": snapshot_as_of,
-                "source": ths_source,
-                "source_family": "ths",
-                "algorithm_group": "new_algorithm_group",
-                "period_kind": "realtime_single_day",
-                "unit": "亿元",
-                "status": "available",
-                "consensus": consensus,
-                "reason": "同花顺即时资金流净额是总净额，未将其等同于新浪历史 r0_net 主力序列",
-            }
-            _record_attempt(ths_source, "available", ths_metadata["reason"])
-            return _decorate(
+            _record_success(_FUND_FLOW_SOURCE_THS)
+            return _with_chain(
                 FundFlowText(
                     (
                         f"【备用数据源：同花顺即时资金流净额快照】{symbol} 当日资金流净额快照"
-                        f"（数据日期：{evidence_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
+                        f"（{curr_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
                         f"资金净额: {net_amount} | 流入资金: {_v('流入资金')} | "
                         f"流出资金: {_v('流出资金')} | 换手率: {_v('换手率')}\n"
                         "（该快照不是新浪历史 netamount/r0_net 同口径主力序列；"
                         "属于同花顺新算法组总净额，仍不得视为 r0_net 主力序列）"
                     ),
                     evidence=evidence,
-                    evidence_meta=ths_metadata,
+                    evidence_meta={
+                        "symbol": symbol,
+                        "requested_as_of": curr_date,
+                        "retrieved_at": retrieved_at,
+                        "source": _FUND_FLOW_SOURCE_THS,
+                        "source_family": "ths",
+                        "algorithm_group": "new_algorithm_group",
+                        "period_kind": "realtime_single_day",
+                        "unit": "亿元",
+                        "status": "available",
+                        "consensus": consensus,
+                        "reason": "同花顺即时资金流净额是总净额，未将其等同于新浪历史 r0_net 主力序列",
+                    },
                 ),
-                final_source=ths_source,
+                _FUND_FLOW_SOURCE_THS,
             )
         except Exception as exc:
-            reason = type(exc).__name__
-            _record_attempt(ths_source, "failed", reason)
-            errors.append(f"stock_fund_flow_individual: {reason}")
+            _record_failure(
+                _FUND_FLOW_SOURCE_THS,
+                "stock_fund_flow_individual",
+                type(exc).__name__,
+                "provider call or formatter failed",
+            )
 
-        gap_reason = "东财/新浪历史/同花顺即时资金流净额快照均失败"
-        if errors:
-            gap_reason = f"{gap_reason}；{'；'.join(errors)}"
-        return _failure_response(
-            f"【数据获取失败】个股资金流向数据获取失败（东财/新浪历史/同花顺即时资金流净额快照均失败：{'；'.join(errors)}）",
-            source="fund_flow_individual",
-            reason=gap_reason,
+        final_errors = "；".join(error_texts) or "no provider attempts"
+        return _gap(
+            f"【数据获取失败】个股资金流向数据获取失败（东财/新浪历史/同花顺即时资金流净额快照均失败：{final_errors}）",
+            _gap_reason("东财/新浪历史/同花顺即时资金流净额快照均失败"),
         )
 
     def _fetch_sina_historical_fund_flow(
@@ -1969,7 +2049,6 @@ class CnAkshareProvider(BaseMarketDataProvider):
             evidence_meta={
                 "symbol": symbol,
                 "requested_as_of": curr_date,
-                "as_of": latest_str,
                 "retrieved_at": retrieved_at,
                 "source": "sina_historical",
                 "algorithm_group": "legacy_web_algorithm",
@@ -2036,10 +2115,48 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 )
                 return FundFlowText(str(value), evidence=evidence, evidence_meta=metadata)
             ths_row = matched.iloc[0]
+            analysis_date_error = unavailable_analysis_date_reason(curr_date)
+            requested_date = parse_yyyymmdd(curr_date)
+            source_date = None
+            for column in (
+                "日期",
+                "date",
+                "measurement_date",
+                "交易日期",
+                "trade_date",
+                "opendate",
+            ):
+                if column not in ths_row:
+                    continue
+                source_date = parse_yyyymmdd(ths_row.get(column))
+                if source_date is not None:
+                    break
+            today = parse_yyyymmdd(cn_today_str())
+            if (
+                analysis_date_error
+                or requested_date is None
+                or source_date is None
+                or source_date != requested_date
+                or (today is not None and source_date > today)
+            ):
+                metadata["manual_calibration_gap"] = build_gap_meta(
+                    symbol=symbol,
+                    requested_as_of=curr_date,
+                    source="sina_app_manual_calibration",
+                    status="blocked",
+                    reason=(
+                        "同花顺快照缺少可验证来源日期或日期超出分析允许范围；"
+                        "未将请求日期写入 THS evidence"
+                    ),
+                    retrieved_at=self._sina_retrieved_at(),
+                    algorithm_group="new_algorithm_group",
+                    period_kind="realtime_single_day",
+                )
+                return FundFlowText(str(value), evidence=evidence, evidence_meta=metadata)
             ths_records = build_ths_evidence(
                 [{
                     "股票代码": code,
-                    "日期": curr_date,
+                    "日期": source_date.isoformat(),
                     "净额": ths_row.get("净额"),
                     "单位": "亿元",
                     "period_kind": "realtime_single_day",
@@ -2103,14 +2220,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         date_col = "日期" if "日期" in df.columns else None
         value_col = "主力净流入-净额" if "主力净流入-净额" in df.columns else None
         if date_col is None or value_col is None:
-            return build_provider_text(
-                f"【数据获取失败】东财资金流结果缺少 日期/主力净流入-净额 字段，"
-                f"{symbol} 本项不可用。",
-                symbol=symbol,
-                requested_as_of=curr_date,
-                source="eastmoney_individual_fund_flow",
-                reason="missing date or r0_net field",
-            )
+            return None
 
         dates = pd.to_datetime(df[date_col], errors="coerce")
         values = pd.to_numeric(df[value_col], errors="coerce")
@@ -2120,25 +2230,14 @@ class CnAkshareProvider(BaseMarketDataProvider):
         df[value_col] = values[valid]
         df = df[df[date_col] <= pd.Timestamp(cutoff)]
         if df.empty:
-            return build_provider_text(
+            return (
                 f"【数据获取失败】资金流数据仅覆盖最近约 120 个交易日，"
-                f"{curr_date} 超出可得范围，{symbol} 本项不可用。",
-                symbol=symbol,
-                requested_as_of=curr_date,
-                source="eastmoney_individual_fund_flow",
-                reason="no finite r0_net rows on or before curr_date",
+                f"{curr_date} 超出可得范围，{symbol} 本项不可用。"
             )
 
         df_recent = chronological(take_latest(df, date_col, 5), date_col)
         if df_recent is None or df_recent.empty:
-            return build_provider_text(
-                f"【数据获取失败】东财资金流结果在日期截断后无可用记录，"
-                f"{curr_date} 下 {symbol} 本项不可用。",
-                symbol=symbol,
-                requested_as_of=curr_date,
-                source="eastmoney_individual_fund_flow",
-                reason="no rows after recent-window selection",
-            )
+            return None
         latest_day = pd.to_datetime(df_recent[date_col], errors="coerce").max()
         latest_str = latest_day.date().isoformat() if pd.notna(latest_day) else curr_date
         retrieved_at = self._sina_retrieved_at()
@@ -2148,15 +2247,6 @@ class CnAkshareProvider(BaseMarketDataProvider):
             requested_as_of=curr_date,
             retrieved_at=retrieved_at,
         )
-        if not evidence:
-            return build_provider_text(
-                f"【数据获取失败】东财资金流结果在日期截断后无可用结构化 evidence，"
-                f"{curr_date} 下 {symbol} 本项不可用。",
-                symbol=symbol,
-                requested_as_of=curr_date,
-                source="eastmoney_individual_fund_flow",
-                reason="structured evidence empty after date truncation",
-            )
         consensus = build_consensus_evidence(
             evidence,
             symbol=symbol,
@@ -2172,7 +2262,6 @@ class CnAkshareProvider(BaseMarketDataProvider):
             evidence_meta={
                 "symbol": symbol,
                 "requested_as_of": curr_date,
-                "as_of": latest_str,
                 "retrieved_at": retrieved_at,
                 "source": "eastmoney_individual_fund_flow",
                 "algorithm_group": "new_algorithm_group",
