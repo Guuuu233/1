@@ -4,7 +4,9 @@ import os
 import re
 from pathlib import Path
 import json
+import logging
 from typing import Dict, Any, List, Optional
+
 
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
@@ -39,6 +41,9 @@ from .setup import GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
 from .signal_processing import SignalProcessor
+
+
+_logger = logging.getLogger(__name__)
 
 
 def _state_logging_enabled() -> bool:
@@ -110,7 +115,7 @@ class TradingAgentsGraph:
                 with get_db_ctx() as session:
                     resolved_roles = resolve_all_roles(session, user_id, runtime_config=self.config)
         except Exception as err:
-            print(f"[TradingAgentsGraph] Warning: failed to resolve role configs: {err}")
+            _logger.warning("[TradingAgentsGraph] Failed to resolve role configs: %s", err)
 
         self.role_llms = {}
         self.role_resolved_configs = resolved_roles
@@ -382,7 +387,7 @@ class TradingAgentsGraph:
             }
 
         # Pre-collect data once (always full data); analysts will read from cache
-        print(f"[TradingAgentsGraph] Collecting data for {ticker} {trade_date}…")
+        _logger.info("[TradingAgentsGraph] Collecting data for %s %s…", ticker, trade_date)
         collected = self.data_collector.collect(ticker, trade_date)
         market_data_context = (
             collected.get("market_data_context")

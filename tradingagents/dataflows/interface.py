@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import logging
 import os
 import threading
 
@@ -20,6 +21,9 @@ from .vendor_result import (
     VendorOk,
     VendorRefuse,
 )
+
+
+_logger = logging.getLogger(__name__)
 
 # Tools organized by category
 TOOLS_CATEGORIES = {
@@ -99,7 +103,10 @@ def _is_trace_enabled() -> bool:
 
 def _trace(msg: str) -> None:
     if _is_trace_enabled():
-        print(f"[provider-trace] {msg}", flush=True)
+        # Provider tracing must not share the service's stdout pipe.  A parent
+        # process may close that pipe while an analysis is still running; a
+        # direct print would then turn observability into a job failure.
+        _logger.info("[provider-trace] %s", msg)
 
 
 _TRACE_KEYS = ("symbol", "ticker", "start_date", "end_date", "curr_date", "indicator")

@@ -103,7 +103,14 @@ class OpenAIClient(BaseLLMClient):
         elif self.provider == "ollama": target_url = "http://localhost:11434/v1"
         elif self.provider == "deepseek": target_url = "https://api.deepseek.com"
 
-        print(f"[LLM Client] Init {self.provider} ({self.model}) at {target_url} (Retries={llm_kwargs['max_retries']}, Timeout={llm_kwargs['timeout']}s)")
+        _logger.info(
+            "[LLM Client] Init %s (%s) at %s (Retries=%s, Timeout=%ss)",
+            self.provider,
+            self.model,
+            target_url,
+            llm_kwargs["max_retries"],
+            llm_kwargs["timeout"],
+        )
 
         if self.provider == "xai":
             llm_kwargs["base_url"] = "https://api.x.ai/v1"
