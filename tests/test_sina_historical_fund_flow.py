@@ -219,7 +219,7 @@ def test_current_day_without_close_row_still_tries_snapshot():
     assert "资金净额: 5.60亿" in text
     assert "不是新浪历史 netamount/r0_net 同口径主力序列" in text
     assert "最新价 1700.00" in text
-    assert "【数据获取失败】" not in text
+    assert "【数据获取失败】" in text
 
 
 @pytest.mark.parametrize(
