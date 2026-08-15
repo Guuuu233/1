@@ -191,7 +191,7 @@ _SINA_HIST_CORE_AMOUNT_FIELDS = ("netamount", "r0_net")
 # f51-f61 are the documented daily fields; f64/f65 are not included because
 # their semantics are not required by the evidence contract.
 _EASTMONEY_DIRECT_FUND_FLOW_URL = (
-    "https://push2.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
 )
 _EASTMONEY_DIRECT_FUND_FLOW_HEADERS = {
     "Referer": "https://data.eastmoney.com/",
@@ -310,6 +310,9 @@ def _fund_flow_failure_category(error: object) -> str:
             "malformed",
             "field_count",
             "no_usable_rows",
+            "no_current_day_row",
+            "duplicate_date",
+            "curr_date_invalid",
             "non_trading_date",
             "curr_date_not_cn_trading_day",
             "missing",
@@ -1422,20 +1425,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
         字段，并把 f52 保持为 ``r0_net``；它不会把总净额或未知字段伪装成
         主力净额。每个成功或失败的 ``FundFlowText`` 都携带完整尝试链。
         """
-        if not curr_date:
-            return (
-                f"【数据获取失败】个股资金流向缺少 curr_date，无法做日期截断，"
-                f"{symbol} 本项不可用。"
-            )
-        cutoff = parse_yyyymmdd(curr_date)
-        if cutoff is None:
-            return f"【数据获取失败】个股资金流向 curr_date 无法解析：{curr_date!r}"
-
-        code = self._normalize_symbol(symbol)
         errors: list[str] = []
         attempted_sources: list[str] = []
         em_typed_gap = ""
-        is_historical = is_historical_analysis_date(curr_date)
 
         def _gap_reason(base_reason: str) -> str:
             return f"{base_reason}；{'；'.join(errors)}" if errors else base_reason
@@ -1465,6 +1457,25 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     metadata["field"] = "r0_net"
                 elif "netamount" in fields:
                     metadata["field"] = "netamount"
+            consensus = metadata.get("consensus")
+            if isinstance(consensus, dict):
+                consensus_status = consensus.get("status")
+                direction_allowed = (
+                    bool(consensus.get("direction_allowed"))
+                    and consensus_status == "consensus"
+                    and metadata.get("algorithm_group") != "legacy_web_algorithm"
+                )
+                metadata["status"] = consensus_status or metadata.get("status")
+                metadata["direction"] = (
+                    consensus.get("direction") if direction_allowed else "blocked"
+                )
+                metadata["direction_allowed"] = direction_allowed
+                metadata["hard_guard"] = {
+                    "blocked": not direction_allowed,
+                    "direction_allowed": direction_allowed,
+                    "reason": consensus.get("reason")
+                    or "consensus unavailable or direction is not permitted",
+                }
             metadata.update(
                 {
                     "attempted_sources": list(attempted_sources),
@@ -1487,6 +1498,39 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 evidence=evidence,
                 evidence_meta=metadata,
             )
+
+        if not curr_date:
+            errors.append("fund_flow_individual: curr_date_missing")
+            gap = build_provider_text(
+                f"【数据获取失败】个股资金流向缺少 curr_date，无法做日期截断，"
+                f"{symbol} 本项不可用。",
+                symbol=symbol,
+                requested_as_of=curr_date,
+                source="fund_flow_individual",
+                reason="curr_date_missing；不得在缺少分析日期时回退到 live 数据源",
+                field="r0_net",
+                raw_unit="元",
+                failure_category="validation",
+            )
+            return _attach_chain(gap, "unavailable")
+
+        cutoff = parse_yyyymmdd(curr_date)
+        if cutoff is None:
+            errors.append(f"fund_flow_individual: curr_date_invalid:{curr_date!r}")
+            gap = build_provider_text(
+                f"【数据获取失败】个股资金流向 curr_date 无法解析：{curr_date!r}",
+                symbol=symbol,
+                requested_as_of=curr_date,
+                source="fund_flow_individual",
+                reason=f"curr_date_invalid:{curr_date!r}",
+                field="r0_net",
+                raw_unit="元",
+                failure_category="validation",
+            )
+            return _attach_chain(gap, "unavailable")
+
+        code = self._normalize_symbol(symbol)
+        is_historical = is_historical_analysis_date(curr_date)
 
         # Source 1: AkShare's Eastmoney wrapper (近 120 交易日逐日序列).
         attempted_sources.append("akshare.stock_individual_fund_flow")
@@ -1554,7 +1598,10 @@ class CnAkshareProvider(BaseMarketDataProvider):
         attempted_sources.append("eastmoney_direct")
         try:
             direct_text, direct_error = self._fetch_eastmoney_direct_fund_flow(
-                symbol, curr_date, cutoff
+                symbol,
+                curr_date,
+                cutoff,
+                require_curr_date=not is_historical,
             )
             if direct_text is not None:
                 return _attach_chain(direct_text, "eastmoney_direct")
@@ -1754,6 +1801,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
         symbol: str,
         curr_date: str,
         cutoff,
+        *,
+        require_curr_date: bool = False,
     ) -> tuple[FundFlowText | None, str | None]:
         """Fetch verified daily fields from Eastmoney's public endpoint.
 
@@ -1761,6 +1810,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
         eleven fields are enough for this provider's contract; only f52 is
         normalized as the documented main-force net amount.  f53-f61 remain
         raw/discovery-only values, and unknown trailing fields are ignored.
+        For a current-day request, a prior close is not an acceptable as-of;
+        the response must contain a valid row dated exactly ``curr_date``.
         """
         import json
         import requests as _requests
@@ -1840,6 +1891,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         cutoff_date = cutoff
         parsed_rows: list[dict[str, str]] = []
         discovery_by_date: dict[str, dict[str, str]] = {}
+        duplicate_dates: list[str] = []
         warnings: list[str] = []
         malformed_rows: list[str] = []
         for row_index, raw_row in enumerate(klines):
@@ -1894,6 +1946,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 return parts[index] if index < len(parts) else ""
 
             day_text = day.isoformat()
+            if day_text in discovery_by_date:
+                warning = f"row {row_index}: duplicate_date={day_text}"
+                warnings.append(warning)
+                duplicate_dates.append(day_text)
+                continue
             discovery_by_date[day_text] = {
                 field: _part(int(field[1:]) - 51)
                 for field in _EASTMONEY_DIRECT_DISCOVERY_FIELDS
@@ -1909,6 +1966,19 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 }
             )
 
+        if duplicate_dates:
+            detail = "; ".join(sorted(set(duplicate_dates))[:5])
+            return None, f"eastmoney_direct: duplicate_date: {detail}"
+        if require_curr_date and parsed_rows:
+            requested_day = cutoff_date.isoformat()
+            if not any(row.get("日期") == requested_day for row in parsed_rows):
+                available = ", ".join(
+                    sorted({str(row.get("日期")) for row in parsed_rows})[-5:]
+                )
+                return None, (
+                    "eastmoney_direct: no_current_day_row "
+                    f"(requested={requested_day}; available={available})"
+                )
         if malformed_rows:
             detail = "; ".join(malformed_rows[:5])
             if not parsed_rows:

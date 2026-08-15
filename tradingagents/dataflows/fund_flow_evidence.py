@@ -519,7 +519,7 @@ def build_provider_text(
     text: str,
     *,
     symbol: str,
-    requested_as_of: str,
+    requested_as_of: str | None,
     source: str,
     reason: str,
     retrieved_at: str | None = None,
@@ -554,7 +554,7 @@ def build_provider_text(
 def build_gap_meta(
     *,
     symbol: str,
-    requested_as_of: str,
+    requested_as_of: str | None,
     source: str,
     status: str,
     reason: str,
