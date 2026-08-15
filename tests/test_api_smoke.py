@@ -599,6 +599,70 @@ class TestReportsEndpoint:
         assert response.status_code == 200
         return response.json()
 
+    def test_report_names_recover_after_failed_cache_and_match_between_list_and_detail(self):
+        from api import main as main_mod
+
+        report = self._create_report("600519.SH", "2026-03-30", "BUY")
+        saved = (
+            main_mod._cn_stock_map,
+            main_mod._cn_stock_reverse_map,
+            main_mod._cn_stock_map_norm,
+            main_mod._cn_stock_map_norm_src,
+            main_mod._cn_stock_map_loaded_at,
+            main_mod._cn_stock_map_last_failure_at,
+        )
+        try:
+            # A failed cold load leaves an empty placeholder, but it must not
+            # make report names permanently fall back to the symbol.
+            main_mod._cn_stock_map = {}
+            main_mod._cn_stock_reverse_map = {}
+            main_mod._cn_stock_map_norm = None
+            main_mod._cn_stock_map_norm_src = None
+            main_mod._cn_stock_map_loaded_at = 0
+            main_mod._cn_stock_map_last_failure_at = (
+                time.time() - main_mod._STOCK_MAP_FAILURE_RETRY_INTERVAL - 1
+            )
+
+            with (
+                patch.object(main_mod, "_schedule_cn_stock_map_refresh") as schedule_refresh,
+                patch.object(main_mod, "_get_reverse_stock_map", return_value={}),
+            ):
+                list_response = self.client.get("/v1/reports", headers=self.headers)
+                detail_response = self.client.get(
+                    f"/v1/reports/{report['id']}", headers=self.headers
+                )
+
+            assert list_response.status_code == 200
+            assert detail_response.status_code == 200
+            assert list_response.json()["reports"][0]["name"] == "600519.SH"
+            assert detail_response.json()["name"] == "600519.SH"
+            assert schedule_refresh.call_count >= 1
+
+            # Once the provider recovers and the successful cache is populated,
+            # both endpoints must expose the same Chinese name.
+            main_mod._cn_stock_map = {"贵州茅台": "600519.SH"}
+            main_mod._cn_stock_reverse_map = {"600519.SH": "贵州茅台"}
+            main_mod._cn_stock_map_loaded_at = time.time()
+            main_mod._cn_stock_map_last_failure_at = 0
+
+            recovered_list = self.client.get("/v1/reports", headers=self.headers)
+            recovered_detail = self.client.get(
+                f"/v1/reports/{report['id']}", headers=self.headers
+            )
+            assert recovered_list.status_code == 200
+            assert recovered_detail.status_code == 200
+            assert recovered_list.json()["reports"][0]["name"] == "贵州茅台"
+            assert recovered_detail.json()["name"] == "贵州茅台"
+        finally:
+            (
+                main_mod._cn_stock_map,
+                main_mod._cn_stock_reverse_map,
+                main_mod._cn_stock_map_norm,
+                main_mod._cn_stock_map_norm_src,
+                main_mod._cn_stock_map_loaded_at,
+                main_mod._cn_stock_map_last_failure_at,
+            ) = saved
+
     def test_latest_by_symbols_returns_only_each_symbol_latest_report(self):
         self._create_report("600519.SH", "2026-03-28", "HOLD")
         self._create_report("600519.SH", "2026-03-30", "BUY")

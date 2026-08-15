@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from numbers import Real
-from threading import Lock
+from threading import Lock, Thread
 from fastapi import Body
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from uuid import uuid4
@@ -522,6 +522,61 @@ _STOCK_MAP_TTL = 7 * 86400  # 7 days
 # failure must not hammer a rate-limited endpoint nor freeze the cache for the
 # full 7-day TTL. Configurable via TA_STOCK_MAP_RETRY_INTERVAL (seconds).
 _STOCK_MAP_FAILURE_RETRY_INTERVAL = int(os.getenv("TA_STOCK_MAP_RETRY_INTERVAL", "1800"))
+_cn_stock_map_refresh_inflight = False
+
+
+def _stock_map_refresh_needed(now: Optional[float] = None) -> bool:
+    """Return whether the name map needs a non-blocking refresh attempt."""
+    current_time = time.time() if now is None else now
+    cache_is_fresh = (
+        _cn_stock_map is not None
+        and _cn_stock_reverse_map is not None
+        and _cn_stock_map_loaded_at > 0
+        and _cn_stock_map_last_failure_at == 0
+        and current_time - _cn_stock_map_loaded_at <= _STOCK_MAP_TTL
+    )
+    if cache_is_fresh:
+        return False
+
+    # A recent failure is deliberately left as an empty placeholder by the
+    # loader, but it must not cause every report request to retry the provider.
+    return not (
+        _cn_stock_map_last_failure_at
+        and current_time - _cn_stock_map_last_failure_at < _STOCK_MAP_FAILURE_RETRY_INTERVAL
+    )
+
+
+def _refresh_cn_stock_map_worker() -> None:
+    """Refresh the stock map outside the request thread."""
+    global _cn_stock_map_refresh_inflight
+    try:
+        _load_cn_stock_map()
+    except Exception as exc:  # pragma: no cover - loader normally handles errors
+        _log(f"[StockMap] Background refresh failed: {exc}")
+    finally:
+        with _cn_stock_map_lock:
+            _cn_stock_map_refresh_inflight = False
+
+
+def _schedule_cn_stock_map_refresh() -> None:
+    """Start at most one provider refresh without delaying the report response."""
+    global _cn_stock_map_refresh_inflight
+    if not _stock_map_refresh_needed():
+        return
+
+    with _cn_stock_map_lock:
+        if not _stock_map_refresh_needed() or _cn_stock_map_refresh_inflight:
+            return
+        _cn_stock_map_refresh_inflight = True
+        try:
+            Thread(
+                target=_refresh_cn_stock_map_worker,
+                name="ta-stock-map-refresh",
+                daemon=True,
+            ).start()
+        except Exception as exc:  # pragma: no cover - thread creation is platform code
+            _cn_stock_map_refresh_inflight = False
+            _log(f"[StockMap] Could not start background refresh: {exc}")
 
 
 def _load_cn_stock_map() -> Dict[str, str]:
@@ -612,6 +667,13 @@ def _get_reverse_stock_map_cached_only() -> Dict[str, str]:
     if _cn_stock_map is None or _cn_stock_reverse_map is None:
         return {}
     return dict(_cn_stock_reverse_map)
+
+
+def _get_report_reverse_stock_map() -> Dict[str, str]:
+    """Return cached report names and refresh a cold cache asynchronously."""
+    code_to_name = _get_reverse_stock_map_cached_only()
+    _schedule_cn_stock_map_refresh()
+    return code_to_name
 
 
 def _get_normalized_stock_map() -> Dict[str, str]:
@@ -4469,7 +4531,7 @@ def list_reports(
         skip=skip,
         limit=limit,
     )
-    code_to_name = _get_reverse_stock_map_cached_only()
+    code_to_name = _get_report_reverse_stock_map()
     for r in reports:
         r.name = code_to_name.get(r.symbol, r.symbol)
         _attach_job_runtime_state(r, str(getattr(r, "id", "")))
@@ -4502,7 +4564,7 @@ def get_report_endpoint(
         raise HTTPException(status_code=404, detail="报告不存在")
     if str(report.status or "") in report_service.ACTIVE_REPORT_STATUSES and not _get_job(report_id):
         report = report_service.finalize_orphan_report(db, report)
-    code_to_name = _get_reverse_stock_map()
+    code_to_name = _get_report_reverse_stock_map()
     report.name = code_to_name.get(report.symbol, report.symbol)
     _attach_job_runtime_state(report, report_id)
     return report
