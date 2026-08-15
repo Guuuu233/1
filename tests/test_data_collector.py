@@ -4,6 +4,7 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from tradingagents.dataflows.fund_flow_evidence import FundFlowText
 from tradingagents.graph.data_collector import (
     DataCollector,
     _build_source_provenance,
@@ -230,6 +231,153 @@ def test_failed_stock_data_enters_ledger_and_gap():
     assert stock_entries
     assert "无有效完整日线数据" in stock_entries[0]["gap"]
     assert result["market_data_context"]["source_provenance"]["stock_data"]["as_of"] is None
+
+
+def test_fetch_all_propagates_manual_calibration_gap_to_ledger_and_provenance():
+    from tradingagents.graph import data_collector
+
+    trade_date = "2026-08-11"
+    manual_gap = {
+        "source": "sina_app_manual_calibration",
+        "status": "blocked",
+        "reason": "新浪 App 无可验证公开接口；截图仅作人工校准",
+        "retrieved_at": "2026-08-11T12:00:00+00:00",
+        "as_of": None,
+        "requested_as_of": "2026-08-09",
+        "gap": "【数据获取失败】资金流 evidence：新浪 App 无可验证公开接口；截图仅作人工校准",
+    }
+    evidence = [
+        {
+            "date": f"2026-08-{day:02d}",
+            "source": "eastmoney_individual_fund_flow",
+            "status": "available",
+            "period_kind": "historical_daily",
+            "window": "1d",
+            "unit": "亿元",
+            "netamount": "1.0",
+            "r0_net": "0.5",
+        }
+        for day in range(7, 12)
+    ]
+    fund_flow = FundFlowText(
+        "东财结构化资金流 evidence",
+        evidence=evidence,
+        evidence_meta={
+            "source": "eastmoney_individual_fund_flow",
+            "status": "available",
+            "requested_as_of": trade_date,
+            "manual_calibration_gap": manual_gap,
+        },
+    )
+    raw_csv = "# vendor: fixture\nDate,Open,High,Low,Close,Volume\n2026-08-11,1,1,1,1,1\n"
+
+    def fake_safe(tool, payload):
+        if tool is data_collector.get_stock_data:
+            return raw_csv
+        if tool is data_collector.get_individual_fund_flow:
+            return fund_flow
+        if tool is data_collector._fetch_realtime_context:
+            return {
+                "status": "not_applicable",
+                "source": None,
+                "quote_as_of": None,
+                "retrieved_at": None,
+                "error": None,
+                "quote": None,
+            }
+        return ""
+
+    with patch.object(data_collector, "_safe", side_effect=fake_safe), \
+         patch.object(data_collector, "FETCH_ALL_TIMEOUT", 1):
+        result = data_collector._fetch_all("600519", trade_date)
+
+    context = result["market_data_context"]
+    assert context["fund_flow_evidence"]["status"] == "available"
+    assert context["fund_flow_evidence"]["manual_calibration_gap"] == manual_gap
+
+    provenance = context["source_provenance"]["fund_flow_individual"]
+    assert provenance["status"] == "available"
+    provenance_gap = provenance["manual_calibration_gap"]
+    assert {key: provenance_gap[key] for key in manual_gap} == manual_gap
+    assert provenance_gap["gap_type"] == "manual_calibration_gap"
+    assert provenance_gap["blocking"] is False
+    assert provenance_gap["non_blocking"] is True
+
+    manual_entries = [
+        entry
+        for entry in context["data_failure_ledger"]
+        if entry.get("gap_type") == "manual_calibration_gap"
+    ]
+    assert len(manual_entries) == 1
+    entry = manual_entries[0]
+    assert entry["source"] == manual_gap["source"]
+    assert entry["status"] == manual_gap["status"]
+    assert entry["reason"] == manual_gap["reason"]
+    assert entry["manual_calibration_gap"] == manual_gap
+    assert entry["blocking"] is False
+    assert entry["non_blocking"] is True
+
+    data_collector._append_manual_calibration_gap(context["data_failure_ledger"], manual_gap)
+    assert len(
+        [
+            item
+            for item in context["data_failure_ledger"]
+            if item.get("gap_type") == "manual_calibration_gap"
+        ]
+    ) == 1
+
+
+def test_fetch_all_without_manual_calibration_gap_keeps_ledger_and_provenance_clean():
+    from tradingagents.graph import data_collector
+
+    fund_flow = FundFlowText(
+        "东财结构化资金流 evidence",
+        evidence=[
+            {
+                "date": f"2026-08-{day:02d}",
+                "source": "eastmoney_individual_fund_flow",
+                "status": "available",
+                "period_kind": "historical_daily",
+                "window": "1d",
+                "unit": "亿元",
+                "netamount": "1.0",
+                "r0_net": "0.5",
+            }
+            for day in range(7, 12)
+        ],
+        evidence_meta={
+            "source": "eastmoney_individual_fund_flow",
+            "status": "available",
+        },
+    )
+    raw_csv = "Date,Open,High,Low,Close,Volume\n2026-08-11,1,1,1,1,1\n"
+
+    def fake_safe(tool, payload):
+        if tool is data_collector.get_stock_data:
+            return raw_csv
+        if tool is data_collector.get_individual_fund_flow:
+            return fund_flow
+        if tool is data_collector._fetch_realtime_context:
+            return {
+                "status": "not_applicable",
+                "source": None,
+                "quote_as_of": None,
+                "retrieved_at": None,
+                "error": None,
+                "quote": None,
+            }
+        return ""
+
+    with patch.object(data_collector, "_safe", side_effect=fake_safe), \
+         patch.object(data_collector, "FETCH_ALL_TIMEOUT", 1):
+        result = data_collector._fetch_all("600519", "2026-08-11")
+
+    context = result["market_data_context"]
+    assert "manual_calibration_gap" not in context["source_provenance"]["fund_flow_individual"]
+    assert not any(
+        entry.get("gap_type") == "manual_calibration_gap"
+        for entry in context["data_failure_ledger"]
+    )
 
 
 def test_fetch_all_completes_executor_with_fast_tools():
