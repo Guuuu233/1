@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from numbers import Real
-from threading import Lock
+from threading import Event, Lock, Thread
 from fastapi import Body
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from uuid import uuid4
@@ -522,6 +522,159 @@ _STOCK_MAP_TTL = 7 * 86400  # 7 days
 # failure must not hammer a rate-limited endpoint nor freeze the cache for the
 # full 7-day TTL. Configurable via TA_STOCK_MAP_RETRY_INTERVAL (seconds).
 _STOCK_MAP_FAILURE_RETRY_INTERVAL = int(os.getenv("TA_STOCK_MAP_RETRY_INTERVAL", "1800"))
+_cn_stock_map_refresh_inflight = False
+_cn_stock_map_refresh_event = Event()
+_cn_stock_map_refresh_event.set()
+
+
+def _stock_map_refresh_needed(now: Optional[float] = None) -> bool:
+    """Return whether the name map needs a non-blocking refresh attempt."""
+    current_time = time.time() if now is None else now
+    cache_is_fresh = (
+        _cn_stock_map is not None
+        and _cn_stock_reverse_map is not None
+        and _cn_stock_map_loaded_at > 0
+        and _cn_stock_map_last_failure_at == 0
+        and current_time - _cn_stock_map_loaded_at <= _STOCK_MAP_TTL
+    )
+    if cache_is_fresh:
+        return False
+
+    # A recent failure is deliberately left as an empty placeholder by the
+    # loader, but it must not cause every report request to retry the provider.
+    return not (
+        _cn_stock_map_last_failure_at
+        and current_time - _cn_stock_map_last_failure_at < _STOCK_MAP_FAILURE_RETRY_INTERVAL
+    )
+
+
+def _refresh_cn_stock_map_worker(refresh_event: Event) -> None:
+    """Refresh the stock map outside the request thread and cache lock."""
+    _run_cn_stock_map_refresh(refresh_event)
+
+
+def _schedule_cn_stock_map_refresh() -> None:
+    """Start at most one provider refresh without delaying the report response."""
+    global _cn_stock_map_refresh_inflight, _cn_stock_map_refresh_event
+    if not _stock_map_refresh_needed():
+        return
+
+    with _cn_stock_map_lock:
+        if not _stock_map_refresh_needed() or _cn_stock_map_refresh_inflight:
+            return
+        _cn_stock_map_refresh_inflight = True
+        refresh_event = Event()
+        _cn_stock_map_refresh_event = refresh_event
+
+    try:
+        Thread(
+            target=_refresh_cn_stock_map_worker,
+            args=(refresh_event,),
+            name="ta-stock-map-refresh",
+            daemon=True,
+        ).start()
+    except Exception as exc:  # pragma: no cover - thread creation is platform code
+        with _cn_stock_map_lock:
+            if _cn_stock_map_refresh_event is refresh_event:
+                _cn_stock_map_refresh_inflight = False
+        refresh_event.set()
+        _log(f"[StockMap] Could not start background refresh: {exc}")
+
+
+def _fetch_cn_stock_map() -> Tuple[Dict[str, str], int, int]:
+    """Fetch and validate stock/fund names without touching shared cache state."""
+    import akshare as ak
+
+    result: Dict[str, str] = {}
+    # A-share stocks (static list, no anti-crawl issue)
+    df = ak.stock_info_a_code_name()
+    for _, row in df.iterrows():
+        name = str(row.get("name", "")).strip()
+        code = str(row.get("code", "")).strip()
+        if name and code:
+            result[name] = _normalize_symbol(code)
+    stock_count = len(result)
+
+    # ETF / funds are supplemental; a provider failure here does not discard
+    # a valid stock source, but a stock source with no usable rows is invalid.
+    fund_count = 0
+    try:
+        fund_df = ak.fund_name_em()
+        existing_codes = set(result.values())
+        for _, row in fund_df.iterrows():
+            code = str(row.get("基金代码", "")).strip()
+            name = str(row.get("基金简称", "")).strip()
+            if name and code and len(code) == 6 and code.isdigit():
+                normalized = _normalize_symbol(code)
+                if normalized not in existing_codes:
+                    result[name] = normalized
+                    existing_codes.add(normalized)
+        fund_count = len(result) - stock_count
+    except Exception as fe:
+        _log(f"[StockMap] ETF/fund load skipped: {fe}")
+
+    if stock_count == 0:
+        raise RuntimeError("AkShare returned an empty stock name map")
+    return result, stock_count, fund_count
+
+
+def _finish_cn_stock_map_refresh(
+    refresh_event: Event,
+    result: Optional[Dict[str, str]] = None,
+    stock_count: int = 0,
+    fund_count: int = 0,
+    error: Optional[Exception] = None,
+) -> Dict[str, str]:
+    """Publish one refresh outcome while holding the lock only briefly."""
+    global _cn_stock_map, _cn_stock_reverse_map, _cn_stock_map_norm, _cn_stock_map_norm_src
+    global _cn_stock_map_loaded_at, _cn_stock_map_last_failure_at, _cn_stock_map_refresh_inflight
+    if error is None and not result:
+        error = RuntimeError("AkShare returned an empty stock name map")
+    now = time.time()
+    with _cn_stock_map_lock:
+        if error is None:
+            loaded_map = result or {}
+            _cn_stock_map = loaded_map
+            _cn_stock_reverse_map = {
+                code: name for name, code in loaded_map.items()
+            }
+            _cn_stock_map_norm = None
+            _cn_stock_map_norm_src = None
+            _cn_stock_map_loaded_at = now
+            _cn_stock_map_last_failure_at = 0
+            message = (
+                f"[StockMap] Loaded {stock_count} stocks + {fund_count} ETFs/funds = "
+                f"{len(loaded_map)} total."
+            )
+        else:
+            _cn_stock_map = {}
+            _cn_stock_reverse_map = {}
+            _cn_stock_map_norm = None
+            _cn_stock_map_norm_src = None
+            _cn_stock_map_loaded_at = 0
+            _cn_stock_map_last_failure_at = now
+            message = (
+                f"[StockMap] Failed to load: {error}; will retry in "
+                f"{_STOCK_MAP_FAILURE_RETRY_INTERVAL // 60} minutes"
+            )
+        _cn_stock_map_refresh_inflight = False
+    refresh_event.set()
+    _log(message)
+    return _cn_stock_map
+
+
+def _run_cn_stock_map_refresh(refresh_event: Event) -> Dict[str, str]:
+    """Run provider I/O outside the cache lock and publish its outcome."""
+    try:
+        result, stock_count, fund_count = _fetch_cn_stock_map()
+    except Exception as exc:
+        return _finish_cn_stock_map_refresh(refresh_event, error=exc)
+    return _finish_cn_stock_map_refresh(
+        refresh_event,
+        result=result,
+        stock_count=stock_count,
+        fund_count=fund_count,
+    )
 
 
 def _load_cn_stock_map() -> Dict[str, str]:
@@ -533,67 +686,47 @@ def _load_cn_stock_map() -> Dict[str, str]:
     Failure handling (DAV-92): a failed load records ``_cn_stock_map_last_failure_at``
     and is NOT treated as a valid cache, so the 7-day TTL only starts on success.
     Subsequent calls back off for ``_STOCK_MAP_FAILURE_RETRY_INTERVAL`` instead of
-    retrying on every request or freezing for the full TTL.
+    retrying on every request or freezing for the full TTL. An empty stock source
+    is treated as a failed load even when the fund source has rows.
     """
-    global _cn_stock_map, _cn_stock_reverse_map, _cn_stock_map_norm, _cn_stock_map_norm_src, _cn_stock_map_loaded_at, _cn_stock_map_last_failure_at
-    import time as _time
-    now = _time.time()
-    if _cn_stock_map is not None and (now - _cn_stock_map_loaded_at) > _STOCK_MAP_TTL:
-        _cn_stock_map = None  # expire cache
-        _cn_stock_reverse_map = None
-        _cn_stock_map_norm = None
-        _cn_stock_map_norm_src = None
-    if _cn_stock_map is not None:
-        return _cn_stock_map
+    global _cn_stock_map, _cn_stock_reverse_map, _cn_stock_map_norm, _cn_stock_map_norm_src
+    global _cn_stock_map_refresh_inflight, _cn_stock_map_refresh_event
+    wait_event: Optional[Event] = None
+    owner_event: Optional[Event] = None
+    now = time.time()
+
     with _cn_stock_map_lock:
-        if _cn_stock_map is not None and (now - _cn_stock_map_loaded_at) <= _STOCK_MAP_TTL:
+        if _cn_stock_map is not None and (now - _cn_stock_map_loaded_at) > _STOCK_MAP_TTL:
+            _cn_stock_map = None  # expire cache
+            _cn_stock_reverse_map = None
+            _cn_stock_map_norm = None
+            _cn_stock_map_norm_src = None
+        cache_is_fresh = (
+            _cn_stock_map is not None
+            and _cn_stock_reverse_map is not None
+            and _cn_stock_map_loaded_at > 0
+            and _cn_stock_map_last_failure_at == 0
+            and now - _cn_stock_map_loaded_at <= _STOCK_MAP_TTL
+        )
+        if cache_is_fresh:
             return _cn_stock_map
         # A recent failed load must not hammer AkShare; wait out the retry window.
-        if _cn_stock_map is None and _cn_stock_map_last_failure_at and (
+        if _cn_stock_map_last_failure_at and (
             now - _cn_stock_map_last_failure_at
         ) < _STOCK_MAP_FAILURE_RETRY_INTERVAL:
-            return {}
-        result: Dict[str, str] = {}
-        try:
-            import akshare as ak
-            # A-share stocks (static list, no anti-crawl issue)
-            df = ak.stock_info_a_code_name()
-            for _, row in df.iterrows():
-                name = str(row.get("name", "")).strip()
-                code = str(row.get("code", "")).strip()
-                if name and code:
-                    result[name] = _normalize_symbol(code)
-            stock_count = len(result)
-            # ETF / funds
-            fund_count = 0
-            try:
-                fund_df = ak.fund_name_em()
-                existing_codes = set(result.values())
-                for _, row in fund_df.iterrows():
-                    code = str(row.get("基金代码", "")).strip()
-                    name = str(row.get("基金简称", "")).strip()
-                    if name and code and len(code) == 6 and code.isdigit():
-                        normalized = _normalize_symbol(code)
-                        if normalized not in existing_codes:
-                            result[name] = normalized
-                            existing_codes.add(normalized)
-                fund_count = len(result) - stock_count
-            except Exception as fe:
-                _log(f"[StockMap] ETF/fund load skipped: {fe}")
-            _cn_stock_map = result
-            _cn_stock_reverse_map = {code: name for name, code in result.items()}
-            _cn_stock_map_norm = None  # lazily rebuilt via _get_normalized_stock_map
-            _cn_stock_map_norm_src = None
-            _cn_stock_map_loaded_at = now
-            _cn_stock_map_last_failure_at = 0  # success clears the failure marker
-            _log(f"[StockMap] Loaded {stock_count} stocks + {fund_count} ETFs/funds = {len(result)} total.")
-        except Exception as e:
-            _cn_stock_map_last_failure_at = now
-            _log(f"[StockMap] Failed to load: {e}; will retry in {_STOCK_MAP_FAILURE_RETRY_INTERVAL // 60} minutes")
-            if _cn_stock_map is None:
-                _cn_stock_map = {}
-                _cn_stock_reverse_map = {}
-    return _cn_stock_map
+            return _cn_stock_map if _cn_stock_map is not None else {}
+        if _cn_stock_map_refresh_inflight:
+            wait_event = _cn_stock_map_refresh_event
+        else:
+            _cn_stock_map_refresh_inflight = True
+            owner_event = Event()
+            _cn_stock_map_refresh_event = owner_event
+
+    if wait_event is not None:
+        wait_event.wait()
+        with _cn_stock_map_lock:
+            return _cn_stock_map if _cn_stock_map is not None else {}
+    return _run_cn_stock_map_refresh(owner_event)
 
 
 def _get_reverse_stock_map() -> Dict[str, str]:
@@ -612,6 +745,13 @@ def _get_reverse_stock_map_cached_only() -> Dict[str, str]:
     if _cn_stock_map is None or _cn_stock_reverse_map is None:
         return {}
     return dict(_cn_stock_reverse_map)
+
+
+def _get_report_reverse_stock_map() -> Dict[str, str]:
+    """Return cached report names and refresh a cold cache asynchronously."""
+    code_to_name = _get_reverse_stock_map_cached_only()
+    _schedule_cn_stock_map_refresh()
+    return code_to_name
 
 
 def _get_normalized_stock_map() -> Dict[str, str]:
@@ -4469,7 +4609,7 @@ def list_reports(
         skip=skip,
         limit=limit,
     )
-    code_to_name = _get_reverse_stock_map_cached_only()
+    code_to_name = _get_report_reverse_stock_map()
     for r in reports:
         r.name = code_to_name.get(r.symbol, r.symbol)
         _attach_job_runtime_state(r, str(getattr(r, "id", "")))
@@ -4502,7 +4642,7 @@ def get_report_endpoint(
         raise HTTPException(status_code=404, detail="报告不存在")
     if str(report.status or "") in report_service.ACTIVE_REPORT_STATUSES and not _get_job(report_id):
         report = report_service.finalize_orphan_report(db, report)
-    code_to_name = _get_reverse_stock_map()
+    code_to_name = _get_report_reverse_stock_map()
     report.name = code_to_name.get(report.symbol, report.symbol)
     _attach_job_runtime_state(report, report_id)
     return report
