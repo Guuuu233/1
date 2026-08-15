@@ -98,11 +98,23 @@ def test_individual_fund_flow_direct_eastmoney_success_is_structured_and_typed()
     assert record["unit"] == "亿元"
     assert record["r0_net"] == "1.2"
     assert record["r0_net_raw"] == "120000000"
-    assert record["large_net"] == "0.5"
-    assert record["super_large_net"] == "0.7"
+    assert "large_net" not in record
+    assert "super_large_net" not in record
+    assert "components" not in record
     assert "netamount" not in record
     assert record["field_semantics"]["r0_net"].startswith("主力净额")
-    assert record["component_semantics"]["large_net"].startswith("大单净额")
+    assert record["vendor_raw_field_status"] == "discovery_only"
+    assert record["vendor_raw_fields"] == {
+        "f53": "-10000000",
+        "f54": "-20000000",
+        "f55": "50000000",
+        "f56": "70000000",
+        "f57": "0.12",
+        "f58": "-0.01",
+        "f59": "-0.02",
+        "f60": "0.05",
+        "f61": "0.07",
+    }
 
     meta = out.fund_flow_evidence_meta
     assert meta["source"] == "eastmoney_direct"
@@ -116,7 +128,20 @@ def test_individual_fund_flow_direct_eastmoney_success_is_structured_and_typed()
         "stock_individual_fund_flow: ConnectionError"
     ]
     assert not ak.stock_fund_flow_individual.called
-    assert meta["field_mapping"]["f52"].endswith("r0_net)")
+    assert meta["field_mapping"]["f52"] == "r0_net"
+    assert meta["field_mapping"]["f55"] == "raw_discovery_only"
+    assert meta["discovery_only_fields"] == [
+        "f53",
+        "f54",
+        "f55",
+        "f56",
+        "f57",
+        "f58",
+        "f59",
+        "f60",
+        "f61",
+    ]
+    assert meta["discovery_field_unit_policy"] == "raw preserved; no normalization"
 
 
 def test_individual_fund_flow_direct_filters_future_rows_without_lookahead():
