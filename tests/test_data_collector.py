@@ -257,7 +257,7 @@ def test_fetch_all_propagates_manual_calibration_gap_to_ledger_and_provenance():
             "netamount": "1.0",
             "r0_net": "0.5",
         }
-        for day in range(7, 12)
+        for day in (5, 6, 7, 10, 11)
     ]
     fund_flow = FundFlowText(
         "东财结构化资金流 evidence",
