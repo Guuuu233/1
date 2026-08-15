@@ -183,6 +183,38 @@ _SINA_HIST_FUND_FLOW_TIMEOUT = 10  # 秒
 _SINA_HIST_FUND_FLOW_FETCH = 20  # 请求行数：取足够多，再按 curr_date 截断
 _SINA_HIST_FUND_FLOW_SHOW = 5  # 展示最近 N 日（与东财版“近5日”对齐）
 _SINA_HIST_CORE_AMOUNT_FIELDS = ("netamount", "r0_net")
+
+# ── 东方财富直连历史资金流（Source 2）────────────────────────────────────────
+# AkShare wraps this same family of data, but its request path can fail on
+# Python TLS/fingerprint issues.  Keep the direct adapter deliberately narrow:
+# f51-f61 are the documented daily fields; f64/f65 are not included because
+# their semantics are not required by the evidence contract.
+_EASTMONEY_DIRECT_FUND_FLOW_URL = (
+    "https://push2.eastmoney.com/api/qt/stock/fflow/daykline/get"
+)
+_EASTMONEY_DIRECT_FUND_FLOW_HEADERS = {
+    "Referer": "https://data.eastmoney.com/",
+    "User-Agent": "Mozilla/5.0",
+}
+_EASTMONEY_DIRECT_FUND_FLOW_TIMEOUT = 10
+_EASTMONEY_DIRECT_FUND_FLOW_FETCH = 120
+_EASTMONEY_DIRECT_FUND_FLOW_FIELDS1 = "f1,f2,f3,f7"
+_EASTMONEY_DIRECT_FUND_FLOW_FIELDS2 = (
+    "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
+)
+_EASTMONEY_DIRECT_FIELD_MAPPING = {
+    "f51": "交易日期",
+    "f52": "主力净流入-净额 (r0_net)",
+    "f53": "小单净流入-净额",
+    "f54": "中单净流入-净额",
+    "f55": "大单净流入-净额",
+    "f56": "超大单净流入-净额",
+    "f57": "主力净流入-净占比",
+    "f58": "小单净流入-净占比",
+    "f59": "中单净流入-净占比",
+    "f60": "大单净流入-净占比",
+    "f61": "超大单净流入-净占比",
+}
 _FUND_AMOUNT_TEXT_RE = re.compile(
     r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*(?:万亿|亿元|万元|亿|万)?$"
 )
@@ -1337,12 +1369,10 @@ class CnAkshareProvider(BaseMarketDataProvider):
     def get_individual_fund_flow(self, symbol: str, curr_date: str = None) -> str:
         """获取个股近期主力资金净流向，并按 curr_date 截断。
 
-        东财 ``stock_individual_fund_flow`` 对当前 IP 间歇不可达
-        （RemoteDisconnected），失败时优先回退到新浪历史收盘序列；当前分析日
-        只有在历史接口含 curr_date 当天收盘行时才直接返回，否则继续尝试
-        同花顺即时资金流净额快照 ``stock_fund_flow_individual``；该快照的
-        ``净额`` 不是新浪历史 ``netamount``/``r0_net`` 同口径的主力序列；
-        匹配目标行后必须先验证 ``净额`` 可用，带单位文本会原样保留。
+        资金流路径按“AkShare EM → 东财公开直连 → 新浪历史 legacy Web →
+        当前日同花顺总净额快照”的顺序尝试。东财直连只接入已核验的 f51-f61
+        字段，并把 f52 保持为 ``r0_net``；它不会把总净额或未知字段伪装成
+        主力净额。每个成功或失败的 ``FundFlowText`` 都携带完整尝试链。
         """
         if not curr_date:
             return (
@@ -1353,51 +1383,112 @@ class CnAkshareProvider(BaseMarketDataProvider):
         if cutoff is None:
             return f"【数据获取失败】个股资金流向 curr_date 无法解析：{curr_date!r}"
 
-        ak = self._ak()
         code = self._normalize_symbol(symbol)
         errors: list[str] = []
+        attempted_sources: list[str] = []
+        em_typed_gap = ""
         is_historical = is_historical_analysis_date(curr_date)
 
         def _gap_reason(base_reason: str) -> str:
-            return (
-                f"{base_reason}；{'；'.join(errors)}"
-                if errors
-                else base_reason
+            return f"{base_reason}；{'；'.join(errors)}" if errors else base_reason
+
+        def _attach_chain(value: str, final_source: str) -> FundFlowText:
+            metadata = dict(getattr(value, "fund_flow_evidence_meta", {}) or {})
+            metadata.update(
+                {
+                    "attempted_sources": list(attempted_sources),
+                    "fallback_errors": list(errors),
+                    "em_typed_gap": em_typed_gap,
+                    "final_source": final_source,
+                    "last_attempted_source": attempted_sources[-1]
+                    if attempted_sources
+                    else None,
+                }
+            )
+            return FundFlowText(
+                str(value),
+                evidence=getattr(value, "fund_flow_evidence", []),
+                evidence_meta=metadata,
             )
 
-        # Source 1: 东财（近 120 交易日逐日序列，可按 curr_date 截断）
+        # Source 1: AkShare's Eastmoney wrapper (近 120 交易日逐日序列).
+        attempted_sources.append("akshare.stock_individual_fund_flow")
+        ak = None
         try:
-            # 沪市：以 5、6、9 开头；其余为深市
-            market = "sh" if code[:1] in ("5", "6", "9") else "sz"
-            with AKSHARE_CALL_LOCK:
-                df = ak.stock_individual_fund_flow(stock=code, market=market)
-            if df is None or df.empty:
-                errors.append("stock_individual_fund_flow: empty dataframe")
-            else:
-                # Invalid or out-of-range Eastmoney data must not terminate the
-                # fallback chain. Only formatted text with evidence is a success;
-                # retain any formatter failure detail for the final typed gap.
-                em_text = self._format_individual_fund_flow_em(
-                    df, symbol, curr_date, cutoff
-                )
-                em_evidence = getattr(em_text, "fund_flow_evidence", None)
-                if em_text is not None and isinstance(em_evidence, list) and em_evidence:
-                    return em_text
-                em_meta = getattr(em_text, "fund_flow_evidence_meta", None) or {}
-                if em_meta.get("reason"):
-                    errors.append(
-                        f"stock_individual_fund_flow: formatter reason: {em_meta['reason']}"
-                    )
-                if em_text:
-                    errors.append(f"stock_individual_fund_flow: formatter failure: {em_text}")
-                errors.append("stock_individual_fund_flow: structured evidence unavailable")
-                errors.append("stock_individual_fund_flow: invalid or empty usable rows")
+            ak = self._ak()
         except Exception as exc:
-            errors.append(f"stock_individual_fund_flow: {type(exc).__name__}")
+            errors.append(f"akshare provider unavailable: {type(exc).__name__}")
+        if ak is None:
+            errors.append("stock_individual_fund_flow: akshare unavailable")
+        else:
+            try:
+                # 沪市：以 5、6、9 开头；其余为深市
+                market = "sh" if code[:1] in ("5", "6", "9") else "sz"
+                with AKSHARE_CALL_LOCK:
+                    df = ak.stock_individual_fund_flow(stock=code, market=market)
+                if df is None or df.empty:
+                    errors.append("stock_individual_fund_flow: empty dataframe")
+                else:
+                    # Invalid or out-of-range data must not terminate the chain.
+                    em_text = self._format_individual_fund_flow_em(
+                        df, symbol, curr_date, cutoff
+                    )
+                    em_evidence = getattr(em_text, "fund_flow_evidence", None)
+                    if (
+                        em_text is not None
+                        and isinstance(em_evidence, list)
+                        and em_evidence
+                    ):
+                        return _attach_chain(
+                            em_text, "eastmoney_individual_fund_flow"
+                        )
+                    em_meta = getattr(em_text, "fund_flow_evidence_meta", None) or {}
+                    if em_meta.get("reason"):
+                        errors.append(
+                            "stock_individual_fund_flow: formatter reason: "
+                            f"{em_meta['reason']}"
+                        )
+                    if em_text:
+                        errors.append(
+                            "stock_individual_fund_flow: formatter failure: "
+                            f"{em_text}"
+                        )
+                    errors.append(
+                        "stock_individual_fund_flow: structured evidence unavailable"
+                    )
+                    errors.append(
+                        "stock_individual_fund_flow: invalid or empty usable rows"
+                    )
+            except Exception as exc:
+                errors.append(f"stock_individual_fund_flow: {type(exc).__name__}")
+
+        em_failures = [
+            error
+            for error in errors
+            if error.startswith("stock_individual_fund_flow:")
+            or error.startswith("akshare provider unavailable:")
+        ]
+        em_typed_gap = "；".join(em_failures) or (
+            "stock_individual_fund_flow: structured evidence unavailable"
+        )
+
+        # Source 2: direct Eastmoney endpoint.  This is a new-algorithm source,
+        # but it must still fall through when the response is not auditable.
+        attempted_sources.append("eastmoney_direct")
+        try:
+            direct_text, direct_error = self._fetch_eastmoney_direct_fund_flow(
+                symbol, curr_date, cutoff
+            )
+            if direct_text is not None:
+                return _attach_chain(direct_text, "eastmoney_direct")
+            if direct_error:
+                errors.append(direct_error)
+        except Exception as exc:
+            errors.append(f"eastmoney_direct: {type(exc).__name__}")
 
         # Source 2.5: Sina Web is legacy reference only. Keep the typed
-        # response for auditability, but it is never a successful main-force
-        # evidence result or direction source.
+        # response for auditability, but it never drives main-force direction.
+        attempted_sources.append("sina_historical")
         try:
             hist_text = self._fetch_sina_historical_fund_flow(
                 symbol,
@@ -1406,31 +1497,34 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 require_curr_date=not is_historical,
             )
             if hist_text is not None:
-                metadata = dict(getattr(hist_text, "fund_flow_evidence_meta", {}) or {})
-                metadata.update({
-                    "legacy_web_algorithm": True,
-                    "legacy_web_reference_only": True,
-                    "direction_allowed": False,
-                    "reason": "新浪旧 Web 参考值，不驱动主力方向",
-                })
-                return FundFlowText(
+                metadata = dict(
+                    getattr(hist_text, "fund_flow_evidence_meta", {}) or {}
+                )
+                metadata.update(
+                    {
+                        "legacy_web_algorithm": True,
+                        "legacy_web_reference_only": True,
+                        "direction_allowed": False,
+                        "reason": "新浪旧 Web 参考值，不驱动主力方向",
+                    }
+                )
+                hist_value = FundFlowText(
                     f"{hist_text}\n（新浪旧 Web 参考值：仅作降级参考，不驱动方向）",
                     evidence=getattr(hist_text, "fund_flow_evidence", []),
                     evidence_meta=metadata,
                 )
+                return _attach_chain(hist_value, "sina_historical")
             if is_historical:
                 errors.append(
                     "sina historical fund flow: no rows on or before curr_date"
                 )
             else:
-                errors.append(
-                    "sina historical fund flow: no current-day close row"
-                )
+                errors.append("sina historical fund flow: no current-day close row")
         except Exception as exc:
             errors.append(f"sina historical fund flow: {type(exc).__name__}")
 
         if is_historical:
-            return build_provider_text(
+            gap = build_provider_text(
                 f"【数据获取失败】历史日期 {curr_date} 新算法与新浪历史/legacy Web 资金流均不可用，"
                 f"{symbol} 本项不可用。（{'；'.join(errors)}）",
                 symbol=symbol,
@@ -1440,16 +1534,22 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     "historical new-algorithm evidence unavailable; legacy Web reference unavailable"
                 ),
             )
+            return _attach_chain(gap, "unavailable")
 
         # Source 3: 同花顺即时资金流净额快照（历史接口尚无当日收盘行时）。
+        attempted_sources.append("ths_instant_snapshot")
         try:
+            if ak is None:
+                ak = self._ak()
+            if ak is None:
+                raise RuntimeError("akshare unavailable")
             with AKSHARE_CALL_LOCK:
                 df = ak.stock_fund_flow_individual(symbol="即时")
             if df is None or df.empty:
                 raise ValueError("empty dataframe")
             stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
             if stock_df.empty:
-                return build_provider_text(
+                gap = build_provider_text(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照无记录"
                     f"（{'；'.join(errors)}）",
                     symbol=symbol,
@@ -1459,9 +1559,10 @@ class CnAkshareProvider(BaseMarketDataProvider):
                         "同花顺即时资金流净额快照无记录；该源不提供新浪 netamount/r0_net evidence"
                     ),
                 )
+                return _attach_chain(gap, "unavailable")
             row = stock_df.iloc[0]
             if "净额" not in stock_df.columns:
-                return build_provider_text(
+                gap = build_provider_text(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照缺少净额字段"
                     f"（{'；'.join(errors)}）",
                     symbol=symbol,
@@ -1471,9 +1572,10 @@ class CnAkshareProvider(BaseMarketDataProvider):
                         "同花顺即时资金流净额快照缺少净额字段；该源不提供新浪 netamount/r0_net evidence"
                     ),
                 )
+                return _attach_chain(gap, "unavailable")
             net_amount = _usable_fund_amount_text(row["净额"])
             if net_amount is None:
-                return build_provider_text(
+                gap = build_provider_text(
                     f"【数据获取失败】{symbol} 同花顺即时资金流净额快照净额缺失或不可解析"
                     f"（{'；'.join(errors)}）",
                     symbol=symbol,
@@ -1483,6 +1585,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                         "同花顺即时资金流净额快照净额缺失或不可解析；该源不提供新浪 netamount/r0_net evidence"
                     ),
                 )
+                return _attach_chain(gap, "unavailable")
 
             def _v(col: str) -> str:
                 if col not in stock_df.columns:
@@ -1510,7 +1613,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 requested_as_of=curr_date,
                 field="netamount",
             )
-            return FundFlowText(
+            snapshot = FundFlowText(
                 (
                     f"【备用数据源：同花顺即时资金流净额快照】{symbol} 当日资金流净额快照"
                     f"（{curr_date}，最新价 {_v('最新价')}，涨跌幅 {_v('涨跌幅')}）：\n"
@@ -1534,18 +1637,186 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     "reason": "同花顺即时资金流净额是总净额，未将其等同于新浪历史 r0_net 主力序列",
                 },
             )
+            return _attach_chain(snapshot, "ths_instant_snapshot")
         except Exception as exc:
             errors.append(f"stock_fund_flow_individual: {type(exc).__name__}")
 
-        gap_reason = "东财/新浪历史/同花顺即时资金流净额快照均失败"
+        gap_reason = "东财 AkShare/东财直连/新浪历史/同花顺即时资金流净额快照均失败"
         if errors:
             gap_reason = f"{gap_reason}；{'；'.join(errors)}"
-        return build_provider_text(
-            f"【数据获取失败】个股资金流向数据获取失败（东财/新浪历史/同花顺即时资金流净额快照均失败：{'；'.join(errors)}）",
+        gap = build_provider_text(
+            f"【数据获取失败】个股资金流向数据获取失败（东财 AkShare/东财直连/新浪历史/同花顺即时资金流净额快照均失败：{'；'.join(errors)}）",
             symbol=symbol,
             requested_as_of=curr_date,
             source="fund_flow_individual",
             reason=gap_reason,
+        )
+        return _attach_chain(gap, "unavailable")
+
+    def _fetch_eastmoney_direct_fund_flow(
+        self,
+        symbol: str,
+        curr_date: str,
+        cutoff,
+    ) -> tuple[FundFlowText | None, str | None]:
+        """Fetch verified daily fields from Eastmoney's public endpoint.
+
+        The endpoint returns comma-separated ``f51`` onward values.  The first
+        eleven fields are enough for this provider's contract; f52 is the
+        documented main-force net amount and f55/f56 are the large/super-large
+        components.  Unknown trailing fields are intentionally ignored.
+        """
+        import json
+        import requests as _requests
+
+        code = self._normalize_symbol(symbol)
+        secid = f"1.{code}" if code.startswith(("5", "6", "9")) else f"0.{code}"
+        params = {
+            "secid": secid,
+            "lmt": str(_EASTMONEY_DIRECT_FUND_FLOW_FETCH),
+            "klt": "101",
+            "fields1": _EASTMONEY_DIRECT_FUND_FLOW_FIELDS1,
+            "fields2": _EASTMONEY_DIRECT_FUND_FLOW_FIELDS2,
+            "ut": "b2884a393a59ad64002292a3e90d46a5",
+        }
+
+        try:
+            response = _requests.get(
+                _EASTMONEY_DIRECT_FUND_FLOW_URL,
+                params=params,
+                headers=_EASTMONEY_DIRECT_FUND_FLOW_HEADERS,
+                timeout=_EASTMONEY_DIRECT_FUND_FLOW_TIMEOUT,
+            )
+        except _requests.Timeout as exc:
+            return None, f"eastmoney_direct: timeout: {type(exc).__name__}"
+        except _requests.RequestException as exc:
+            return None, f"eastmoney_direct: request: {type(exc).__name__}"
+        except Exception as exc:
+            return None, f"eastmoney_direct: request: {type(exc).__name__}"
+
+        status_code = getattr(response, "status_code", None)
+        try:
+            if status_code is not None and int(status_code) >= 400:
+                return None, f"eastmoney_direct: http_status: {status_code}"
+        except (TypeError, ValueError):
+            pass
+        try:
+            raise_for_status = getattr(response, "raise_for_status", None)
+            if callable(raise_for_status):
+                raise_for_status()
+        except Exception as exc:
+            return None, f"eastmoney_direct: http_status: {type(exc).__name__}"
+
+        try:
+            raw_text = getattr(response, "text", None)
+            if raw_text is not None and str(raw_text).strip():
+                payload = json.loads(raw_text)
+            elif callable(getattr(response, "json", None)):
+                payload = response.json()
+            else:
+                payload = json.loads(raw_text or "")
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            return None, f"eastmoney_direct: json_decode: {type(exc).__name__}"
+        except Exception as exc:
+            return None, f"eastmoney_direct: json_decode: {type(exc).__name__}"
+
+        if not isinstance(payload, dict):
+            return None, "eastmoney_direct: json_shape: root is not an object"
+        if "rc" not in payload:
+            return None, "eastmoney_direct: rc_missing"
+        if str(payload.get("rc")).strip() not in {"0", "0.0"}:
+            return None, f"eastmoney_direct: rc={payload.get('rc')!r}"
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return None, "eastmoney_direct: data_missing_or_invalid"
+        klines = data.get("klines")
+        if not isinstance(klines, (list, tuple)):
+            return None, "eastmoney_direct: klines_missing_or_invalid"
+        if not klines:
+            return None, "eastmoney_direct: klines_empty"
+
+        cutoff_date = cutoff
+        parsed_rows: list[dict[str, str]] = []
+        warnings: list[str] = []
+        for row_index, raw_row in enumerate(klines):
+            if not isinstance(raw_row, str):
+                warnings.append(f"row {row_index}: kline is not text")
+                continue
+            parts = [part.strip() for part in raw_row.split(",")]
+            if len(parts) < 11:
+                warnings.append(
+                    f"row {row_index}: field_count={len(parts)}, need_at_least=11"
+                )
+                continue
+            day_ts = pd.to_datetime(parts[0], errors="coerce")
+            if pd.isna(day_ts):
+                warnings.append(f"row {row_index}: invalid_date")
+                continue
+            day = day_ts.date()
+            if day > cutoff_date:
+                # Future rows are deliberately ignored, not rendered or used.
+                continue
+            if _sina_decimal(parts[1]) is None:
+                warnings.append(f"row {row_index}: invalid_f52")
+                continue
+
+            def _part(index: int) -> str:
+                return parts[index] if index < len(parts) else ""
+
+            parsed_rows.append(
+                {
+                    "日期": day.isoformat(),
+                    "主力净流入-净额": _part(1),
+                    "小单净流入-净额": _part(2),
+                    "中单净流入-净额": _part(3),
+                    # These aliases are consumed by build_source_evidence and
+                    # preserve the verified f55/f56 component semantics.
+                    "大单净流入": _part(4),
+                    "超大单净流入": _part(5),
+                    "主力净流入-净占比": _part(6),
+                    "小单净流入-净占比": _part(7),
+                    "中单净流入-净占比": _part(8),
+                    "大单净流入-净占比": _part(9),
+                    "超大单净流入-净占比": _part(10),
+                    "收盘价": _part(11),
+                    "涨跌幅": _part(12),
+                }
+            )
+
+        if not parsed_rows:
+            detail = f" ({'; '.join(warnings[:5])})" if warnings else ""
+            return None, f"eastmoney_direct: no_usable_rows_on_or_before_curr_date{detail}"
+
+        frame = pd.DataFrame(parsed_rows)
+        formatted = self._format_individual_fund_flow_em(
+            frame,
+            symbol,
+            curr_date,
+            cutoff,
+            source="eastmoney_direct",
+        )
+        evidence = getattr(formatted, "fund_flow_evidence", None)
+        if formatted is None or not isinstance(evidence, list) or not evidence:
+            return None, "eastmoney_direct: structured_evidence_unavailable"
+
+        metadata = dict(getattr(formatted, "fund_flow_evidence_meta", {}) or {})
+        metadata.update(
+            {
+                "endpoint": _EASTMONEY_DIRECT_FUND_FLOW_URL,
+                "field_mapping": dict(_EASTMONEY_DIRECT_FIELD_MAPPING),
+                "field_semantics_verified": True,
+                "status": "available",
+            }
+        )
+        if warnings:
+            metadata["parse_warnings"] = warnings[:20]
+        return (
+            FundFlowText(
+                str(formatted),
+                evidence=evidence,
+                evidence_meta=metadata,
+            ),
+            None,
         )
 
     def _fetch_sina_historical_fund_flow(
@@ -1828,6 +2099,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
         symbol: str,
         curr_date: str,
         cutoff,
+        *,
+        source: str = "eastmoney_individual_fund_flow",
     ) -> str | None:
         """Format the Eastmoney per-day fund-flow series truncated to curr_date.
 
@@ -1866,6 +2139,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             symbol=symbol,
             requested_as_of=curr_date,
             retrieved_at=retrieved_at,
+            source=source,
         )
         consensus = build_consensus_evidence(
             evidence,
@@ -1873,9 +2147,19 @@ class CnAkshareProvider(BaseMarketDataProvider):
             requested_as_of=curr_date,
             field="r0_net",
         )
+        source_prefix = (
+            "【备用数据源：东方财富直连】" if source == "eastmoney_direct" else ""
+        )
+        reason = (
+            "东方财富直连已核验 f52 主力净额及 f55/f56 组成项；"
+            "未将其等同于总净额 netamount"
+            if source == "eastmoney_direct"
+            else "东方财富来源仅提供主力净额；未将其等同于总净额 netamount"
+        )
         return FundFlowText(
             (
-                f"{symbol} 近5日主力资金净流向（截至于 {curr_date}，最新数据日 {latest_str}）：\n"
+                f"{source_prefix}{symbol} 近5日主力资金净流向"
+                f"（截至于 {curr_date}，最新数据日 {latest_str}）：\n"
                 f"{df_recent.to_string(index=False)}"
             ),
             evidence=evidence,
@@ -1883,13 +2167,17 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 "symbol": symbol,
                 "requested_as_of": curr_date,
                 "retrieved_at": retrieved_at,
-                "source": "eastmoney_individual_fund_flow",
+                "source": source,
                 "algorithm_group": "new_algorithm_group",
                 "source_family": "eastmoney",
+                "raw_unit": "元",
                 "unit": "亿元",
-                "status": "partial",
+                "period_kind": "historical_daily",
+                "window": "1d",
+                "as_of": latest_str,
+                "status": "available" if source == "eastmoney_direct" else "partial",
                 "consensus": consensus,
-                "reason": "东方财富来源仅提供主力净额；未将其等同于总净额 netamount",
+                "reason": reason,
             },
         )
 
