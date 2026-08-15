@@ -203,18 +203,21 @@ _EASTMONEY_DIRECT_FUND_FLOW_FIELDS2 = (
     "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
 )
 _EASTMONEY_DIRECT_FIELD_MAPPING = {
-    "f51": "交易日期",
-    "f52": "主力净流入-净额 (r0_net)",
-    "f53": "小单净流入-净额",
-    "f54": "中单净流入-净额",
-    "f55": "大单净流入-净额",
-    "f56": "超大单净流入-净额",
-    "f57": "主力净流入-净占比",
-    "f58": "小单净流入-净占比",
-    "f59": "中单净流入-净占比",
-    "f60": "大单净流入-净占比",
-    "f61": "超大单净流入-净占比",
+    "f51": "measurement_date",
+    "f52": "r0_net",
+    "f53": "raw_discovery_only",
+    "f54": "raw_discovery_only",
+    "f55": "raw_discovery_only",
+    "f56": "raw_discovery_only",
+    "f57": "raw_discovery_only",
+    "f58": "raw_discovery_only",
+    "f59": "raw_discovery_only",
+    "f60": "raw_discovery_only",
+    "f61": "raw_discovery_only",
 }
+_EASTMONEY_DIRECT_DISCOVERY_FIELDS = tuple(
+    f"f{field_number}" for field_number in range(53, 62)
+)
 _FUND_AMOUNT_TEXT_RE = re.compile(
     r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*(?:万亿|亿元|万元|亿|万)?$"
 )
@@ -1662,9 +1665,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
         """Fetch verified daily fields from Eastmoney's public endpoint.
 
         The endpoint returns comma-separated ``f51`` onward values.  The first
-        eleven fields are enough for this provider's contract; f52 is the
-        documented main-force net amount and f55/f56 are the large/super-large
-        components.  Unknown trailing fields are intentionally ignored.
+        eleven fields are enough for this provider's contract; only f52 is
+        normalized as the documented main-force net amount.  f53-f61 remain
+        raw/discovery-only values, and unknown trailing fields are ignored.
         """
         import json
         import requests as _requests
@@ -1737,6 +1740,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
 
         cutoff_date = cutoff
         parsed_rows: list[dict[str, str]] = []
+        discovery_by_date: dict[str, dict[str, str]] = {}
         warnings: list[str] = []
         for row_index, raw_row in enumerate(klines):
             if not isinstance(raw_row, str):
@@ -1763,23 +1767,19 @@ class CnAkshareProvider(BaseMarketDataProvider):
             def _part(index: int) -> str:
                 return parts[index] if index < len(parts) else ""
 
+            day_text = day.isoformat()
+            discovery_by_date[day_text] = {
+                field: _part(int(field[1:]) - 51)
+                for field in _EASTMONEY_DIRECT_DISCOVERY_FIELDS
+            }
             parsed_rows.append(
                 {
-                    "日期": day.isoformat(),
+                    "日期": day_text,
                     "主力净流入-净额": _part(1),
-                    "小单净流入-净额": _part(2),
-                    "中单净流入-净额": _part(3),
-                    # These aliases are consumed by build_source_evidence and
-                    # preserve the verified f55/f56 component semantics.
-                    "大单净流入": _part(4),
-                    "超大单净流入": _part(5),
-                    "主力净流入-净占比": _part(6),
-                    "小单净流入-净占比": _part(7),
-                    "中单净流入-净占比": _part(8),
-                    "大单净流入-净占比": _part(9),
-                    "超大单净流入-净占比": _part(10),
-                    "收盘价": _part(11),
-                    "涨跌幅": _part(12),
+                    **{
+                        f"{field}_raw": raw_value
+                        for field, raw_value in discovery_by_date[day_text].items()
+                    },
                 }
             )
 
@@ -1799,12 +1799,28 @@ class CnAkshareProvider(BaseMarketDataProvider):
         if formatted is None or not isinstance(evidence, list) or not evidence:
             return None, "eastmoney_direct: structured_evidence_unavailable"
 
+        evidence = [dict(record) for record in evidence]
+        for record in evidence:
+            raw_fields = dict(discovery_by_date.get(record.get("date"), {}))
+            record["vendor_raw_fields"] = raw_fields
+            record["vendor_raw_field_status"] = "discovery_only"
+            record["vendor_raw_field_units"] = {
+                field: None for field in _EASTMONEY_DIRECT_DISCOVERY_FIELDS
+            }
+
         metadata = dict(getattr(formatted, "fund_flow_evidence_meta", {}) or {})
         metadata.update(
             {
                 "endpoint": _EASTMONEY_DIRECT_FUND_FLOW_URL,
                 "field_mapping": dict(_EASTMONEY_DIRECT_FIELD_MAPPING),
-                "field_semantics_verified": True,
+                "field_semantics_verified": {
+                    "f51": "measurement_date",
+                    "f52": "r0_net",
+                },
+                "discovery_only_fields": list(
+                    _EASTMONEY_DIRECT_DISCOVERY_FIELDS
+                ),
+                "discovery_field_unit_policy": "raw preserved; no normalization",
                 "status": "available",
             }
         )
@@ -2151,8 +2167,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
             "【备用数据源：东方财富直连】" if source == "eastmoney_direct" else ""
         )
         reason = (
-            "东方财富直连已核验 f52 主力净额及 f55/f56 组成项；"
-            "未将其等同于总净额 netamount"
+            "东方财富直连仅将 f52 映射为主力净额 r0_net；"
+            "f53-f61 仅保留原始发现值，未将其等同于总净额 netamount"
             if source == "eastmoney_direct"
             else "东方财富来源仅提供主力净额；未将其等同于总净额 netamount"
         )
