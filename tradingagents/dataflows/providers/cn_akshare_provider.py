@@ -278,6 +278,50 @@ def _usable_fund_amount_text(value) -> str | None:
     return None
 
 
+def _fund_flow_failure_category(error: object) -> str:
+    """Classify fallback errors without exposing provider exception payloads."""
+    text = str(error or "").lower()
+    if any(
+        token in text
+        for token in (
+            "http_status",
+            "timeout",
+            "request:",
+            "connectionerror",
+            "remotedisconnected",
+        )
+    ):
+        return "transport"
+    if any(
+        token in text
+        for token in (
+            "json_decode",
+            "json_shape",
+            "rc_",
+            "data_missing",
+            "klines_",
+        )
+    ):
+        return "envelope"
+    if any(
+        token in text
+        for token in (
+            "invalid_f52",
+            "malformed",
+            "field_count",
+            "no_usable_rows",
+            "non_trading_date",
+            "curr_date_not_cn_trading_day",
+            "missing",
+            "not parseable",
+        )
+    ):
+        return "validation"
+    if any(token in text for token in ("empty", "unavailable", "no rows")):
+        return "availability"
+    return "provider"
+
+
 class CnAkshareProvider(BaseMarketDataProvider):
     """A-share provider backed by AkShare."""
 
@@ -1397,11 +1441,40 @@ class CnAkshareProvider(BaseMarketDataProvider):
             return f"{base_reason}；{'；'.join(errors)}" if errors else base_reason
 
         def _attach_chain(value: str, final_source: str) -> FundFlowText:
+            evidence = list(getattr(value, "fund_flow_evidence", []) or [])
             metadata = dict(getattr(value, "fund_flow_evidence_meta", {}) or {})
+            if metadata.get("as_of") is None and evidence:
+                observed_dates = sorted(
+                    {
+                        str(record.get("as_of") or record.get("date"))
+                        for record in evidence
+                        if record.get("as_of") or record.get("date")
+                    }
+                )
+                if observed_dates:
+                    metadata["as_of"] = observed_dates[-1]
+            metadata.setdefault("actual_as_of", metadata.get("as_of"))
+            if metadata.get("field") is None:
+                fields = {
+                    field
+                    for record in evidence
+                    for field in ("r0_net", "netamount")
+                    if record.get(field) is not None
+                }
+                if "r0_net" in fields:
+                    metadata["field"] = "r0_net"
+                elif "netamount" in fields:
+                    metadata["field"] = "netamount"
             metadata.update(
                 {
                     "attempted_sources": list(attempted_sources),
                     "fallback_errors": list(errors),
+                    "failure_categories": sorted(
+                        {
+                            _fund_flow_failure_category(error)
+                            for error in errors
+                        }
+                    ),
                     "em_typed_gap": em_typed_gap,
                     "final_source": final_source,
                     "last_attempted_source": attempted_sources[-1]
@@ -1411,7 +1484,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             )
             return FundFlowText(
                 str(value),
-                evidence=getattr(value, "fund_flow_evidence", []),
+                evidence=evidence,
                 evidence_meta=metadata,
             )
 
@@ -1537,6 +1610,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 reason=_gap_reason(
                     "historical new-algorithm evidence unavailable; legacy Web reference unavailable"
                 ),
+                field="r0_net",
+                raw_unit="元",
+                failure_category="source_unavailable",
             )
             return _attach_chain(gap, "unavailable")
 
@@ -1562,6 +1638,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     reason=_gap_reason(
                         "同花顺即时资金流净额快照无记录；该源不提供新浪 netamount/r0_net evidence"
                     ),
+                    field="netamount",
+                    raw_unit="亿元",
+                    failure_category="validation_failure",
                 )
                 return _attach_chain(gap, "unavailable")
             row = stock_df.iloc[0]
@@ -1575,6 +1654,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     reason=_gap_reason(
                         "同花顺即时资金流净额快照缺少净额字段；该源不提供新浪 netamount/r0_net evidence"
                     ),
+                    field="netamount",
+                    raw_unit="亿元",
+                    failure_category="validation_failure",
                 )
                 return _attach_chain(gap, "unavailable")
             net_amount = _usable_fund_amount_text(row["净额"])
@@ -1588,6 +1670,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     reason=_gap_reason(
                         "同花顺即时资金流净额快照净额缺失或不可解析；该源不提供新浪 netamount/r0_net evidence"
                     ),
+                    field="netamount",
+                    raw_unit="亿元",
+                    failure_category="validation_failure",
                 )
                 return _attach_chain(gap, "unavailable")
 
@@ -1635,7 +1720,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     "source_family": "ths",
                     "algorithm_group": "new_algorithm_group",
                     "period_kind": "realtime_single_day",
+                    "field": "netamount",
+                    "raw_unit": "亿元",
                     "unit": "亿元",
+                    "as_of": curr_date,
+                    "actual_as_of": curr_date,
                     "status": "available",
                     "consensus": consensus,
                     "reason": "同花顺即时资金流净额是总净额，未将其等同于新浪历史 r0_net 主力序列",
@@ -1654,6 +1743,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
             requested_as_of=curr_date,
             source="fund_flow_individual",
             reason=gap_reason,
+            field="r0_net",
+            raw_unit="元",
+            failure_category="source_unavailable",
         )
         return _attach_chain(gap, "unavailable")
 
@@ -2253,9 +2345,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 "source_family": "eastmoney",
                 "raw_unit": "元",
                 "unit": "亿元",
+                "field": "r0_net",
                 "period_kind": "historical_daily",
                 "window": "1d",
                 "as_of": latest_str,
+                "actual_as_of": latest_str,
                 "status": "available" if source == "eastmoney_direct" else "partial",
                 "consensus": consensus,
                 "reason": reason,

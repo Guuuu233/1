@@ -525,6 +525,10 @@ def build_provider_text(
     retrieved_at: str | None = None,
     algorithm_group: str | None = None,
     period_kind: str | None = None,
+    field: str | None = "r0_net",
+    raw_unit: str | None = "元",
+    actual_as_of: str | None = None,
+    failure_category: str = "source_unavailable",
 ) -> FundFlowText:
     """Keep formatted provider text while exposing an explicit evidence gap."""
     return FundFlowText(
@@ -539,6 +543,10 @@ def build_provider_text(
             retrieved_at=retrieved_at,
             algorithm_group=algorithm_group,
             period_kind=period_kind,
+            field=field,
+            raw_unit=raw_unit,
+            actual_as_of=actual_as_of,
+            failure_category=failure_category,
         ),
     )
 
@@ -553,6 +561,10 @@ def build_gap_meta(
     retrieved_at: str | None = None,
     algorithm_group: str | None = None,
     period_kind: str | None = None,
+    field: str | None = "r0_net",
+    raw_unit: str | None = "元",
+    actual_as_of: str | None = None,
+    failure_category: str = "source_unavailable",
 ) -> dict[str, Any]:
     """Build explicit evidence-gap metadata without fabricating daily values."""
     group = infer_algorithm_group(source, algorithm_group)
@@ -565,12 +577,18 @@ def build_gap_meta(
         "source_group": group,
         "legacy_web_algorithm": group == LEGACY_WEB_ALGORITHM,
         "period_kind": period_kind,
+        "field": field,
+        "raw_unit": raw_unit,
         "unit": "亿元",
         "status": status,
+        "direction": "blocked",
+        "direction_allowed": False,
         "reason": reason,
+        "failure_category": failure_category,
         "gap": f"【数据获取失败】资金流 evidence：{reason}",
         "retrieved_at": retrieved_at,
-        "as_of": None,
+        "actual_as_of": actual_as_of,
+        "as_of": actual_as_of,
     }
 
 

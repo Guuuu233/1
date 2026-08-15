@@ -151,6 +151,45 @@ def test_individual_fund_flow_direct_eastmoney_success_is_structured_and_typed()
     assert meta["discovery_field_unit_policy"] == "raw preserved; no normalization"
 
 
+@pytest.mark.parametrize(
+    "symbol, expected_secid",
+    [("601398.SH", "1.601398"), ("002167.SZ", "0.002167")],
+)
+def test_direct_fixed_historical_symbols_preserve_evidence_contract(
+    symbol, expected_secid
+):
+    """The fixed DAV-167 symbols use the audited market-specific secid path."""
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+
+    with patch(
+        "requests.get",
+        return_value=_EastmoneyResponse(_direct_payload(_DIRECT_KLINE)),
+    ) as mock_get:
+        out = p.get_individual_fund_flow(symbol, curr_date="2026-08-14")
+
+    assert mock_get.call_args.kwargs["params"]["secid"] == expected_secid
+    assert out.fund_flow_evidence_meta["final_source"] == "eastmoney_direct"
+    assert out.fund_flow_evidence_meta["requested_as_of"] == "2026-08-14"
+    assert out.fund_flow_evidence
+    record = out.fund_flow_evidence[0]
+    assert record["symbol"] == symbol
+    assert record["source"] == "eastmoney_direct"
+    assert record["algorithm_group"] == "new_algorithm_group"
+    assert record["date"] == "2026-08-14"
+    assert record["as_of"] == "2026-08-14"
+    assert record["requested_as_of"] == "2026-08-14"
+    assert record["field_semantics"]["r0_net"].startswith("主力净额")
+    assert record["r0_net"] == "1.2"
+    assert record["r0_net_raw"] == "120000000"
+    assert record["raw_unit"] == "元"
+    assert record["unit"] == "亿元"
+    assert "netamount" not in record
+    assert out.fund_flow_evidence_meta["field_mapping"]["f52"] == "r0_net"
+
+
 def test_individual_fund_flow_direct_filters_future_rows_without_lookahead():
     ak = MagicMock()
     ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
@@ -248,6 +287,18 @@ def test_direct_preserves_f52_raw_decimal_text_without_float_rounding():
             "eastmoney_direct: http_status: 503",
         ),
         (
+            _EastmoneyResponse({}, status_code=200),
+            "eastmoney_direct: rc_missing",
+        ),
+        (
+            _EastmoneyResponse({"rc": 0}, status_code=200),
+            "eastmoney_direct: data_missing_or_invalid",
+        ),
+        (
+            _EastmoneyResponse({"rc": 0, "data": {}}, status_code=200),
+            "eastmoney_direct: klines_missing_or_invalid",
+        ),
+        (
             _EastmoneyResponse(text="not-json"),
             "eastmoney_direct: json_decode:",
         ),
@@ -288,6 +339,34 @@ def test_direct_failure_keeps_chain_and_falls_back_to_ths(response, expected_err
     )
     assert "sina historical fund flow: ConnectionError" in meta["fallback_errors"]
     assert "stock_individual_fund_flow: ConnectionError" in meta["em_typed_gap"]
+
+
+def test_direct_date_mismatch_is_typed_gap_and_continues_to_current_fallback():
+    """A response containing only future rows cannot satisfy the requested as-of."""
+    today = cn_today_str()
+    future = (pd.Timestamp(today) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
+    ak.stock_fund_flow_individual.return_value = _current_day_ths()
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+
+    with patch(
+        "requests.get",
+        side_effect=[
+            _EastmoneyResponse(_direct_payload(_DIRECT_KLINE.replace("2026-08-14", future))),
+            ConnectionError("Sina down"),
+        ],
+    ):
+        out = p.get_individual_fund_flow("600519", curr_date=today)
+
+    assert "同花顺即时资金流净额快照" in out
+    assert out.fund_flow_evidence_meta["final_source"] == "ths_instant_snapshot"
+    assert any(
+        "eastmoney_direct: no_usable_rows_on_or_before_curr_date" in error
+        for error in out.fund_flow_evidence_meta["fallback_errors"]
+    )
+    assert all(record["date"] == today for record in out.fund_flow_evidence)
 
 
 def test_direct_missing_f52_does_not_derive_r0_net_from_components():
@@ -482,6 +561,16 @@ def test_individual_fund_flow_sina_refuses_historical_date():
     assert "不可用" in out
     assert "同花顺即时资金流净额快照" not in out
     assert "3.61亿" not in out
+    assert meta["requested_as_of"] == past
+    assert meta["actual_as_of"] is None
+    assert meta["as_of"] is None
+    assert meta["field"] == "r0_net"
+    assert meta["raw_unit"] == "元"
+    assert meta["unit"] == "亿元"
+    assert meta["failure_category"] == "source_unavailable"
+    assert meta["direction"] == "blocked"
+    assert meta["direction_allowed"] is False
+    assert "transport" in meta["failure_categories"]
 
 
 def test_lhb_detail_falls_back_to_sina_when_em_fails():
