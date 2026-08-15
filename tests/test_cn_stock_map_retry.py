@@ -105,6 +105,47 @@ def test_failed_load_returns_empty_but_retries_after_interval_not_ttl():
         assert ak.stock_info_a_code_name.call_count >= 1
 
 
+def test_empty_provider_results_use_failure_backoff_then_recover():
+    """Empty stock and fund responses are failures, not a successful 7-day cache."""
+    _reset_cold()
+    empty_stock = pd.DataFrame(columns=["name", "code"])
+    empty_fund = pd.DataFrame(columns=["基金代码", "基金简称"])
+    recovered_stock = _stock_df(("贵州茅台", "600519"))
+    recovered_fund = pd.DataFrame([{"基金代码": "159915", "基金简称": "创业板ETF"}])
+    ak = _akshare_stub(
+        stock_behavior=[empty_stock, recovered_stock],
+        fund_behavior=[empty_fund, recovered_fund],
+    )
+
+    with patch.dict(sys.modules, {"akshare": ak}):
+        assert main._load_cn_stock_map() == {}
+        assert main._cn_stock_map_loaded_at == 0
+        assert main._cn_stock_map_last_failure_at > 0
+
+        # The empty response is subject to the same short retry backoff as an
+        # exception; it must not call either provider again immediately.
+        ak.stock_info_a_code_name.reset_mock()
+        ak.fund_name_em.reset_mock()
+        assert main._load_cn_stock_map() == {}
+        assert ak.stock_info_a_code_name.call_count == 0
+        assert ak.fund_name_em.call_count == 0
+
+        # Once the backoff expires, non-empty provider responses recover the
+        # cache and start the success TTL.
+        main._cn_stock_map_last_failure_at -= main._STOCK_MAP_FAILURE_RETRY_INTERVAL + 1
+        result = main._load_cn_stock_map()
+        assert result == {
+            "贵州茅台": "600519.SH",
+            "创业板ETF": "159915.SZ",
+        }
+        assert main._cn_stock_reverse_map == {
+            "600519.SH": "贵州茅台",
+            "159915.SZ": "创业板ETF",
+        }
+        assert main._cn_stock_map_loaded_at > 0
+        assert main._cn_stock_map_last_failure_at == 0
+
+
 def test_failed_cold_cache_cached_only_returns_empty():
     """Requirement 4: after a cold failure, cached-only list lookups fast-return
     empty (no blocking load)."""

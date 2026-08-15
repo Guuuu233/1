@@ -588,7 +588,8 @@ def _load_cn_stock_map() -> Dict[str, str]:
     Failure handling (DAV-92): a failed load records ``_cn_stock_map_last_failure_at``
     and is NOT treated as a valid cache, so the 7-day TTL only starts on success.
     Subsequent calls back off for ``_STOCK_MAP_FAILURE_RETRY_INTERVAL`` instead of
-    retrying on every request or freezing for the full TTL.
+    retrying on every request or freezing for the full TTL. An empty combined
+    response is treated as a failed load as well.
     """
     global _cn_stock_map, _cn_stock_reverse_map, _cn_stock_map_norm, _cn_stock_map_norm_src, _cn_stock_map_loaded_at, _cn_stock_map_last_failure_at
     import time as _time
@@ -635,6 +636,8 @@ def _load_cn_stock_map() -> Dict[str, str]:
                 fund_count = len(result) - stock_count
             except Exception as fe:
                 _log(f"[StockMap] ETF/fund load skipped: {fe}")
+            if not result:
+                raise RuntimeError("AkShare returned empty stock and fund name maps")
             _cn_stock_map = result
             _cn_stock_reverse_map = {code: name for name, code in result.items()}
             _cn_stock_map_norm = None  # lazily rebuilt via _get_normalized_stock_map
