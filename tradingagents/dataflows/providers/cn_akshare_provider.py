@@ -19,6 +19,7 @@ from ..trade_calendar import (
     dedupe_daily_bars,
     drop_incomplete_today_bar,
     fetch_with_date_fallback,
+    is_cn_trading_day,
     is_historical_analysis_date,
     snapshot_historical_refusal,
 )
@@ -1684,6 +1685,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
         }
 
         try:
+            if not is_cn_trading_day(curr_date):
+                return None, "eastmoney_direct: curr_date_not_cn_trading_day"
+        except Exception as exc:
+            return None, f"eastmoney_direct: trade_calendar: {type(exc).__name__}"
+
+        try:
             response = _requests.get(
                 _EASTMONEY_DIRECT_FUND_FLOW_URL,
                 params=params,
@@ -1742,26 +1749,53 @@ class CnAkshareProvider(BaseMarketDataProvider):
         parsed_rows: list[dict[str, str]] = []
         discovery_by_date: dict[str, dict[str, str]] = {}
         warnings: list[str] = []
+        malformed_rows: list[str] = []
         for row_index, raw_row in enumerate(klines):
             if not isinstance(raw_row, str):
-                warnings.append(f"row {row_index}: kline is not text")
+                warning = f"row {row_index}: kline is not text"
+                warnings.append(warning)
+                malformed_rows.append(warning)
                 continue
             parts = [part.strip() for part in raw_row.split(",")]
-            if len(parts) < 11:
-                warnings.append(
-                    f"row {row_index}: field_count={len(parts)}, need_at_least=11"
-                )
-                continue
-            day_ts = pd.to_datetime(parts[0], errors="coerce")
+            day_ts = (
+                pd.to_datetime(parts[0], errors="coerce")
+                if parts
+                else pd.NaT
+            )
             if pd.isna(day_ts):
-                warnings.append(f"row {row_index}: invalid_date")
+                warning = f"row {row_index}: invalid_date"
+                warnings.append(warning)
+                malformed_rows.append(warning)
                 continue
             day = day_ts.date()
             if day > cutoff_date:
                 # Future rows are deliberately ignored, not rendered or used.
                 continue
+            if len(parts) < 11:
+                warning = (
+                    f"row {row_index}: field_count={len(parts)}, need_at_least=11"
+                )
+                warnings.append(warning)
+                malformed_rows.append(warning)
+                continue
+            try:
+                is_trade_day = is_cn_trading_day(day.isoformat())
+            except Exception as exc:
+                warning = (
+                    f"row {row_index}: trade_calendar: {type(exc).__name__}"
+                )
+                warnings.append(warning)
+                malformed_rows.append(warning)
+                continue
+            if not is_trade_day:
+                warning = f"row {row_index}: non_trading_date={day.isoformat()}"
+                warnings.append(warning)
+                malformed_rows.append(warning)
+                continue
             if _sina_decimal(parts[1]) is None:
-                warnings.append(f"row {row_index}: invalid_f52")
+                warning = f"row {row_index}: invalid_f52"
+                warnings.append(warning)
+                malformed_rows.append(warning)
                 continue
 
             def _part(index: int) -> str:
@@ -1783,6 +1817,17 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 }
             )
 
+        if malformed_rows:
+            detail = "; ".join(malformed_rows[:5])
+            if not parsed_rows:
+                return None, (
+                    "eastmoney_direct: no_usable_rows_on_or_before_curr_date "
+                    f"(malformed_kline_rows: {detail})"
+                )
+            return None, (
+                "eastmoney_direct: malformed_kline_rows_on_or_before_curr_date "
+                f"({detail})"
+            )
         if not parsed_rows:
             detail = f" ({'; '.join(warnings[:5])})" if warnings else ""
             return None, f"eastmoney_direct: no_usable_rows_on_or_before_curr_date{detail}"
@@ -2132,11 +2177,27 @@ class CnAkshareProvider(BaseMarketDataProvider):
             return None
 
         dates = pd.to_datetime(df[date_col], errors="coerce")
-        values = pd.to_numeric(df[value_col], errors="coerce")
-        valid = dates.notna() & values.notna() & values.map(math.isfinite)
+
+        def _raw_amount_text(value) -> str:
+            if value is None:
+                return ""
+            try:
+                if pd.isna(value):
+                    return ""
+            except (TypeError, ValueError):
+                return ""
+            return str(value).strip()
+
+        raw_values = df[value_col].map(_raw_amount_text)
+        values = raw_values.map(_sina_decimal)
+        valid = dates.notna() & values.map(
+            lambda value: value is not None and value.is_finite()
+        )
         df = df.loc[valid].copy()
         df[date_col] = dates[valid]
-        df[value_col] = values[valid]
+        # Keep the vendor text beside the date-filtering frame.  The evidence
+        # builder must receive this text, not a float64 conversion of f52.
+        df["__r0_net_raw"] = raw_values[valid]
         df = df[df[date_col] <= pd.Timestamp(cutoff)]
         if df.empty:
             return (
@@ -2150,8 +2211,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
         latest_day = pd.to_datetime(df_recent[date_col], errors="coerce").max()
         latest_str = latest_day.date().isoformat() if pd.notna(latest_day) else curr_date
         retrieved_at = self._sina_retrieved_at()
+        evidence_frame = df_recent.copy()
+        evidence_frame[value_col] = evidence_frame["__r0_net_raw"]
+        evidence_frame = evidence_frame.drop(columns=["__r0_net_raw"])
+        display_frame = df_recent.drop(columns=["__r0_net_raw"])
         evidence = build_em_evidence(
-            df_recent,
+            evidence_frame,
             symbol=symbol,
             requested_as_of=curr_date,
             retrieved_at=retrieved_at,
@@ -2176,7 +2241,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             (
                 f"{source_prefix}{symbol} 近5日主力资金净流向"
                 f"（截至于 {curr_date}，最新数据日 {latest_str}）：\n"
-                f"{df_recent.to_string(index=False)}"
+                f"{display_frame.to_string(index=False)}"
             ),
             evidence=evidence,
             evidence_meta={
