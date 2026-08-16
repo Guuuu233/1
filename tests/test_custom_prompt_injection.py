@@ -37,7 +37,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tests.fund_flow_fixtures import valid_fund_flow_consensus_guard
+from tests.fund_flow_fixtures import (
+    blocked_fund_flow_consensus_guard,
+    direction_disallowed_fund_flow_consensus_guard,
+    mismatched_fund_flow_consensus_guard,
+    valid_fund_flow_consensus_guard,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -345,6 +350,27 @@ def test_T9_factory_signatures_accept_new_params():
     assert callable(node_mgr)
     assert callable(node_trader)
     assert callable(node_risk)
+
+
+def test_fund_flow_allow_fixture_matches_production_builder_shapes():
+    guard = valid_fund_flow_consensus_guard()
+    consensus = guard["consensus"]
+    validation = guard["validation"]
+
+    assert guard["blocked"] is False
+    assert guard["direction_allowed"] is True
+    assert guard["status"] == "consensus"
+    assert consensus["field"] == "r0_net"
+    assert consensus["field_category"] == "main_force"
+    assert consensus["status"] == "consensus"
+    assert consensus["data_conflict"] is False
+    assert consensus["hard_guard"]["blocked"] is False
+    assert consensus["raw_values"]
+    assert validation["status"] == "not_checked"
+    assert validation["structured"]["status"] == "available"
+    assert validation["model"] == {}
+    assert validation["hard_guard"]["blocked"] is False
+    assert guard["reason"] == validation["hard_guard"]["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -982,6 +1008,85 @@ def _make_risk_debate_state(**overrides):
     }
     base.update(overrides)
     return base
+
+
+_INVALID_GUARD_CASES = (
+    ("missing", None),
+    ("blocked", blocked_fund_flow_consensus_guard),
+    ("mismatch", mismatched_fund_flow_consensus_guard),
+    ("direction_disallowed", direction_disallowed_fund_flow_consensus_guard),
+)
+
+
+@pytest.mark.parametrize("role", ("research_manager", "trader", "risk_manager"))
+@pytest.mark.parametrize("guard_case", _INVALID_GUARD_CASES, ids=lambda item: item[0])
+def test_downstream_nodes_fail_closed_for_invalid_fund_flow_guards(role, guard_case):
+    import asyncio
+
+    from tradingagents.agents.managers.research_manager import create_research_manager
+    from tradingagents.agents.managers.risk_manager import create_risk_manager
+    from tradingagents.agents.trader.trader import create_trader
+
+    case_name, guard_factory = guard_case
+    state = _make_graph_state()
+    if guard_factory is None:
+        state.pop("fund_flow_consensus_guard")
+    else:
+        state["fund_flow_consensus_guard"] = guard_factory()
+
+    if role == "research_manager":
+        node_factory = create_research_manager
+    elif role == "trader":
+        state.update(
+            {
+                "company_of_interest": "600519",
+                "investment_plan": "研究经理给交易员下发的投资方案",
+                "trader_investment_plan": "",
+                "instrument_context": {},
+                "market_context": {},
+                "user_context": {},
+                "risk_feedback_state": {},
+            }
+        )
+        node_factory = create_trader
+    else:
+        state.update(
+            {
+                "company_of_interest": "600519",
+                "trader_investment_plan": "交易员方案",
+                "risk_debate_state": _make_risk_debate_state(),
+                "instrument_context": {},
+                "market_context": {},
+                "user_context": {},
+            }
+        )
+        node_factory = create_risk_manager
+
+    llm = MagicMock()
+    llm.prompts = []
+
+    async def _unexpected_astream(prompt, **_kwargs):
+        llm.prompts.append(prompt)
+        yield MagicMock(content="unexpected LLM output")
+
+    llm.astream = _unexpected_astream
+    memory = MagicMock()
+    memory.get_memories.return_value = []
+    node = node_factory(llm, memory, custom_prompt="", placement="after_data")
+    result = asyncio.run(node(state))
+
+    assert not llm.prompts, f"{case_name} guard must block {role} before llm.astream"
+    assert result["fund_flow_consensus_guard"]["blocked"] is True
+    assert result["fund_flow_consensus_guard"]["direction_allowed"] is False
+    if guard_factory is not None:
+        assert result["fund_flow_consensus_guard"] == state["fund_flow_consensus_guard"]
+
+    result_key = {
+        "research_manager": "investment_plan",
+        "trader": "trader_investment_plan",
+        "risk_manager": "final_trade_decision",
+    }[role]
+    assert "guard 已阻断" in result[result_key]
 
 
 def test_T23_risk_manager_injection_position_after_data():
