@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -181,5 +182,70 @@ def test_create_report_strips_thinking_traces_before_persist():
         assert "High node at 11.80" in (persisted.volume_price_report or "")
         assert "I think" not in (persisted.trader_investment_plan or "")
         assert "Plan: buy." in (persisted.trader_investment_plan or "")
+    finally:
+        db.close()
+
+
+def test_completed_report_has_immutable_revision_hash_and_rejects_mutations():
+    db = _make_session()
+    try:
+        report = report_service.create_report(
+            db=db,
+            symbol="600519.SH",
+            trade_date="2026-07-29",
+            decision="HOLD",
+            result_data={"final_trade_decision": "结论：持有"},
+        )
+
+        audit = report.result_data[report_service.IMMUTABLE_REPORT_AUDIT_KEY]
+        assert audit["revision"] == report_service.IMMUTABLE_REPORT_REVISION
+        assert audit["algorithm"] == "sha256"
+        assert len(audit["hash"]) == 64
+        assert report_service.verify_report_immutable_audit(report) is True
+
+        with pytest.raises(report_service.ImmutableReportError, match="immutable"):
+            report_service.update_report_partial(
+                db,
+                report.id,
+                result_data={"final_trade_decision": "篡改后的结论"},
+            )
+
+        persisted = db.query(ReportDB).filter(ReportDB.id == report.id).one()
+        assert persisted.result_data["final_trade_decision"] == "结论：持有"
+        assert report_service.delete_report(db, report.id) is False
+        batch_result = report_service.batch_delete_reports(db, [report.id])
+        assert batch_result == {"deleted_ids": [], "missing_ids": [report.id]}
+        assert db.query(ReportDB).filter(ReportDB.id == report.id).count() == 1
+    finally:
+        db.close()
+
+
+def test_completed_report_audit_mismatch_blocks_replace_and_delete():
+    db = _make_session()
+    try:
+        report = report_service.create_report(
+            db=db,
+            symbol="600519.SH",
+            trade_date="2026-07-29",
+            result_data={"final_trade_decision": "原始结论"},
+        )
+        report.result_data = {
+            **report.result_data,
+            "final_trade_decision": "未经授权的改写",
+        }
+        db.commit()
+        db.refresh(report)
+
+        assert report_service.verify_report_immutable_audit(report) is False
+        with pytest.raises(report_service.ImmutableReportError, match="audit"):
+            report_service.create_report(
+                db=db,
+                symbol=report.symbol,
+                trade_date=report.trade_date,
+                result_data={"final_trade_decision": "再次改写"},
+                report_id=report.id,
+            )
+        assert report_service.delete_report(db, report.id) is False
+        assert db.query(ReportDB).filter(ReportDB.id == report.id).count() == 1
     finally:
         db.close()

@@ -616,6 +616,181 @@ def _extract_source_as_of(value: Any, requested_as_of: str) -> Optional[str]:
     return max(dates) if dates else None
 
 
+def _fund_flow_metadata(value: Any) -> Optional[Dict[str, Any]]:
+    metadata = getattr(value, "fund_flow_evidence_meta", None)
+    return metadata if isinstance(metadata, dict) else None
+
+
+def _fund_flow_evidence_records(value: Any) -> list[dict[str, Any]]:
+    evidence = getattr(value, "fund_flow_evidence", None)
+    if not isinstance(evidence, list):
+        return []
+    return [record for record in evidence if isinstance(record, dict)]
+
+
+def _fund_flow_date_text(value: Any) -> Optional[str]:
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.strftime("%Y-%m-%d")
+
+
+def _fund_flow_record_date(record: Dict[str, Any]) -> Optional[str]:
+    for key in (
+        "measurement_date",
+        "date",
+        "日期",
+        "opendate",
+        "trade_date",
+        "交易日期",
+        "as_of",
+    ):
+        date_text = _fund_flow_date_text(record.get(key))
+        if date_text:
+            return date_text
+    return None
+
+
+def _fund_flow_actual_as_of(
+    metadata: Optional[Dict[str, Any]],
+    records: list[dict[str, Any]],
+    requested_as_of: str,
+) -> Optional[str]:
+    requested = pd.to_datetime(requested_as_of, errors="coerce")
+    if pd.isna(requested):
+        return None
+    candidates: list[str] = []
+    if isinstance(metadata, dict):
+        for key in ("actual_as_of", "as_of"):
+            date_text = _fund_flow_date_text(metadata.get(key))
+            if date_text:
+                candidates.append(date_text)
+    for record in records:
+        date_text = _fund_flow_record_date(record)
+        if date_text:
+            candidates.append(date_text)
+    eligible = [
+        candidate
+        for candidate in candidates
+        if pd.to_datetime(candidate, errors="coerce") <= requested
+    ]
+    return max(eligible) if eligible else None
+
+
+def _fund_flow_period_window(
+    metadata: Optional[Dict[str, Any]],
+    records: list[dict[str, Any]],
+) -> tuple[Optional[str], Optional[str]]:
+    period = None
+    window = None
+    if isinstance(metadata, dict):
+        period = metadata.get("period_kind") or metadata.get("window_kind") or metadata.get("period")
+        window = metadata.get("time_window") or metadata.get("window")
+    if period is None:
+        periods = {
+            str(record.get("period_kind") or record.get("window_kind") or record.get("period"))
+            for record in records
+            if record.get("period_kind") or record.get("window_kind") or record.get("period")
+        }
+        if len(periods) == 1:
+            period = next(iter(periods))
+    if window is None:
+        windows = {
+            str(record.get("time_window") or record.get("window"))
+            for record in records
+            if record.get("time_window") or record.get("window")
+        }
+        if len(windows) == 1:
+            window = next(iter(windows))
+    return (
+        str(period) if period is not None else None,
+        str(window) if window is not None else None,
+    )
+
+
+def _fund_flow_status(
+    metadata: Optional[Dict[str, Any]],
+    records: list[dict[str, Any]],
+) -> Optional[str]:
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("data_conflict") is True:
+        return "data_conflict"
+    hard_guard = metadata.get("hard_guard")
+    if isinstance(hard_guard, dict) and hard_guard.get("blocked") is True:
+        status = str(metadata.get("status") or "").strip().lower()
+        if status in {"available", "consensus", "ok", "completed"}:
+            return "data_conflict"
+    status = str(metadata.get("status") or "").strip().lower()
+    consensus = metadata.get("consensus")
+    if not status and isinstance(consensus, dict):
+        status = str(consensus.get("status") or "").strip().lower()
+    if not status and records:
+        status = "available"
+    return status or None
+
+
+def _fund_flow_provenance_entry(
+    value: Any,
+    requested_as_of: str,
+) -> Optional[Dict[str, Any]]:
+    metadata = _fund_flow_metadata(value)
+    if metadata is None:
+        return None
+    records = _fund_flow_evidence_records(value)
+    status = _fund_flow_status(metadata, records) or "unavailable"
+    actual_as_of = _fund_flow_actual_as_of(metadata, records, requested_as_of)
+    period, window = _fund_flow_period_window(metadata, records)
+    entry: Dict[str, Any] = {
+        "requested_as_of": requested_as_of,
+        "as_of": actual_as_of,
+        "actual_as_of": actual_as_of,
+        "status": status,
+    }
+    for key in (
+        "source",
+        "source_family",
+        "algorithm_group",
+        "field",
+        "raw_unit",
+        "unit",
+        "retrieved_at",
+        "direction",
+        "direction_allowed",
+        "hard_guard",
+        "reason",
+        "data_conflict",
+    ):
+        if key in metadata and metadata[key] is not None:
+            entry[key] = copy.deepcopy(metadata[key])
+    if period is not None:
+        entry["period_kind"] = period
+    if window is not None:
+        entry["time_window"] = window
+        entry["window"] = window
+    if metadata.get("requested_as_of") not in (None, requested_as_of):
+        entry["provider_requested_as_of"] = metadata["requested_as_of"]
+    if metadata.get("gap"):
+        entry["gap"] = str(metadata["gap"])
+    elif status in {"data_conflict", "partial"}:
+        entry["gap"] = (
+            f"【数据获取失败】fund_flow_individual："
+            f"{metadata.get('reason') or status}"
+        )
+    elif status in {"failed", "timeout", "unavailable", "refused", "error"}:
+        entry["gap"] = str(
+            f"【数据获取失败】fund_flow_individual：{_compact_failure_reason(status)}"
+        )
+    elif actual_as_of is None:
+        entry["gap"] = "【数据获取失败】fund_flow_individual：未返回可验证数据日期"
+    elif actual_as_of < requested_as_of:
+        entry["gap"] = (
+            f"【数据获取失败】fund_flow_individual：实际最新数据日 {actual_as_of} "
+            f"早于请求日期 {requested_as_of}"
+        )
+    return entry
+
+
 def _build_source_provenance(
     results: Dict[str, Any],
     requested_as_of: str,
@@ -624,6 +799,11 @@ def _build_source_provenance(
     """Persist per-source cutoff evidence beside the compact failure ledger."""
     provenance: Dict[str, Dict[str, Any]] = {}
     for source, value in results.items():
+        if source == "fund_flow_individual":
+            evidence_entry = _fund_flow_provenance_entry(value, requested_as_of)
+            if evidence_entry is not None:
+                provenance[str(source)] = evidence_entry
+                continue
         status = _classify_failure_value(value) or "available"
         as_of = _extract_source_as_of(value, requested_as_of)
         if source == "stock_data":
@@ -706,20 +886,109 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
     data_failure_ledger = _build_data_failure_ledger(results)
 
     fund_flow_value = results.get("fund_flow_individual")
-    fund_flow_evidence = getattr(fund_flow_value, "fund_flow_evidence", None)
-    fund_flow_evidence_meta = getattr(fund_flow_value, "fund_flow_evidence_meta", None)
-    if isinstance(fund_flow_evidence, list) and fund_flow_evidence:
+    raw_fund_flow_evidence = _fund_flow_evidence_records(fund_flow_value)
+    fund_flow_evidence: list[dict[str, Any]] = []
+    rejected_fund_flow_records: list[dict[str, Any]] = []
+    trade_dt = pd.to_datetime(trade_date, errors="coerce")
+    for record in raw_fund_flow_evidence:
+        record_date = _fund_flow_record_date(record)
+        record_dt = pd.to_datetime(record_date, errors="coerce")
+        if record_date and not pd.isna(trade_dt) and record_dt > trade_dt:
+            rejected_fund_flow_records.append(record)
+        else:
+            fund_flow_evidence.append(record)
+    fund_flow_evidence_meta = copy.deepcopy(_fund_flow_metadata(fund_flow_value) or {})
+    if rejected_fund_flow_records:
+        fund_flow_evidence_meta["status"] = "data_conflict"
+        fund_flow_evidence_meta["data_conflict"] = True
+        fund_flow_evidence_meta["reason"] = "fund-flow evidence contains rows after requested as-of"
+    if fund_flow_evidence:
         summary = summarize_evidence(fund_flow_evidence, window_days=5)
         fund_flow_context = {
-            **dict(fund_flow_evidence_meta or {}),
+            **copy.deepcopy(fund_flow_evidence_meta or {}),
             "records": copy.deepcopy(fund_flow_evidence),
             "summary": summary,
-            "validation": {"status": "not_checked", "mismatches": []},
+            "validation": copy.deepcopy(
+                fund_flow_evidence_meta.get("validation")
+                if isinstance(fund_flow_evidence_meta, dict)
+                and isinstance(fund_flow_evidence_meta.get("validation"), dict)
+                else {"status": "not_checked", "mismatches": []}
+            ),
         }
-        if summary.get("status") == "available":
-            fund_flow_context["status"] = "available"
+        provider_requested_as_of = fund_flow_context.get("requested_as_of")
+        fund_flow_context["requested_as_of"] = trade_date
+        if provider_requested_as_of not in (None, trade_date):
+            fund_flow_context["provider_requested_as_of"] = provider_requested_as_of
+        actual_as_of = _fund_flow_actual_as_of(
+            fund_flow_evidence_meta,
+            fund_flow_evidence,
+            trade_date,
+        )
+        if actual_as_of is not None:
+            fund_flow_context["actual_as_of"] = actual_as_of
+            fund_flow_context["as_of"] = actual_as_of
+        else:
+            fund_flow_context["actual_as_of"] = None
+            fund_flow_context["as_of"] = None
+        period_kind, time_window = _fund_flow_period_window(
+            fund_flow_evidence_meta,
+            fund_flow_evidence,
+        )
+        if period_kind is not None:
+            fund_flow_context["period_kind"] = period_kind
+        if time_window is not None:
+            fund_flow_context["time_window"] = time_window
+            fund_flow_context["window"] = time_window
+
+        provider_status = _fund_flow_status(
+            fund_flow_evidence_meta,
+            fund_flow_evidence,
+        )
+        summary_status = str(summary.get("status") or "").strip().lower()
+        blocked_statuses = {
+            "data_conflict",
+            "partial",
+            "failed",
+            "timeout",
+            "unavailable",
+            "refused",
+            "error",
+        }
+        if provider_status in blocked_statuses:
+            fund_flow_context["status"] = provider_status
+        elif summary_status == "data_conflict":
+            fund_flow_context["status"] = "data_conflict"
+        elif summary_status:
+            fund_flow_context["status"] = summary_status
+        elif provider_status:
+            fund_flow_context["status"] = provider_status
         else:
             fund_flow_context["status"] = "partial"
+        if fund_flow_context.get("status") == "data_conflict" or summary.get("data_conflict") is True:
+            fund_flow_context["data_conflict"] = True
+            fund_flow_context["direction_allowed"] = False
+            guard = fund_flow_context.get("hard_guard")
+            if not isinstance(guard, dict):
+                guard = {}
+            guard = copy.deepcopy(guard)
+            guard.update(
+                {
+                    "blocked": True,
+                    "direction_allowed": False,
+                    "reason": guard.get("reason")
+                    or fund_flow_context.get("reason")
+                    or summary.get("reason")
+                    or "fund-flow evidence conflict",
+                }
+            )
+            fund_flow_context["hard_guard"] = guard
+        else:
+            guard = fund_flow_context.get("hard_guard")
+            if isinstance(guard, dict) and (
+                guard.get("blocked") is True or guard.get("direction_allowed") is False
+            ):
+                # A computable arithmetic summary must never reopen a provider guard.
+                fund_flow_context["direction_allowed"] = False
     else:
         generic_gap = build_gap_meta(
             symbol=ticker,
@@ -735,6 +1004,30 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         )
         for key, value in generic_gap.items():
             fund_flow_context.setdefault(key, value)
+        fund_flow_context["requested_as_of"] = trade_date
+        fund_flow_context["actual_as_of"] = None
+        fund_flow_context["as_of"] = None
+        provider_status = _fund_flow_status(fund_flow_evidence_meta, [])
+        if provider_status in {"data_conflict", "partial", "failed", "timeout", "refused", "error"}:
+            fund_flow_context["status"] = provider_status
+        else:
+            fund_flow_context["status"] = "unavailable"
+        fund_flow_context["direction"] = "blocked"
+        fund_flow_context["direction_allowed"] = False
+        guard = fund_flow_context.get("hard_guard")
+        if not isinstance(guard, dict):
+            guard = {}
+        guard = copy.deepcopy(guard)
+        guard.update(
+            {
+                "blocked": True,
+                "direction_allowed": False,
+                "reason": guard.get("reason")
+                or fund_flow_context.get("reason")
+                or "structured evidence unavailable",
+            }
+        )
+        fund_flow_context["hard_guard"] = guard
         fund_flow_context.setdefault("records", [])
         fund_flow_context.setdefault(
             "summary", summarize_evidence([], window_days=5)
@@ -749,6 +1042,8 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
                 "reason": "structured evidence unavailable",
                 "gap": fund_flow_context["gap"],
             })
+    if rejected_fund_flow_records:
+        fund_flow_context["rejected_records"] = copy.deepcopy(rejected_fund_flow_records)
 
     # ── Parse CSV once, reuse for indicators and VPA ──────────────────
     raw_csv = results.get("stock_data", "")
@@ -789,6 +1084,22 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         trade_date,
         daily_context.get("as_of"),
     )
+    fund_flow_provenance = source_provenance.get("fund_flow_individual")
+    if isinstance(fund_flow_provenance, dict):
+        for key in (
+            "requested_as_of",
+            "actual_as_of",
+            "as_of",
+            "status",
+            "data_conflict",
+            "period_kind",
+            "time_window",
+            "window",
+            "direction_allowed",
+            "hard_guard",
+        ):
+            if key in fund_flow_context:
+                fund_flow_provenance[key] = copy.deepcopy(fund_flow_context[key])
     ledger_sources = {
         str(entry.get("source"))
         for entry in data_failure_ledger

@@ -393,3 +393,129 @@ def test_fetch_all_completes_executor_with_fast_tools():
 
     assert "stock_data" in result
     assert "market_data_context" in result
+
+
+def test_fund_flow_conflict_guard_and_provenance_survive_computable_summary():
+    from tradingagents.graph import data_collector
+
+    trade_date = "2026-08-13"
+    dates = ["2026-08-07", "2026-08-10", "2026-08-11", "2026-08-12", trade_date]
+    records = [
+        {
+            "date": date,
+            "as_of": date,
+            "source": "sina_historical",
+            "status": "available",
+            "unit": "亿元",
+            "period_kind": "historical_daily",
+            "time_window": "1d",
+            "window": "1d",
+            "netamount": "0.10",
+            "r0_net": "0.20",
+        }
+        for date in dates
+    ]
+    provider_meta = {
+        "symbol": "002167.SZ",
+        "requested_as_of": trade_date,
+        "actual_as_of": trade_date,
+        "as_of": trade_date,
+        "source": "sina_historical",
+        "source_family": "sina_web",
+        "algorithm_group": "legacy_web_algorithm",
+        "field": "r0_net",
+        "raw_unit": "元",
+        "unit": "亿元",
+        "status": "data_conflict",
+        "data_conflict": True,
+        "period_kind": "historical_daily",
+        "time_window": "1d",
+        "window": "1d",
+        "direction": "blocked",
+        "direction_allowed": False,
+        "hard_guard": {
+            "blocked": True,
+            "direction_allowed": False,
+            "reason": "legacy reference only",
+        },
+        "reason": "legacy reference only",
+        "retrieved_at": "2026-08-13T12:00:00+00:00",
+    }
+    provider_value = FundFlowText(
+        "typed fund-flow reference",
+        evidence=records,
+        evidence_meta=provider_meta,
+    )
+
+    def fake_safe(tool, _payload):
+        if tool is data_collector.get_individual_fund_flow:
+            return provider_value
+        return ""
+
+    with patch.object(data_collector, "_safe", side_effect=fake_safe), \
+         patch.object(data_collector, "FETCH_ALL_TIMEOUT", 1):
+        result = data_collector._fetch_all("002167.SZ", trade_date)
+
+    context = result["market_data_context"]["fund_flow_evidence"]
+    provenance = result["market_data_context"]["source_provenance"]["fund_flow_individual"]
+
+    assert context["summary"]["status"] == "available"
+    assert context["status"] == "data_conflict"
+    assert context["data_conflict"] is True
+    assert context["requested_as_of"] == trade_date
+    assert context["actual_as_of"] == trade_date
+    assert context["as_of"] == trade_date
+    assert context["period_kind"] == "historical_daily"
+    assert context["time_window"] == "1d"
+    assert context["window"] == "1d"
+    assert context["direction_allowed"] is False
+    assert context["hard_guard"]["blocked"] is True
+
+    assert provenance["status"] == "data_conflict"
+    assert provenance["requested_as_of"] == trade_date
+    assert provenance["actual_as_of"] == trade_date
+    assert provenance["period_kind"] == "historical_daily"
+    assert provenance["time_window"] == "1d"
+    assert provenance["direction_allowed"] is False
+    assert provenance["hard_guard"]["blocked"] is True
+
+
+def test_fund_flow_future_rows_are_rejected_by_requested_as_of():
+    from tradingagents.graph import data_collector
+
+    trade_date = "2026-08-13"
+    records = [
+        {
+            "date": "2026-08-14",
+            "as_of": "2026-08-14",
+            "source": "sina_historical",
+            "status": "available",
+            "unit": "亿元",
+            "period_kind": "historical_daily",
+            "time_window": "1d",
+            "netamount": "0.10",
+            "r0_net": "0.20",
+        }
+        for _ in range(5)
+    ]
+    provider_value = FundFlowText(
+        "future fund-flow fixture",
+        evidence=records,
+        evidence_meta={"status": "available", "direction_allowed": True},
+    )
+
+    def fake_safe(tool, _payload):
+        return provider_value if tool is data_collector.get_individual_fund_flow else ""
+
+    with patch.object(data_collector, "_safe", side_effect=fake_safe), \
+         patch.object(data_collector, "FETCH_ALL_TIMEOUT", 1):
+        result = data_collector._fetch_all("002167.SZ", trade_date)
+
+    context = result["market_data_context"]["fund_flow_evidence"]
+    assert context["records"] == []
+    assert len(context["rejected_records"]) == 5
+    assert context["status"] == "data_conflict"
+    assert context["direction_allowed"] is False
+    assert context["hard_guard"]["blocked"] is True
+    assert context["actual_as_of"] is None
+    assert context["as_of"] is None

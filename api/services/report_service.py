@@ -1,5 +1,7 @@
 """Report service for database operations."""
 
+import copy
+import hashlib
 import json
 import json_repair
 import logging
@@ -45,6 +47,133 @@ REPORT_SUMMARY_COLUMNS = (
 
 ACTIVE_REPORT_STATUSES = ("pending", "running")
 STALE_REPORT_ERROR_MESSAGE = "分析任务已中断，请重新发起分析"
+
+# Completed reports are persisted as an audit boundary.  Keep this marker in
+# result_data rather than adding a database column so the guard is deployable
+# without a schema migration.
+IMMUTABLE_REPORT_AUDIT_KEY = "_immutable_audit"
+IMMUTABLE_REPORT_REVISION = 1
+_REPORT_IMMUTABLE_FIELDS = (
+    "id",
+    "user_id",
+    "symbol",
+    "trade_date",
+    "status",
+    "error",
+    "decision",
+    "direction",
+    "confidence",
+    "probability",
+    "target_price",
+    "stop_loss_price",
+    "result_data",
+    "risk_items",
+    "key_metrics",
+    "data_gaps",
+    "falsification_conditions",
+    "not_applicable",
+    "analyst_traces",
+    "market_report",
+    "sentiment_report",
+    "news_report",
+    "fundamentals_report",
+    "macro_report",
+    "smart_money_report",
+    "volume_price_report",
+    "game_theory_report",
+    "investment_plan",
+    "trader_investment_plan",
+    "final_trade_decision",
+)
+
+
+class ImmutableReportError(ValueError):
+    """Raised when a completed report crosses its immutable audit boundary."""
+
+
+def _without_immutable_audit(result_data: Any) -> Any:
+    if not isinstance(result_data, dict):
+        return result_data
+    clean = copy.deepcopy(result_data)
+    clean.pop(IMMUTABLE_REPORT_AUDIT_KEY, None)
+    return clean
+
+
+def _canonical_audit_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _immutable_payload_from_values(values: Dict[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    for field_name in _REPORT_IMMUTABLE_FIELDS:
+        value = values.get(field_name)
+        if field_name == "result_data":
+            value = _without_immutable_audit(value)
+            if value is None:
+                value = {}
+        payload[field_name] = copy.deepcopy(value)
+    return payload
+
+
+def _immutable_payload(report: ReportDB) -> Dict[str, Any]:
+    return _immutable_payload_from_values(
+        {field_name: getattr(report, field_name, None) for field_name in _REPORT_IMMUTABLE_FIELDS}
+    )
+
+
+def _immutable_hash(payload: Dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_audit_json(payload).encode("utf-8")).hexdigest()
+
+
+def _build_immutable_audit(values: Dict[str, Any]) -> Dict[str, Any]:
+    payload = _immutable_payload_from_values(values)
+    return {
+        "revision": IMMUTABLE_REPORT_REVISION,
+        "algorithm": "sha256",
+        "hash": _immutable_hash(payload),
+    }
+
+
+def _with_immutable_audit(result_data: Optional[Dict[str, Any]], audit: Dict[str, Any]) -> Dict[str, Any]:
+    audited = _without_immutable_audit(result_data)
+    if not isinstance(audited, dict):
+        audited = {}
+    audited[IMMUTABLE_REPORT_AUDIT_KEY] = dict(audit)
+    return audited
+
+
+def verify_report_immutable_audit(report: ReportDB) -> bool:
+    """Return whether a completed report still matches its persisted audit hash."""
+    result_data = report.result_data if isinstance(report.result_data, dict) else None
+    audit = result_data.get(IMMUTABLE_REPORT_AUDIT_KEY) if result_data else None
+    if not isinstance(audit, dict):
+        return False
+    if audit.get("revision") != IMMUTABLE_REPORT_REVISION:
+        return False
+    if audit.get("algorithm") != "sha256":
+        return False
+    stored_hash = audit.get("hash")
+    if not isinstance(stored_hash, str) or len(stored_hash) != 64:
+        return False
+    return stored_hash == _immutable_hash(_immutable_payload(report))
+
+
+def _guard_completed_report(report: ReportDB, operation: str) -> None:
+    if str(report.status or "") != "completed":
+        return
+    if not verify_report_immutable_audit(report):
+        raise ImmutableReportError(
+            f"completed report immutable audit missing or mismatched; cannot {operation}"
+        )
+    raise ImmutableReportError(
+        f"completed report is immutable; cannot {operation}"
+    )
 
 
 # ─── Structured extraction schemas ───────────────────────────────────────────
@@ -721,10 +850,20 @@ def update_report_partial(
     **fields: Any
 ) -> Optional[ReportDB]:
     """Update specific fields of an existing report (e.g., partial analyst reports)."""
-    db_report = db.query(ReportDB).filter(ReportDB.id == report_id).first()
+    db_report = (
+        db.query(ReportDB)
+        .with_for_update()
+        .filter(ReportDB.id == report_id)
+        .first()
+    )
     if not db_report:
         return None
-    
+    _guard_completed_report(db_report, "update")
+    if status and str(status).strip().lower() == "completed":
+        raise ImmutableReportError(
+            "completed reports must be finalized through create_report"
+        )
+
     canonical_fields: Dict[str, Any] = {}
     try:
         for key, value in fields.items():
@@ -766,15 +905,23 @@ def finalize_orphan_report(
     error_message: str = STALE_REPORT_ERROR_MESSAGE,
 ) -> ReportDB:
     """Mark an orphaned pending/running report as failed."""
-    if str(report.status or "") not in ACTIVE_REPORT_STATUSES:
+    current_report = (
+        db.query(ReportDB)
+        .with_for_update()
+        .filter(ReportDB.id == report.id)
+        .first()
+    )
+    if current_report is None:
         return report
+    if str(current_report.status or "") not in ACTIVE_REPORT_STATUSES:
+        return current_report
 
-    report.status = "failed"
-    report.error = error_message
-    report.updated_at = datetime.now(timezone.utc)
+    current_report.status = "failed"
+    current_report.error = error_message
+    current_report.updated_at = datetime.now(timezone.utc)
     db.commit()
-    db.refresh(report)
-    return report
+    db.refresh(current_report)
+    return current_report
 
 
 def recover_stale_active_reports(
@@ -787,6 +934,7 @@ def recover_stale_active_reports(
     active_job_id_set = {str(job_id) for job_id in (active_job_ids or []) if str(job_id).strip()}
     rows = (
         db.query(ReportDB)
+        .with_for_update()
         .filter(ReportDB.status.in_(ACTIVE_REPORT_STATUSES))
         .all()
     )
@@ -843,14 +991,34 @@ def create_report(
     report_id: Optional[str] = None,  # If provided, update existing
 ) -> ReportDB:
     """Create or finalize a report."""
+    db_report = None
+    if report_id:
+        db_report = (
+        db.query(ReportDB)
+        .with_for_update()
+        .filter(ReportDB.id == report_id)
+        .first()
+    )
+        if db_report:
+            _guard_completed_report(db_report, "replace")
+
     validated_probability = _coerce_probability_value(probability)
     canonical_result_data = canonicalize_report_result_data(result_data)
     # Bug D: strip AI thinking monologue from report sections before they are
     # persisted, so neither the DB text columns nor result_data carry reasoning
     # filler (e.g. "Let me think", "Hmm, wait,").
-    canonical_result_data = clean_report_result_data(canonical_result_data)
+    canonical_result_data = _without_immutable_audit(
+        clean_report_result_data(canonical_result_data)
+    )
     canonical_risk_items = _canonicalize_structured_items(risk_items, RiskItemSchema, "risk_items")
     canonical_key_metrics = _canonicalize_structured_items(key_metrics, KeyMetricSchema, "key_metrics")
+    persisted_data_gaps = list(data_gaps or [])
+    persisted_falsification_conditions = list(falsification_conditions or [])
+    persisted_not_applicable = bool(not_applicable)
+    persisted_report_id = db_report.id if db_report else (report_id or str(uuid4()))
+    persisted_user_id = db_report.user_id if db_report else user_id
+    persisted_symbol = db_report.symbol if db_report else symbol
+    persisted_trade_date = db_report.trade_date if db_report else trade_date
     resolved = resolve_report_fields(
         result_data=canonical_result_data,
         confidence_override=confidence_override,
@@ -858,12 +1026,44 @@ def create_report(
         stop_loss_override=stop_loss_override,
     )
 
+    immutable_values = {
+        "id": persisted_report_id,
+        "user_id": persisted_user_id,
+        "symbol": persisted_symbol,
+        "trade_date": persisted_trade_date,
+        "status": "completed",
+        "error": None,
+        "decision": decision,
+        "direction": resolved["direction"],
+        "confidence": resolved["confidence"],
+        "probability": validated_probability,
+        "target_price": resolved["target_price"],
+        "stop_loss_price": resolved["stop_loss_price"],
+        "result_data": canonical_result_data,
+        "risk_items": canonical_risk_items,
+        "key_metrics": canonical_key_metrics,
+        "data_gaps": persisted_data_gaps,
+        "falsification_conditions": persisted_falsification_conditions,
+        "not_applicable": persisted_not_applicable,
+        "analyst_traces": analyst_traces,
+        "market_report": resolved["market_report"],
+        "sentiment_report": resolved["sentiment_report"],
+        "news_report": resolved["news_report"],
+        "fundamentals_report": resolved["fundamentals_report"],
+        "macro_report": resolved["macro_report"],
+        "smart_money_report": resolved["smart_money_report"],
+        "volume_price_report": resolved["volume_price_report"],
+        "game_theory_report": resolved["game_theory_report"],
+        "investment_plan": resolved["investment_plan"],
+        "trader_investment_plan": resolved["trader_investment_plan"],
+        "final_trade_decision": resolved["final_trade_decision"],
+    }
+    canonical_result_data = _with_immutable_audit(
+        canonical_result_data,
+        _build_immutable_audit(immutable_values),
+    )
+
     now = datetime.now(timezone.utc)
-    
-    # Check if we should update an existing record (initialized via init_report)
-    db_report = None
-    if report_id:
-        db_report = db.query(ReportDB).filter(ReportDB.id == report_id).first()
 
     if db_report:
         # Update existing
@@ -880,9 +1080,9 @@ def create_report(
         db_report.result_data = canonical_result_data
         db_report.risk_items = canonical_risk_items
         db_report.key_metrics = canonical_key_metrics
-        db_report.data_gaps = list(data_gaps or [])
-        db_report.falsification_conditions = list(falsification_conditions or [])
-        db_report.not_applicable = bool(not_applicable)
+        db_report.data_gaps = persisted_data_gaps
+        db_report.falsification_conditions = persisted_falsification_conditions
+        db_report.not_applicable = persisted_not_applicable
         db_report.analyst_traces = analyst_traces
         db_report.market_report = resolved["market_report"]
         db_report.sentiment_report = resolved["sentiment_report"]
@@ -899,10 +1099,10 @@ def create_report(
     else:
         # Create new
         db_report = ReportDB(
-            id=report_id or str(uuid4()),
-            user_id=user_id,
-            symbol=symbol,
-            trade_date=trade_date,
+            id=persisted_report_id,
+            user_id=persisted_user_id,
+            symbol=persisted_symbol,
+            trade_date=persisted_trade_date,
             status="completed",
             decision=decision,
             direction=resolved["direction"],
@@ -913,9 +1113,9 @@ def create_report(
             result_data=canonical_result_data,
             risk_items=canonical_risk_items,
             key_metrics=canonical_key_metrics,
-            data_gaps=list(data_gaps or []),
-            falsification_conditions=list(falsification_conditions or []),
-            not_applicable=bool(not_applicable),
+            data_gaps=persisted_data_gaps,
+            falsification_conditions=persisted_falsification_conditions,
+            not_applicable=persisted_not_applicable,
             analyst_traces=analyst_traces,
             market_report=resolved["market_report"],
             sentiment_report=resolved["sentiment_report"],
@@ -1006,11 +1206,18 @@ def count_reports(
 
 
 def delete_report(db: Session, report_id: str, user_id: Optional[str] = None) -> bool:
-    query = db.query(ReportDB).filter(ReportDB.id == report_id)
+    query = db.query(ReportDB).with_for_update().filter(ReportDB.id == report_id)
     if user_id:
         query = query.filter(ReportDB.user_id == user_id)
     report = query.first()
     if report:
+        if str(report.status or "") == "completed":
+            try:
+                _guard_completed_report(report, "delete")
+            except ImmutableReportError as exc:
+                db.rollback()
+                logger.warning("[report_service] immutable delete rejected for %s: %s", report_id, exc)
+                return False
         db.delete(report)
         db.commit()
         return True
@@ -1030,7 +1237,7 @@ def batch_delete_reports(db: Session, report_ids: Iterable[str], user_id: Option
     if not normalized_ids:
         raise ValueError("请至少选择 1 份报告")
 
-    query = db.query(ReportDB).filter(ReportDB.id.in_(normalized_ids))
+    query = db.query(ReportDB).with_for_update().filter(ReportDB.id.in_(normalized_ids))
     if user_id:
         query = query.filter(ReportDB.user_id == user_id)
 
@@ -1044,6 +1251,13 @@ def batch_delete_reports(db: Session, report_ids: Iterable[str], user_id: Option
         if row is None:
             missing_ids.append(report_id)
             continue
+        if str(row.status or "") == "completed":
+            try:
+                _guard_completed_report(row, "delete")
+            except ImmutableReportError as exc:
+                logger.warning("[report_service] immutable batch delete rejected for %s: %s", report_id, exc)
+                missing_ids.append(report_id)
+                continue
         db.delete(row)
         deleted_ids.append(report_id)
 

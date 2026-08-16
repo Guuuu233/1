@@ -680,7 +680,7 @@ class TestReportsEndpoint:
         assert body["reports"][0]["decision"] == "SELL"
         assert body["reports"][1]["decision"] == "BUY"
 
-    def test_batch_delete_endpoint_removes_multiple_reports(self):
+    def test_batch_delete_endpoint_keeps_completed_reports_immutable(self):
         first = self._create_report("600519.SH", "2026-03-28", "HOLD")
         second = self._create_report("300750.SZ", "2026-03-29", "SELL")
         third = self._create_report("000001.SZ", "2026-03-30", "BUY")
@@ -693,13 +693,13 @@ class TestReportsEndpoint:
 
         assert response.status_code == 200
         body = response.json()
-        assert body["deleted_ids"] == [first["id"], second["id"]]
-        assert body["missing_ids"] == ["missing-report-id"]
+        assert body["deleted_ids"] == []
+        assert body["missing_ids"] == [first["id"], second["id"], "missing-report-id"]
 
         remaining = self.client.get("/v1/reports", headers=self.headers)
         assert remaining.status_code == 200
         remaining_ids = [item["id"] for item in remaining.json()["reports"]]
-        assert remaining_ids == [third["id"]]
+        assert set(remaining_ids) == {first["id"], second["id"], third["id"]}
 
 
 class TestPortfolioOverviewEndpoint:
