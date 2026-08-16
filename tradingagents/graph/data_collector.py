@@ -721,18 +721,27 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         else:
             fund_flow_context["status"] = "partial"
     else:
-        fund_flow_context = build_gap_meta(
+        generic_gap = build_gap_meta(
             symbol=ticker,
             requested_as_of=trade_date,
             source="fund_flow_individual",
             status="unavailable",
             reason="未返回结构化逐日 netamount/r0_net evidence",
         )
-        fund_flow_context.update({
-            "records": [],
-            "summary": summarize_evidence([], window_days=5),
-            "validation": {"status": "not_checked", "mismatches": []},
-        })
+        fund_flow_context = (
+            copy.deepcopy(dict(fund_flow_evidence_meta))
+            if isinstance(fund_flow_evidence_meta, dict)
+            else {}
+        )
+        for key, value in generic_gap.items():
+            fund_flow_context.setdefault(key, value)
+        fund_flow_context["records"] = []
+        fund_flow_context.setdefault(
+            "summary", summarize_evidence([], window_days=5)
+        )
+        fund_flow_context.setdefault(
+            "validation", {"status": "not_checked", "mismatches": []}
+        )
         if not any(entry.get("source") == "fund_flow_individual" for entry in data_failure_ledger):
             data_failure_ledger.append({
                 "source": "fund_flow_individual",

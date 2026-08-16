@@ -1,5 +1,8 @@
-from unittest.mock import patch
+import json
 import threading
+from unittest.mock import patch
+
+from tradingagents.dataflows.fund_flow_evidence import FundFlowText
 
 from tradingagents.graph.data_collector import (
     DataCollector,
@@ -227,6 +230,92 @@ def test_failed_stock_data_enters_ledger_and_gap():
     assert stock_entries
     assert "无有效完整日线数据" in stock_entries[0]["gap"]
     assert result["market_data_context"]["source_provenance"]["stock_data"]["as_of"] is None
+
+
+def test_empty_fund_flow_evidence_preserves_provider_gap_at_report_boundary():
+    from tradingagents.graph import data_collector
+
+    provider_meta = {
+        "symbol": "601398.SH",
+        "requested_as_of": "2026-08-14",
+        "actual_as_of": None,
+        "as_of": None,
+        "source": "fund_flow_individual",
+        "algorithm_group": "unknown_algorithm_group",
+        "legacy_web_algorithm": False,
+        "field": "r0_net",
+        "raw_unit": "元",
+        "unit": "亿元",
+        "status": "unavailable",
+        "direction": "blocked",
+        "direction_allowed": False,
+        "hard_guard": {
+            "blocked": True,
+            "direction_allowed": False,
+            "reason": "all provider sources unavailable",
+        },
+        "reason": "all provider sources unavailable",
+        "gap": "【数据获取失败】资金流 evidence：all provider sources unavailable",
+        "failure_category": "transport",
+        "attempted_sources": [
+            "akshare.stock_individual_fund_flow",
+            "eastmoney_direct",
+            "sina_historical",
+        ],
+        "fallback_errors": [
+            "stock_individual_fund_flow: SSLError",
+            "eastmoney_direct: request: SSLError",
+            "sina historical fund flow: ConnectionError",
+        ],
+        "failure_categories": ["transport"],
+        "final_source": "unavailable",
+        "last_attempted_source": "sina_historical",
+    }
+    provider_gap = FundFlowText(
+        "【数据获取失败】all fund-flow sources unavailable",
+        evidence=[],
+        evidence_meta=provider_meta,
+    )
+
+    def fake_safe(tool, _payload):
+        if tool is data_collector.get_individual_fund_flow:
+            return provider_gap
+        return ""
+
+    with patch.object(data_collector, "_safe", side_effect=fake_safe), \
+         patch.object(data_collector, "FETCH_ALL_TIMEOUT", 1):
+        result = data_collector._fetch_all("601398.SH", "2026-08-14")
+
+    serialized = json.loads(
+        json.dumps(result["market_data_context"], ensure_ascii=False)
+    )
+    fund_flow = serialized["fund_flow_evidence"]
+
+    assert fund_flow["records"] == []
+    assert fund_flow["requested_as_of"] == "2026-08-14"
+    assert fund_flow["actual_as_of"] is None
+    assert fund_flow["as_of"] is None
+    assert fund_flow["field"] == "r0_net"
+    assert fund_flow["raw_unit"] == "元"
+    assert fund_flow["unit"] == "亿元"
+    assert fund_flow["failure_category"] == "transport"
+    assert fund_flow["attempted_sources"] == provider_meta["attempted_sources"]
+    assert fund_flow["fallback_errors"] == provider_meta["fallback_errors"]
+    assert fund_flow["failure_categories"] == ["transport"]
+    assert fund_flow["final_source"] == "unavailable"
+    assert fund_flow["last_attempted_source"] == "sina_historical"
+    assert fund_flow["reason"] == "all provider sources unavailable"
+    assert fund_flow["gap"] == provider_meta["gap"]
+    assert fund_flow["direction"] == "blocked"
+    assert fund_flow["direction_allowed"] is False
+    assert fund_flow["hard_guard"]["blocked"] is True
+    assert fund_flow["algorithm_group"] == "unknown_algorithm_group"
+    assert fund_flow["legacy_web_algorithm"] is False
+    assert fund_flow["status"] == "unavailable"
+    assert "new_algorithm_sources" not in fund_flow
+    assert fund_flow["source_family"] == "fund_flow_individual"
+    assert fund_flow["summary"]["status"] == "partial"
+    assert fund_flow["validation"]["status"] == "not_checked"
 
 
 def test_fetch_all_completes_executor_with_fast_tools():
