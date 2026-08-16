@@ -37,6 +37,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.fund_flow_fixtures import valid_fund_flow_consensus_guard
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -492,6 +494,9 @@ def _make_graph_state(**overrides):
         "fundamentals_report": "F",
         "volume_price_report": "V",
         "smart_money_report": "SM",
+        # Prompt/LLM-path tests use an explicit valid guard instead of relying on
+        # the production fail-closed default for missing state.
+        "fund_flow_consensus_guard": valid_fund_flow_consensus_guard(),
         "investment_debate_state": _make_debate_state(),
         "horizon": "short",
         "user_intent": None,

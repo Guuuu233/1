@@ -15,6 +15,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.fund_flow_fixtures import valid_fund_flow_consensus_guard
+
 
 TARGET_ROLES = ("bull_researcher", "bear_researcher", "research_manager")
 LANGUAGES = ("zh", "en")
@@ -87,6 +89,8 @@ def _make_graph_state(**overrides):
         "fundamentals_report": "固定基本面报告",
         "volume_price_report": "固定量价报告",
         "smart_money_report": "固定主力报告",
+        # Normal prompt-path fixtures must satisfy the explicit guard contract.
+        "fund_flow_consensus_guard": valid_fund_flow_consensus_guard(),
         "investment_debate_state": _make_investment_debate_state(),
         "horizon": "short",
         "user_intent": None,

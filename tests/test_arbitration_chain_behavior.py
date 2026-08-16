@@ -24,6 +24,7 @@ from tradingagents.agents.utils.debate_utils import (
     build_empty_risk_debate_state,
     extract_risk_judge_result,
 )
+from tests.fund_flow_fixtures import valid_fund_flow_consensus_guard
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +72,8 @@ def _fake_llm(golden_output: str, captured: list | None = None) -> MagicMock:
 def _state(**overrides) -> dict:
     base = {
         "company_of_interest": "600519",
+        # Normal-path tests must opt into the complete non-blocking guard contract.
+        "fund_flow_consensus_guard": valid_fund_flow_consensus_guard(),
         "market_report": "市场 RSI 48.2",
         "sentiment_report": "情绪中性",
         "news_report": "新闻利好",

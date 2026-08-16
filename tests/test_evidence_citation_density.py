@@ -27,6 +27,7 @@ import pytest
 from tradingagents.agents.managers.research_manager import create_research_manager
 from tradingagents.agents.managers.risk_manager import create_risk_manager
 from tradingagents.agents.trader.trader import create_trader
+from tests.fund_flow_fixtures import valid_fund_flow_consensus_guard
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +176,7 @@ def _risk_debate_state(**overrides):
 def _state(**overrides):
     state = {
         "company_of_interest": "600519",
+        "fund_flow_consensus_guard": valid_fund_flow_consensus_guard(),
         "instrument_context": {},
         "market_context": {},
         "user_context": {},
