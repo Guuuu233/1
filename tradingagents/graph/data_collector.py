@@ -735,7 +735,7 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
         )
         for key, value in generic_gap.items():
             fund_flow_context.setdefault(key, value)
-        fund_flow_context["records"] = []
+        fund_flow_context.setdefault("records", [])
         fund_flow_context.setdefault(
             "summary", summarize_evidence([], window_days=5)
         )

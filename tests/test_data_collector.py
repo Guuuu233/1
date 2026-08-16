@@ -1,3 +1,4 @@
+import copy
 import json
 import threading
 from unittest.mock import patch
@@ -316,6 +317,73 @@ def test_empty_fund_flow_evidence_preserves_provider_gap_at_report_boundary():
     assert fund_flow["source_family"] == "fund_flow_individual"
     assert fund_flow["summary"]["status"] == "partial"
     assert fund_flow["validation"]["status"] == "not_checked"
+
+
+def test_empty_fund_flow_evidence_preserves_provider_records_at_report_boundary():
+    from tradingagents.graph import data_collector
+
+    provider_meta = {
+        "status": "unavailable",
+        "reason": "provider-specific failure chain",
+        "records": [
+            {
+                "source": "provider_failure_chain",
+                "failure_chain": [
+                    {
+                        "source": "akshare.stock_individual_fund_flow",
+                        "failure_category": "transport",
+                    },
+                    {
+                        "source": "eastmoney_direct",
+                        "failure_category": "transport",
+                    },
+                ],
+            }
+        ],
+        "summary": {"status": "provider_unavailable", "attempt_count": 2},
+        "validation": {
+            "status": "provider_checked",
+            "mismatches": ["provider-owned marker"],
+        },
+        "source_family": "provider_fund_flow_chain",
+    }
+    provider_snapshot = copy.deepcopy(provider_meta)
+    provider_gap = FundFlowText(
+        "【数据获取失败】provider records must survive",
+        evidence=[],
+        evidence_meta=provider_meta,
+    )
+
+    def fake_safe(tool, _payload):
+        if tool is data_collector.get_individual_fund_flow:
+            return provider_gap
+        return ""
+
+    with patch.object(data_collector, "_safe", side_effect=fake_safe), \
+         patch.object(data_collector, "FETCH_ALL_TIMEOUT", 1):
+        result = data_collector._fetch_all("601398.SH", "2026-08-14")
+
+    fund_flow = result["market_data_context"]["fund_flow_evidence"]
+    serialized = json.loads(
+        json.dumps(result["market_data_context"], ensure_ascii=False)
+    )["fund_flow_evidence"]
+
+    assert fund_flow["records"] == provider_snapshot["records"]
+    assert serialized["records"] == provider_snapshot["records"]
+    assert serialized["summary"] == provider_snapshot["summary"]
+    assert serialized["validation"] == provider_snapshot["validation"]
+    assert serialized["source_family"] == provider_snapshot["source_family"]
+    assert fund_flow["records"] is not provider_meta["records"]
+    assert fund_flow["records"] is not provider_gap.fund_flow_evidence_meta["records"]
+    assert fund_flow["records"][0] is not provider_meta["records"][0]
+    assert (
+        fund_flow["records"][0]["failure_chain"]
+        is not provider_meta["records"][0]["failure_chain"]
+    )
+
+    fund_flow["records"][0]["failure_chain"].append({"source": "collector mutation"})
+    assert provider_meta == provider_snapshot
+    assert provider_gap.fund_flow_evidence_meta == provider_snapshot
 
 
 def test_fetch_all_completes_executor_with_fast_tools():
