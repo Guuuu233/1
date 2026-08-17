@@ -188,10 +188,11 @@ _SINA_HIST_CORE_AMOUNT_FIELDS = ("netamount", "r0_net")
 # ── 东方财富直连历史资金流（Source 2）────────────────────────────────────────
 # AkShare wraps this same family of data, but its request path can fail on
 # Python TLS/fingerprint issues.  Keep the direct adapter deliberately narrow:
-# f51-f61 are the documented daily fields; f64/f65 are not included because
-# their semantics are not required by the evidence contract.
+# f51 is the measurement date and f52 is the only verified canonical amount.
+# f53-f56 are retained as raw discovery values when the vendor returns them;
+# trailing fields are not required and are never given fabricated semantics.
 _EASTMONEY_DIRECT_FUND_FLOW_URL = (
-    "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    "https://push2his.eastmoney.com/api/qt/stock/fflow/kline/get"
 )
 _EASTMONEY_DIRECT_FUND_FLOW_HEADERS = {
     "Referer": "https://data.eastmoney.com/",
@@ -201,7 +202,7 @@ _EASTMONEY_DIRECT_FUND_FLOW_TIMEOUT = 10
 _EASTMONEY_DIRECT_FUND_FLOW_FETCH = 120
 _EASTMONEY_DIRECT_FUND_FLOW_FIELDS1 = "f1,f2,f3,f7"
 _EASTMONEY_DIRECT_FUND_FLOW_FIELDS2 = (
-    "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
+    "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63"
 )
 _EASTMONEY_DIRECT_FIELD_MAPPING = {
     "f51": "measurement_date",
@@ -210,14 +211,9 @@ _EASTMONEY_DIRECT_FIELD_MAPPING = {
     "f54": "raw_discovery_only",
     "f55": "raw_discovery_only",
     "f56": "raw_discovery_only",
-    "f57": "raw_discovery_only",
-    "f58": "raw_discovery_only",
-    "f59": "raw_discovery_only",
-    "f60": "raw_discovery_only",
-    "f61": "raw_discovery_only",
 }
 _EASTMONEY_DIRECT_DISCOVERY_FIELDS = tuple(
-    f"f{field_number}" for field_number in range(53, 62)
+    f"f{field_number}" for field_number in range(53, 57)
 )
 _FUND_AMOUNT_TEXT_RE = re.compile(
     r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*(?:万亿|亿元|万元|亿|万)?$"
@@ -1421,9 +1417,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
         """获取个股近期主力资金净流向，并按 curr_date 截断。
 
         资金流路径按“AkShare EM → 东财公开直连 → 新浪历史 legacy Web →
-        当前日同花顺总净额快照”的顺序尝试。东财直连只接入已核验的 f51-f61
-        字段，并把 f52 保持为 ``r0_net``；它不会把总净额或未知字段伪装成
-        主力净额。每个成功或失败的 ``FundFlowText`` 都携带完整尝试链。
+        当前日同花顺总净额快照”的顺序尝试。东财直连只接入已核验的 f51/f52
+        契约，并把 f52 保持为 ``r0_net``；f53-f56 仅作原始发现值保留，缺失的
+        尾部字段不会伪装成语义值。每个成功或失败的 ``FundFlowText`` 都携带完整尝试链。
         """
         errors: list[str] = []
         attempted_sources: list[str] = []
@@ -1601,7 +1597,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 symbol,
                 curr_date,
                 cutoff,
-                require_curr_date=not is_historical,
+                require_curr_date=True,
             )
             if direct_text is not None:
                 return _attach_chain(direct_text, "eastmoney_direct")
@@ -1806,12 +1802,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
     ) -> tuple[FundFlowText | None, str | None]:
         """Fetch verified daily fields from Eastmoney's public endpoint.
 
-        The endpoint returns comma-separated ``f51`` onward values.  The first
-        eleven fields are enough for this provider's contract; only f52 is
-        normalized as the documented main-force net amount.  f53-f61 remain
-        raw/discovery-only values, and unknown trailing fields are ignored.
-        For a current-day request, a prior close is not an acceptable as-of;
-        the response must contain a valid row dated exactly ``curr_date``.
+        The endpoint returns comma-separated ``f51`` onward values.  The
+        provider contract requires only f51 (date) and f52 (finite main-force
+        net amount).  f53-f56 remain raw/discovery-only values when present;
+        unknown or missing trailing fields are ignored without fabricated
+        semantics.  When the requested date is required, a prior close is not
+        an acceptable as-of; the response must contain a valid row dated
+        exactly ``curr_date``.
         """
         import json
         import requests as _requests
@@ -1915,9 +1912,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
             if day > cutoff_date:
                 # Future rows are deliberately ignored, not rendered or used.
                 continue
-            if len(parts) < 11:
+            if len(parts) < 2:
                 warning = (
-                    f"row {row_index}: field_count={len(parts)}, need_at_least=11"
+                    f"row {row_index}: field_count={len(parts)}, need_at_least=2"
                 )
                 warnings.append(warning)
                 malformed_rows.append(warning)
@@ -1942,26 +1939,25 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 malformed_rows.append(warning)
                 continue
 
-            def _part(index: int) -> str:
-                return parts[index] if index < len(parts) else ""
-
             day_text = day.isoformat()
             if day_text in discovery_by_date:
                 warning = f"row {row_index}: duplicate_date={day_text}"
                 warnings.append(warning)
                 duplicate_dates.append(day_text)
                 continue
-            discovery_by_date[day_text] = {
-                field: _part(int(field[1:]) - 51)
-                for field in _EASTMONEY_DIRECT_DISCOVERY_FIELDS
-            }
+            discovery_fields: dict[str, str] = {}
+            for field in _EASTMONEY_DIRECT_DISCOVERY_FIELDS:
+                field_index = int(field[1:]) - 51
+                if field_index < len(parts):
+                    discovery_fields[field] = parts[field_index]
+            discovery_by_date[day_text] = discovery_fields
             parsed_rows.append(
                 {
                     "日期": day_text,
-                    "主力净流入-净额": _part(1),
+                    "主力净流入-净额": parts[1],
                     **{
                         f"{field}_raw": raw_value
-                        for field, raw_value in discovery_by_date[day_text].items()
+                        for field, raw_value in discovery_fields.items()
                     },
                 }
             )
@@ -1975,8 +1971,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 available = ", ".join(
                     sorted({str(row.get("日期")) for row in parsed_rows})[-5:]
                 )
+                reason = (
+                    "no_requested_date_row"
+                    if is_historical_analysis_date(curr_date)
+                    else "no_current_day_row"
+                )
                 return None, (
-                    "eastmoney_direct: no_current_day_row "
+                    f"eastmoney_direct: {reason} "
                     f"(requested={requested_day}; available={available})"
                 )
         if malformed_rows:
@@ -2012,7 +2013,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             record["vendor_raw_fields"] = raw_fields
             record["vendor_raw_field_status"] = "discovery_only"
             record["vendor_raw_field_units"] = {
-                field: None for field in _EASTMONEY_DIRECT_DISCOVERY_FIELDS
+                field: None for field in raw_fields
             }
 
         metadata = dict(getattr(formatted, "fund_flow_evidence_meta", {}) or {})
@@ -2395,7 +2396,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         )
         reason = (
             "东方财富直连仅将 f52 映射为主力净额 r0_net；"
-            "f53-f61 仅保留原始发现值，未将其等同于总净额 netamount"
+            "f53-f56 仅保留原始发现值，未将其等同于总净额 netamount"
             if source == "eastmoney_direct"
             else "东方财富来源仅提供主力净额；未将其等同于总净额 netamount"
         )

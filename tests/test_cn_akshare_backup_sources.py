@@ -45,10 +45,9 @@ class _EastmoneyResponse:
             raise RuntimeError(f"HTTP {self.status_code}")
 
 
-_DIRECT_KLINE = (
-    "2026-08-14,120000000,-10000000,-20000000,50000000,70000000,"
-    "0.12,-0.01,-0.02,0.05,0.07,12.34,1.20,unknown-a,unknown-b"
-)
+# The live /fflow/kline/get response currently returns six fields, not the
+# full requested f51-f63 projection: f51 date, f52 r0_net, f53-f56 raw only.
+_DIRECT_KLINE = "2026-08-14,120000000,-10000000,-20000000,50000000,70000000"
 
 
 def _direct_payload(*klines, rc=0):
@@ -90,11 +89,15 @@ def test_individual_fund_flow_direct_eastmoney_success_is_structured_and_typed(
     request_kwargs = mock_get.call_args.kwargs
     assert (
         mock_get.call_args.args[0]
-        == "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+        == "https://push2his.eastmoney.com/api/qt/stock/fflow/kline/get"
     )
     assert request_kwargs["params"]["secid"] == "1.600519"
     assert request_kwargs["params"]["klt"] == "101"
-    assert "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61" in request_kwargs["params"]["fields2"]
+    assert request_kwargs["params"]["fields2"].startswith(
+        "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63"
+    )
+    assert "f64" not in request_kwargs["params"]["fields2"]
+    assert "f65" not in request_kwargs["params"]["fields2"]
     assert request_kwargs["timeout"] == 10
     evidence = out.fund_flow_evidence
     assert len(evidence) == 1
@@ -120,11 +123,12 @@ def test_individual_fund_flow_direct_eastmoney_success_is_structured_and_typed(
         "f54": "-20000000",
         "f55": "50000000",
         "f56": "70000000",
-        "f57": "0.12",
-        "f58": "-0.01",
-        "f59": "-0.02",
-        "f60": "0.05",
-        "f61": "0.07",
+    }
+    assert record["vendor_raw_field_units"] == {
+        "f53": None,
+        "f54": None,
+        "f55": None,
+        "f56": None,
     }
 
     meta = out.fund_flow_evidence_meta
@@ -145,18 +149,34 @@ def test_individual_fund_flow_direct_eastmoney_success_is_structured_and_typed(
     assert not ak.stock_fund_flow_individual.called
     assert meta["field_mapping"]["f52"] == "r0_net"
     assert meta["field_mapping"]["f55"] == "raw_discovery_only"
-    assert meta["discovery_only_fields"] == [
-        "f53",
-        "f54",
-        "f55",
-        "f56",
-        "f57",
-        "f58",
-        "f59",
-        "f60",
-        "f61",
-    ]
+    assert meta["discovery_only_fields"] == ["f53", "f54", "f55", "f56"]
+    assert "f57" not in meta["field_mapping"]
+    assert "f57" not in record["vendor_raw_fields"]
     assert meta["discovery_field_unit_policy"] == "raw preserved; no normalization"
+
+
+def test_direct_accepts_minimum_two_field_contract_without_fabricated_discovery(
+    trading_day,
+):
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+    minimal_kline = "2026-08-14,0"
+
+    with patch(
+        "requests.get",
+        return_value=_EastmoneyResponse(_direct_payload(minimal_kline)),
+    ):
+        out = p.get_individual_fund_flow("600519", curr_date="2026-08-14")
+
+    assert out.fund_flow_evidence_meta["final_source"] == "eastmoney_direct"
+    record = out.fund_flow_evidence[0]
+    assert record["r0_net"] == "0"
+    assert record["r0_net_raw"] == "0"
+    assert record["vendor_raw_fields"] == {}
+    assert record["vendor_raw_field_units"] == {}
+    assert "f57" not in out.fund_flow_evidence_meta["field_mapping"]
 
 
 @pytest.mark.parametrize(
@@ -219,6 +239,40 @@ def test_individual_fund_flow_direct_filters_future_rows_without_lookahead(
     assert out.fund_flow_evidence_meta["final_source"] == "eastmoney_direct"
 
 
+def test_direct_historical_requires_requested_date_before_sina_fallback(
+    trading_day,
+):
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+    older = _DIRECT_KLINE.replace("2026-08-14", "2026-08-12")
+    sina_rows = [
+        {
+            "opendate": "2026-08-12",
+            "netamount": "100000000",
+            "r0_net": "50000000",
+        }
+    ]
+
+    with patch(
+        "requests.get",
+        side_effect=[
+            _EastmoneyResponse(_direct_payload(older)),
+            _EastmoneyResponse(sina_rows),
+        ],
+    ):
+        out = p.get_individual_fund_flow("600519", curr_date="2026-08-14")
+
+    meta = out.fund_flow_evidence_meta
+    assert meta["final_source"] == "sina_historical"
+    assert any(
+        "eastmoney_direct: no_requested_date_row" in error
+        for error in meta["fallback_errors"]
+    )
+    assert [row["date"] for row in out.fund_flow_evidence] == ["2026-08-12"]
+
+
 def test_direct_current_day_requires_exact_as_of_before_ths_fallback(trading_day):
     today = cn_today_str()
     stale = _DIRECT_KLINE.replace(
@@ -250,6 +304,35 @@ def test_direct_current_day_requires_exact_as_of_before_ths_fallback(trading_day
     assert meta["actual_as_of"] == today
     assert all(record["date"] == today for record in out.fund_flow_evidence)
     ak.stock_fund_flow_individual.assert_called_once_with(symbol="即时")
+
+
+def test_direct_invalid_date_fails_closed_before_sina_fallback(trading_day):
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+    sina_rows = [
+        {
+            "opendate": "2026-08-14",
+            "netamount": "100000000",
+            "r0_net": "50000000",
+        }
+    ]
+
+    with patch(
+        "requests.get",
+        side_effect=[
+            _EastmoneyResponse(_direct_payload("not-a-date,120000000")),
+            _EastmoneyResponse(sina_rows),
+        ],
+    ):
+        out = p.get_individual_fund_flow("600519", curr_date="2026-08-14")
+
+    assert out.fund_flow_evidence_meta["final_source"] == "sina_historical"
+    assert any(
+        "eastmoney_direct: no_usable_rows_on_or_before_curr_date" in error
+        for error in out.fund_flow_evidence_meta["fallback_errors"]
+    )
 
 
 def test_direct_duplicate_normalized_date_is_typed_validation_gap(trading_day):
@@ -308,7 +391,7 @@ def test_direct_mixed_valid_and_corrupt_rows_continue_to_sina_fallback(
     ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
     p = CnAkshareProvider()
     p._ak = lambda: ak
-    corrupt = "2026-08-13,1,2"
+    corrupt = "2026-08-13"
     sina_rows = [
         {
             "opendate": "2026-08-13",
@@ -382,7 +465,7 @@ def test_direct_preserves_f52_raw_decimal_text_without_float_rounding(trading_da
         ),
         (
             _EastmoneyResponse(
-                _direct_payload("2026-08-14,1,2,3,4,5,6,7,8,9"),
+                _direct_payload("2026-08-14"),
                 status_code=200,
             ),
             "eastmoney_direct: no_usable_rows_on_or_before_curr_date",
@@ -447,14 +530,18 @@ def test_direct_date_mismatch_is_typed_gap_and_continues_to_current_fallback(
     assert all(record["date"] == today for record in out.fund_flow_evidence)
 
 
-def test_direct_missing_f52_does_not_derive_r0_net_from_components(trading_day):
+
+@pytest.mark.parametrize("invalid_f52", ["", "NaN", "Infinity", "-Infinity"])
+def test_direct_invalid_f52_does_not_derive_r0_net_from_components(
+    invalid_f52, trading_day
+):
     ak = MagicMock()
     ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
     ak.stock_fund_flow_individual.return_value = _current_day_ths()
     p = CnAkshareProvider()
     p._ak = lambda: ak
     fields = _DIRECT_KLINE.split(",")
-    fields[1] = ""
+    fields[1] = invalid_f52
     missing_main_force = ",".join(fields)
 
     with patch(
