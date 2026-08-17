@@ -238,29 +238,33 @@ _TUSHARE_DC_FIELD_SEMANTICS = "今日主力净流入额（万元）"
 _TUSHARE_THS_FIELD_SEMANTICS = "资金净流入（万元）"
 _TUSHARE_THS_D5_SEMANTICS = "5日主力净额（万元）"
 _TUSHARE_REQUEST_FIELDS = {
+    # Keep each request aligned with the endpoint's documented schema; an
+    # unsupported field can make an otherwise valid token request fail.
     _TUSHARE_DC_API: (
-        "ts_code,trade_date,net_amount,buy_sm_amount,sell_sm_amount,"
-        "buy_md_amount,sell_md_amount,buy_lg_amount,sell_lg_amount,"
-        "buy_elg_amount,sell_elg_amount"
+        "ts_code,trade_date,net_amount,buy_sm_amount,buy_md_amount,"
+        "buy_lg_amount,buy_elg_amount"
     ),
     _TUSHARE_THS_API: (
         "ts_code,trade_date,net_amount,net_d5_amount,buy_sm_amount,"
-        "sell_sm_amount,buy_md_amount,sell_md_amount,buy_lg_amount,"
-        "sell_lg_amount,buy_elg_amount,sell_elg_amount"
+        "buy_md_amount,buy_lg_amount"
     ),
 }
-_TUSHARE_COMPONENT_FIELDS = (
-    "buy_sm_amount",
-    "sell_sm_amount",
-    "buy_md_amount",
-    "sell_md_amount",
-    "buy_lg_amount",
-    "sell_lg_amount",
-    "buy_elg_amount",
-    "sell_elg_amount",
-)
+_TUSHARE_COMPONENT_FIELDS = {
+    _TUSHARE_DC_API: (
+        "buy_sm_amount",
+        "buy_md_amount",
+        "buy_lg_amount",
+        "buy_elg_amount",
+    ),
+    _TUSHARE_THS_API: (
+        "buy_sm_amount",
+        "buy_md_amount",
+        "buy_lg_amount",
+    ),
+}
 _TUSHARE_AUTH_CODES = {2001, 2002, 40101, 40102, 40103}
 _TUSHARE_RATE_LIMIT_CODES = {2003, 40203, 40204, 40205, 40206}
+_TUSHARE_TS_CODE_RE = re.compile(r"^\d{6}\.(?:SH|SZ|BJ)$", re.IGNORECASE)
 _FUND_AMOUNT_TEXT_RE = re.compile(
     r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*(?:万亿|亿元|万元|亿|万)?$"
 )
@@ -356,6 +360,7 @@ def _fund_flow_failure_category(error: object) -> str:
         for token in (
             "invalid_f52",
             "invalid_amount",
+            "invalid_identity",
             "malformed",
             "field_count",
             "missing_field",
@@ -1575,15 +1580,25 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 "transport_error",
                 True,
             )
-        except Exception as exc:
+        except ConnectionError as exc:
             _provider_logger.warning(
-                "tushare %s request failed: %s", api_name, type(exc).__name__
+                "tushare %s connection failed: %s", api_name, type(exc).__name__
             )
             return (
                 None,
                 self._tushare_error(api_name, "transport_error"),
                 "transport_error",
                 True,
+            )
+        except Exception as exc:
+            _provider_logger.warning(
+                "tushare %s provider error: %s", api_name, type(exc).__name__
+            )
+            return (
+                None,
+                self._tushare_error(api_name, "provider_error"),
+                "provider_error",
+                False,
             )
         return response, None, None, False
 
@@ -1630,6 +1645,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
         trade_date: str,
     ) -> tuple[dict | None, str | None, str | None]:
         """POST one exact-date Tushare request without leaking the token."""
+        if _TUSHARE_FUND_FLOW_MAX_ATTEMPTS <= 0:
+            return (
+                None,
+                self._tushare_error(api_name, "provider_error", "retry_unconfigured"),
+                "provider_error",
+            )
         result: tuple[dict | None, str | None, str | None, bool]
         for attempt in range(_TUSHARE_FUND_FLOW_MAX_ATTEMPTS):
             result = self._tushare_post_once(
@@ -1683,7 +1704,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 self._tushare_error(api_name, "json_shape", "fields_not_list"),
                 "json_shape",
             )
-        required_fields = ("trade_date", "net_amount")
+        required_fields = ("ts_code", "trade_date", "net_amount")
         if api_name == _TUSHARE_THS_API:
             required_fields = (*required_fields, "net_d5_amount")
         missing_fields = [field for field in required_fields if field not in fields]
@@ -1738,6 +1759,19 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 "duplicate_date",
             )
         row = matches[0]
+        raw_ts_code = str(row.get("ts_code") or "").strip().upper()
+        if not raw_ts_code:
+            return (
+                None,
+                self._tushare_error(api_name, "missing_field", "ts_code_value"),
+                "missing_field",
+            )
+        if _TUSHARE_TS_CODE_RE.fullmatch(raw_ts_code) is None:
+            return (
+                None,
+                self._tushare_error(api_name, "invalid_identity"),
+                "invalid_identity",
+            )
         raw_amount = row.get("net_amount")
         if raw_amount is None or (isinstance(raw_amount, str) and not raw_amount.strip()):
             return (
@@ -1786,18 +1820,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
         return text.rstrip("0").rstrip(".") if "." in text else text
 
     @staticmethod
-    def _tushare_raw_fields(row: dict) -> dict:
-        return {
-            field: row.get(field)
-            for field in (
-                "ts_code",
-                "trade_date",
-                "net_amount",
-                "net_d5_amount",
-                *_TUSHARE_COMPONENT_FIELDS,
-            )
-            if field in row
-        }
+    def _tushare_raw_fields(row: dict, api_name: str) -> dict:
+        fields = ["ts_code", "trade_date", "net_amount"]
+        if api_name == _TUSHARE_THS_API:
+            fields.append("net_d5_amount")
+        fields.extend(_TUSHARE_COMPONENT_FIELDS[api_name])
+        return {field: row.get(field) for field in fields if field in row}
 
     def _tushare_attach_record(
         self,
@@ -1879,7 +1907,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         )
         if not records:
             return []
-        raw_fields = self._tushare_raw_fields(row)
+        raw_fields = self._tushare_raw_fields(row, api_name)
         for record in records:
             self._tushare_attach_record(record, api_name, row, raw_fields)
         return records
@@ -2011,6 +2039,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         ths_records: list[dict],
         failures: list[dict[str, str]],
         retrieved_at: str,
+        requested_as_of: str | None = None,
     ) -> FundFlowText:
         records = [*dc_records, *ths_records]
         lines = [
@@ -2022,7 +2051,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         status = "available" if len(failures) == 0 else "partial"
         metadata = {
             "symbol": symbol,
-            "requested_as_of": requested_date,
+            "requested_as_of": requested_as_of or requested_date,
             "actual_as_of": requested_date,
             "as_of": requested_date,
             "retrieved_at": retrieved_at,
@@ -2042,7 +2071,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             "failure_categories": sorted({item["category"] for item in failures}),
         }
         return FundFlowText(
-            "\\n".join(lines), evidence=records, evidence_meta=metadata
+            "\n".join(lines), evidence=records, evidence_meta=metadata
         )
 
     @staticmethod
@@ -2064,7 +2093,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 "status": "blocked",
                 "transport_provider": "tushare",
                 "source": "tushare_moneyflow",
-                "attempted_sources": list(api_names),
+                "attempted_sources": [],
+                "gated_sources": list(api_names),
                 "tushare_failures": failures,
                 "failure_categories": ["token_missing"],
                 "reason": "TUSHARE_TOKEN 未配置；拒绝把 legacy Web 值冒充新算法",
@@ -2103,7 +2133,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
         )
 
     def _fetch_tushare_fund_flow(
-        self, symbol: str, requested_date: str
+        self,
+        symbol: str,
+        requested_date: str,
+        *,
+        requested_as_of: str | None = None,
     ) -> tuple[FundFlowText | None, list[str], dict]:
         """Fetch DC/THS rows or return an explicit token/provider gap."""
         token = os.getenv("TUSHARE_TOKEN", "").strip()
@@ -2132,6 +2166,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             ths_records,
             failures,
             retrieved_at,
+            requested_as_of=requested_as_of,
         )
         return value, errors, value.fund_flow_evidence_meta
 
@@ -2253,6 +2288,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
 
         code = self._normalize_symbol(symbol)
         is_historical = is_historical_analysis_date(curr_date)
+        tushare_requested_date = cutoff.isoformat()
 
         # Source 1: AkShare's Eastmoney wrapper (近 120 交易日逐日序列).
         attempted_sources.append("akshare.stock_individual_fund_flow")
@@ -2340,7 +2376,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 ["tushare.moneyflow_dc", "tushare.moneyflow_ths"]
             )
         tushare_text, tushare_errors, tushare_meta = self._fetch_tushare_fund_flow(
-            symbol, curr_date
+            symbol,
+            tushare_requested_date,
+            requested_as_of=curr_date,
         )
         errors.extend(tushare_errors)
         if tushare_text is not None:
@@ -2517,11 +2555,16 @@ class CnAkshareProvider(BaseMarketDataProvider):
         except Exception as exc:
             errors.append(f"stock_fund_flow_individual: {type(exc).__name__}")
 
-        gap_reason = "东财 AkShare/东财直连/新浪历史/同花顺即时资金流净额快照均失败"
+        gap_reason = (
+            "东财 AkShare/东财直连/Tushare DC/THS/新浪历史/"
+            "同花顺即时资金流净额快照均失败"
+        )
         if errors:
             gap_reason = f"{gap_reason}；{'；'.join(errors)}"
         gap = build_provider_text(
-            f"【数据获取失败】个股资金流向数据获取失败（东财 AkShare/东财直连/新浪历史/同花顺即时资金流净额快照均失败：{'；'.join(errors)}）",
+            f"【数据获取失败】个股资金流向数据获取失败（东财 AkShare/东财直连/"
+            f"Tushare DC/THS/新浪历史/同花顺即时资金流净额快照均失败："
+            f"{'；'.join(errors)}）",
             symbol=symbol,
             requested_as_of=curr_date,
             source="fund_flow_individual",

@@ -5,7 +5,7 @@ connection (RemoteDisconnected) on the current IP. Each affected method now
 falls back to an alternative source inside the provider:
 
 - get_board_fund_flow        EM stock_fund_flow_industry  -> THS stock_board_industry_summary_ths
-- get_individual_fund_flow   EM stock_individual_fund_flow -> Sina historical close API
+- get_individual_fund_flow   EM stock_individual_fund_flow -> Tushare DC/THS -> Sina historical close API
   (DAV-88 Bug E) for dated rows; Tonghuashun stock_fund_flow_individual for the
   current-day generic funds net-flow snapshot when the close row is unavailable
   (not a same-semantic Sina netamount/r0_net main-force series)
@@ -97,24 +97,26 @@ def _tushare_payload(
     code: int = 0,
     include_net_amount: bool = True,
     ts_code: str = "600519.SH",
+    include_ts_code: bool = True,
 ):
-    fields = ["ts_code", "trade_date"]
+    fields = ["trade_date"]
+    if include_ts_code:
+        fields.insert(0, "ts_code")
     if include_net_amount:
         fields.append("net_amount")
     if api_name == "moneyflow_ths":
         fields.append("net_d5_amount")
-    fields.extend(
-        [
-            "buy_sm_amount",
-            "sell_sm_amount",
-            "buy_md_amount",
-            "sell_md_amount",
-            "buy_lg_amount",
-            "sell_lg_amount",
-            "buy_elg_amount",
-            "sell_elg_amount",
-        ]
-    )
+    if api_name == "moneyflow_dc":
+        fields.extend(
+            [
+                "buy_sm_amount",
+                "buy_md_amount",
+                "buy_lg_amount",
+                "buy_elg_amount",
+            ]
+        )
+    else:
+        fields.extend(["buy_sm_amount", "buy_md_amount", "buy_lg_amount"])
     values = {
         "ts_code": ts_code,
         "trade_date": trade_date,
@@ -152,10 +154,30 @@ def test_tushare_dc_ths_success_keeps_transport_and_field_semantics(monkeypatch)
     assert errors == []
     assert mock_post.call_count == 2
     assert mock_post.call_args_list[0].kwargs["json"]["api_name"] == "moneyflow_dc"
-    assert mock_post.call_args_list[0].kwargs["json"]["params"] == {
+    first_request = mock_post.call_args_list[0].kwargs["json"]
+    assert first_request["params"] == {
         "ts_code": "600519.SH",
         "trade_date": "20260814",
     }
+    assert first_request["fields"].split(",") == [
+        "ts_code",
+        "trade_date",
+        "net_amount",
+        "buy_sm_amount",
+        "buy_md_amount",
+        "buy_lg_amount",
+        "buy_elg_amount",
+    ]
+    second_request = mock_post.call_args_list[1].kwargs["json"]
+    assert second_request["fields"].split(",") == [
+        "ts_code",
+        "trade_date",
+        "net_amount",
+        "net_d5_amount",
+        "buy_sm_amount",
+        "buy_md_amount",
+        "buy_lg_amount",
+    ]
     assert out is not None
     assert len(out.fund_flow_evidence) == 2
     dc_record, ths_record = out.fund_flow_evidence
@@ -189,6 +211,8 @@ def test_tushare_token_missing_is_typed_and_does_not_call_network(monkeypatch):
     assert mock_post.call_count == 0
     assert len(errors) == 2
     assert meta["transport_provider"] == "tushare"
+    assert meta["attempted_sources"] == []
+    assert meta["gated_sources"] == ["moneyflow_dc", "moneyflow_ths"]
     assert meta["failure_categories"] == ["token_missing"]
     assert all("token_missing" in error for error in errors)
 
@@ -202,6 +226,8 @@ def test_tushare_token_missing_is_typed_and_does_not_call_network(monkeypatch):
         (_tushare_payload("moneyflow_dc", include_net_amount=False), "missing_field"),
         (_tushare_payload("moneyflow_dc", trade_date="20260813"), "date_mismatch"),
         (_tushare_payload("moneyflow_dc", ts_code="000001.SZ"), "symbol_mismatch"),
+        (_tushare_payload("moneyflow_dc", ts_code="bad"), "invalid_identity"),
+        (_tushare_payload("moneyflow_dc", include_ts_code=False), "missing_field"),
     ],
 )
 def test_tushare_typed_api_and_validation_gaps(
@@ -261,13 +287,21 @@ def test_individual_fund_flow_uses_tushare_before_legacy_when_configured(
             _TushareResponse(_tushare_payload("moneyflow_dc")),
             _TushareResponse(_tushare_payload("moneyflow_ths")),
         ],
-    ):
+    ) as mock_post:
         out = provider.get_individual_fund_flow(
-            "600519", curr_date="2026-08-14"
+            "600519", curr_date="20260814"
         )
 
+    assert (
+        mock_post.call_args_list[0].kwargs["json"]["params"]["trade_date"]
+        == "20260814"
+    )
+    assert "\\n" not in str(out)
+    assert "\n" in str(out)
     meta = out.fund_flow_evidence_meta
     assert meta["final_source"] == "tushare"
+    assert meta["requested_as_of"] == "20260814"
+    assert meta["actual_as_of"] == "2026-08-14"
     assert meta["transport_provider"] == "tushare"
     assert "sina_historical" not in meta["attempted_sources"]
     assert "Tushare Pro" in out
