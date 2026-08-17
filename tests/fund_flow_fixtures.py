@@ -6,6 +6,7 @@ from typing import Any
 from tradingagents.dataflows.fund_flow_evidence import (
     build_consensus_evidence,
     build_sina_evidence,
+    select_fund_flow_source,
     validate_model_summary,
 )
 
@@ -27,6 +28,11 @@ def _new_algorithm_records(field: str, values: tuple[str, str]) -> list[dict[str
             "time_window": "1d",
             "field": field,
             "value": value,
+            "field_semantics": {
+                field: "主力净额（负值表示净流出）"
+                if field == "r0_net"
+                else "总净额（负值表示净流出）"
+            },
             "unit": "亿元",
         }
         for source, value in zip(("sina_app", "eastmoney"), values)
@@ -58,7 +64,7 @@ def _guard_from_production_outputs(
     """Assemble the same guard envelope and fail-closed predicate as production."""
     blocked = bool(
         not isinstance(consensus, dict)
-        or consensus.get("status") != "consensus"
+        or consensus.get("status") not in {"selected", "consensus"}
         or not consensus.get("direction_allowed")
         or consensus.get("hard_guard", {}).get("blocked")
         or validation.get("status") in {"blocked", "mismatch"}
@@ -88,6 +94,22 @@ def valid_fund_flow_consensus_guard() -> dict[str, Any]:
     )
     validation = validate_model_summary(_validation_records(), model_text=None)
     return _guard_from_production_outputs(consensus, validation)
+
+
+def single_source_fund_flow_selection_guard() -> dict[str, Any]:
+    """Return an allow guard for exactly one valid new-algorithm source."""
+    records = _new_algorithm_records("r0_net", ("1.0", "1.1"))[:1]
+    selection = select_fund_flow_source(
+        records,
+        symbol=_SYMBOL,
+        requested_as_of=_AS_OF,
+    )
+    validation = validate_model_summary(
+        records,
+        model_text=None,
+        selected_field=selection.get("selected_field"),
+    )
+    return _guard_from_production_outputs(selection, validation)
 
 
 def blocked_fund_flow_consensus_guard() -> dict[str, Any]:

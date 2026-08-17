@@ -26,7 +26,7 @@ def create_risk_manager(llm, memory, custom_prompt: str = "", placement: Placeme
         risk_feedback_state = state.get("risk_feedback_state", {})
         fund_flow_guard = state.get("fund_flow_consensus_guard") or {"blocked": True, "direction_allowed": False}
         if fund_flow_guard.get("blocked") or not fund_flow_guard.get("direction_allowed"):
-            blocked_decision = "资金流共识 guard 已阻断：风险计划不得批准增持、减持或吸筹方向。"
+            blocked_decision = "资金流来源选择 guard 已阻断：风险计划不得批准增持、减持或吸筹方向。"
             return {
                 "fund_flow_consensus_guard": fund_flow_guard,
                 "final_trade_decision": blocked_decision,

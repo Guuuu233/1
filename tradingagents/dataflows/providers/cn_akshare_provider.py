@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 import re
 import time
 import threading
@@ -41,10 +42,12 @@ from ..fund_flow_evidence import (
     FundFlowText,
     build_consensus_evidence,
     build_em_evidence,
+    build_source_evidence,
     build_gap_meta,
     build_provider_text,
     build_sina_evidence,
     build_ths_evidence,
+    select_fund_flow_source,
 )
 from ..financial_announce import (
     build_effective_announce_map,
@@ -217,6 +220,50 @@ _EASTMONEY_DIRECT_DISCOVERY_FIELDS = tuple(
 )
 _EASTMONEY_FUND_FLOW_TIMEZONE = "Asia/Shanghai"
 _EASTMONEY_FUND_FLOW_MAX_DECIMAL_ADJUSTED = 64
+
+# ── Tushare Pro structured fund flow (Source 2.1) ───────────────────────────
+# Keep the provider narrow: one exact trade_date per API call, with no token
+# fallback to a different credential source.  The raw unit for both APIs is
+# 万元; evidence builders convert it to 亿元 without binary-float rounding.
+_TUSHARE_FUND_FLOW_URL = "https://api.tushare.pro"
+_TUSHARE_FUND_FLOW_TIMEOUT = 10
+_TUSHARE_FUND_FLOW_MAX_ATTEMPTS = 2
+_TUSHARE_FUND_FLOW_RETRY_DELAY = 0.2
+_TUSHARE_DC_API = "moneyflow_dc"
+_TUSHARE_THS_API = "moneyflow_ths"
+_TUSHARE_DC_SOURCE = "tushare_eastmoney_moneyflow_dc"
+_TUSHARE_THS_SOURCE = "tushare_ths_moneyflow_ths"
+_TUSHARE_DC_FIELD_SEMANTICS = "今日主力净流入额（万元）"
+_TUSHARE_THS_FIELD_SEMANTICS = "资金净流入（万元）"
+_TUSHARE_THS_D5_SEMANTICS = "5日主力净额（万元）"
+_TUSHARE_REQUEST_FIELDS = {
+    # Keep each request aligned with the endpoint's documented schema; an
+    # unsupported field can make an otherwise valid token request fail.
+    _TUSHARE_DC_API: (
+        "ts_code,trade_date,net_amount,buy_sm_amount,buy_md_amount,"
+        "buy_lg_amount,buy_elg_amount"
+    ),
+    _TUSHARE_THS_API: (
+        "ts_code,trade_date,net_amount,buy_sm_amount,buy_md_amount,"
+        "buy_lg_amount"
+    ),
+}
+_TUSHARE_COMPONENT_FIELDS = {
+    _TUSHARE_DC_API: (
+        "buy_sm_amount",
+        "buy_md_amount",
+        "buy_lg_amount",
+        "buy_elg_amount",
+    ),
+    _TUSHARE_THS_API: (
+        "buy_sm_amount",
+        "buy_md_amount",
+        "buy_lg_amount",
+    ),
+}
+_TUSHARE_AUTH_CODES = {2001, 2002, 40101, 40102, 40103}
+_TUSHARE_RATE_LIMIT_CODES = {2003, 40203, 40204, 40205, 40206}
+_TUSHARE_TS_CODE_RE = re.compile(r"^\d{6}\.(?:SH|SZ|BJ)$", re.IGNORECASE)
 _FUND_AMOUNT_TEXT_RE = re.compile(
     r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*(?:万亿|亿元|万元|亿|万)?$"
 )
@@ -315,10 +362,15 @@ def _usable_fund_amount_text(value) -> str | None:
 def _fund_flow_failure_category(error: object) -> str:
     """Classify fallback errors without exposing provider exception payloads."""
     text = str(error or "").lower()
+    if any(token in text for token in ("token_missing", "permission_denied", "auth")):
+        return "authentication"
+    if any(token in text for token in ("rate_limit", "rate_limited", "429")):
+        return "rate_limit"
+    if any(token in text for token in ("http_status", "http_error")):
+        return "transport"
     if any(
         token in text
         for token in (
-            "http_status",
             "timeout",
             "request:",
             "connectionerror",
@@ -330,6 +382,7 @@ def _fund_flow_failure_category(error: object) -> str:
         token in text
         for token in (
             "json_decode",
+            "json_error",
             "json_shape",
             "rc_",
             "rc=",
@@ -342,9 +395,14 @@ def _fund_flow_failure_category(error: object) -> str:
         token in text
         for token in (
             "invalid_f52",
+            "invalid_amount",
+            "invalid_identity",
             "malformed",
             "field_count",
+            "missing_field",
             "no_usable_rows",
+            "date_mismatch",
+            "symbol_mismatch",
             "no_current_day_row",
             "no_requested_date_row",
             "duplicate_date",
@@ -356,7 +414,7 @@ def _fund_flow_failure_category(error: object) -> str:
         )
     ):
         return "validation"
-    if any(token in text for token in ("empty", "unavailable", "no rows")):
+    if any(token in text for token in ("empty", "unavailable", "no rows", "no_rows")):
         return "availability"
     return "provider"
 
@@ -1453,20 +1511,743 @@ class CnAkshareProvider(BaseMarketDataProvider):
             )
         return f"板块资金流向排名（共{total}个板块，前10名）：\n{result}"
 
+    @staticmethod
+    def _tushare_error(
+        api_name: str, category: str, detail: str | None = None
+    ) -> str:
+        suffix = f"({detail})" if detail else ""
+        return f"tushare.{api_name}:{category}{suffix}"
+
+    @staticmethod
+    def _tushare_ts_code(symbol: str) -> str:
+        code = re.search(r"(\d{6})", str(symbol or ""))
+        if not code:
+            raise ValueError(f"invalid A-share symbol for Tushare: {symbol!r}")
+        value = code.group(1)
+        market = (
+            "SH"
+            if value.startswith(("5", "6", "9"))
+            else "BJ"
+            if value.startswith(("4", "8"))
+            else "SZ"
+        )
+        return f"{value}.{market}"
+
+    @staticmethod
+    def _tushare_api_failure_category(
+        api_code: object, api_message: object = None
+    ) -> str:
+        try:
+            code = abs(int(api_code))
+        except (TypeError, ValueError):
+            return "api_code_invalid"
+        message = str(api_message or "").lower()
+        if any(token in message for token in ("权限", "permission", "unauthor")):
+            return "permission_denied"
+        if any(token in message for token in ("频率", "rate", "limit")):
+            return "rate_limited"
+        if code in _TUSHARE_AUTH_CODES:
+            return "permission_denied"
+        if code in _TUSHARE_RATE_LIMIT_CODES:
+            return "rate_limited"
+        return "api_code"
+
+    @staticmethod
+    def _tushare_date(value: object) -> str | None:
+        text = str(value or "").strip()
+        if len(text) == 8 and text.isdigit():
+            text = f"{text[:4]}-{text[4:6]}-{text[6:]}"
+        elif len(text) >= 10 and text[4] == "-" and text[7] == "-":
+            text = text[:10]
+        try:
+            return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _tushare_decode_response(
+        response, api_name: str
+    ) -> tuple[dict | None, str | None, str | None]:
+        import json
+
+        try:
+            payload = response.json()
+        except (AttributeError, TypeError, ValueError):
+            try:
+                payload = json.loads(getattr(response, "text", "") or "")
+            except (TypeError, ValueError):
+                return (
+                    None,
+                    CnAkshareProvider._tushare_error(api_name, "json_error"),
+                    "json_error",
+                )
+        if not isinstance(payload, dict):
+            return (
+                None,
+                CnAkshareProvider._tushare_error(api_name, "json_shape"),
+                "json_shape",
+            )
+        return payload, None, None
+
+    def _tushare_transport_post(
+        self, api_name: str, payload: dict
+    ) -> tuple[object | None, str | None, str | None, bool]:
+        import requests as _requests
+
+        try:
+            response = _requests.post(
+                _TUSHARE_FUND_FLOW_URL,
+                json=payload,
+                timeout=_TUSHARE_FUND_FLOW_TIMEOUT,
+            )
+        except _requests.Timeout:
+            return (
+                None,
+                self._tushare_error(api_name, "transport_timeout"),
+                "transport_timeout",
+                True,
+            )
+        except _requests.RequestException as exc:
+            _provider_logger.warning(
+                "tushare %s request failed: %s", api_name, type(exc).__name__
+            )
+            return (
+                None,
+                self._tushare_error(api_name, "transport_error"),
+                "transport_error",
+                True,
+            )
+        except ConnectionError as exc:
+            _provider_logger.warning(
+                "tushare %s connection failed: %s", api_name, type(exc).__name__
+            )
+            return (
+                None,
+                self._tushare_error(api_name, "transport_error"),
+                "transport_error",
+                True,
+            )
+        except Exception as exc:
+            _provider_logger.warning(
+                "tushare %s provider error: %s", api_name, type(exc).__name__
+            )
+            return (
+                None,
+                self._tushare_error(api_name, "provider_error"),
+                "provider_error",
+                False,
+            )
+        return response, None, None, False
+
+    def _tushare_post_once(
+        self,
+        api_name: str,
+        token: str,
+        ts_code: str,
+        trade_date: str,
+    ) -> tuple[dict | None, str | None, str | None, bool]:
+        payload = {
+            "api_name": api_name,
+            "token": token,
+            "params": {"ts_code": ts_code, "trade_date": trade_date},
+            "fields": _TUSHARE_REQUEST_FIELDS[api_name],
+        }
+        response, error, category, retryable = self._tushare_transport_post(
+            api_name, payload
+        )
+        if error:
+            return None, error, category, retryable
+        try:
+            status_code = int(getattr(response, "status_code", 200))
+        except (TypeError, ValueError):
+            status_code = 0
+        if status_code >= 400:
+            category = "rate_limited" if status_code == 429 else "http_error"
+            return (
+                None,
+                self._tushare_error(api_name, category, f"status={status_code}"),
+                category,
+                status_code == 429 or status_code >= 500,
+            )
+        payload_data, error, category = self._tushare_decode_response(
+            response, api_name
+        )
+        return payload_data, error, category, False
+
+    def _tushare_post(
+        self,
+        api_name: str,
+        token: str,
+        ts_code: str,
+        trade_date: str,
+    ) -> tuple[dict | None, str | None, str | None]:
+        """POST one exact-date Tushare request without leaking the token."""
+        if _TUSHARE_FUND_FLOW_MAX_ATTEMPTS <= 0:
+            return (
+                None,
+                self._tushare_error(api_name, "provider_error", "retry_unconfigured"),
+                "provider_error",
+            )
+        result: tuple[dict | None, str | None, str | None, bool]
+        for attempt in range(_TUSHARE_FUND_FLOW_MAX_ATTEMPTS):
+            result = self._tushare_post_once(
+                api_name, token, ts_code, trade_date
+            )
+            payload, error, category, retryable = result
+            if not retryable or attempt + 1 >= _TUSHARE_FUND_FLOW_MAX_ATTEMPTS:
+                return payload, error, category
+            time.sleep(_TUSHARE_FUND_FLOW_RETRY_DELAY * (attempt + 1))
+        return result[:3]
+
+    def _tushare_validate_envelope(
+        self, payload: dict, api_name: str
+    ) -> tuple[list | tuple | None, list | tuple | None, str | None, str | None]:
+        code = payload.get("code")
+        try:
+            code_value = int(code)
+        except (TypeError, ValueError):
+            return None, None, self._tushare_error(api_name, "api_code_invalid"), "api_code_invalid"
+        if code_value != 0:
+            category = self._tushare_api_failure_category(code, payload.get("msg"))
+            return (
+                None,
+                None,
+                self._tushare_error(api_name, category, f"code={code}"),
+                category,
+            )
+        if "data" not in payload:
+            return (
+                None,
+                None,
+                self._tushare_error(api_name, "json_shape", "data_missing"),
+                "json_shape",
+            )
+        data = payload.get("data")
+        if data is None:
+            return None, None, self._tushare_error(api_name, "no_rows"), "no_rows"
+        if not isinstance(data, dict):
+            return (
+                None,
+                None,
+                self._tushare_error(api_name, "json_shape", "data_not_object"),
+                "json_shape",
+            )
+        fields = data.get("fields")
+        items = data.get("items")
+        if not isinstance(fields, (list, tuple)):
+            return (
+                None,
+                None,
+                self._tushare_error(api_name, "json_shape", "fields_not_list"),
+                "json_shape",
+            )
+        # THS daily direction only requires net_amount. net_d5_amount is an
+        # optional 5-day side field and must not make a valid daily row fail.
+        required_fields = ("ts_code", "trade_date", "net_amount")
+        missing_fields = [field for field in required_fields if field not in fields]
+        if missing_fields:
+            return (
+                None,
+                None,
+                self._tushare_error(
+                    api_name, "missing_field", ",".join(missing_fields)
+                ),
+                "missing_field",
+            )
+        if not isinstance(items, (list, tuple)):
+            return (
+                None,
+                None,
+                self._tushare_error(api_name, "json_shape", "items_not_list"),
+                "json_shape",
+            )
+        if not items:
+            return None, None, self._tushare_error(api_name, "no_rows"), "no_rows"
+        return fields, items, None, None
+
+    def _tushare_match_row(
+        self,
+        fields: list | tuple,
+        items: list | tuple,
+        api_name: str,
+        requested_date: str,
+    ) -> tuple[dict | None, str | None, str | None]:
+        field_names = [str(field) for field in fields]
+        matches: list[dict] = []
+        malformed_rows = 0
+        for item in items:
+            if isinstance(item, dict):
+                row = dict(item)
+            elif isinstance(item, (list, tuple)) and len(item) >= len(field_names):
+                row = dict(zip(field_names, item))
+            else:
+                malformed_rows += 1
+                continue
+            if self._tushare_date(row.get("trade_date")) == requested_date:
+                matches.append(row)
+        if not matches:
+            category = "json_shape" if malformed_rows == len(items) else "date_mismatch"
+            detail = "row_shape" if category == "json_shape" else requested_date
+            return None, self._tushare_error(api_name, category, detail), category
+        if len(matches) > 1:
+            return (
+                None,
+                self._tushare_error(api_name, "duplicate_date", requested_date),
+                "duplicate_date",
+            )
+        row = matches[0]
+        raw_ts_code = str(row.get("ts_code") or "").strip().upper()
+        if not raw_ts_code:
+            return (
+                None,
+                self._tushare_error(api_name, "missing_field", "ts_code_value"),
+                "missing_field",
+            )
+        if _TUSHARE_TS_CODE_RE.fullmatch(raw_ts_code) is None:
+            return (
+                None,
+                self._tushare_error(api_name, "invalid_identity"),
+                "invalid_identity",
+            )
+        raw_amount = row.get("net_amount")
+        if raw_amount is None or (isinstance(raw_amount, str) and not raw_amount.strip()):
+            return (
+                None,
+                self._tushare_error(api_name, "missing_field", "net_amount_value"),
+                "missing_field",
+            )
+        # ``net_d5_amount`` is optional side evidence. If absent or malformed,
+        # retain the exact daily ``net_amount`` row and omit the 5-day field.
+        if api_name == _TUSHARE_THS_API and _sina_decimal(row.get("net_d5_amount")) is None:
+            row = dict(row)
+            row.pop("net_d5_amount", None)
+        return row, None, None
+
+    def _tushare_extract_row(
+        self,
+        payload: dict,
+        api_name: str,
+        requested_date: str,
+    ) -> tuple[dict | None, str | None, str | None]:
+        """Validate the response envelope and require the exact requested day."""
+        fields, items, error, category = self._tushare_validate_envelope(
+            payload, api_name
+        )
+        if error:
+            return None, error, category
+        return self._tushare_match_row(
+            fields or [], items or [], api_name, requested_date
+        )
+
+    @staticmethod
+    def _tushare_yi_text(value: object) -> str | None:
+        parsed = _sina_decimal(value)
+        if parsed is None:
+            return None
+        text = format(parsed / Decimal("10000"), "f")
+        return text.rstrip("0").rstrip(".") if "." in text else text
+
+    @staticmethod
+    def _tushare_raw_fields(row: dict, api_name: str) -> dict:
+        fields = ["ts_code", "trade_date", "net_amount"]
+        if api_name == _TUSHARE_THS_API:
+            fields.append("net_d5_amount")
+        fields.extend(_TUSHARE_COMPONENT_FIELDS[api_name])
+        return {field: row.get(field) for field in fields if field in row}
+
+    def _tushare_attach_record(
+        self,
+        record: dict,
+        api_name: str,
+        row: dict,
+        raw_fields: dict,
+    ) -> None:
+        is_dc = api_name == _TUSHARE_DC_API
+        normalized_fields = {
+            field: self._tushare_yi_text(value)
+            for field, value in raw_fields.items()
+            if field.endswith("_amount") and self._tushare_yi_text(value) is not None
+        }
+        record.update(
+            {
+                "transport_provider": "tushare",
+                "upstream_api": api_name,
+                "upstream_field": "net_amount",
+                "upstream_field_semantics": (
+                    _TUSHARE_DC_FIELD_SEMANTICS
+                    if is_dc
+                    else _TUSHARE_THS_FIELD_SEMANTICS
+                ),
+                "upstream_unit": "万元",
+                "vendor_raw_fields": raw_fields,
+                "vendor_raw_field_units": {
+                    field: "万元" for field in raw_fields if field.endswith("_amount")
+                },
+                "vendor_normalized_fields": normalized_fields,
+                "vendor_raw_field_status": "audited",
+            }
+        )
+        if not is_dc and row.get("net_d5_amount") is not None:
+            net_d5_yi = self._tushare_yi_text(row.get("net_d5_amount"))
+            if net_d5_yi is not None:
+                record.update(
+                    {
+                        "net_d5_amount": net_d5_yi,
+                        "net_d5_amount_raw": str(row.get("net_d5_amount")),
+                        "net_d5_amount_raw_unit": "万元",
+                        "net_d5_amount_unit": "亿元",
+                        "net_d5_amount_period_kind": "five_day_cumulative",
+                        "net_d5_amount_window": "5d",
+                        "net_d5_amount_semantics": _TUSHARE_THS_D5_SEMANTICS,
+                    }
+                )
+
+    def _tushare_records_for_row(
+        self,
+        api_name: str,
+        row: dict,
+        symbol: str,
+        requested_date: str,
+        retrieved_at: str,
+    ) -> list[dict]:
+        is_dc = api_name == _TUSHARE_DC_API
+        source = _TUSHARE_DC_SOURCE if is_dc else _TUSHARE_THS_SOURCE
+        canonical_field = "r0_net" if is_dc else "netamount"
+        source_row = {
+            # The API row has YYYYMMDD; evidence alignment uses ISO dates.
+            "trade_date": requested_date,
+            canonical_field: row.get("net_amount"),
+            f"{canonical_field}_unit": "万元",
+            "period_kind": "historical_daily",
+            "time_window": "1d",
+            "raw_unit": "万元",
+        }
+        records = build_source_evidence(
+            [source_row],
+            symbol=symbol,
+            requested_as_of=requested_date,
+            retrieved_at=retrieved_at,
+            source=source,
+            raw_unit="万元",
+            algorithm_group="new_algorithm_group",
+            period_kind="historical_daily",
+            window="1d",
+        )
+        if not records:
+            return []
+        raw_fields = self._tushare_raw_fields(row, api_name)
+        for record in records:
+            self._tushare_attach_record(record, api_name, row, raw_fields)
+        return records
+
+    def _fetch_tushare_api_records(
+        self,
+        api_name: str,
+        token: str,
+        symbol: str,
+        requested_date: str,
+        retrieved_at: str,
+    ) -> tuple[list[dict], str | None, str | None]:
+        try:
+            ts_code = self._tushare_ts_code(symbol)
+        except ValueError:
+            return (
+                [],
+                self._tushare_error(api_name, "validation", "symbol"),
+                "validation",
+            )
+        trade_date = requested_date.replace("-", "")
+        payload, error, category = self._tushare_post(
+            api_name, token, ts_code, trade_date
+        )
+        if error:
+            return [], error, category
+        row, error, category = self._tushare_extract_row(
+            payload or {}, api_name, requested_date
+        )
+        if error:
+            return [], error, category
+        returned_ts_code = str((row or {}).get("ts_code") or "").strip().upper()
+        if returned_ts_code and returned_ts_code != ts_code.upper():
+            error = self._tushare_error(api_name, "symbol_mismatch")
+            return [], error, "symbol_mismatch"
+        records = self._tushare_records_for_row(
+            api_name, row or {}, symbol, requested_date, retrieved_at
+        )
+        if not records:
+            error = self._tushare_error(api_name, "invalid_amount")
+            return [], error, "invalid_amount"
+        return records, None, None
+
+    @staticmethod
+    def _tushare_failure_entry(
+        api_name: str, error: str, category: str | None
+    ) -> dict[str, str]:
+        return {
+            "api": api_name,
+            "category": category or "provider",
+            "error": error,
+        }
+
+    @staticmethod
+    def _tushare_incomparable_consensus(
+        dc_records: list[dict], ths_records: list[dict]
+    ) -> dict:
+        dc_consensus = build_consensus_evidence(
+            dc_records,
+            symbol=dc_records[0].get("symbol") if dc_records else None,
+            requested_as_of=dc_records[0].get("requested_as_of") if dc_records else None,
+            field="r0_net",
+        )
+        ths_consensus = build_consensus_evidence(
+            ths_records,
+            symbol=ths_records[0].get("symbol") if ths_records else None,
+            requested_as_of=ths_records[0].get("requested_as_of") if ths_records else None,
+            field="netamount",
+        )
+        return {
+            "status": "data_conflict",
+            "data_conflict": True,
+            "reason_code": "incomparable_field_semantics",
+            "reason": (
+                "moneyflow_dc.net_amount 是今日主力净流入额，"
+                "moneyflow_ths.net_amount 是资金净流入；"
+                "net_d5_amount 另属 5 日主力净额，禁止跨字段平均"
+            ),
+            "direction": "blocked",
+            "direction_allowed": False,
+            "field_results": {
+                "r0_net": dc_consensus,
+                "netamount": ths_consensus,
+            },
+            "raw_values": [
+                *dc_consensus.get("raw_values", []),
+                *ths_consensus.get("raw_values", []),
+            ],
+        }
+
+    @staticmethod
+    def _tushare_consensus(
+        dc_records: list[dict], ths_records: list[dict]
+    ) -> dict:
+        """Select DC first while retaining THS as non-combined side evidence."""
+        records = [*dc_records, *ths_records]
+        return select_fund_flow_source(
+            records,
+            symbol=records[0].get("symbol") if records else None,
+            requested_as_of=records[0].get("requested_as_of") if records else None,
+        )
+
+    @staticmethod
+    def _tushare_text_line(record: dict) -> str:
+        is_dc = record.get("upstream_api") == _TUSHARE_DC_API
+        field = "r0_net" if is_dc else "netamount"
+        label = "今日主力净流入额" if is_dc else "资金净流入"
+        value = record.get(field) or ""
+        source_label = "东方财富 moneyflow_dc" if is_dc else "同花顺 moneyflow_ths"
+        line = f"- {source_label}：{label} {value} 亿元（上游单位：万元）"
+        if not is_dc and record.get("net_d5_amount") is not None:
+            line += (
+                f"；5日主力净额 {record['net_d5_amount']} 亿元"
+                f"（原值 {record.get('net_d5_amount_raw')} 万元；周期：5d，"
+                "不与单日值混合）"
+            )
+        return line
+
+    def _format_tushare_fund_flow(
+        self,
+        symbol: str,
+        requested_date: str,
+        dc_records: list[dict],
+        ths_records: list[dict],
+        failures: list[dict[str, str]],
+        retrieved_at: str,
+        requested_as_of: str | None = None,
+    ) -> FundFlowText:
+        records = [*dc_records, *ths_records]
+        lines = [
+            f"【数据源：Tushare Pro】{symbol} 资金流（交易日：{requested_date}；单位：亿元）",
+            "（仅接受 trade_date 精确匹配；东方财富与同花顺字段语义分别保留）",
+        ]
+        lines.extend(self._tushare_text_line(record) for record in records)
+        selection = self._tushare_consensus(dc_records, ths_records)
+        consensus_audit = (
+            self._tushare_incomparable_consensus(dc_records, ths_records)
+            if dc_records and ths_records
+            else build_consensus_evidence(
+                records,
+                symbol=records[0].get("symbol") if records else None,
+                requested_as_of=records[0].get("requested_as_of") if records else None,
+                field="r0_net" if dc_records else "netamount",
+            )
+        )
+        status = "available" if len(failures) == 0 else "partial"
+        metadata = {
+            "symbol": symbol,
+            "requested_as_of": requested_as_of or requested_date,
+            "actual_as_of": requested_date,
+            "as_of": requested_date,
+            "retrieved_at": retrieved_at,
+            "source": "tushare_moneyflow",
+            "transport_provider": "tushare",
+            "source_families": sorted(
+                {record.get("source_family", "unknown") for record in records}
+            ),
+            "algorithm_group": "new_algorithm_group",
+            "period_kind": "historical_daily",
+            "window": "1d",
+            "unit": "亿元",
+            "raw_unit": "万元",
+            "status": status,
+            "selection": selection,
+            # Keep the old median/field comparison as audit evidence only; it
+            # no longer gates a valid higher-priority source.
+            "consensus": selection,
+            "consensus_audit": consensus_audit,
+            "tushare_failures": list(failures),
+            "failure_categories": sorted({item["category"] for item in failures}),
+        }
+        return FundFlowText(
+            "\n".join(lines), evidence=records, evidence_meta=metadata
+        )
+
+    @staticmethod
+    def _tushare_token_gap(
+        api_names: tuple[str, str]
+    ) -> tuple[None, list[str], dict]:
+        failures = [
+            CnAkshareProvider._tushare_failure_entry(
+                api_name,
+                CnAkshareProvider._tushare_error(api_name, "token_missing"),
+                "token_missing",
+            )
+            for api_name in api_names
+        ]
+        return (
+            None,
+            [item["error"] for item in failures],
+            {
+                "status": "blocked",
+                "transport_provider": "tushare",
+                "source": "tushare_moneyflow",
+                "attempted_sources": [],
+                "gated_sources": list(api_names),
+                "tushare_failures": failures,
+                "failure_categories": ["token_missing"],
+                "reason": "TUSHARE_TOKEN 未配置；拒绝把 legacy Web 值冒充新算法",
+            },
+        )
+
+    @staticmethod
+    def _tushare_collect_failures(
+        failures_by_api: tuple[tuple[str, str | None, str | None], ...]
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        failures: list[dict[str, str]] = []
+        errors: list[str] = []
+        for api_name, error, category in failures_by_api:
+            if error:
+                errors.append(error)
+                failures.append(
+                    CnAkshareProvider._tushare_failure_entry(api_name, error, category)
+                )
+        return failures, errors
+
+    @staticmethod
+    def _tushare_unavailable(
+        api_names: tuple[str, str], failures: list[dict[str, str]], errors: list[str]
+    ) -> tuple[None, list[str], dict]:
+        return (
+            None,
+            errors,
+            {
+                "status": "unavailable",
+                "transport_provider": "tushare",
+                "source": "tushare_moneyflow",
+                "attempted_sources": list(api_names),
+                "tushare_failures": failures,
+                "failure_categories": sorted({item["category"] for item in failures}),
+            },
+        )
+
+    def _fetch_tushare_fund_flow(
+        self,
+        symbol: str,
+        requested_date: str,
+        *,
+        requested_as_of: str | None = None,
+    ) -> tuple[FundFlowText | None, list[str], dict]:
+        """Fetch DC/THS rows or return an explicit token/provider gap."""
+        token = os.getenv("TUSHARE_TOKEN", "").strip()
+        api_names = (_TUSHARE_DC_API, _TUSHARE_THS_API)
+        if not token:
+            return self._tushare_token_gap(api_names)
+        retrieved_at = self._sina_retrieved_at()
+        dc_records, dc_error, dc_category = self._fetch_tushare_api_records(
+            _TUSHARE_DC_API, token, symbol, requested_date, retrieved_at
+        )
+        ths_records, ths_error, ths_category = self._fetch_tushare_api_records(
+            _TUSHARE_THS_API, token, symbol, requested_date, retrieved_at
+        )
+        failures, errors = self._tushare_collect_failures(
+            (
+                (_TUSHARE_DC_API, dc_error, dc_category),
+                (_TUSHARE_THS_API, ths_error, ths_category),
+            )
+        )
+        if not dc_records and not ths_records:
+            return self._tushare_unavailable(api_names, failures, errors)
+        value = self._format_tushare_fund_flow(
+            symbol,
+            requested_date,
+            dc_records,
+            ths_records,
+            failures,
+            retrieved_at,
+            requested_as_of=requested_as_of,
+        )
+        return value, errors, value.fund_flow_evidence_meta
+
     def get_individual_fund_flow(self, symbol: str, curr_date: str = None) -> str:
         """获取个股近期主力资金净流向，并按 curr_date 截断。
 
-        资金流路径按“AkShare EM → 东财公开直连 → 新浪历史 legacy Web →
-        当前日同花顺总净额快照”的顺序尝试。东财直连只接入已核验的 f51/f52
-        契约，并把 f52 保持为 ``r0_net``；f53-f56 仅作原始发现值保留，缺失的
-        尾部字段不会伪装成语义值。每个成功或失败的 ``FundFlowText`` 都携带完整尝试链。
+        资金流路径按“AkShare EM → 东财公开直连 → Tushare DC/THS →
+        当前日同花顺总净额快照 → 新浪历史 legacy Web”的顺序尝试。东财直连只
+        接入已核验的 f51-f56 字段，并把 f52 保持为 ``r0_net``；它不会把总净额
+        或未知字段伪装成主力净额。每个成功或失败的 ``FundFlowText`` 都携带
+        完整尝试链。
         """
         errors: list[str] = []
         attempted_sources: list[str] = []
         em_typed_gap = ""
+        em_candidate: FundFlowText | None = None
+        tushare_meta: dict = {}
 
         def _gap_reason(base_reason: str) -> str:
             return f"{base_reason}；{'；'.join(errors)}" if errors else base_reason
+
+        def _merge_side_evidence(primary: FundFlowText, side: FundFlowText) -> FundFlowText:
+            """Retain lower-priority valid evidence without changing primary text."""
+            primary_records = list(getattr(primary, "fund_flow_evidence", []) or [])
+            side_records = list(getattr(side, "fund_flow_evidence", []) or [])
+            if not side_records:
+                return primary
+            metadata = dict(getattr(primary, "fund_flow_evidence_meta", {}) or {})
+            combined = [*primary_records, *side_records]
+            selection = select_fund_flow_source(
+                combined,
+                symbol=metadata.get("symbol") or symbol,
+                requested_as_of=metadata.get("requested_as_of") or curr_date,
+            )
+            metadata["selection"] = selection
+            metadata["consensus"] = selection
+            metadata["side_evidence_sources"] = sorted(
+                {str(record.get("source")) for record in side_records if record.get("source")}
+            )
+            return FundFlowText(
+                str(primary),
+                evidence=combined,
+                evidence_meta=metadata,
+            )
 
         def _attach_chain(value: str, final_source: str) -> FundFlowText:
             evidence = list(getattr(value, "fund_flow_evidence", []) or [])
@@ -1493,25 +2274,69 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     metadata["field"] = "r0_net"
                 elif "netamount" in fields:
                     metadata["field"] = "netamount"
-            consensus = metadata.get("consensus")
-            if isinstance(consensus, dict):
-                consensus_status = consensus.get("status")
-                direction_allowed = (
-                    bool(consensus.get("direction_allowed"))
-                    and consensus_status == "consensus"
-                    and metadata.get("algorithm_group") != "legacy_web_algorithm"
+            selection = metadata.get("selection")
+            existing_consensus = metadata.get("consensus")
+            if not isinstance(selection, dict) or "selected_source" not in selection:
+                if isinstance(existing_consensus, dict):
+                    # Preserve the former median/MAD result for audit, but do
+                    # not let its source-count gate decide the direction.
+                    metadata.setdefault("consensus_audit", existing_consensus)
+                selection = select_fund_flow_source(
+                    evidence,
+                    symbol=metadata.get("symbol") or (evidence[0].get("symbol") if evidence else None),
+                    requested_as_of=metadata.get("requested_as_of"),
                 )
-                metadata["status"] = consensus_status or metadata.get("status")
-                metadata["direction"] = (
-                    consensus.get("direction") if direction_allowed else "blocked"
+            metadata["selection"] = selection
+            # ``consensus`` is retained as a compatibility key for API/report
+            # consumers; the old comparison is available as consensus_audit.
+            metadata["consensus"] = selection
+            selection_status = selection.get("status")
+            direction_allowed = bool(
+                selection.get("direction_allowed")
+                and selection_status in {"selected", "consensus"}
+            )
+            metadata.setdefault("provider_status", metadata.get("status"))
+            metadata["status"] = selection_status or metadata.get("status")
+            metadata["direction"] = (
+                selection.get("selected_direction") or selection.get("direction")
+                if direction_allowed
+                else "blocked"
+            )
+            metadata["direction_allowed"] = direction_allowed
+            metadata["hard_guard"] = {
+                "blocked": not direction_allowed,
+                "direction_allowed": direction_allowed,
+                "reason": selection.get("selection_reason")
+                or selection.get("reason")
+                or "source selection unavailable",
+            }
+            for key in (
+                "selected_source",
+                "selected_source_family",
+                "selected_algorithm_group",
+                "selected_field",
+                "selected_value",
+                "selected_unit",
+                "selected_direction",
+                "selected_as_of",
+                "selected_period_kind",
+                "selected_time_window",
+                "selected_window_days",
+                "fallback_rank",
+                "legacy_reference",
+                "legacy_web_algorithm",
+                "selection_reason",
+            ):
+                if key in selection:
+                    metadata[key] = selection[key]
+            if selection.get("legacy_reference"):
+                metadata["legacy_web_reference_only"] = True
+                metadata.setdefault(
+                    "legacy_warning",
+                    "legacy_web_algorithm：新浪旧 Web，仅供参考，不得冒充新算法来源",
                 )
-                metadata["direction_allowed"] = direction_allowed
-                metadata["hard_guard"] = {
-                    "blocked": not direction_allowed,
-                    "direction_allowed": direction_allowed,
-                    "reason": consensus.get("reason")
-                    or "consensus unavailable or direction is not permitted",
-                }
+            if tushare_meta:
+                metadata["tushare_provider"] = dict(tushare_meta)
             metadata.update(
                 {
                     "attempted_sources": list(attempted_sources),
@@ -1565,8 +2390,24 @@ class CnAkshareProvider(BaseMarketDataProvider):
             )
             return _attach_chain(gap, "unavailable")
 
+        today_cutoff = parse_yyyymmdd(cn_today_str())
+        if today_cutoff is not None and cutoff > today_cutoff:
+            errors.append(f"fund_flow_individual: curr_date_future:{curr_date!r}")
+            gap = build_provider_text(
+                f"【数据获取失败】个股资金流向 curr_date 不得晚于当前交易日：{curr_date!r}",
+                symbol=symbol,
+                requested_as_of=curr_date,
+                source="fund_flow_individual",
+                reason=f"curr_date_future:{curr_date!r}；拒绝把 live 数据伪装成未来日期",
+                field="r0_net",
+                raw_unit="元",
+                failure_category="validation",
+            )
+            return _attach_chain(gap, "unavailable")
+
         code = self._normalize_symbol(symbol)
         is_historical = is_historical_analysis_date(curr_date)
+        tushare_requested_date = cutoff.isoformat()
 
         # Source 1: AkShare's Eastmoney wrapper (近 120 交易日逐日序列).
         attempted_sources.append("akshare.stock_individual_fund_flow")
@@ -1595,31 +2436,39 @@ class CnAkshareProvider(BaseMarketDataProvider):
                         require_curr_date=True,
                     )
                     em_evidence = getattr(em_text, "fund_flow_evidence", None)
+                    em_meta = getattr(em_text, "fund_flow_evidence_meta", None) or {}
+                    em_selection = em_meta.get("selection")
                     if (
                         em_text is not None
                         and isinstance(em_evidence, list)
                         and em_evidence
+                        and isinstance(em_selection, dict)
+                        and em_selection.get("direction_allowed")
                     ):
-                        return _attach_chain(
-                            em_text, "eastmoney_individual_fund_flow"
-                        )
-                    em_meta = getattr(em_text, "fund_flow_evidence_meta", None) or {}
-                    if em_meta.get("reason"):
+                        # Keep the lower-ranked Eastmoney wrapper as a
+                        # candidate; direct/Tushare must get first refusal.
+                        em_candidate = em_text
+                    elif em_evidence:
                         errors.append(
-                            "stock_individual_fund_flow: formatter reason: "
-                            f"{em_meta['reason']}"
+                            "stock_individual_fund_flow: selection unavailable"
                         )
-                    if em_text:
+                    if em_candidate is None:
+                        if em_meta.get("reason"):
+                            errors.append(
+                                "stock_individual_fund_flow: formatter reason: "
+                                f"{em_meta['reason']}"
+                            )
+                        if em_text:
+                            errors.append(
+                                "stock_individual_fund_flow: formatter failure: "
+                                f"{em_text}"
+                            )
                         errors.append(
-                            "stock_individual_fund_flow: formatter failure: "
-                            f"{em_text}"
+                            "stock_individual_fund_flow: structured evidence unavailable"
                         )
-                    errors.append(
-                        "stock_individual_fund_flow: structured evidence unavailable"
-                    )
-                    errors.append(
-                        "stock_individual_fund_flow: invalid or empty usable rows"
-                    )
+                        errors.append(
+                            "stock_individual_fund_flow: invalid or empty usable rows"
+                        )
             except Exception as exc:
                 errors.append(f"stock_individual_fund_flow: {type(exc).__name__}")
 
@@ -1644,14 +2493,61 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 require_curr_date=True,
             )
             if direct_text is not None:
+                if em_candidate is not None:
+                    direct_text = _merge_side_evidence(direct_text, em_candidate)
                 return _attach_chain(direct_text, "eastmoney_direct")
             if direct_error:
                 errors.append(direct_error)
         except Exception as exc:
             errors.append(f"eastmoney_direct: {type(exc).__name__}")
 
-        # Source 2.5: Sina Web is legacy reference only. Keep the typed
-        # response for auditability, but it never drives main-force direction.
+        # Source 2.1: Tushare Pro provides audited DC/THS structured rows.
+        # A missing token is recorded as a typed gate but is not presented as a
+        # network attempt; this preserves the existing fallback-chain trace.
+        if os.getenv("TUSHARE_TOKEN", "").strip():
+            attempted_sources.extend(
+                ["tushare.moneyflow_dc", "tushare.moneyflow_ths"]
+            )
+        tushare_text, tushare_errors, tushare_meta = self._fetch_tushare_fund_flow(
+            symbol,
+            tushare_requested_date,
+            requested_as_of=curr_date,
+        )
+        errors.extend(tushare_errors)
+        if tushare_text is not None:
+            if em_candidate is not None:
+                # Compare DC/THS and the retained EM wrapper together; the
+                # selector still chooses DC/EM before THS by declared rank.
+                tushare_text = _merge_side_evidence(tushare_text, em_candidate)
+                return _attach_chain(tushare_text, "tushare")
+            return _attach_chain(tushare_text, "tushare")
+        if em_candidate is not None:
+            return _attach_chain(em_candidate, "eastmoney_individual_fund_flow")
+
+        # Source 2.5: current-day THS is a validated new source and must be
+        # tried before any legacy Web fallback. Historical dates never use this
+        # snapshot because it has no historical as-of parameter.
+        if not is_historical:
+            attempted_sources.append("ths_instant_snapshot")
+            try:
+                is_trade_day = is_cn_trading_day(curr_date)
+            except Exception as exc:
+                is_trade_day = False
+                errors.append(f"ths_instant_snapshot: trade_calendar: {type(exc).__name__}")
+            if is_trade_day:
+                snapshot, snapshot_error = self._fetch_ths_instant_snapshot(
+                    symbol, curr_date, code, ak
+                )
+                if snapshot is not None:
+                    return _attach_chain(snapshot, "ths_instant_snapshot")
+                if snapshot_error:
+                    errors.append(snapshot_error)
+            else:
+                errors.append("ths_instant_snapshot: curr_date_not_cn_trading_day")
+
+        # Sina Web is legacy reference only and is reached after every new
+        # algorithm source has failed. Its own direction remains visible but is
+        # explicitly marked legacy and never relabeled as DC/THS evidence.
         attempted_sources.append("sina_historical")
         try:
             hist_text = self._fetch_sina_historical_fund_flow(
@@ -1668,12 +2564,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     {
                         "legacy_web_algorithm": True,
                         "legacy_web_reference_only": True,
-                        "direction_allowed": False,
-                        "reason": "新浪旧 Web 参考值，不驱动主力方向",
+                        "legacy_warning": "legacy_web_algorithm：新浪旧 Web，仅供参考，不得冒充新算法来源",
+                        "reason": "新算法来源均不可用，新浪旧 Web 仅展示其自身方向并醒目标注 legacy",
                     }
                 )
                 hist_value = FundFlowText(
-                    f"{hist_text}\n（新浪旧 Web 参考值：仅作降级参考，不驱动方向）",
+                    f"{hist_text}\n（legacy_web_algorithm：新浪旧 Web 参考值/旧算法，仅供参考；方向来自该来源自身，不代表新算法）",
                     evidence=getattr(hist_text, "fund_flow_evidence", []),
                     evidence_meta=metadata,
                 )
@@ -1703,8 +2599,34 @@ class CnAkshareProvider(BaseMarketDataProvider):
             )
             return _attach_chain(gap, "unavailable")
 
-        # Source 3: 同花顺即时资金流净额快照（历史接口尚无当日收盘行时）。
-        attempted_sources.append("ths_instant_snapshot")
+        gap_reason = (
+            "东财 AkShare/东财直连/Tushare DC/THS/新浪历史/"
+            "同花顺即时资金流净额快照均失败"
+        )
+        if errors:
+            gap_reason = f"{gap_reason}；{'；'.join(errors)}"
+        gap = build_provider_text(
+            f"【数据获取失败】个股资金流向数据获取失败（东财 AkShare/东财直连/"
+            f"Tushare DC/THS/新浪历史/同花顺即时资金流净额快照均失败："
+            f"{'；'.join(errors)}）",
+            symbol=symbol,
+            requested_as_of=curr_date,
+            source="fund_flow_individual",
+            reason=gap_reason,
+            field="r0_net",
+            raw_unit="元",
+            failure_category="source_unavailable",
+        )
+        return _attach_chain(gap, "unavailable")
+
+    def _fetch_ths_instant_snapshot(
+        self,
+        symbol: str,
+        curr_date: str,
+        code: str,
+        ak,
+    ) -> tuple[FundFlowText | None, str | None]:
+        """Fetch the validated current-day THS total-net snapshot."""
         try:
             if ak is None:
                 ak = self._ak()
@@ -1713,55 +2635,24 @@ class CnAkshareProvider(BaseMarketDataProvider):
             with AKSHARE_CALL_LOCK:
                 df = ak.stock_fund_flow_individual(symbol="即时")
             if df is None or df.empty:
-                raise ValueError("empty dataframe")
+                return None, "ths_instant_snapshot: empty dataframe"
+            if "股票代码" not in df.columns:
+                return None, "ths_instant_snapshot: missing symbol column"
             stock_df = df[df["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
             if stock_df.empty:
-                gap = build_provider_text(
-                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照无记录"
-                    f"（{'；'.join(errors)}）",
-                    symbol=symbol,
-                    requested_as_of=curr_date,
-                    source="ths_instant_snapshot",
-                    reason=_gap_reason(
-                        "同花顺即时资金流净额快照无记录；该源不提供新浪 netamount/r0_net evidence"
-                    ),
-                    field="netamount",
-                    raw_unit="亿元",
-                    failure_category="validation_failure",
-                )
-                return _attach_chain(gap, "unavailable")
-            row = stock_df.iloc[0]
+                return None, "ths_instant_snapshot: no_matching_symbol"
             if "净额" not in stock_df.columns:
-                gap = build_provider_text(
-                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照缺少净额字段"
-                    f"（{'；'.join(errors)}）",
-                    symbol=symbol,
-                    requested_as_of=curr_date,
-                    source="ths_instant_snapshot",
-                    reason=_gap_reason(
-                        "同花顺即时资金流净额快照缺少净额字段；该源不提供新浪 netamount/r0_net evidence"
-                    ),
-                    field="netamount",
-                    raw_unit="亿元",
-                    failure_category="validation_failure",
-                )
-                return _attach_chain(gap, "unavailable")
+                return None, "ths_instant_snapshot: missing_net_amount_column"
+            if len(stock_df) > 1:
+                duplicate_values = [
+                    _usable_fund_amount_text(value) for value in stock_df["净额"].tolist()
+                ]
+                if any(value is None for value in duplicate_values) or len(set(duplicate_values)) > 1:
+                    return None, "ths_instant_snapshot: duplicate_symbol_conflict"
+            row = stock_df.iloc[0]
             net_amount = _usable_fund_amount_text(row["净额"])
             if net_amount is None:
-                gap = build_provider_text(
-                    f"【数据获取失败】{symbol} 同花顺即时资金流净额快照净额缺失或不可解析"
-                    f"（{'；'.join(errors)}）",
-                    symbol=symbol,
-                    requested_as_of=curr_date,
-                    source="ths_instant_snapshot",
-                    reason=_gap_reason(
-                        "同花顺即时资金流净额快照净额缺失或不可解析；该源不提供新浪 netamount/r0_net evidence"
-                    ),
-                    field="netamount",
-                    raw_unit="亿元",
-                    failure_category="validation_failure",
-                )
-                return _attach_chain(gap, "unavailable")
+                return None, "ths_instant_snapshot: invalid_net_amount"
 
             def _v(col: str) -> str:
                 if col not in stock_df.columns:
@@ -1769,21 +2660,29 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 val = row[col]
                 return "" if pd.isna(val) else str(val)
 
-            row_payload = {
-                "股票代码": code,
-                "日期": curr_date,
-                "净额": row.get("净额"),
-                "单位": "亿元",
-                "period_kind": "realtime_single_day",
-                "window": "1d",
-            }
+            retrieved_at = self._sina_retrieved_at()
             evidence = build_ths_evidence(
-                [row_payload],
+                [{
+                    "股票代码": code,
+                    "日期": curr_date,
+                    "净额": row.get("净额"),
+                    "单位": "亿元",
+                    "period_kind": "realtime_single_day",
+                    "window": "1d",
+                }],
                 symbol=symbol,
                 requested_as_of=curr_date,
-                retrieved_at=self._sina_retrieved_at(),
+                retrieved_at=retrieved_at,
             )
-            consensus = build_consensus_evidence(
+            if not evidence:
+                return None, "ths_instant_snapshot: structured_evidence_unavailable"
+            consensus_audit = build_consensus_evidence(
+                evidence,
+                symbol=symbol,
+                requested_as_of=curr_date,
+                field="netamount",
+            )
+            selection = select_fund_flow_source(
                 evidence,
                 symbol=symbol,
                 requested_as_of=curr_date,
@@ -1802,7 +2701,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 evidence_meta={
                     "symbol": symbol,
                     "requested_as_of": curr_date,
-                    "retrieved_at": self._sina_retrieved_at(),
+                    "retrieved_at": retrieved_at,
                     "source": "ths_instant_snapshot",
                     "source_family": "ths",
                     "algorithm_group": "new_algorithm_group",
@@ -1813,28 +2712,15 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     "as_of": curr_date,
                     "actual_as_of": curr_date,
                     "status": "available",
-                    "consensus": consensus,
+                    "selection": selection,
+                    "consensus": selection,
+                    "consensus_audit": consensus_audit,
                     "reason": "同花顺即时资金流净额是总净额，未将其等同于新浪历史 r0_net 主力序列",
                 },
             )
-            return _attach_chain(snapshot, "ths_instant_snapshot")
+            return snapshot, None
         except Exception as exc:
-            errors.append(f"stock_fund_flow_individual: {type(exc).__name__}")
-
-        gap_reason = "东财 AkShare/东财直连/新浪历史/同花顺即时资金流净额快照均失败"
-        if errors:
-            gap_reason = f"{gap_reason}；{'；'.join(errors)}"
-        gap = build_provider_text(
-            f"【数据获取失败】个股资金流向数据获取失败（东财 AkShare/东财直连/新浪历史/同花顺即时资金流净额快照均失败：{'；'.join(errors)}）",
-            symbol=symbol,
-            requested_as_of=curr_date,
-            source="fund_flow_individual",
-            reason=gap_reason,
-            field="r0_net",
-            raw_unit="元",
-            failure_category="source_unavailable",
-        )
-        return _attach_chain(gap, "unavailable")
+            return None, f"stock_fund_flow_individual: {type(exc).__name__}"
 
     def _fetch_eastmoney_direct_fund_flow(
         self,
@@ -1923,6 +2809,14 @@ class CnAkshareProvider(BaseMarketDataProvider):
         data = payload.get("data")
         if not isinstance(data, dict):
             return None, "eastmoney_direct: data_missing_or_invalid"
+        returned_code = data.get("code")
+        if returned_code is not None:
+            code_match = re.search(r"(?<!\d)(\d{6})(?!\d)", str(returned_code))
+            if code_match is None or code_match.group(1) != code.zfill(6):
+                return None, (
+                    "eastmoney_direct: symbol_mismatch "
+                    f"(requested={code}; returned={returned_code!r})"
+                )
         klines = data.get("klines")
         if not isinstance(klines, (list, tuple)):
             return None, "eastmoney_direct: klines_missing_or_invalid"
@@ -2235,18 +3129,25 @@ class CnAkshareProvider(BaseMarketDataProvider):
             return None
         latest_day = pd.to_datetime(df_recent["日期"], errors="coerce").max()
         latest_str = latest_day.date().isoformat() if pd.notna(latest_day) else curr_date
+        series_label = "主力资金" if any(record.get("r0_net") is not None for record in evidence) else "总资金"
         header = (
-            f"【备用数据源：新浪历史/收盘数据】{symbol} 近{len(df_recent)}日主力资金净流向"
+            f"【备用数据源：新浪历史/收盘数据】{symbol} 近{len(df_recent)}日{series_label}净流向"
             f"（截至于 {curr_date}，最新数据日 {latest_str}，单位：亿元）：\n"
             f"{df_recent.to_string(index=False)}"
         )
         if not has_sub_orders:
             header += "\n（新浪历史接口未提供超大单/大单/中单/小单明细）"
-        consensus = build_consensus_evidence(
+        audit_field = "r0_net" if any(record.get("r0_net") is not None for record in evidence) else "netamount"
+        consensus_audit = build_consensus_evidence(
             evidence,
             symbol=symbol,
             requested_as_of=curr_date,
-            field="r0_net",
+            field=audit_field,
+        )
+        selection = select_fund_flow_source(
+            evidence,
+            symbol=symbol,
+            requested_as_of=curr_date,
         )
         return FundFlowText(
             header,
@@ -2260,7 +3161,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 "source_family": "sina_web",
                 "unit": "亿元",
                 "status": "available" if len(evidence) >= _SINA_HIST_FUND_FLOW_SHOW else "partial",
-                "consensus": consensus,
+                "selection": selection,
+                "consensus": selection,
+                "consensus_audit": consensus_audit,
             },
         )
 
@@ -2346,9 +3249,16 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 )
                 return FundFlowText(str(value), evidence=evidence, evidence_meta=metadata)
             # THS instant ``净额`` is total-net, while EM's value is r0_net;
-            # retain both raw sources but never place them in one consensus field.
+            # retain both raw sources but let the selector choose one field by
+            # source priority rather than averaging unlike semantics.
             all_records = evidence + ths_records
-            metadata["consensus"] = build_consensus_evidence(
+            metadata["selection"] = select_fund_flow_source(
+                all_records,
+                symbol=symbol,
+                requested_as_of=curr_date,
+            )
+            metadata["consensus"] = metadata["selection"]
+            metadata["consensus_audit"] = build_consensus_evidence(
                 evidence,
                 symbol=symbol,
                 requested_as_of=curr_date,
@@ -2493,6 +3403,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
             return None
         latest_day = pd.to_datetime(df_recent[date_col], errors="coerce").max()
         latest_str = latest_day.date().isoformat() if pd.notna(latest_day) else curr_date
+        requested_iso = parse_yyyymmdd(curr_date)
+        requested_iso_text = requested_iso.isoformat() if requested_iso is not None else str(curr_date)
+        if require_curr_date and latest_str != requested_iso_text:
+            return (
+                f"【数据获取失败】东方财富资金流缺少请求日 {curr_date} 的有效收盘行，"
+                f"最新可用日期为 {latest_str}，{symbol} 本项不可用。"
+            )
         retrieved_at = self._sina_retrieved_at()
         evidence_frame = df_recent.copy()
         evidence_frame[value_col] = evidence_frame["__r0_net_raw"]
@@ -2509,7 +3426,13 @@ class CnAkshareProvider(BaseMarketDataProvider):
             retrieved_at=retrieved_at,
             source=source,
         )
-        consensus = build_consensus_evidence(
+        consensus_audit = build_consensus_evidence(
+            evidence,
+            symbol=symbol,
+            requested_as_of=curr_date,
+            field="r0_net",
+        )
+        selection = select_fund_flow_source(
             evidence,
             symbol=symbol,
             requested_as_of=curr_date,
@@ -2546,7 +3469,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 "as_of": latest_str,
                 "actual_as_of": latest_str,
                 "status": "available" if source == "eastmoney_direct" else "partial",
-                "consensus": consensus,
+                "selection": selection,
+                "consensus": selection,
+                "consensus_audit": consensus_audit,
                 "reason": reason,
             },
         )

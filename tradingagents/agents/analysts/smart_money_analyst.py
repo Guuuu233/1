@@ -4,8 +4,8 @@ import asyncio
 import json
 
 from tradingagents.dataflows.fund_flow_evidence import (
-    build_consensus_evidence,
     consensus_prompt_instruction,
+    select_fund_flow_source,
     validate_model_summary,
 )
 
@@ -73,41 +73,55 @@ def create_smart_money_analyst(llm, data_collector=None):
             fund_flow, lhb, volume = results
             fund_flow_evidence = {}
 
-        consensus = {}
+        selection: dict = {}
         if isinstance(fund_flow_evidence, dict):
-            consensus = fund_flow_evidence.get("consensus") or {}
-        if not consensus and isinstance(fund_flow_evidence, dict):
-            records = fund_flow_evidence.get("records") or []
-            if records:
-                consensus = build_consensus_evidence(
-                    records,
-                    symbol=ticker,
-                    requested_as_of=current_date,
-                )
-                fund_flow_evidence["consensus"] = consensus
+            selection = fund_flow_evidence.get("selection") or {}
+            if not isinstance(selection, dict) or "selected_source" not in selection:
+                legacy_consensus = fund_flow_evidence.get("consensus") or {}
+                if isinstance(legacy_consensus, dict) and "selected_source" in legacy_consensus:
+                    selection = legacy_consensus
+        if not isinstance(selection, dict) or "selected_source" not in selection:
+            records = fund_flow_evidence.get("records") or [] if isinstance(fund_flow_evidence, dict) else []
+            selection = select_fund_flow_source(
+                records,
+                symbol=ticker,
+                requested_as_of=current_date,
+            )
+            if isinstance(fund_flow_evidence, dict):
+                fund_flow_evidence["selection"] = selection
+                fund_flow_evidence["consensus"] = selection
+        consensus = selection
         evidence_text = json.dumps(fund_flow_evidence, ensure_ascii=False, sort_keys=True)
-        consensus_instruction = consensus_prompt_instruction(consensus)
+        consensus_instruction = consensus_prompt_instruction(selection)
         validation = (
             fund_flow_evidence.get("validation", {})
             if isinstance(fund_flow_evidence, dict)
             else {}
         )
+        selection_allowed = bool(
+            isinstance(selection, dict)
+            and selection.get("status") in {"selected", "consensus"}
+            and selection.get("direction_allowed")
+            and selection.get("selected_source")
+            and selection.get("selected_field")
+            and selection.get("selected_value") is not None
+            and isinstance(selection.get("hard_guard"), dict)
+            and not selection.get("hard_guard", {}).get("blocked")
+        )
         consensus_blocked = bool(
-            not isinstance(consensus, dict)
-            or consensus.get("status") != "consensus"
-            or not consensus.get("direction_allowed")
-            or consensus.get("hard_guard", {}).get("blocked")
+            not selection_allowed
             or validation.get("status") in {"blocked", "mismatch"}
             or validation.get("hard_guard", {}).get("blocked")
         )
         consensus_guard = {
             "blocked": consensus_blocked,
             "direction_allowed": not consensus_blocked,
-            "status": consensus.get("status", "not_checked") if isinstance(consensus, dict) else "not_checked",
-            "consensus": consensus,
+            "status": selection.get("status", "not_checked") if isinstance(selection, dict) else "not_checked",
+            "selection": selection,
+            "consensus": selection,
             "validation": validation,
             "reason": (validation or {}).get("hard_guard", {}).get("reason")
-            or (consensus or {}).get("reason", "fund-flow consensus unavailable"),
+            or (selection or {}).get("reason", "fund-flow source selection unavailable"),
         }
         messages = [
             SystemMessage(content=(
@@ -120,7 +134,7 @@ def create_smart_money_analyst(llm, data_collector=None):
                 "不得将其视为新浪历史 netamount/r0_net 同口径的主力序列。\n\n"
                 f"【资金流数据（来源、日期与口径见数据）】\n{fund_flow}\n\n"
                 f"【资金流结构化 evidence（仅用于精确累计，不得从展示文本反推）】\n{evidence_text}\n\n"
-                f"【新算法组共识规则】\n{consensus_instruction}\n\n"
+                f"【资金流来源选择与方向规则】\n{consensus_instruction}\n\n"
                 f"【龙虎榜数据】\n{lhb}\n\n"
                 f"【成交量指标(vwma)】\n{volume}"
             )),
@@ -193,24 +207,44 @@ def create_smart_money_analyst(llm, data_collector=None):
         if isinstance(market_data_context, dict):
             fund_flow_evidence = market_data_context.get("fund_flow_evidence", fund_flow_evidence)
         if isinstance(fund_flow_evidence, dict) and fund_flow_evidence.get("records"):
-            fund_flow_evidence["validation"] = validate_model_summary(
-                fund_flow_evidence.get("records", []), full_content, window_days=5
-            )
-            if not fund_flow_evidence.get("consensus"):
-                fund_flow_evidence["consensus"] = build_consensus_evidence(
+            current_selection = fund_flow_evidence.get("selection")
+            if not isinstance(current_selection, dict) or "selected_source" not in current_selection:
+                current_selection = select_fund_flow_source(
                     fund_flow_evidence.get("records", []),
                     symbol=ticker,
                     requested_as_of=current_date,
                 )
+                fund_flow_evidence["selection"] = current_selection
+            selection = current_selection
+            selected_field = selection.get("selected_field")
+            selected_source = selection.get("selected_source")
+            validation_window = int(selection.get("selected_window_days") or 5)
+            fund_flow_evidence["validation"] = validate_model_summary(
+                fund_flow_evidence.get("records", []),
+                full_content,
+                window_days=validation_window,
+                selected_field=selected_field,
+                selected_source=selected_source,
+                requested_as_of=current_date,
+            )
+            fund_flow_evidence["consensus"] = current_selection
             if isinstance(market_data_context, dict):
                 market_data_context["fund_flow_evidence"] = fund_flow_evidence
-            consensus = fund_flow_evidence.get("consensus") or consensus
+            selection = current_selection
+            consensus = selection
             validation = fund_flow_evidence.get("validation", validation)
+            selection_allowed = bool(
+                isinstance(selection, dict)
+                and selection.get("status") in {"selected", "consensus"}
+                and selection.get("direction_allowed")
+                and selection.get("selected_source")
+                and selection.get("selected_field")
+                and selection.get("selected_value") is not None
+                and isinstance(selection.get("hard_guard"), dict)
+                and not selection.get("hard_guard", {}).get("blocked")
+            )
             consensus_blocked = bool(
-                not isinstance(consensus, dict)
-                or consensus.get("status") != "consensus"
-                or not consensus.get("direction_allowed")
-                or consensus.get("hard_guard", {}).get("blocked")
+                not selection_allowed
                 or validation.get("status") in {"blocked", "mismatch"}
                 or validation.get("hard_guard", {}).get("blocked")
             )
@@ -218,8 +252,14 @@ def create_smart_money_analyst(llm, data_collector=None):
             full_content = "主力资金分析生成异常（输出退化），本项不可用"
         if consensus_blocked:
             full_content = (
-                "资金流新算法组共识不可用或存在口径冲突；已阻断增持、减持、吸筹方向摘要。"
-                "请保留各来源原值，待同一股票、日期、窗口、单位和字段可比后复核。"
+                "资金流来源选择不可用或结构化累计存在冲突；已阻断增持、减持、吸筹方向摘要。"
+                "请保留各来源原值，待日期、窗口、单位和字段语义校验通过后复核。"
+            )
+        elif isinstance(selection, dict) and selection.get("legacy_reference"):
+            full_content = (
+                "⚠️ legacy_web_algorithm：以下方向仅来自新浪旧 Web 算法，"
+                "仅供参考，不得视为 Eastmoney/THS 新算法结论。\n"
+                + full_content
             )
         _elapsed = _time.monotonic() - _t0
         _meta = getattr(_last_chunk, "response_metadata", {}) or {}
@@ -239,9 +279,31 @@ def create_smart_money_analyst(llm, data_collector=None):
         consensus_guard.update({
             "blocked": consensus_blocked,
             "direction_allowed": not consensus_blocked,
+            "status": selection.get("status", "not_checked") if isinstance(selection, dict) else "not_checked",
             "validation": validation,
+            "selection": selection,
             "consensus": consensus,
         })
+        if isinstance(selection, dict):
+            for key in (
+                "selected_source",
+                "selected_source_family",
+                "selected_algorithm_group",
+                "selected_field",
+                "selected_value",
+                "selected_unit",
+                "selected_direction",
+                "selected_as_of",
+                "selected_period_kind",
+                "selected_time_window",
+                "selected_window_days",
+                "fallback_rank",
+                "legacy_reference",
+                "legacy_web_algorithm",
+                "selection_reason",
+            ):
+                if key in selection:
+                    consensus_guard[key] = selection[key]
         return {
             "smart_money_report": full_content,
             "fund_flow_consensus_guard": consensus_guard,

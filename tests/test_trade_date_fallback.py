@@ -105,7 +105,8 @@ def test_normalize_hard_fails_when_calendar_unavailable():
     def _boom():
         raise RuntimeError("network down")
 
-    with patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=_boom):
+    with patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=_boom), \
+         patch.object(tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=_boom):
         with pytest.raises(tc.TradeCalendarUnavailableError) as ei:
             tc.normalize_to_trading_day("2026-07-26")
     assert "交易日历不可用" in str(ei.value)
@@ -249,6 +250,10 @@ def test_fetch_fallback_calendar_unavailable_message():
     with patch.object(
         tc,
         "_fetch_cn_trade_dates_from_akshare",
+        side_effect=RuntimeError("down"),
+    ), patch.object(
+        tc,
+        "_fetch_cn_trade_dates_from_fuyao",
         side_effect=RuntimeError("down"),
     ):
         result = tc.fetch_with_date_fallback(lambda d: d, "2026-07-29", max_back=3)
@@ -411,7 +416,8 @@ def test_get_lhb_detail_rolls_back_until_market_table_available():
 
 def test_is_cn_trading_day_hard_fails_without_explicit_fallback():
     tc.clear_cn_trade_date_cache()
-    with patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=RuntimeError("down")):
+    with patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=RuntimeError("down")), \
+         patch.object(tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=RuntimeError("down")):
         with pytest.raises(tc.TradeCalendarUnavailableError):
             tc.is_cn_trading_day("2026-07-26")
 
@@ -420,7 +426,8 @@ def test_is_cn_trading_day_soft_fallback_requires_explicit_true(caplog):
     import logging
 
     tc.clear_cn_trade_date_cache()
-    with patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=RuntimeError("down")):
+    with patch.object(tc, "_fetch_cn_trade_dates_from_akshare", side_effect=RuntimeError("down")), \
+         patch.object(tc, "_fetch_cn_trade_dates_from_fuyao", side_effect=RuntimeError("down")):
         with caplog.at_level(logging.WARNING):
             assert tc.is_cn_trading_day("2026-07-28", allow_weekday_fallback=True) is True  # Tuesday
             assert tc.is_cn_trading_day("2026-07-26", allow_weekday_fallback=True) is False  # Sunday
