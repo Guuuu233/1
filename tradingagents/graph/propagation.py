@@ -21,13 +21,13 @@ from .data_collector import default_market_data_context
 
 
 def default_fund_flow_consensus_guard() -> Dict[str, Any]:
-    """Return the serialized fail-closed fund-flow contract."""
+    """Return the serialized fail-closed fund-flow source-selection contract."""
     return {
         "blocked": True,
         "direction_allowed": False,
         "status": "not_checked",
         "validation": {"status": "not_checked", "hard_guard": {"blocked": True}},
-        "reason": "fund-flow consensus not checked",
+        "reason": "fund-flow source selection not checked",
     }
 
 

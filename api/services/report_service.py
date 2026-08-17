@@ -444,15 +444,66 @@ def _validate_fund_flow_evidence(result_data: Dict[str, Any]) -> None:
                     if isinstance(item_context, dict) and isinstance(item_context.get("fund_flow_evidence"), dict):
                         contexts.append(item_context["fund_flow_evidence"])
     for context in contexts:
-        guard = context.get("consensus") or context.get("fund_flow_consensus_guard")
-        if isinstance(guard, dict) and guard.get("blocked") is False:
-            continue
+        # Selection supersedes the historical median/MAD consensus envelope;
+        # retain the latter only as an audit field for older reports.
+        guard = (
+            context.get("selection")
+            or context.get("consensus")
+            or context.get("fund_flow_consensus_guard")
+        )
+        hard_guard = guard.get("hard_guard", {}) if isinstance(guard, dict) else {}
+        hard_guard_valid = (
+            isinstance(guard, dict)
+            and ("hard_guard" not in guard or isinstance(hard_guard, dict))
+        )
+        top_level_allowed = (
+            isinstance(guard, dict)
+            and guard.get("blocked") is False
+            and guard.get("direction_allowed") is True
+            and hard_guard_valid
+            and not (isinstance(hard_guard, dict) and hard_guard.get("blocked"))
+        )
+        selection_allowed = (
+            isinstance(guard, dict)
+            and guard.get("status") in {"selected", "consensus"}
+            and guard.get("direction_allowed") is True
+            and isinstance(hard_guard, dict)
+            and hard_guard.get("blocked") is False
+        )
+        guard_allowed = top_level_allowed or selection_allowed
+        is_selection = isinstance(guard, dict) and "selected_source" in guard
+        if guard_allowed and is_selection:
+            selected_unit = guard.get("selected_unit") or context.get("selected_unit")
+            if selected_unit is not None and selected_unit != "亿元":
+                raise ValueError("selected fund-flow unit must be 亿元")
+            selected_source = guard.get("selected_source") or context.get("selected_source")
+            selected_field = guard.get("selected_field") or context.get("selected_field")
+            if not selected_source or not selected_field:
+                raise ValueError("selected fund-flow source and field are required")
+            if (
+                guard.get("selected_algorithm_group") == "legacy_web_algorithm"
+                and not (guard.get("legacy_reference") or context.get("legacy_reference"))
+            ):
+                raise ValueError("legacy fund-flow selection must be marked as reference")
         unit = context.get("unit")
         if unit is not None and unit != "亿元":
             raise ValueError("fund_flow_evidence unit must be 亿元")
         records = context.get("records")
         if records is not None and not isinstance(records, list):
             raise ValueError("fund_flow_evidence records must be an array")
+        if guard_allowed and is_selection and records:
+            selected_source = guard.get("selected_source")
+            selected_field = guard.get("selected_field")
+            if not any(
+                isinstance(record, dict)
+                and record.get("source") == selected_source
+                and (
+                    record.get("field") == selected_field
+                    or record.get(selected_field) is not None
+                )
+                for record in records
+            ):
+                raise ValueError("selected fund-flow source/field not present in records")
         if isinstance(context.get("manual_calibration_gap"), dict):
             context.setdefault("provenance", []).append(context["manual_calibration_gap"])
         for record in records or []:

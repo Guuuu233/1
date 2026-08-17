@@ -195,8 +195,11 @@ def test_tushare_dc_ths_success_keeps_transport_and_field_semantics(monkeypatch)
     assert ths_record["net_d5_amount_raw"] == "56000"
     assert ths_record["net_d5_amount_period_kind"] == "five_day_cumulative"
     assert meta["transport_provider"] == "tushare"
-    assert meta["consensus"]["reason_code"] == "incomparable_field_semantics"
-    assert meta["consensus"]["direction_allowed"] is False
+    assert meta["consensus"]["selected_source"] == "tushare_eastmoney_moneyflow_dc"
+    assert meta["consensus"]["selected_field"] == "r0_net"
+    assert meta["consensus"]["direction_allowed"] is True
+    assert meta["consensus"]["alternative_sources"][0]["source"] == "tushare_ths_moneyflow_ths"
+    assert meta["consensus_audit"]["reason_code"] == "incomparable_field_semantics"
 
 
 def test_tushare_token_missing_is_typed_and_does_not_call_network(monkeypatch):
@@ -348,6 +351,10 @@ def test_tushare_failure_then_legacy_reference_is_explicit(monkeypatch):
         for failure in tushare_meta["tushare_failures"]
     )
     assert "新浪旧 Web 参考值" in out
+    assert out.fund_flow_evidence_meta["selected_source"] == "sina_historical"
+    assert out.fund_flow_evidence_meta["selection_reason"] == "no_new_algorithm_source_legacy_fallback"
+    assert out.fund_flow_evidence_meta["legacy_reference"] is True
+    assert out.fund_flow_evidence_meta["direction_allowed"] is True
 
 
 def test_individual_fund_flow_direct_eastmoney_success_is_structured_and_typed(
@@ -410,10 +417,12 @@ def test_individual_fund_flow_direct_eastmoney_success_is_structured_and_typed(
     meta = out.fund_flow_evidence_meta
     assert meta["source"] == "eastmoney_direct"
     assert meta["final_source"] == "eastmoney_direct"
-    assert meta["status"] == "data_conflict"
-    assert meta["direction"] == "blocked"
-    assert meta["direction_allowed"] is False
-    assert meta["hard_guard"]["blocked"] is True
+    assert meta["status"] == "selected"
+    assert meta["selected_source"] == "eastmoney_direct"
+    assert meta["selected_field"] == "r0_net"
+    assert meta["direction"] == "inflow"
+    assert meta["direction_allowed"] is True
+    assert meta["hard_guard"]["blocked"] is False
     assert meta["attempted_sources"] == [
         "akshare.stock_individual_fund_flow",
         "eastmoney_direct",
@@ -687,13 +696,13 @@ def test_direct_failure_keeps_chain_and_falls_back_to_ths(
     assert meta["attempted_sources"] == [
         "akshare.stock_individual_fund_flow",
         "eastmoney_direct",
-        "sina_historical",
         "ths_instant_snapshot",
     ]
     assert expected_error in meta["fallback_errors"] or any(
         expected_error in error for error in meta["fallback_errors"]
     )
-    assert "sina historical fund flow: ConnectionError" in meta["fallback_errors"]
+    assert "sina_historical" not in meta["attempted_sources"]
+    assert "stock_fund_flow_individual" not in meta["fallback_errors"]
     assert "stock_individual_fund_flow: ConnectionError" in meta["em_typed_gap"]
 
 
@@ -809,6 +818,93 @@ def test_invalid_curr_date_returns_structured_provider_gap(curr_date):
     assert meta["direction_allowed"] is False
 
 
+def test_stale_akshare_current_row_falls_through_to_current_ths_snapshot(
+    monkeypatch, trading_day
+):
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    today = cn_today_str()
+    stale = (pd.Timestamp(today) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.return_value = pd.DataFrame(
+        {"日期": [stale], "主力净流入-净额": ["100000000"]}
+    )
+    ak.stock_fund_flow_individual.return_value = _current_day_ths()
+    provider = CnAkshareProvider()
+    provider._ak = lambda: ak
+
+    with patch("requests.get", side_effect=ConnectionError("direct down")):
+        out = provider.get_individual_fund_flow("600519", curr_date=today)
+
+    assert out.fund_flow_evidence_meta["final_source"] == "ths_instant_snapshot"
+    assert out.fund_flow_evidence_meta["selected_as_of"] == today
+    assert "eastmoney_individual_fund_flow" not in out.fund_flow_evidence_meta["attempted_sources"]
+
+
+def test_future_fund_flow_date_is_rejected_before_live_sources(monkeypatch):
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    provider = CnAkshareProvider()
+    with patch("requests.get") as mock_get, patch("requests.post") as mock_post:
+        out = provider.get_individual_fund_flow("600519", curr_date="2099-01-01")
+
+    assert out.fund_flow_evidence_meta["failure_category"] == "validation"
+    assert out.fund_flow_evidence_meta["direction_allowed"] is False
+    assert mock_get.call_count == 0
+    assert mock_post.call_count == 0
+
+
+def test_legacy_netamount_only_row_keeps_its_own_direction(monkeypatch):
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
+    provider = CnAkshareProvider()
+    provider._ak = lambda: ak
+    legacy_rows = [{"opendate": "2026-08-14", "netamount": "-200000000"}]
+    with patch(
+        "requests.get",
+        side_effect=[ConnectionError("direct down"), _EastmoneyResponse(legacy_rows)],
+    ):
+        out = provider.get_individual_fund_flow("600519", curr_date="2026-08-14")
+
+    assert out.fund_flow_evidence_meta["final_source"] == "sina_historical"
+    assert out.fund_flow_evidence_meta["selected_field"] == "netamount"
+    assert out.fund_flow_evidence_meta["direction"] == "outflow"
+    assert out.fund_flow_evidence_meta["direction_allowed"] is True
+    assert out.fund_flow_evidence_meta["legacy_reference"] is True
+
+
+def test_tushare_ths_daily_row_does_not_require_optional_d5(monkeypatch):
+    monkeypatch.setenv("TUSHARE_TOKEN", "configured")
+    payload = _tushare_payload("moneyflow_ths")
+    d5_index = payload["data"]["fields"].index("net_d5_amount")
+    payload["data"]["fields"].pop(d5_index)
+    payload["data"]["items"][0].pop(d5_index)
+    provider = CnAkshareProvider()
+    with patch("requests.post", return_value=_TushareResponse(payload)):
+        out, errors, _meta = provider._fetch_tushare_fund_flow(
+            "600519", "2026-08-14"
+        )
+
+    assert errors == []
+    assert out is not None
+    ths_record = next(record for record in out.fund_flow_evidence if "netamount" in record)
+    assert ths_record["netamount"] == "1.2"
+    assert "net_d5_amount" not in ths_record
+
+
+def test_direct_data_code_mismatch_is_rejected(trading_day):
+    provider = CnAkshareProvider()
+    payload = _direct_payload(_DIRECT_KLINE)
+    payload["data"]["code"] = "000001"
+    response = _EastmoneyResponse(payload)
+    with patch("requests.get", return_value=response):
+        _text, error = provider._fetch_eastmoney_direct_fund_flow(
+            "600519", "2026-08-14", pd.Timestamp("2026-08-14").date(), require_curr_date=True
+        )
+
+    assert error is not None
+    assert "symbol_mismatch" in error
+
+
 def test_board_fund_flow_falls_back_to_ths_when_em_fails():
     ths_df = pd.DataFrame(
         {
@@ -907,10 +1003,12 @@ def test_individual_fund_flow_nonempty_invalid_em_falls_back_with_typed_ths_evid
     assert out.fund_flow_evidence
     assert out.fund_flow_evidence[0]["source"] == "ths_instant_snapshot"
     assert out.fund_flow_evidence_meta["source"] == "ths_instant_snapshot"
-    assert out.fund_flow_evidence_meta["status"] == "data_conflict"
-    assert out.fund_flow_evidence_meta["direction"] == "blocked"
-    assert out.fund_flow_evidence_meta["direction_allowed"] is False
-    assert out.fund_flow_evidence_meta["hard_guard"]["blocked"] is True
+    assert out.fund_flow_evidence_meta["status"] == "selected"
+    assert out.fund_flow_evidence_meta["selected_source"] == "ths_instant_snapshot"
+    assert out.fund_flow_evidence_meta["selected_field"] == "netamount"
+    assert out.fund_flow_evidence_meta["direction"] == "inflow"
+    assert out.fund_flow_evidence_meta["direction_allowed"] is True
+    assert out.fund_flow_evidence_meta["hard_guard"]["blocked"] is False
     ak.stock_fund_flow_individual.assert_called_once_with(symbol="即时")
 
 

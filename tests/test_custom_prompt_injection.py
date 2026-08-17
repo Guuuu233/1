@@ -41,6 +41,7 @@ from tests.fund_flow_fixtures import (
     blocked_fund_flow_consensus_guard,
     direction_disallowed_fund_flow_consensus_guard,
     mismatched_fund_flow_consensus_guard,
+    single_source_fund_flow_selection_guard,
     valid_fund_flow_consensus_guard,
 )
 
@@ -1087,6 +1088,62 @@ def test_downstream_nodes_fail_closed_for_invalid_fund_flow_guards(role, guard_c
         "risk_manager": "final_trade_decision",
     }[role]
     assert "guard 已阻断" in result[result_key]
+
+
+@pytest.mark.parametrize("role", ("research_manager", "trader", "risk_manager"))
+def test_downstream_nodes_allow_single_new_source_selection(role):
+    import asyncio
+
+    from tradingagents.agents.managers.research_manager import create_research_manager
+    from tradingagents.agents.managers.risk_manager import create_risk_manager
+    from tradingagents.agents.trader.trader import create_trader
+
+    state = _make_graph_state()
+    state["fund_flow_consensus_guard"] = single_source_fund_flow_selection_guard()
+    prompts: list[object] = []
+    llm = MagicMock()
+
+    async def _astream(prompt, **_kwargs):
+        prompts.append(prompt)
+        content = RISK_MANAGER_RESPONSE if role == "risk_manager" else "单一高优先级来源方向可用，继续执行。"
+        yield MagicMock(content=content)
+
+    llm.astream = _astream
+    memory = MagicMock()
+    memory.get_memories.return_value = []
+    if role == "research_manager":
+        node = create_research_manager(llm, memory, custom_prompt="", placement="after_data")
+    elif role == "trader":
+        state.update(
+            {
+                "company_of_interest": "600519",
+                "investment_plan": "研究经理给交易员下发的投资方案",
+                "trader_investment_plan": "",
+                "instrument_context": {},
+                "market_context": {},
+                "user_context": {},
+                "risk_feedback_state": {},
+            }
+        )
+        node = create_trader(llm, memory, custom_prompt="", placement="after_data")
+    else:
+        state.update(
+            {
+                "company_of_interest": "600519",
+                "trader_investment_plan": "交易员方案",
+                "risk_debate_state": _make_risk_debate_state(),
+                "instrument_context": {},
+                "market_context": {},
+                "user_context": {},
+            }
+        )
+        node = create_risk_manager(llm, memory, custom_prompt="", placement="after_data")
+
+    result = asyncio.run(node(state))
+    assert prompts, f"{role} must not reimpose a two-source gate"
+    returned_guard = result.get("fund_flow_consensus_guard", {})
+    assert returned_guard.get("blocked") is not True
+    assert returned_guard.get("direction_allowed") is not False
 
 
 def test_T23_risk_manager_injection_position_after_data():
