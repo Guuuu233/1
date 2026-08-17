@@ -1594,9 +1594,14 @@ class CnAkshareProvider(BaseMarketDataProvider):
     ) -> tuple[object | None, str | None, str | None, bool]:
         import requests as _requests
 
+        url = (
+            os.getenv("TUSHARE_API_URL", "").strip()
+            or os.getenv("TUSHARE_BASE_URL", "").strip()
+            or _TUSHARE_FUND_FLOW_URL
+        )
         try:
             response = _requests.post(
-                _TUSHARE_FUND_FLOW_URL,
+                url,
                 json=payload,
                 timeout=_TUSHARE_FUND_FLOW_TIMEOUT,
             )
