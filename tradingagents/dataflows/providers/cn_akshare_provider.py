@@ -215,6 +215,8 @@ _EASTMONEY_DIRECT_FIELD_MAPPING = {
 _EASTMONEY_DIRECT_DISCOVERY_FIELDS = tuple(
     f"f{field_number}" for field_number in range(53, 57)
 )
+_EASTMONEY_FUND_FLOW_TIMEZONE = "Asia/Shanghai"
+_EASTMONEY_FUND_FLOW_MAX_DECIMAL_ADJUSTED = 64
 _FUND_AMOUNT_TEXT_RE = re.compile(
     r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*(?:万亿|亿元|万元|亿|万)?$"
 )
@@ -229,6 +231,42 @@ def _sina_decimal(value) -> Decimal | None:
     except (InvalidOperation, TypeError, ValueError):
         return None
     return parsed if parsed.is_finite() else None
+
+
+def _eastmoney_fund_flow_day(value):
+    """Parse a daily fund-flow date without silently accepting string timestamps."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            return None
+        try:
+            return datetime.strptime(text, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(timestamp):
+        return None
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert(_EASTMONEY_FUND_FLOW_TIMEZONE)
+    return timestamp.date()
+
+
+def _eastmoney_fund_flow_amount(value) -> Decimal | None:
+    """Parse a finite, bounded fund-flow amount without float conversion."""
+    parsed = _sina_decimal(value)
+    if parsed is None:
+        return None
+    try:
+        if abs(parsed.adjusted()) > _EASTMONEY_FUND_FLOW_MAX_DECIMAL_ADJUSTED:
+            return None
+    except (ValueError, OverflowError):
+        return None
+    return parsed
 
 
 def _sina_amount_yi_decimal(value) -> Decimal | None:
@@ -1550,7 +1588,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 else:
                     # Invalid or out-of-range data must not terminate the chain.
                     em_text = self._format_individual_fund_flow_em(
-                        df, symbol, curr_date, cutoff
+                        df,
+                        symbol,
+                        curr_date,
+                        cutoff,
+                        require_curr_date=True,
                     )
                     em_evidence = getattr(em_text, "fund_flow_evidence", None)
                     if (
@@ -1900,17 +1942,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 malformed_rows.append(warning)
                 continue
             parts = [part.strip() for part in raw_row.split(",")]
-            day_ts = (
-                pd.to_datetime(parts[0], errors="coerce")
-                if parts
-                else pd.NaT
-            )
-            if pd.isna(day_ts):
+            day = _eastmoney_fund_flow_day(parts[0]) if parts else None
+            if day is None:
                 warning = f"row {row_index}: invalid_date"
                 warnings.append(warning)
                 malformed_rows.append(warning)
                 continue
-            day = day_ts.date()
             if day > cutoff_date:
                 # Future rows are deliberately ignored, not rendered or used.
                 continue
@@ -1935,7 +1972,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 warnings.append(warning)
                 malformed_rows.append(warning)
                 continue
-            if _sina_decimal(parts[1]) is None:
+            if _eastmoney_fund_flow_amount(parts[1]) is None:
                 warning = f"row {row_index}: invalid_f52"
                 warnings.append(warning)
                 malformed_rows.append(warning)
@@ -2004,6 +2041,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             curr_date,
             cutoff,
             source="eastmoney_direct",
+            require_curr_date=True,
         )
         evidence = getattr(formatted, "fund_flow_evidence", None)
         if formatted is None or not isinstance(evidence, list) or not evidence:
@@ -2012,8 +2050,16 @@ class CnAkshareProvider(BaseMarketDataProvider):
         evidence = [dict(record) for record in evidence]
         for record in evidence:
             raw_fields = dict(discovery_by_date.get(record.get("date"), {}))
+            missing_fields = [
+                field
+                for field in _EASTMONEY_DIRECT_DISCOVERY_FIELDS
+                if field not in raw_fields
+            ]
             record["vendor_raw_fields"] = raw_fields
-            record["vendor_raw_field_status"] = "discovery_only"
+            record["vendor_raw_field_status"] = (
+                "discovery_only" if raw_fields else "not_returned"
+            )
+            record["vendor_raw_fields_missing"] = missing_fields
             record["vendor_raw_field_units"] = {
                 field: None for field in raw_fields
             }
@@ -2029,6 +2075,10 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 },
                 "discovery_only_fields": list(
                     _EASTMONEY_DIRECT_DISCOVERY_FIELDS
+                ),
+                "discovery_field_status_policy": (
+                    "per-record vendor_raw_field_status and "
+                    "vendor_raw_fields_missing"
                 ),
                 "discovery_field_unit_policy": "raw preserved; no normalization",
                 "status": "available",
@@ -2327,21 +2377,21 @@ class CnAkshareProvider(BaseMarketDataProvider):
         cutoff,
         *,
         source: str = "eastmoney_individual_fund_flow",
+        require_curr_date: bool = False,
     ) -> str | None:
         """Format the Eastmoney per-day fund-flow series truncated to curr_date.
 
-        Returns evidence-bearing ``FundFlowText`` only when usable records
-        remain on or before ``curr_date``.  When nothing usable remains
-        (``curr_date`` is outside the ~120-trading-day window or dates/amounts
-        are unusable), it may return an ordinary failure string or ``None``;
-        the caller must keep the failure detail and continue its fallback chain.
+        Returns evidence-bearing ``FundFlowText`` only when all rows on or
+        before ``curr_date`` satisfy the daily date, trading-day, duplicate,
+        and finite-amount contract.  Future rows are ignored.  When
+        ``require_curr_date`` is true, the requested date must be present;
+        validation failures carry structured reasons so the caller continues
+        its fallback chain instead of accepting partial evidence.
         """
         date_col = "日期" if "日期" in df.columns else None
         value_col = "主力净流入-净额" if "主力净流入-净额" in df.columns else None
         if date_col is None or value_col is None:
             return None
-
-        dates = pd.to_datetime(df[date_col], errors="coerce")
 
         def _raw_amount_text(value) -> str:
             if value is None:
@@ -2353,22 +2403,90 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 return ""
             return str(value).strip()
 
-        raw_values = df[value_col].map(_raw_amount_text)
-        values = raw_values.map(_sina_decimal)
-        valid = dates.notna() & values.map(
-            lambda value: value is not None and value.is_finite()
-        )
-        df = df.loc[valid].copy()
-        df[date_col] = dates[valid]
-        # Keep the vendor text beside the date-filtering frame.  The evidence
-        # builder must receive this text, not a float64 conversion of f52.
-        df["__r0_net_raw"] = raw_values[valid]
-        df = df[df[date_col] <= pd.Timestamp(cutoff)]
-        if df.empty:
-            return (
-                f"【数据获取失败】资金流数据仅覆盖最近约 120 个交易日，"
-                f"{curr_date} 超出可得范围，{symbol} 本项不可用。"
+        def _validation_gap(reason: str) -> FundFlowText:
+            return build_provider_text(
+                f"【数据获取失败】东方财富资金流行校验失败（{reason}）",
+                symbol=symbol,
+                requested_as_of=curr_date,
+                source=source,
+                reason=reason,
+                field="r0_net",
+                raw_unit="元",
+                failure_category="validation",
             )
+
+        work = df.reset_index(drop=True).copy()
+        kept_indices: list[int] = []
+        normalized_dates: dict[int, object] = {}
+        raw_values: dict[int, str] = {}
+        malformed_rows: list[str] = []
+        duplicate_dates: list[str] = []
+        seen_dates: set[object] = set()
+        for row_index, row in work.iterrows():
+            day = _eastmoney_fund_flow_day(row.get(date_col))
+            if day is None:
+                malformed_rows.append(f"row {row_index}: invalid_date")
+                continue
+            if day > cutoff:
+                continue
+            raw_value = _raw_amount_text(row.get(value_col))
+            if _eastmoney_fund_flow_amount(raw_value) is None:
+                malformed_rows.append(f"row {row_index}: invalid_f52")
+                continue
+            try:
+                if not is_cn_trading_day(day.isoformat()):
+                    malformed_rows.append(
+                        f"row {row_index}: non_trading_date={day.isoformat()}"
+                    )
+                    continue
+            except Exception as exc:
+                malformed_rows.append(
+                    f"row {row_index}: trade_calendar: {type(exc).__name__}"
+                )
+                continue
+            if day in seen_dates:
+                duplicate_dates.append(day.isoformat())
+                continue
+            seen_dates.add(day)
+            kept_indices.append(row_index)
+            normalized_dates[row_index] = day
+            raw_values[row_index] = raw_value
+
+        if duplicate_dates:
+            detail = "; ".join(sorted(set(duplicate_dates))[:5])
+            return _validation_gap(f"duplicate_date: {detail}")
+        if malformed_rows:
+            detail = "; ".join(malformed_rows[:5])
+            return _validation_gap(
+                f"malformed_kline_rows_on_or_before_curr_date: {detail}"
+            )
+        if not kept_indices:
+            return _validation_gap(
+                "no_usable_rows_on_or_before_curr_date; "
+                "资金流数据仅覆盖最近约 120 个交易日，requested date 超出范围"
+            )
+        requested_day = cutoff.isoformat()
+        if require_curr_date and requested_day not in {
+            normalized_dates[index].isoformat() for index in kept_indices
+        }:
+            available = ", ".join(
+                sorted(
+                    {normalized_dates[index].isoformat() for index in kept_indices}
+                )[-5:]
+            )
+            reason = (
+                "no_requested_date_row"
+                if is_historical_analysis_date(curr_date)
+                else "no_current_day_row"
+            )
+            return _validation_gap(
+                f"{reason} (requested={requested_day}; available={available})"
+            )
+
+        df = work.loc[kept_indices].copy()
+        df[date_col] = [pd.Timestamp(normalized_dates[index]) for index in kept_indices]
+        # Keep vendor text beside the frame so evidence never receives a float64 conversion.
+        df["__r0_net_raw"] = [raw_values[index] for index in kept_indices]
 
         df_recent = chronological(take_latest(df, date_col, 5), date_col)
         if df_recent is None or df_recent.empty:
@@ -2379,7 +2497,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
         evidence_frame = df_recent.copy()
         evidence_frame[value_col] = evidence_frame["__r0_net_raw"]
         evidence_frame = evidence_frame.drop(columns=["__r0_net_raw"])
-        display_frame = df_recent.drop(columns=["__r0_net_raw"])
+        display_frame = df_recent[[date_col, value_col]].copy()
+        display_rows = "\n".join(
+            f"{row[date_col]} 主力净流入-净额={row[value_col]}"
+            for _, row in display_frame.iterrows()
+        )
         evidence = build_em_evidence(
             evidence_frame,
             symbol=symbol,
@@ -2406,7 +2528,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             (
                 f"{source_prefix}{symbol} 近5日主力资金净流向"
                 f"（截至于 {curr_date}，最新数据日 {latest_str}）：\n"
-                f"{display_frame.to_string(index=False)}"
+                f"{display_rows}"
             ),
             evidence=evidence,
             evidence_meta={

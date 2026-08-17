@@ -48,6 +48,7 @@ class _EastmoneyResponse:
 # The live /fflow/kline/get response currently returns six fields, not the
 # full requested f51-f63 projection: f51 date, f52 r0_net, f53-f56 raw only.
 _DIRECT_KLINE = "2026-08-14,120000000,-10000000,-20000000,50000000,70000000"
+_DIRECT_KLINE_WITH_UNKNOWN_TAIL = f"{_DIRECT_KLINE},0.12,-0.01,12.34,unknown-tail"
 
 
 def _direct_payload(*klines, rc=0):
@@ -93,6 +94,12 @@ def test_individual_fund_flow_direct_eastmoney_success_is_structured_and_typed(
     )
     assert request_kwargs["params"]["secid"] == "1.600519"
     assert request_kwargs["params"]["klt"] == "101"
+    assert request_kwargs["params"]["lmt"] == "120"
+    assert request_kwargs["params"]["fields1"] == "f1,f2,f3,f7"
+    assert request_kwargs["headers"] == {
+        "Referer": "https://data.eastmoney.com/",
+        "User-Agent": "Mozilla/5.0",
+    }
     assert request_kwargs["params"]["fields2"].startswith(
         "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63"
     )
@@ -118,6 +125,7 @@ def test_individual_fund_flow_direct_eastmoney_success_is_structured_and_typed(
     assert "netamount" not in record
     assert record["field_semantics"]["r0_net"].startswith("主力净额")
     assert record["vendor_raw_field_status"] == "discovery_only"
+    assert record["vendor_raw_fields_missing"] == []
     assert record["vendor_raw_fields"] == {
         "f53": "-10000000",
         "f54": "-20000000",
@@ -130,6 +138,8 @@ def test_individual_fund_flow_direct_eastmoney_success_is_structured_and_typed(
         "f55": None,
         "f56": None,
     }
+    assert "f53_raw" not in out
+    assert "f54_raw" not in out
 
     meta = out.fund_flow_evidence_meta
     assert meta["source"] == "eastmoney_direct"
@@ -175,8 +185,41 @@ def test_direct_accepts_minimum_two_field_contract_without_fabricated_discovery(
     assert record["r0_net"] == "0"
     assert record["r0_net_raw"] == "0"
     assert record["vendor_raw_fields"] == {}
+    assert record["vendor_raw_field_status"] == "not_returned"
+    assert record["vendor_raw_fields_missing"] == ["f53", "f54", "f55", "f56"]
     assert record["vendor_raw_field_units"] == {}
+    assert out.fund_flow_evidence_meta["discovery_field_status_policy"].startswith(
+        "per-record"
+    )
     assert "f57" not in out.fund_flow_evidence_meta["field_mapping"]
+
+
+def test_direct_drops_unverified_trailing_fields_from_evidence_and_prompt(
+    trading_day,
+):
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+
+    with patch(
+        "requests.get",
+        return_value=_EastmoneyResponse(
+            _direct_payload(_DIRECT_KLINE_WITH_UNKNOWN_TAIL)
+        ),
+    ):
+        out = p.get_individual_fund_flow("600519", curr_date="2026-08-14")
+
+    record = out.fund_flow_evidence[0]
+    assert record["r0_net"] == "1.2"
+    assert record["vendor_raw_fields"] == {
+        "f53": "-10000000",
+        "f54": "-20000000",
+        "f55": "50000000",
+        "f56": "70000000",
+    }
+    assert "f57" not in record
+    assert "unknown-tail" not in out
 
 
 @pytest.mark.parametrize(
@@ -368,6 +411,37 @@ def test_direct_invalid_date_fails_closed_before_sina_fallback(trading_day):
     )
 
 
+def test_direct_rejects_timezone_bearing_date_input(trading_day):
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+    sina_rows = [
+        {
+            "opendate": "2026-08-14",
+            "netamount": "100000000",
+            "r0_net": "50000000",
+        }
+    ]
+
+    with patch(
+        "requests.get",
+        side_effect=[
+            _EastmoneyResponse(
+                _direct_payload("2026-08-14T23:30:00-05:00,120000000")
+            ),
+            _EastmoneyResponse(sina_rows),
+        ],
+    ):
+        out = p.get_individual_fund_flow("600519", curr_date="2026-08-14")
+
+    assert out.fund_flow_evidence_meta["final_source"] == "sina_historical"
+    assert any(
+        "invalid_date" in error
+        for error in out.fund_flow_evidence_meta["fallback_errors"]
+    )
+
+
 def test_direct_duplicate_normalized_date_is_typed_validation_gap(trading_day):
     ak = MagicMock()
     ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
@@ -470,31 +544,37 @@ def test_direct_preserves_f52_raw_decimal_text_without_float_rounding(trading_da
 
 
 @pytest.mark.parametrize(
-    "response, expected_error",
+    "response, expected_error, expected_category",
     [
         (
             _EastmoneyResponse({}, status_code=503),
             "eastmoney_direct: http_status: 503",
+            "transport",
         ),
         (
             _EastmoneyResponse({}, status_code=200),
             "eastmoney_direct: rc_missing",
+            "envelope",
         ),
         (
             _EastmoneyResponse({"rc": 0}, status_code=200),
             "eastmoney_direct: data_missing_or_invalid",
+            "envelope",
         ),
         (
             _EastmoneyResponse({"rc": 0, "data": {}}, status_code=200),
             "eastmoney_direct: klines_missing_or_invalid",
+            "envelope",
         ),
         (
             _EastmoneyResponse(text="not-json"),
             "eastmoney_direct: json_decode:",
+            "envelope",
         ),
         (
             _EastmoneyResponse(_direct_payload(_DIRECT_KLINE, rc=-1), status_code=200),
             "eastmoney_direct: rc=-1",
+            "envelope",
         ),
         (
             _EastmoneyResponse(
@@ -502,11 +582,12 @@ def test_direct_preserves_f52_raw_decimal_text_without_float_rounding(trading_da
                 status_code=200,
             ),
             "eastmoney_direct: no_usable_rows_on_or_before_curr_date",
+            "validation",
         ),
     ],
 )
 def test_direct_failure_keeps_chain_and_falls_back_to_ths(
-    response, expected_error, trading_day
+    response, expected_error, expected_category, trading_day
 ):
     ak = MagicMock()
     ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
@@ -529,8 +610,7 @@ def test_direct_failure_keeps_chain_and_falls_back_to_ths(
     assert expected_error in meta["fallback_errors"] or any(
         expected_error in error for error in meta["fallback_errors"]
     )
-    if "eastmoney_direct: rc=" in expected_error:
-        assert "envelope" in meta["failure_categories"]
+    assert expected_category in meta["failure_categories"]
     assert "sina historical fund flow: ConnectionError" in meta["fallback_errors"]
     assert "stock_individual_fund_flow: ConnectionError" in meta["em_typed_gap"]
 
@@ -566,7 +646,9 @@ def test_direct_date_mismatch_is_typed_gap_and_continues_to_current_fallback(
 
 
 
-@pytest.mark.parametrize("invalid_f52", ["", "NaN", "Infinity", "-Infinity"])
+@pytest.mark.parametrize(
+    "invalid_f52", ["", "NaN", "Infinity", "-Infinity", "1e309"]
+)
 def test_direct_invalid_f52_does_not_derive_r0_net_from_components(
     invalid_f52, trading_day
 ):
@@ -713,6 +795,114 @@ def test_individual_fund_flow_falls_back_to_ths_when_em_fails(trading_day):
     assert "资金净额: 3.61亿" in out
     assert "不是新浪历史 netamount/r0_net 同口径主力序列" in out
     assert "600519" in out
+
+
+def test_primary_historical_requires_requested_date_before_fallback(trading_day):
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.return_value = pd.DataFrame(
+        {
+            "日期": ["2026-08-13"],
+            "主力净流入-净额": ["100000000"],
+        }
+    )
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+    sina_rows = [
+        {
+            "opendate": "2026-08-14",
+            "netamount": "100000000",
+            "r0_net": "50000000",
+        }
+    ]
+
+    with patch(
+        "requests.get",
+        side_effect=[
+            ConnectionError("Direct down"),
+            _EastmoneyResponse(sina_rows),
+        ],
+    ):
+        out = p.get_individual_fund_flow("600519", curr_date="2026-08-14")
+
+    meta = out.fund_flow_evidence_meta
+    assert meta["final_source"] == "sina_historical"
+    assert meta["attempted_sources"] == [
+        "akshare.stock_individual_fund_flow",
+        "eastmoney_direct",
+        "sina_historical",
+    ]
+    assert any(
+        "stock_individual_fund_flow: formatter reason:" in error
+        and "no_requested_date_row" in error
+        for error in meta["fallback_errors"]
+    )
+    assert [row["date"] for row in out.fund_flow_evidence] == ["2026-08-14"]
+
+
+@pytest.mark.parametrize(
+    "case, dates, amounts, expected_reason",
+    [
+        (
+            "invalid_amount",
+            ["2026-08-14", "2026-08-13"],
+            ["100000000", "NaN"],
+            "invalid_f52",
+        ),
+        (
+            "duplicate_date",
+            ["2026-08-14", "2026-08-14"],
+            ["100000000", "100000001"],
+            "duplicate_date",
+        ),
+        (
+            "non_trading_date",
+            ["2026-08-14", "2026-08-13"],
+            ["100000000", "100000001"],
+            "non_trading_date=2026-08-13",
+        ),
+    ],
+)
+def test_primary_malformed_rows_fail_closed_before_fallback(
+    case, dates, amounts, expected_reason, trading_day
+):
+    del case
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.return_value = pd.DataFrame(
+        {"日期": dates, "主力净流入-净额": amounts}
+    )
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+    sina_rows = [
+        {
+            "opendate": "2026-08-14",
+            "netamount": "100000000",
+            "r0_net": "50000000",
+        }
+    ]
+    calendar = (
+        lambda day: day != "2026-08-13"
+        if expected_reason.startswith("non_trading_date")
+        else True
+    )
+
+    with patch.object(
+        cn_akshare_provider, "is_cn_trading_day", side_effect=calendar
+    ), patch(
+        "requests.get",
+        side_effect=[
+            ConnectionError("Direct down"),
+            _EastmoneyResponse(sina_rows),
+        ],
+    ):
+        out = p.get_individual_fund_flow("600519", curr_date="2026-08-14")
+
+    meta = out.fund_flow_evidence_meta
+    assert meta["final_source"] == "sina_historical"
+    assert any(
+        "stock_individual_fund_flow: formatter reason:" in error
+        and expected_reason in error
+        for error in meta["fallback_errors"]
+    )
 
 
 def test_individual_fund_flow_nonempty_invalid_em_falls_back_with_typed_ths_evidence(
