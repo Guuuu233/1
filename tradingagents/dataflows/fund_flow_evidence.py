@@ -131,6 +131,9 @@ def infer_algorithm_group(
             "dongfangcaifu",
             "东方财富",
             "ths",
+            "moneyflow_dc",
+            "moneyflow_ths",
+            "tushare",
             "tonghuashun",
             "同花顺",
         )
@@ -618,10 +621,8 @@ def _normalise_summary_record(
         return None, "unparseable_date"
     normalized = dict(record)
     normalized["date"] = date
-    normalized["period_kind"] = str(
-        record.get("period_kind") or record.get("window_kind") or record.get("period") or "historical_daily"
-    )
-    normalized["window"] = str(record.get("window") or record.get("time_window") or "1d")
+    normalized["period_kind"] = _observation_period(record)
+    normalized["window"] = _observation_window(record, normalized["period_kind"])
     fields = [field] if field else ("netamount", "r0_net", "r0_in", "r0_out", "r0")
     if field and field not in record:
         explicit = _canonical_field(record.get("field") or record.get("字段"))
@@ -830,7 +831,14 @@ def _canonical_field(value: Any) -> str | None:
 def _observation_period(record: Mapping[str, Any]) -> str:
     period = record.get("period_kind") or record.get("window_kind") or record.get("period")
     if period:
-        return str(period)
+        normalized = str(period).strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized in {"5d", "5_day", "five_day", "five_days", "five_day_total"}:
+            return "five_day_cumulative"
+        if normalized in {"daily", "day", "1d", "one_day"}:
+            return "historical_daily"
+        if normalized in {"realtime", "intraday", "intraday_snapshot", "snapshot"}:
+            return "realtime_single_day"
+        return normalized
     if record.get("realtime") is True or record.get("is_realtime") is True:
         return "realtime_single_day"
     return "historical_daily"
@@ -839,7 +847,7 @@ def _observation_period(record: Mapping[str, Any]) -> str:
 def _observation_window(record: Mapping[str, Any], period: str) -> str:
     value = record.get("time_window") or record.get("window")
     if value:
-        return str(value)
+        return _normalise_window(value)
     return "5d" if period == "five_day_cumulative" else "1d"
 
 
@@ -1134,7 +1142,7 @@ def _field_semantics_are_valid(record: Mapping[str, Any], field: str) -> bool:
         )
     if field == "r0_net":
         return "主力" in text and "净" in text and (
-            "流入" in text or "净额" in text
+            "流入" in text or "流出" in text or "净额" in text
         )
     if field == "r0_in":
         return "主力" in text and "流入" in text and "净" not in text
@@ -1149,18 +1157,24 @@ def _selection_fields(
     record: Mapping[str, Any], field: str | None
 ) -> list[tuple[str, Any, str | None]]:
     """Extract canonical candidate fields without combining their semantics."""
+    requested_field = _canonical_field(field) if field else None
     explicit_field = _canonical_field(record.get("field") or record.get("字段"))
     if explicit_field is not None and record.get("value") is not None:
-        if field and explicit_field != field:
+        if requested_field and explicit_field != requested_field:
             return []
         return [
             (
                 explicit_field,
                 record.get("value"),
-                record.get("value_unit") or record.get("unit") or record.get("raw_unit"),
+                record.get("value_unit")
+                or record.get(f"{explicit_field}_unit")
+                or record.get("unit")
+                or record.get("raw_unit"),
             )
         ]
-    ordered = [field] if field else list(_FIELD_ORDER)
+    if field and requested_field is None:
+        return []
+    ordered = [requested_field] if requested_field else list(_FIELD_ORDER)
     candidates: list[tuple[str, Any, str | None]] = []
     for candidate in ordered:
         if not candidate:
@@ -1226,7 +1240,7 @@ def _selection_candidate(
         return None, "date_mismatch"
     period = _observation_period(record)
     window = _normalise_window(_observation_window(record, period))
-    if period in {"five_day_cumulative", "five_day_aggregate", "weekly", "monthly"}:
+    if period not in {"historical_daily", "realtime_single_day"}:
         return None, "period_not_daily"
     if window != "1d":
         return None, "window_not_daily"
@@ -1271,6 +1285,11 @@ def _selection_candidate(
         # Distinguish an invalid field/unit from a structurally valid record so
         # the rejected-source chain remains useful to operators.
         return None, "field_semantics_or_value_invalid"
+    candidate_names = {candidate["field"] for candidate in candidates}
+    if {"r0_in", "r0_out"}.issubset(candidate_names) and not (
+        {"r0_net", "r0", "netamount"} & candidate_names
+    ):
+        return None, "inflow_outflow_not_net"
     return candidates[0], None
 
 
@@ -1294,17 +1313,13 @@ def _selection_group_summary(
         if previous is not None and previous["value"] != item["value"]:
             return None, "duplicate_date_conflict"
         by_date[item["date"]] = item
-    requested = candidates[0].get("requested_as_of")
-    source_label = _normalise_source_text(source)
-    if requested and source_label in {
-        "eastmoney_direct",
-        "eastmoney_individual_fund_flow",
-    } and len(by_date) == 1 and max(by_date) != requested:
-        return None, "date_mismatch"
     ordered = [by_date[key] for key in sorted(by_date)][-DEFAULT_WINDOW_DAYS:]
     if candidates[0]["period_kind"] == "realtime_single_day" and len(ordered) != 1:
         return None, "realtime_multiple_dates"
-    value = sum((item["value"] for item in ordered), Decimal("0"))
+    try:
+        value = sum((item["value"] for item in ordered), Decimal("0"))
+    except (DecimalException, OverflowError, ValueError):
+        return None, "aggregate_value_invalid"
     selected = ordered[-1]
     direction = _direction_for_field(field, value)
     selected_records = [
@@ -1379,7 +1394,14 @@ def select_fund_flow_source(
         else:
             accepted.append(candidate)
 
-    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    if not symbol and len({candidate["symbol"] for candidate in accepted}) > 1:
+        rejected.extend(
+            {"source": candidate["source"], "reason": "mixed_symbol_identity"}
+            for candidate in accepted
+        )
+        accepted = []
+
+    grouped: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
     for candidate in accepted:
         grouped.setdefault(
             (
@@ -1387,6 +1409,7 @@ def select_fund_flow_source(
                 candidate["field"],
                 candidate["period_kind"],
                 candidate["time_window"],
+                candidate["algorithm_group"],
             ),
             [],
         ).append(candidate)
@@ -1404,8 +1427,8 @@ def select_fund_flow_source(
     valid_groups.sort(
         key=lambda item: (
             item["fallback_rank"],
-            field_rank.get(item["field"], len(field_rank)),
             -int(item["as_of"].replace("-", "")),
+            field_rank.get(item["field"], len(field_rank)),
             item["source"],
         )
     )
@@ -1470,7 +1493,17 @@ def select_fund_flow_source(
     alternatives = [
         item
         for item in valid_groups
-        if item["source"] != selected["source"] or item["field"] != selected["field"]
+        if (
+            item["source"],
+            item["field"],
+            item["period_kind"],
+            item["time_window"],
+        ) != (
+            selected["source"],
+            selected["field"],
+            selected["period_kind"],
+            selected["time_window"],
+        )
     ]
     selection_reason = (
         "no_new_algorithm_source_legacy_fallback"
@@ -1878,12 +1911,12 @@ def consensus_prompt_instruction(consensus: Mapping[str, Any] | None) -> str:
 
 _MODEL_TOTAL_PATTERNS = {
     "r0_net": (
-        re.compile(r"主力(?:资金)?净(?:流入|额)[^\n。；;]{0,40}?(?:累计|合计|总计)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
-        re.compile(r"(?:累计|合计|总计)[^\n。；;]{0,20}?主力(?:资金)?净(?:流入|额)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
+        re.compile(r"主力(?:资金)?净(?:流入|流出|额)[^\n。；;]{0,40}?(?:累计|合计|总计)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
+        re.compile(r"(?:累计|合计|总计)[^\n。；;]{0,20}?主力(?:资金)?净(?:流入|流出|额)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
     ),
     "netamount": (
-        re.compile(r"(?<!主力)(?:总)?净(?:流入额|流入|额)[^\n。；;]{0,40}?(?:累计|合计|总计)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
-        re.compile(r"(?:累计|合计|总计)[^\n。；;]{0,20}?(?<!主力)(?:总)?净(?:流入额|流入|额)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
+        re.compile(r"(?<!主力)(?:总)?净(?:流入额|流出额|流入|流出|额)[^\n。；;]{0,40}?(?:累计|合计|总计)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
+        re.compile(r"(?:累计|合计|总计)[^\n。；;]{0,20}?(?<!主力)(?:总)?净(?:流入额|流出额|流入|流出|额)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
     ),
 }
 
@@ -1901,7 +1934,7 @@ def extract_model_totals(text: str | None) -> dict[str, str]:
                     # but it is not a total-net claim. Inspect the local
                     # clause instead of relying on a fixed-width lookbehind.
                     clause_start = max(
-                        (text.rfind(marker, 0, match.start()) for marker in ("。", "；", ";", "\n")),
+                        (text.rfind(marker, 0, match.start()) for marker in ("。", "；", ";", "，", ",", "\n")),
                         default=-1,
                     ) + 1
                     clause = text[clause_start:match.start()]

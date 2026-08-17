@@ -5,6 +5,7 @@ import json_repair
 import logging
 import math
 import re
+from decimal import Decimal, InvalidOperation
 from numbers import Real
 
 logger = logging.getLogger(__name__)
@@ -478,10 +479,17 @@ def _validate_fund_flow_evidence(result_data: Dict[str, Any]) -> None:
                 raise ValueError("selected fund-flow unit must be 亿元")
             selected_source = guard.get("selected_source") or context.get("selected_source")
             selected_field = guard.get("selected_field") or context.get("selected_field")
-            if not selected_source or not selected_field:
-                raise ValueError("selected fund-flow source and field are required")
+            selected_as_of = guard.get("selected_as_of") or context.get("selected_as_of")
+            selected_group = guard.get("selected_algorithm_group") or context.get("selected_algorithm_group")
+            fallback_rank = guard.get("fallback_rank")
+            if fallback_rank is None:
+                fallback_rank = context.get("fallback_rank")
+            if not selected_source or not selected_field or not selected_as_of or not selected_group:
+                raise ValueError("selected fund-flow provenance is incomplete")
+            if not isinstance(fallback_rank, int) or fallback_rank < 1:
+                raise ValueError("selected fund-flow fallback rank is required")
             if (
-                guard.get("selected_algorithm_group") == "legacy_web_algorithm"
+                selected_group == "legacy_web_algorithm"
                 and not (guard.get("legacy_reference") or context.get("legacy_reference"))
             ):
                 raise ValueError("legacy fund-flow selection must be marked as reference")
@@ -491,19 +499,51 @@ def _validate_fund_flow_evidence(result_data: Dict[str, Any]) -> None:
         records = context.get("records")
         if records is not None and not isinstance(records, list):
             raise ValueError("fund_flow_evidence records must be an array")
+        if guard_allowed and is_selection and not records:
+            raise ValueError("selected fund-flow records are required")
         if guard_allowed and is_selection and records:
             selected_source = guard.get("selected_source")
             selected_field = guard.get("selected_field")
-            if not any(
-                isinstance(record, dict)
+            matching_records = [
+                record
+                for record in records
+                if isinstance(record, dict)
                 and record.get("source") == selected_source
                 and (
                     record.get("field") == selected_field
                     or record.get(selected_field) is not None
                 )
-                for record in records
-            ):
+            ]
+            if not matching_records:
                 raise ValueError("selected fund-flow source/field not present in records")
+            values: list[Decimal] = []
+            for record in matching_records:
+                raw_value = (
+                    record.get("value")
+                    if record.get("field") == selected_field
+                    else record.get(selected_field)
+                )
+                try:
+                    value = Decimal(str(raw_value))
+                except (InvalidOperation, TypeError, ValueError):
+                    raise ValueError("selected fund-flow value is invalid") from None
+                if not value.is_finite():
+                    raise ValueError("selected fund-flow value is non-finite")
+                values.append(value)
+            try:
+                selected_value = Decimal(str(guard.get("selected_value")))
+                total_value = sum(values, Decimal("0"))
+            except (InvalidOperation, TypeError, ValueError, OverflowError):
+                raise ValueError("selected fund-flow value is invalid") from None
+            if not selected_value.is_finite() or abs(total_value - selected_value) > Decimal("0.00000001"):
+                raise ValueError("selected fund-flow value does not match records")
+            selected_direction = guard.get("selected_direction") or guard.get("direction")
+            if selected_field == "r0_out":
+                expected_direction = "outflow" if total_value > 0 else "inflow" if total_value < 0 else "neutral"
+            else:
+                expected_direction = "inflow" if total_value > 0 else "outflow" if total_value < 0 else "neutral"
+            if selected_direction != expected_direction:
+                raise ValueError("selected fund-flow direction does not match records")
         if isinstance(context.get("manual_calibration_gap"), dict):
             context.setdefault("provenance", []).append(context["manual_calibration_gap"])
         for record in records or []:

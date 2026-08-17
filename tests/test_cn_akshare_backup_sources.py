@@ -173,7 +173,6 @@ def test_tushare_dc_ths_success_keeps_transport_and_field_semantics(monkeypatch)
         "ts_code",
         "trade_date",
         "net_amount",
-        "net_d5_amount",
         "buy_sm_amount",
         "buy_md_amount",
         "buy_lg_amount",
@@ -582,10 +581,14 @@ def test_direct_rejects_non_trading_curr_date_and_continues_fallback(trading_day
     ), patch("requests.get", side_effect=ConnectionError("Sina down")):
         out = p.get_individual_fund_flow("600519", curr_date=cn_today_str())
 
-    assert "同花顺即时资金流净额快照" in out
-    assert out.fund_flow_evidence_meta["final_source"] == "ths_instant_snapshot"
+    assert "【备用数据源：同花顺即时资金流净额快照】" not in out
+    assert out.fund_flow_evidence_meta["final_source"] == "unavailable"
     assert any(
         "eastmoney_direct: curr_date_not_cn_trading_day" in error
+        for error in out.fund_flow_evidence_meta["fallback_errors"]
+    )
+    assert any(
+        "ths_instant_snapshot: curr_date_not_cn_trading_day" in error
         for error in out.fund_flow_evidence_meta["fallback_errors"]
     )
 

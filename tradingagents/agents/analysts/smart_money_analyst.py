@@ -218,10 +218,11 @@ def create_smart_money_analyst(llm, data_collector=None):
             selection = current_selection
             selected_field = selection.get("selected_field")
             selected_source = selection.get("selected_source")
+            validation_window = int(selection.get("selected_window_days") or 5)
             fund_flow_evidence["validation"] = validate_model_summary(
                 fund_flow_evidence.get("records", []),
                 full_content,
-                window_days=5,
+                window_days=validation_window,
                 selected_field=selected_field,
                 selected_source=selected_source,
                 requested_as_of=current_date,
@@ -236,6 +237,10 @@ def create_smart_money_analyst(llm, data_collector=None):
                 isinstance(selection, dict)
                 and selection.get("status") in {"selected", "consensus"}
                 and selection.get("direction_allowed")
+                and selection.get("selected_source")
+                and selection.get("selected_field")
+                and selection.get("selected_value") is not None
+                and isinstance(selection.get("hard_guard"), dict)
                 and not selection.get("hard_guard", {}).get("blocked")
             )
             consensus_blocked = bool(
@@ -288,6 +293,10 @@ def create_smart_money_analyst(llm, data_collector=None):
                 "selected_value",
                 "selected_unit",
                 "selected_direction",
+                "selected_as_of",
+                "selected_period_kind",
+                "selected_time_window",
+                "selected_window_days",
                 "fallback_rank",
                 "legacy_reference",
                 "legacy_web_algorithm",

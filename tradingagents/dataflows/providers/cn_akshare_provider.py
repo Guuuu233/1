@@ -246,8 +246,8 @@ _TUSHARE_REQUEST_FIELDS = {
         "buy_lg_amount,buy_elg_amount"
     ),
     _TUSHARE_THS_API: (
-        "ts_code,trade_date,net_amount,net_d5_amount,buy_sm_amount,"
-        "buy_md_amount,buy_lg_amount"
+        "ts_code,trade_date,net_amount,buy_sm_amount,buy_md_amount,"
+        "buy_lg_amount"
     ),
 }
 _TUSHARE_COMPONENT_FIELDS = {
@@ -2189,6 +2189,30 @@ class CnAkshareProvider(BaseMarketDataProvider):
         def _gap_reason(base_reason: str) -> str:
             return f"{base_reason}；{'；'.join(errors)}" if errors else base_reason
 
+        def _merge_side_evidence(primary: FundFlowText, side: FundFlowText) -> FundFlowText:
+            """Retain lower-priority valid evidence without changing primary text."""
+            primary_records = list(getattr(primary, "fund_flow_evidence", []) or [])
+            side_records = list(getattr(side, "fund_flow_evidence", []) or [])
+            if not side_records:
+                return primary
+            metadata = dict(getattr(primary, "fund_flow_evidence_meta", {}) or {})
+            combined = [*primary_records, *side_records]
+            selection = select_fund_flow_source(
+                combined,
+                symbol=metadata.get("symbol") or symbol,
+                requested_as_of=metadata.get("requested_as_of") or curr_date,
+            )
+            metadata["selection"] = selection
+            metadata["consensus"] = selection
+            metadata["side_evidence_sources"] = sorted(
+                {str(record.get("source")) for record in side_records if record.get("source")}
+            )
+            return FundFlowText(
+                str(primary),
+                evidence=combined,
+                evidence_meta=metadata,
+            )
+
         def _attach_chain(value: str, final_source: str) -> FundFlowText:
             evidence = list(getattr(value, "fund_flow_evidence", []) or [])
             metadata = dict(getattr(value, "fund_flow_evidence_meta", {}) or {})
@@ -2392,22 +2416,23 @@ class CnAkshareProvider(BaseMarketDataProvider):
                         errors.append(
                             "stock_individual_fund_flow: selection unavailable"
                         )
-                    if em_meta.get("reason"):
+                    if em_candidate is None:
+                        if em_meta.get("reason"):
+                            errors.append(
+                                "stock_individual_fund_flow: formatter reason: "
+                                f"{em_meta['reason']}"
+                            )
+                        if em_text:
+                            errors.append(
+                                "stock_individual_fund_flow: formatter failure: "
+                                f"{em_text}"
+                            )
                         errors.append(
-                            "stock_individual_fund_flow: formatter reason: "
-                            f"{em_meta['reason']}"
+                            "stock_individual_fund_flow: structured evidence unavailable"
                         )
-                    if em_text:
                         errors.append(
-                            "stock_individual_fund_flow: formatter failure: "
-                            f"{em_text}"
+                            "stock_individual_fund_flow: invalid or empty usable rows"
                         )
-                    errors.append(
-                        "stock_individual_fund_flow: structured evidence unavailable"
-                    )
-                    errors.append(
-                        "stock_individual_fund_flow: invalid or empty usable rows"
-                    )
             except Exception as exc:
                 errors.append(f"stock_individual_fund_flow: {type(exc).__name__}")
 
@@ -2429,9 +2454,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 symbol,
                 curr_date,
                 cutoff,
-                require_curr_date=True,
+                require_curr_date=not is_historical,
             )
             if direct_text is not None:
+                if em_candidate is not None:
+                    direct_text = _merge_side_evidence(direct_text, em_candidate)
                 return _attach_chain(direct_text, "eastmoney_direct")
             if direct_error:
                 errors.append(direct_error)
@@ -2452,6 +2479,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
         )
         errors.extend(tushare_errors)
         if tushare_text is not None:
+            if em_candidate is not None:
+                # Compare DC/THS and the retained EM wrapper together; the
+                # selector still chooses DC/EM before THS by declared rank.
+                tushare_text = _merge_side_evidence(tushare_text, em_candidate)
+                return _attach_chain(tushare_text, "tushare")
             return _attach_chain(tushare_text, "tushare")
         if em_candidate is not None:
             return _attach_chain(em_candidate, "eastmoney_individual_fund_flow")
@@ -2461,13 +2493,21 @@ class CnAkshareProvider(BaseMarketDataProvider):
         # snapshot because it has no historical as-of parameter.
         if not is_historical:
             attempted_sources.append("ths_instant_snapshot")
-            snapshot, snapshot_error = self._fetch_ths_instant_snapshot(
-                symbol, curr_date, code, ak
-            )
-            if snapshot is not None:
-                return _attach_chain(snapshot, "ths_instant_snapshot")
-            if snapshot_error:
-                errors.append(snapshot_error)
+            try:
+                is_trade_day = is_cn_trading_day(curr_date)
+            except Exception as exc:
+                is_trade_day = False
+                errors.append(f"ths_instant_snapshot: trade_calendar: {type(exc).__name__}")
+            if is_trade_day:
+                snapshot, snapshot_error = self._fetch_ths_instant_snapshot(
+                    symbol, curr_date, code, ak
+                )
+                if snapshot is not None:
+                    return _attach_chain(snapshot, "ths_instant_snapshot")
+                if snapshot_error:
+                    errors.append(snapshot_error)
+            else:
+                errors.append("ths_instant_snapshot: curr_date_not_cn_trading_day")
 
         # Sina Web is legacy reference only and is reached after every new
         # algorithm source has failed. Its own direction remains visible but is
@@ -3247,7 +3287,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
             return None
         latest_day = pd.to_datetime(df_recent[date_col], errors="coerce").max()
         latest_str = latest_day.date().isoformat() if pd.notna(latest_day) else curr_date
-        if require_curr_date and latest_str != curr_date:
+        requested_iso = parse_yyyymmdd(curr_date)
+        requested_iso_text = requested_iso.isoformat() if requested_iso is not None else str(curr_date)
+        if require_curr_date and latest_str != requested_iso_text:
             return (
                 f"【数据获取失败】东方财富资金流缺少请求日 {curr_date} 的有效收盘行，"
                 f"最新可用日期为 {latest_str}，{symbol} 本项不可用。"
