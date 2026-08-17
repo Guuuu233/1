@@ -294,6 +294,7 @@ def _fund_flow_failure_category(error: object) -> str:
             "json_decode",
             "json_shape",
             "rc_",
+            "rc=",
             "data_missing",
             "klines_",
         )
@@ -307,6 +308,7 @@ def _fund_flow_failure_category(error: object) -> str:
             "field_count",
             "no_usable_rows",
             "no_current_day_row",
+            "no_requested_date_row",
             "duplicate_date",
             "curr_date_invalid",
             "non_trading_date",
@@ -1965,6 +1967,17 @@ class CnAkshareProvider(BaseMarketDataProvider):
         if duplicate_dates:
             detail = "; ".join(sorted(set(duplicate_dates))[:5])
             return None, f"eastmoney_direct: duplicate_date: {detail}"
+        if malformed_rows:
+            detail = "; ".join(malformed_rows[:5])
+            if not parsed_rows:
+                return None, (
+                    "eastmoney_direct: no_usable_rows_on_or_before_curr_date "
+                    f"(malformed_kline_rows: {detail})"
+                )
+            return None, (
+                "eastmoney_direct: malformed_kline_rows_on_or_before_curr_date "
+                f"({detail})"
+            )
         if require_curr_date and parsed_rows:
             requested_day = cutoff_date.isoformat()
             if not any(row.get("日期") == requested_day for row in parsed_rows):
@@ -1980,17 +1993,6 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     f"eastmoney_direct: {reason} "
                     f"(requested={requested_day}; available={available})"
                 )
-        if malformed_rows:
-            detail = "; ".join(malformed_rows[:5])
-            if not parsed_rows:
-                return None, (
-                    "eastmoney_direct: no_usable_rows_on_or_before_curr_date "
-                    f"(malformed_kline_rows: {detail})"
-                )
-            return None, (
-                "eastmoney_direct: malformed_kline_rows_on_or_before_curr_date "
-                f"({detail})"
-            )
         if not parsed_rows:
             detail = f" ({'; '.join(warnings[:5])})" if warnings else ""
             return None, f"eastmoney_direct: no_usable_rows_on_or_before_curr_date{detail}"

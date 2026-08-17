@@ -270,7 +270,40 @@ def test_direct_historical_requires_requested_date_before_sina_fallback(
         "eastmoney_direct: no_requested_date_row" in error
         for error in meta["fallback_errors"]
     )
+    assert "validation" in meta["failure_categories"]
     assert [row["date"] for row in out.fund_flow_evidence] == ["2026-08-12"]
+
+
+def test_direct_malformed_requested_row_keeps_validation_detail(trading_day):
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
+    p = CnAkshareProvider()
+    p._ak = lambda: ak
+    older = _DIRECT_KLINE.replace("2026-08-14", "2026-08-12")
+    invalid_requested = "2026-08-14,NaN"
+    sina_rows = [
+        {
+            "opendate": "2026-08-12",
+            "netamount": "100000000",
+            "r0_net": "50000000",
+        }
+    ]
+
+    with patch(
+        "requests.get",
+        side_effect=[
+            _EastmoneyResponse(_direct_payload(older, invalid_requested)),
+            _EastmoneyResponse(sina_rows),
+        ],
+    ):
+        out = p.get_individual_fund_flow("600519", curr_date="2026-08-14")
+
+    assert out.fund_flow_evidence_meta["final_source"] == "sina_historical"
+    assert any(
+        "eastmoney_direct: malformed_kline_rows_on_or_before_curr_date" in error
+        and "invalid_f52" in error
+        for error in out.fund_flow_evidence_meta["fallback_errors"]
+    )
 
 
 def test_direct_current_day_requires_exact_as_of_before_ths_fallback(trading_day):
@@ -496,6 +529,8 @@ def test_direct_failure_keeps_chain_and_falls_back_to_ths(
     assert expected_error in meta["fallback_errors"] or any(
         expected_error in error for error in meta["fallback_errors"]
     )
+    if "eastmoney_direct: rc=" in expected_error:
+        assert "envelope" in meta["failure_categories"]
     assert "sina historical fund flow: ConnectionError" in meta["fallback_errors"]
     assert "stock_individual_fund_flow: ConnectionError" in meta["em_typed_gap"]
 
