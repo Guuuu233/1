@@ -8,6 +8,9 @@ Covers:
 5. /v1/chat/completions — valid stock dry_run completes job
 6. /v1/jobs/{id}/result — completed job returns result
 """
+import asyncio
+import json
+import subprocess
 import time
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -342,6 +345,189 @@ class TestChatCompletionsEndpoint:
         assert r.status_code == 200
 
 
+class TestRuntimeIdentity:
+    def test_build_runtime_identity_uses_safe_public_identity(self, tmp_path):
+        from api import main as main_mod
+
+        commit_sha = "a" * 40
+        identity = main_mod._build_runtime_identity(tmp_path, commit_sha, "0.6.0")
+
+        assert identity.commit_sha == commit_sha
+        assert identity.build_identity == f"tradingagents-api@{commit_sha}"
+        assert identity.public_payload() == {
+            "commit_sha": commit_sha,
+            "build_identity": f"tradingagents-api@{commit_sha}",
+            "version": "0.6.0",
+            "source_id": "tradingagents-api",
+        }
+        assert "source_root" not in identity.public_payload()
+        assert identity.log_payload()["source_root"] == str(tmp_path)
+
+    def test_build_runtime_identity_keeps_version_separate_when_sha_missing(self, tmp_path):
+        from api import main as main_mod
+
+        identity = main_mod._build_runtime_identity(tmp_path, "", "0.6.0")
+        payload = identity.public_payload()
+
+        assert payload["commit_sha"] == "unknown"
+        assert payload["build_identity"] == "unknown"
+        assert payload["version"] == "0.6.0"
+        assert payload["source_id"] == "tradingagents-api"
+
+    @pytest.mark.parametrize(
+        "commit_sha",
+        ["a" * 7, "b" * 40, "c" * 64],
+        ids=["short", "sha1", "sha256"],
+    )
+    def test_resolve_runtime_commit_sha_accepts_7_to_64_hex(self, tmp_path, commit_sha):
+        from api import main as main_mod
+
+        completed = subprocess.CompletedProcess(
+            "git", 0, stdout=f"{tmp_path}\n{commit_sha}\n"
+        )
+        with patch("api.main.subprocess.run", return_value=completed) as run:
+            assert main_mod._resolve_runtime_commit_sha(tmp_path) == commit_sha
+
+        args, kwargs = run.call_args
+        assert args[0] == [
+            "git",
+            "-C",
+            str(tmp_path),
+            "rev-parse",
+            "--show-toplevel",
+            "--verify",
+            "HEAD^{commit}",
+        ]
+        assert kwargs["capture_output"] is True
+        assert kwargs["check"] is True
+        assert kwargs["text"] is True
+        assert kwargs["timeout"] == main_mod._RUNTIME_IDENTITY_GIT_TIMEOUT_SECONDS
+        assert "GIT_DIR" not in kwargs["env"]
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            FileNotFoundError("git unavailable"),
+            subprocess.CalledProcessError(128, "git"),
+            subprocess.TimeoutExpired("git", 0.5),
+        ],
+        ids=["git-missing", "not-a-checkout", "git-timeout"],
+    )
+    def test_resolve_runtime_commit_sha_returns_unknown_on_git_failure(
+        self, tmp_path, failure
+    ):
+        from api import main as main_mod
+
+        with patch("api.main.subprocess.run", side_effect=failure):
+            assert main_mod._resolve_runtime_commit_sha(tmp_path) == "unknown"
+
+    def test_resolve_runtime_commit_sha_returns_unknown_for_invalid_output(self, tmp_path):
+        from api import main as main_mod
+
+        completed = subprocess.CompletedProcess(
+            "git", 0, stdout=f"{tmp_path}\nnot-a-sha\n"
+        )
+        with patch("api.main.subprocess.run", return_value=completed):
+            assert main_mod._resolve_runtime_commit_sha(tmp_path) == "unknown"
+
+    def test_resolve_runtime_commit_sha_ignores_ambient_git_dir(self, tmp_path, monkeypatch):
+        from api import main as main_mod
+
+        monkeypatch.setenv("GIT_DIR", str(main_mod._RUNTIME_SOURCE_ROOT / ".git"))
+        assert main_mod._resolve_runtime_commit_sha(tmp_path) == "unknown"
+
+    def test_healthz_exposes_unknown_when_git_metadata_is_missing(self, monkeypatch):
+        from api import main as main_mod
+
+        identity = main_mod._build_runtime_identity(
+            main_mod._RUNTIME_SOURCE_ROOT, "", "0.6.0"
+        )
+        monkeypatch.setattr(main_mod, "_RUNTIME_IDENTITY_CACHE", identity)
+
+        response = _get_client().get("/healthz")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["commit_sha"] == "unknown"
+        assert body["build_identity"] == "unknown"
+        assert body["version"] == "0.6.0"
+        assert "source_root" not in body
+
+    def test_runtime_identity_is_cached(self, monkeypatch):
+        from api import main as main_mod
+
+        commit_sha = "d" * 40
+        monkeypatch.setattr(main_mod, "_RUNTIME_IDENTITY_CACHE", None)
+        with patch.object(
+            main_mod, "_resolve_runtime_commit_sha", return_value=commit_sha
+        ) as resolve:
+            first = main_mod._get_runtime_identity()
+            second = main_mod._get_runtime_identity()
+
+        assert first is second
+        resolve.assert_called_once_with(main_mod._RUNTIME_SOURCE_ROOT)
+
+    def test_lifespan_can_restart_on_same_event_loop(self, monkeypatch):
+        from api import main as main_mod
+
+        monkeypatch.setattr(main_mod, "_RUNTIME_IDENTITY_CACHE", None)
+
+        async def _run_lifespans():
+            with (
+                patch("api.main.auth_service.ensure_secure_secret_configured"),
+                patch("api.main.auth_service.is_custom_secret_configured", return_value=True),
+                patch("api.main._report_version_stats"),
+                patch("api.main._load_cn_stock_map", return_value={}),
+                patch("tradingagents.dataflows.trade_calendar._load_cn_trade_dates"),
+                patch(
+                    "api.services.report_service.recover_stale_active_reports",
+                    return_value={"failed": 0},
+                ),
+                patch.object(
+                    main_mod,
+                    "_resolve_runtime_commit_sha",
+                    return_value="e" * 40,
+                ),
+            ):
+                async with main_mod.lifespan(main_mod.app):
+                    pass
+                async with main_mod.lifespan(main_mod.app):
+                    pass
+
+        asyncio.run(_run_lifespans())
+
+    def test_lifespan_logs_same_safe_identity_as_healthz(self, caplog):
+        from api import main as main_mod
+
+        caplog.set_level("INFO", logger="api.main")
+        with (
+            patch("api.main._report_version_stats"),
+            patch("api.main._load_cn_stock_map", return_value={}),
+            patch("tradingagents.dataflows.trade_calendar._load_cn_trade_dates"),
+            _get_client() as client,
+        ):
+            response = client.get("/healthz")
+
+        assert response.status_code == 200
+        health_identity = {
+            key: response.json()[key]
+            for key in ("commit_sha", "build_identity", "version", "source_id")
+        }
+        identity_logs = [
+            record.message
+            for record in caplog.records
+            if record.message.startswith("[Runtime Identity] ")
+        ]
+        assert identity_logs
+        logged_identity = json.loads(
+            identity_logs[-1][len("[Runtime Identity] "):]
+        )
+        assert {
+            key: logged_identity[key] for key in health_identity
+        } == health_identity
+        assert logged_identity["source_root"] == str(main_mod._RUNTIME_SOURCE_ROOT)
+
+
 class TestOpenAPISchema:
     def test_analyze_request_has_query_field(self):
         client = _get_client()
@@ -360,7 +546,13 @@ class TestOpenAPISchema:
         client = _get_client()
         r = client.get("/healthz")
         assert r.status_code == 200
-        assert r.json()["status"] == "ok"
+        body = r.json()
+        assert body["status"] == "ok"
+        assert body["commit_sha"]
+        assert body["build_identity"]
+        assert body["version"]
+        assert body["source_id"] == "tradingagents-api"
+        assert "source_root" not in body
 
 
 class TestRuntimeConfigWarmup:

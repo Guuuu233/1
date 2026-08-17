@@ -8,10 +8,12 @@ import math
 import os
 import re
 import socket
+import subprocess
 import traceback
 import unicodedata
 import urllib.parse
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -342,6 +344,8 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         _log(f"Could not configure default asyncio executor: {exc}")
 
+    identity = await asyncio.to_thread(_get_runtime_identity)
+    _log(_runtime_identity_log_line(identity))
     init_db()
     _log("Database initialized.")
     store = get_job_store()
@@ -411,6 +415,131 @@ def _get_version() -> str:
 
 
 APP_VERSION = _get_version()
+
+
+_RUNTIME_IDENTITY_UNKNOWN = "unknown"
+_RUNTIME_IDENTITY_GIT_TIMEOUT_SECONDS = 0.5
+_RUNTIME_IDENTITY_SHA_RE = re.compile(r"^[0-9a-f]{7,64}$", re.IGNORECASE)
+_RUNTIME_SOURCE_ID = "tradingagents-api"
+_RUNTIME_SOURCE_ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass(frozen=True)
+class RuntimeIdentity:
+    """Immutable code identity captured once on first runtime use."""
+
+    commit_sha: str
+    build_identity: str
+    version: str
+    source_id: str
+    source_root: str
+
+    def public_payload(self) -> Dict[str, str]:
+        return {
+            "commit_sha": self.commit_sha,
+            "build_identity": self.build_identity,
+            "version": self.version,
+            "source_id": self.source_id,
+        }
+
+    def log_payload(self) -> Dict[str, str]:
+        payload = self.public_payload()
+        payload["source_root"] = self.source_root
+        return payload
+
+
+def _normalize_runtime_commit_sha(value: Any) -> str:
+    candidate = str(value or "").strip()
+    return (
+        candidate
+        if _RUNTIME_IDENTITY_SHA_RE.fullmatch(candidate)
+        else _RUNTIME_IDENTITY_UNKNOWN
+    )
+
+
+def _resolve_runtime_commit_sha(source_root: Path) -> str:
+    """Read the exact checkout SHA without guessing when Git metadata is absent."""
+    try:
+        # Ambient Git variables can redirect discovery to an unrelated checkout;
+        # identity must describe this source root or remain explicitly unknown.
+        git_env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        }
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source_root),
+                "rev-parse",
+                "--show-toplevel",
+                "--verify",
+                "HEAD^{commit}",
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=_RUNTIME_IDENTITY_GIT_TIMEOUT_SECONDS,
+            env=git_env,
+        )
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if len(lines) != 2 or Path(lines[0]).resolve() != source_root.resolve():
+            return _RUNTIME_IDENTITY_UNKNOWN
+        return _normalize_runtime_commit_sha(lines[1])
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError, RuntimeError):
+        return _RUNTIME_IDENTITY_UNKNOWN
+    except Exception as exc:  # pragma: no cover - defensive subprocess boundary
+        logger.warning("[Runtime Identity] Git metadata unavailable: %s", exc)
+        return _RUNTIME_IDENTITY_UNKNOWN
+
+
+def _build_runtime_identity(
+    source_root: Path,
+    commit_sha: str,
+    app_version: str,
+) -> RuntimeIdentity:
+    normalized_sha = _normalize_runtime_commit_sha(commit_sha)
+    build_identity = (
+        f"{_RUNTIME_SOURCE_ID}@{normalized_sha}"
+        if normalized_sha != _RUNTIME_IDENTITY_UNKNOWN
+        else _RUNTIME_IDENTITY_UNKNOWN
+    )
+    return RuntimeIdentity(
+        commit_sha=normalized_sha,
+        build_identity=build_identity,
+        version=app_version,
+        source_id=_RUNTIME_SOURCE_ID,
+        source_root=str(source_root),
+    )
+
+
+_RUNTIME_IDENTITY_CACHE: Optional[RuntimeIdentity] = None
+_RUNTIME_IDENTITY_LOCK = Lock()
+
+
+def _get_runtime_identity() -> RuntimeIdentity:
+    """Resolve identity once, keeping Git failures out of every health probe."""
+    global _RUNTIME_IDENTITY_CACHE
+    if _RUNTIME_IDENTITY_CACHE is not None:
+        return _RUNTIME_IDENTITY_CACHE
+    with _RUNTIME_IDENTITY_LOCK:
+        if _RUNTIME_IDENTITY_CACHE is None:
+            _RUNTIME_IDENTITY_CACHE = _build_runtime_identity(
+                source_root=_RUNTIME_SOURCE_ROOT,
+                commit_sha=_resolve_runtime_commit_sha(_RUNTIME_SOURCE_ROOT),
+                app_version=APP_VERSION,
+            )
+    return _RUNTIME_IDENTITY_CACHE
+
+
+def _runtime_identity_log_line(identity: RuntimeIdentity) -> str:
+    return "[Runtime Identity] " + json.dumps(
+        identity.log_payload(),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
 
 app = FastAPI(
     title="TradingAgents-AShare API",
@@ -3725,7 +3854,11 @@ async def healthz():
     （生产事故：无超时的网络调用把 64 个 worker 全部占死，所有依赖
     to_thread 的接口静默挂起，前端表现为 Cloudflare 524）。
     """
-    payload: Dict[str, Any] = {"status": "ok"}
+    identity = _get_runtime_identity()
+    payload: Dict[str, Any] = {
+        "status": "ok",
+        **identity.public_payload(),
+    }
     if _default_executor is not None:
         payload["executor_queued"] = _default_executor._work_queue.qsize()
         payload["executor_threads"] = len(_default_executor._threads)
