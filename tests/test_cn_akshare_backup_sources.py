@@ -70,6 +70,252 @@ def _current_day_ths():
     )
 
 
+class _TushareResponse:
+    def __init__(self, payload, *, status_code=200):
+        self.payload = payload
+        self.status_code = status_code
+        self.text = json.dumps(payload)
+
+    def json(self):
+        return self.payload
+
+
+class _BrokenTushareResponse:
+    status_code = 200
+    text = "not-json"
+
+    def json(self):
+        raise ValueError("invalid JSON fixture")
+
+
+def _tushare_payload(
+    api_name: str,
+    *,
+    trade_date: str = "20260814",
+    net_amount: str = "12000",
+    net_d5_amount: str = "56000",
+    code: int = 0,
+    include_net_amount: bool = True,
+    ts_code: str = "600519.SH",
+):
+    fields = ["ts_code", "trade_date"]
+    if include_net_amount:
+        fields.append("net_amount")
+    if api_name == "moneyflow_ths":
+        fields.append("net_d5_amount")
+    fields.extend(
+        [
+            "buy_sm_amount",
+            "sell_sm_amount",
+            "buy_md_amount",
+            "sell_md_amount",
+            "buy_lg_amount",
+            "sell_lg_amount",
+            "buy_elg_amount",
+            "sell_elg_amount",
+        ]
+    )
+    values = {
+        "ts_code": ts_code,
+        "trade_date": trade_date,
+        "net_amount": net_amount,
+        "net_d5_amount": net_d5_amount,
+        "buy_sm_amount": "100",
+        "sell_sm_amount": "80",
+        "buy_md_amount": "200",
+        "sell_md_amount": "150",
+        "buy_lg_amount": "300",
+        "sell_lg_amount": "250",
+        "buy_elg_amount": "400",
+        "sell_elg_amount": "350",
+    }
+    return {
+        "code": code,
+        "data": {"fields": fields, "items": [[values[field] for field in fields]]},
+    }
+
+
+def test_tushare_dc_ths_success_keeps_transport_and_field_semantics(monkeypatch):
+    monkeypatch.setenv("TUSHARE_TOKEN", "configured")
+    provider = CnAkshareProvider()
+    with patch(
+        "requests.post",
+        side_effect=[
+            _TushareResponse(_tushare_payload("moneyflow_dc")),
+            _TushareResponse(_tushare_payload("moneyflow_ths")),
+        ],
+    ) as mock_post:
+        out, errors, meta = provider._fetch_tushare_fund_flow(
+            "600519", "2026-08-14"
+        )
+
+    assert errors == []
+    assert mock_post.call_count == 2
+    assert mock_post.call_args_list[0].kwargs["json"]["api_name"] == "moneyflow_dc"
+    assert mock_post.call_args_list[0].kwargs["json"]["params"] == {
+        "ts_code": "600519.SH",
+        "trade_date": "20260814",
+    }
+    assert out is not None
+    assert len(out.fund_flow_evidence) == 2
+    dc_record, ths_record = out.fund_flow_evidence
+    assert dc_record["transport_provider"] == "tushare"
+    assert dc_record["date"] == "2026-08-14"
+    assert dc_record["source_family"] == "eastmoney"
+    assert dc_record["upstream_field"] == "net_amount"
+    assert dc_record["upstream_field_semantics"] == "今日主力净流入额（万元）"
+    assert dc_record["r0_net"] == "1.2"
+    assert dc_record["vendor_raw_fields"]["buy_sm_amount"] == "100"
+    assert dc_record["vendor_normalized_fields"]["buy_sm_amount"] == "0.01"
+    assert ths_record["source_family"] == "ths"
+    assert ths_record["netamount"] == "1.2"
+    assert ths_record["net_d5_amount"] == "5.6"
+    assert ths_record["net_d5_amount_raw"] == "56000"
+    assert ths_record["net_d5_amount_period_kind"] == "five_day_cumulative"
+    assert meta["transport_provider"] == "tushare"
+    assert meta["consensus"]["reason_code"] == "incomparable_field_semantics"
+    assert meta["consensus"]["direction_allowed"] is False
+
+
+def test_tushare_token_missing_is_typed_and_does_not_call_network(monkeypatch):
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    provider = CnAkshareProvider()
+    with patch("requests.post") as mock_post:
+        out, errors, meta = provider._fetch_tushare_fund_flow(
+            "600519", "2026-08-14"
+        )
+
+    assert out is None
+    assert mock_post.call_count == 0
+    assert len(errors) == 2
+    assert meta["transport_provider"] == "tushare"
+    assert meta["failure_categories"] == ["token_missing"]
+    assert all("token_missing" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "payload, expected_category",
+    [
+        (_tushare_payload("moneyflow_dc", code=2002), "permission_denied"),
+        (_tushare_payload("moneyflow_dc", code=40203), "rate_limited"),
+        (_tushare_payload("moneyflow_dc", code=12345), "api_code"),
+        (_tushare_payload("moneyflow_dc", include_net_amount=False), "missing_field"),
+        (_tushare_payload("moneyflow_dc", trade_date="20260813"), "date_mismatch"),
+        (_tushare_payload("moneyflow_dc", ts_code="000001.SZ"), "symbol_mismatch"),
+    ],
+)
+def test_tushare_typed_api_and_validation_gaps(
+    monkeypatch, payload, expected_category
+):
+    monkeypatch.setenv("TUSHARE_TOKEN", "configured")
+    provider = CnAkshareProvider()
+    with patch("requests.post", return_value=_TushareResponse(payload)):
+        out, errors, meta = provider._fetch_tushare_fund_flow(
+            "600519", "2026-08-14"
+        )
+
+    assert out is None
+    assert len(errors) == 2
+    assert meta["status"] == "unavailable"
+    assert expected_category in [
+        failure["category"] for failure in meta["tushare_failures"]
+    ]
+
+
+@pytest.mark.parametrize(
+    "response, expected_category",
+    [
+        (_TushareResponse({}, status_code=503), "http_error"),
+        (_BrokenTushareResponse(), "json_error"),
+    ],
+)
+def test_tushare_http_and_json_failures_are_typed(
+    monkeypatch, response, expected_category
+):
+    monkeypatch.setenv("TUSHARE_TOKEN", "configured")
+    provider = CnAkshareProvider()
+    with patch("requests.post", return_value=response):
+        out, errors, meta = provider._fetch_tushare_fund_flow(
+            "600519", "2026-08-14"
+        )
+
+    assert out is None
+    assert len(errors) == 2
+    assert all(
+        failure["category"] == expected_category
+        for failure in meta["tushare_failures"]
+    )
+
+
+def test_individual_fund_flow_uses_tushare_before_legacy_when_configured(
+    monkeypatch, trading_day
+):
+    monkeypatch.setenv("TUSHARE_TOKEN", "configured")
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
+    provider = CnAkshareProvider()
+    provider._ak = lambda: ak
+    with patch("requests.get", side_effect=ConnectionError("EM direct down")), patch(
+        "requests.post",
+        side_effect=[
+            _TushareResponse(_tushare_payload("moneyflow_dc")),
+            _TushareResponse(_tushare_payload("moneyflow_ths")),
+        ],
+    ):
+        out = provider.get_individual_fund_flow(
+            "600519", curr_date="2026-08-14"
+        )
+
+    meta = out.fund_flow_evidence_meta
+    assert meta["final_source"] == "tushare"
+    assert meta["transport_provider"] == "tushare"
+    assert "sina_historical" not in meta["attempted_sources"]
+    assert "Tushare Pro" in out
+
+
+def test_tushare_failure_then_legacy_reference_is_explicit(monkeypatch):
+    monkeypatch.setenv("TUSHARE_TOKEN", "configured")
+    ak = MagicMock()
+    ak.stock_individual_fund_flow.side_effect = ConnectionError("EM unavailable")
+    provider = CnAkshareProvider()
+    provider._ak = lambda: ak
+    legacy_rows = [
+        {
+            "opendate": "2026-08-14",
+            "netamount": "100000000",
+            "r0_net": "50000000",
+        }
+    ]
+    with patch(
+        "requests.get",
+        side_effect=[
+            ConnectionError("eastmoney direct down"),
+            _EastmoneyResponse(legacy_rows),
+        ],
+    ), patch(
+        "requests.post",
+        side_effect=[
+            ConnectionError("Tushare unavailable"),
+            ConnectionError("Tushare unavailable"),
+            ConnectionError("Tushare unavailable"),
+            ConnectionError("Tushare unavailable"),
+        ],
+    ):
+        out = provider.get_individual_fund_flow(
+            "600519", curr_date="2026-08-14"
+        )
+
+    assert out.fund_flow_evidence_meta["final_source"] == "sina_historical"
+    assert out.fund_flow_evidence_meta["legacy_web_reference_only"] is True
+    tushare_meta = out.fund_flow_evidence_meta["tushare_provider"]
+    assert tushare_meta["transport_provider"] == "tushare"
+    assert all(
+        failure["category"] == "transport_error"
+        for failure in tushare_meta["tushare_failures"]
+    )
+    assert "新浪旧 Web 参考值" in out
+
+
 def test_individual_fund_flow_direct_eastmoney_success_is_structured_and_typed(
     trading_day,
 ):
