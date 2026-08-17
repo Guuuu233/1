@@ -709,7 +709,14 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
     fund_flow_evidence = getattr(fund_flow_value, "fund_flow_evidence", None)
     fund_flow_evidence_meta = getattr(fund_flow_value, "fund_flow_evidence_meta", None)
     if isinstance(fund_flow_evidence, list) and fund_flow_evidence:
-        summary = summarize_evidence(fund_flow_evidence, window_days=5)
+        evidence_meta = dict(fund_flow_evidence_meta or {})
+        summary = summarize_evidence(
+            fund_flow_evidence,
+            window_days=5,
+            selected_source=evidence_meta.get("selected_source") or evidence_meta.get("source"),
+            selected_field=evidence_meta.get("selected_field") or evidence_meta.get("field"),
+            requested_as_of=trade_date,
+        )
         fund_flow_context = {
             **dict(fund_flow_evidence_meta or {}),
             "records": copy.deepcopy(fund_flow_evidence),

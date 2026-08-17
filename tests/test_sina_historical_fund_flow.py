@@ -183,8 +183,8 @@ def test_sina_history_empty_rows_reports_explicitly():
     assert "不可用" in text
 
 
-def test_current_day_history_close_precedes_snapshot_after_eastmoney_failure():
-    """A same-day Sina close row is preferred over the live snapshot path."""
+def test_current_day_new_algorithm_snapshot_precedes_legacy_close_after_eastmoney_failure():
+    """A valid same-day new-algorithm snapshot outranks Sina legacy close data."""
     today = cn_today_str()
     rows = [
         *_SINA_HIST_ROWS,
@@ -200,11 +200,12 @@ def test_current_day_history_close_precedes_snapshot_after_eastmoney_failure():
     with patch("requests.get", return_value=_FakeResp(rows)):
         text = provider.get_individual_fund_flow("600519", curr_date=today)
 
-    assert "新浪历史/收盘数据" in text
+    assert "【备用数据源：同花顺即时资金流净额快照】" in text
     assert today in text
-    assert "-2.87" in text
-    assert "-3.81" in text
-    assert "【备用数据源：同花顺即时资金流净额快照】" not in text
+    assert "资金净额: 5.60亿" in text
+    assert "不是新浪历史 netamount/r0_net 同口径主力序列" in text
+    assert "fallback_rank=3" in text
+    assert "新浪历史/收盘数据" not in text
 
 
 def test_current_day_without_close_row_still_tries_snapshot():

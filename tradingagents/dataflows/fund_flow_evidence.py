@@ -17,6 +17,35 @@ _EPSILON = Decimal("0.0000000001")
 
 _MAIN_FORCE_FIELDS = ("r0_in", "r0_out", "r0", "r0_net")
 _FIELD_ORDER = ("r0_net", "r0", "r0_in", "r0_out", "netamount")
+
+# The selection contract is intentionally source-first, not consensus-first.
+# ``fallback_rank`` is a stable category rank retained in every selected and
+# side-evidence record; sources in the same category use the fixed order below.
+_SOURCE_PRIORITY = {
+    "tushare_eastmoney_moneyflow_dc": 1,
+    "tushare_dc": 1,
+    "tushare_moneyflow_dc": 1,
+    "moneyflow_dc": 1,
+    "tushare_ths_moneyflow_ths": 2,
+    "tushare_ths": 2,
+    "tushare_moneyflow_ths": 2,
+    "moneyflow_ths": 2,
+    "eastmoney_direct": 3,
+    "eastmoney_individual_fund_flow": 3,
+    "ths_instant_snapshot": 3,
+    "sina_app_manual_calibration": 3,
+    "sina_historical": 4,
+}
+_SOURCE_PRIORITY_ORDER = (
+    "tushare_eastmoney_moneyflow_dc",
+    "tushare_ths_moneyflow_ths",
+    "eastmoney_direct",
+    "eastmoney_individual_fund_flow",
+    "ths_instant_snapshot",
+    "sina_app_manual_calibration",
+    "sina_historical",
+)
+
 _FIELD_ALIASES = {
     "主力净流入-净额": "r0_net",
     "主力净流入净额": "r0_net",
@@ -128,9 +157,13 @@ def infer_algorithm_group(
             "eastmoney",
             "em_",
             "_em",
+            "tushare_dc",
+            "moneyflow_dc",
             "dongfangcaifu",
             "东方财富",
             "ths",
+            "tushare_ths",
+            "moneyflow_ths",
             "tonghuashun",
             "同花顺",
         )
@@ -157,9 +190,9 @@ def source_family(source: Any) -> str:
     label = _normalise_source_text(source)
     if "sina" in label or "新浪" in label:
         return "sina_app" if any(token in label for token in ("app", "mobile")) else "sina_web"
-    if any(token in label for token in ("eastmoney", "em_", "_em", "东方财富", "dongfangcaifu")):
+    if any(token in label for token in ("eastmoney", "em_", "_em", "tushare_dc", "moneyflow_dc", "东方财富", "dongfangcaifu")):
         return "eastmoney"
-    if any(token in label for token in ("ths", "tonghuashun", "同花顺")):
+    if any(token in label for token in ("ths", "tushare_ths", "moneyflow_ths", "tonghuashun", "同花顺")):
         return "ths"
     return label or "unknown_source"
 
@@ -287,7 +320,10 @@ def build_source_evidence(
     records: list[dict[str, Any]] = []
     for row in _iter_rows(rows):
         date = _date_value(row)
-        as_of = str(row.get("as_of") or date or requested_as_of).strip() or requested_as_of
+        # Never manufacture a measurement date from the request.  An undated
+        # row may remain in the audit trail, but source selection must reject it.
+        as_of_value = row.get("as_of") or date
+        as_of = str(as_of_value).strip() if as_of_value is not None else None
         effective_period = _period_kind(row, source, period_kind)
         effective_window = str(
             row.get("time_window") or row.get("window") or window or
@@ -484,7 +520,9 @@ def build_sina_evidence(
             "netamount": _decimal_text(netamount_raw / YI) if netamount_raw is not None else None,
             "r0_net": _decimal_text(r0_net_raw / YI) if r0_net_raw is not None else None,
             "netamount_raw": _decimal_text(netamount_raw),
+            "netamount_raw_unit": "元",
             "r0_net_raw": _decimal_text(r0_net_raw),
+            "r0_net_raw_unit": "元",
             "raw_unit": "元",
             "unit": "亿元",
             "source": source,
@@ -585,6 +623,12 @@ def build_gap_meta(
         "direction_allowed": False,
         "reason": reason,
         "failure_category": failure_category,
+        "failure_categories": [failure_category],
+        "attempted_sources": [],
+        "fallback_errors": [],
+        "failure_chain": [],
+        "final_source": "unavailable",
+        "last_attempted_source": None,
         "gap": f"【数据获取失败】资金流 evidence：{reason}",
         "retrieved_at": retrieved_at,
         "actual_as_of": actual_as_of,
@@ -609,6 +653,15 @@ def _normalise_summary_record(record: Mapping[str, Any]) -> tuple[dict[str, Any]
         record.get("period_kind") or record.get("window_kind") or record.get("period") or "historical_daily"
     )
     normalized["window"] = str(record.get("window") or record.get("time_window") or "1d")
+    explicit_field = _canonical_field(record.get("field") or record.get("字段"))
+    if explicit_field and record.get("value") is not None and explicit_field not in normalized:
+        raw_value = record.get("value")
+        raw_unit = record.get("value_unit") or record.get("unit") or record.get("raw_unit")
+        amount, parsed_unit = _amount_to_yi(raw_value, raw_unit)
+        if amount is None:
+            return None, f"invalid_{explicit_field}_unit_or_amount"
+        normalized[explicit_field] = _decimal_text(amount)
+        normalized[f"{explicit_field}_raw_unit"] = parsed_unit
     for field in ("netamount", "r0_net", "r0_in", "r0_out", "r0"):
         if field not in record or record.get(field) is None:
             continue
@@ -652,14 +705,36 @@ def summarize_evidence(
     records: Iterable[Mapping[str, Any]],
     *,
     window_days: int = DEFAULT_WINDOW_DAYS,
+    selected_source: str | None = None,
+    selected_field: str | None = None,
+    requested_as_of: str | None = None,
 ) -> dict[str, Any]:
-    """Compute exact daily totals without mixing sources, units, or windows."""
+    """Compute exact totals for one selected source/field only.
+
+    When selection metadata is supplied, lower-ranked side evidence is ignored
+    for arithmetic while remaining available to the report provenance layer.
+    """
     usable: list[dict[str, Any]] = []
     invalid_records: list[str] = []
+    request_date = _normalise_date_text(requested_as_of)
     for record in records:
         if not isinstance(record, Mapping) or record.get("status") != "available":
             continue
-        normalized, error = _normalise_summary_record(record)
+        if selected_source and str(record.get("source") or "") != str(selected_source):
+            continue
+        record_date = _date_value(record)
+        if request_date and record_date and record_date > request_date:
+            continue
+        candidate = dict(record)
+        if selected_field:
+            # Keep arithmetic tied to one official field; other fields remain
+            # in the original evidence record for side-by-side audit.
+            for other_field in ("netamount", "r0_net", "r0_in", "r0_out", "r0"):
+                if other_field != selected_field:
+                    candidate.pop(other_field, None)
+                    candidate.pop(f"{other_field}_raw", None)
+                    candidate.pop(f"{other_field}_raw_unit", None)
+        normalized, error = _normalise_summary_record(candidate)
         if normalized is None:
             invalid_records.append(error or "invalid_record")
         else:
@@ -840,6 +915,449 @@ def _record_observations(record: Mapping[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return observations
+
+
+def _source_fallback_rank(source: Any) -> int:
+    """Return the stable priority category for a source label."""
+    label = str(source or "").strip()
+    if label in _SOURCE_PRIORITY:
+        return _SOURCE_PRIORITY[label]
+    group = infer_algorithm_group(label)
+    return 4 if group == LEGACY_WEB_ALGORITHM else 3 if group == NEW_ALGORITHM_GROUP else 99
+
+
+def _source_order_index(source: Any) -> int:
+    label = str(source or "").strip()
+    try:
+        return _SOURCE_PRIORITY_ORDER.index(label)
+    except ValueError:
+        return len(_SOURCE_PRIORITY_ORDER)
+
+
+def _field_semantics_are_valid(record: Mapping[str, Any], field: str) -> bool:
+    """Reject a contradictory provider label without requiring a label."""
+    expected = _FIELD_SEMANTICS.get(field) or _COMPONENT_SEMANTICS.get(field)
+    if expected is None:
+        return False
+    semantics = record.get("field_semantics")
+    if isinstance(semantics, Mapping):
+        supplied = semantics.get(field)
+    else:
+        supplied = record.get(f"{field}_semantics")
+    if supplied is None:
+        supplied = record.get("upstream_field_semantics") if field == "r0_net" else None
+    if supplied is None or not str(supplied).strip():
+        return True
+    text = str(supplied).strip().lower()
+    if field in {"r0_net", "netamount", "super_large_net", "large_net"}:
+        if "净" not in text:
+            return False
+        if field == "r0_net" and "主力" not in text:
+            return False
+        if field == "netamount" and "主力" in text and "总" not in text:
+            return False
+    elif field == "r0_in":
+        if "流入" not in text or "净" in text:
+            return False
+    elif field == "r0_out":
+        if "流出" not in text or "净" in text:
+            return False
+    elif field == "r0" and "主力" not in text:
+        return False
+    return True
+
+
+def _observation_raw_value(item: Mapping[str, Any]) -> str:
+    record = item.get("record")
+    if isinstance(record, Mapping):
+        raw = record.get(f"{item.get('field')}_raw")
+        if raw is not None:
+            return str(raw)
+    return str(item.get("raw_value") or item.get("value_text") or "")
+
+
+def _observation_audit(item: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "source": item["source"],
+        "source_family": item["source_family"],
+        "algorithm_group": item["algorithm_group"],
+        "legacy_web_algorithm": item["legacy_web_algorithm"],
+        "value": item["value_text"],
+        "selected_value": item["value_text"],
+        "raw_value": _observation_raw_value(item),
+        "raw_unit": item["raw_unit"],
+        "unit": item["unit"],
+        "date": item["date"],
+        "period_kind": item["period_kind"],
+        "time_window": item["time_window"],
+        "field": item["field"],
+        "field_category": item["field_category"],
+        "transport_provider": (item.get("record") or {}).get("transport_provider"),
+    }
+
+
+def _selection_direction_summary(field: str, direction: str) -> str:
+    scope = "主力" if field in _MAIN_FORCE_FIELDS else "总资金" if field == "netamount" else "订单组成项"
+    if direction == "inflow":
+        return f"{scope}偏流入"
+    if direction == "outflow":
+        return f"{scope}偏流出"
+    return f"{scope}接近平衡"
+
+
+def select_fund_flow_source(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    symbol: str | None = None,
+    requested_as_of: str | None = None,
+    field: str | None = None,
+    failure_chain: Iterable[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Select the first valid source without requiring cross-source consensus.
+
+    Sources are ranked ``Tushare DC -> Tushare THS -> other new algorithms ->
+    Sina legacy``.  A candidate is valid when at least one field from the same
+    source has a real measurement date, a known unit, a finite value, and a
+    non-contradictory field semantic.  Values are aggregated only within that
+    source, field, date, period, and window; lower-ranked valid observations are
+    retained as side evidence and never mixed into the selected value.
+    """
+    request_date = _normalise_date_text(requested_as_of)
+    requested_symbol = str(symbol or "").strip() or None
+    all_records: list[dict[str, Any]] = []
+    observations: list[dict[str, Any]] = []
+    invalid: list[dict[str, Any]] = []
+
+    for raw_record in records:
+        if not isinstance(raw_record, Mapping):
+            invalid.append({"source": "unknown_source", "reason": "record_not_object"})
+            continue
+        record = dict(raw_record)
+        source = str(record.get("source") or "unknown_source").strip() or "unknown_source"
+        group = infer_algorithm_group(source, record.get("algorithm_group"))
+        rank = _source_fallback_rank(source)
+        record.setdefault("source_family", source_family(source))
+        record.setdefault("algorithm_group", group)
+        record.setdefault("legacy_web_algorithm", group == LEGACY_WEB_ALGORITHM)
+        record.setdefault("fallback_rank", rank)
+        all_records.append(record)
+        if record.get("status", "available") != "available":
+            invalid.append({"source": source, "fallback_rank": rank, "reason": "status_unavailable"})
+            continue
+        if group not in {NEW_ALGORITHM_GROUP, LEGACY_WEB_ALGORITHM}:
+            invalid.append({"source": source, "fallback_rank": rank, "reason": "unknown_algorithm_group"})
+            continue
+        record_symbol = str(record.get("symbol") or "").strip() or None
+        if requested_symbol and record_symbol and record_symbol != requested_symbol:
+            invalid.append({"source": source, "fallback_rank": rank, "reason": "symbol_mismatch"})
+            continue
+        date = _observation_date(record)
+        if date is None:
+            invalid.append({"source": source, "fallback_rank": rank, "reason": "missing_measurement_date"})
+            continue
+        if request_date and date > request_date:
+            invalid.append({
+                "source": source,
+                "fallback_rank": rank,
+                "date": date,
+                "reason": "future_measurement_date",
+            })
+            continue
+        unit = _unit_name(record.get("unit") or "")
+        if unit != "亿元":
+            invalid.append({
+                "source": source,
+                "fallback_rank": rank,
+                "reason": "invalid_normalized_unit",
+                "unit": unit,
+            })
+            continue
+        record_observations = _record_observations(record)
+        if not record_observations:
+            invalid.append({"source": source, "fallback_rank": rank, "reason": "no_usable_field"})
+            continue
+        accepted = False
+        for item in record_observations:
+            if field and item["field"] != field:
+                continue
+            raw_unit = _unit_name(
+                record.get(f"{item['field']}_raw_unit")
+                or record.get("raw_unit")
+                or item.get("raw_unit")
+                or item.get("unit")
+            )
+            if raw_unit not in {"元", "万", "万元", "亿", "亿元", "万亿"}:
+                invalid.append({
+                    "source": source,
+                    "fallback_rank": rank,
+                    "field": item["field"],
+                    "reason": "invalid_raw_unit",
+                    "unit": raw_unit,
+                })
+                continue
+            if not _field_semantics_are_valid(record, item["field"]):
+                invalid.append({
+                    "source": source,
+                    "fallback_rank": rank,
+                    "field": item["field"],
+                    "reason": "field_semantics_invalid",
+                })
+                continue
+            item = dict(item)
+            item["record"] = record
+            item["fallback_rank"] = rank
+            observations.append(item)
+            accepted = True
+        if not accepted:
+            invalid.append({
+                "source": source,
+                "fallback_rank": rank,
+                "reason": "requested_field_unavailable" if field else "no_semantically_valid_field",
+            })
+
+    raw_values = [_observation_audit(item) for item in observations]
+    base: dict[str, Any] = {
+        "algorithm_group": NEW_ALGORITHM_GROUP,
+        "group_priority": "tushare_dc_then_ths_then_other_new_then_legacy",
+        "selection_mode": "priority",
+        "consensus_required": False,
+        "status": "data_conflict",
+        "data_conflict": True,
+        "direction": "blocked",
+        "direction_allowed": False,
+        "selected_source": None,
+        "selected_source_family": None,
+        "selected_algorithm_group": None,
+        "selected_field": None,
+        "selected_value": None,
+        "selected_direction": None,
+        "fallback_rank": None,
+        "legacy_reference": False,
+        "legacy_web_algorithm": False,
+        "raw_values": raw_values,
+        "all_records": all_records,
+        "legacy_sources": [item for item in raw_values if item["algorithm_group"] == LEGACY_WEB_ALGORITHM],
+        "unknown_sources": [],
+        "new_algorithm_sources": [item for item in raw_values if item["algorithm_group"] == NEW_ALGORITHM_GROUP],
+        "side_evidence": [],
+        "field_results": {},
+        "failure_chain": [dict(item) for item in (failure_chain or ())] + invalid,
+        "invalid_records": invalid,
+        "relative_dispersion_threshold": _decimal_text(DEFAULT_RELATIVE_DISPERSION),
+        "legacy_web_is_corroboration_only": any(
+            item["algorithm_group"] == LEGACY_WEB_ALGORITHM for item in raw_values
+        ),
+    }
+    if not observations:
+        base.update({
+            "reason_code": "no_valid_source",
+            "selection_reason": "no_valid_fund_flow_source",
+            "reason": "所有资金流来源均缺少日期、字段、单位或有效值",
+            "hard_guard": {
+                "blocked": True,
+                "direction_allowed": False,
+                "reason": "所有资金流来源均不可用",
+            },
+            "legacy_reference": False,
+            "fallback_rank": None,
+        })
+        return base
+
+    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    for item in observations:
+        key = (
+            item["source"],
+            item["field"],
+            item["period_kind"],
+            item["time_window"],
+        )
+        grouped.setdefault(key, []).append(item)
+
+    field_rank = {name: index for index, name in enumerate(_FIELD_ORDER)}
+    candidates: list[dict[str, Any]] = []
+    for (source, candidate_field, period, window), items in grouped.items():
+        items = sorted(items, key=lambda item: str(item.get("date") or ""))
+        by_date: dict[str, list[dict[str, Any]]] = {}
+        for item in items:
+            by_date.setdefault(str(item["date"]), []).append(item)
+        duplicate_conflict = any(
+            len({entry["value"] for entry in same_date}) > 1
+            for same_date in by_date.values()
+        )
+        rank = _source_fallback_rank(source)
+        if duplicate_conflict:
+            invalid.append({
+                "source": source,
+                "fallback_rank": rank,
+                "field": candidate_field,
+                "reason": "duplicate_date_conflict",
+            })
+            continue
+        deduped = [same_date[0] for same_date in by_date.values()]
+        deduped.sort(key=lambda item: str(item.get("date") or ""))
+        selected_items = deduped[-DEFAULT_WINDOW_DAYS:]
+        if period in {"five_day_cumulative", "five_day_aggregate"} or window != "1d":
+            value = selected_items[-1]["value"]
+        else:
+            value = sum((item["value"] for item in selected_items), Decimal("0"))
+        latest = selected_items[-1]
+        candidates.append({
+            "source": source,
+            "field": candidate_field,
+            "period_kind": period,
+            "time_window": window,
+            "fallback_rank": rank,
+            "source_order": _source_order_index(source),
+            "field_rank": field_rank.get(candidate_field, len(field_rank)),
+            "items": selected_items,
+            "latest": latest,
+            "value": value,
+        })
+
+    if not candidates:
+        base.update({
+            "reason_code": "no_valid_source",
+            "selection_reason": "no_valid_fund_flow_source",
+            "reason": "资金流来源存在记录但没有同源、同字段、同日期和同窗口的有效候选",
+            "failure_chain": [dict(item) for item in (failure_chain or ())] + invalid,
+            "invalid_records": invalid,
+            "hard_guard": {
+                "blocked": True,
+                "direction_allowed": False,
+                "reason": "没有满足字段、日期、单位和窗口校验的资金流来源",
+            },
+            "legacy_reference": False,
+            "fallback_rank": None,
+        })
+        return base
+
+    def _candidate_sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
+        latest_date = str(item["latest"].get("date") or "")
+        try:
+            latest_number = int(latest_date.replace("-", ""))
+        except ValueError:
+            latest_number = 0
+        period_rank = 0 if item["period_kind"] == "historical_daily" else 1
+        return (
+            item["fallback_rank"],
+            item["source_order"],
+            item["field_rank"],
+            period_rank,
+            -latest_number,
+        )
+
+    candidates.sort(key=_candidate_sort_key)
+    selected_candidate = candidates[0]
+    selected_source = selected_candidate["source"]
+    selected_field = selected_candidate["field"]
+    selected_items = selected_candidate["items"]
+    selected_value = selected_candidate["value"]
+    selected_latest = selected_candidate["latest"]
+    selected_group = infer_algorithm_group(selected_source)
+    selected_direction = _direction_for_field(selected_field, selected_value)
+    field_results: dict[str, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        candidate_direction = _direction_for_field(
+            candidate["field"], candidate["value"]
+        )
+        field_results.setdefault(candidate["field"], []).append({
+            "source": candidate["source"],
+            "source_family": source_family(candidate["source"]),
+            "algorithm_group": infer_algorithm_group(candidate["source"]),
+            "fallback_rank": candidate["fallback_rank"],
+            "field": candidate["field"],
+            "period_kind": candidate["period_kind"],
+            "time_window": candidate["time_window"],
+            "dates": [item["date"] for item in candidate["items"]],
+            "selected_value": _decimal_text(candidate["value"]),
+            "direction": candidate_direction,
+            "selected": candidate is selected_candidate,
+        })
+    base["field_results"] = field_results
+
+    # Mark the selected source/field while retaining every valid lower-ranked
+    # record for audit and side-by-side reporting.
+    selected_audit = []
+    side_audit = []
+    selected_dates = {str(item.get("date")) for item in selected_items}
+    for item in raw_values:
+        is_selected = (
+            item["source"] == selected_source
+            and item["field"] == selected_field
+            and str(item.get("date")) in selected_dates
+        )
+        item["selected"] = is_selected
+        item["fallback_rank"] = _source_fallback_rank(item["source"])
+        if is_selected:
+            selected_audit.append(item)
+        else:
+            side_audit.append(item)
+
+    selected_reason = (
+        "no_new_algorithm_source_legacy_fallback"
+        if selected_group == LEGACY_WEB_ALGORITHM
+        else "first_valid_source_by_priority"
+    )
+    selected_record = selected_latest.get("record") or {}
+    transport_provider = selected_record.get("transport_provider")
+    if transport_provider is None:
+        transport_provider = {
+            "eastmoney": "eastmoney",
+            "ths": "ths",
+            "sina_web": "sina_http",
+            "sina_app": "sina_app",
+        }.get(source_family(selected_source), source_family(selected_source))
+    selected_as_of = str(selected_latest.get("date"))
+    base.update({
+        "status": "consensus",  # compatibility envelope; selection_mode explains the semantics.
+        "data_conflict": False,
+        "reason_code": "legacy_fallback" if selected_group == LEGACY_WEB_ALGORITHM else "priority_source_selected",
+        "selection_reason": selected_reason,
+        "reason": (
+            "新算法来源均不可用，使用新浪 legacy 自身字段方向；仅供参考"
+            if selected_group == LEGACY_WEB_ALGORITHM
+            else "按固定来源优先级选择首个字段、日期、单位和有效值均合格的来源"
+        ),
+        "selected_source": selected_source,
+        "selected_source_family": source_family(selected_source),
+        "selected_algorithm_group": selected_group,
+        "selected_field": selected_field,
+        "field": selected_field,
+        "field_category": _FIELD_CATEGORIES.get(selected_field, "main_force_component"),
+        "selected_value": _decimal_text(selected_value),
+        "selected_value_unit": "亿元",
+        "selected_direction": selected_direction,
+        "direction": selected_direction,
+        "direction_allowed": True,
+        "direction_summary": _selection_direction_summary(selected_field, selected_direction),
+        "selected_as_of": selected_as_of,
+        "actual_as_of": selected_as_of,
+        "as_of": selected_as_of,
+        "transport_provider": transport_provider,
+        "fallback_rank": selected_candidate["fallback_rank"],
+        "legacy_reference": selected_group == LEGACY_WEB_ALGORITHM,
+        "legacy_reference_only": selected_group == LEGACY_WEB_ALGORITHM,
+        "legacy_web_algorithm": selected_group == LEGACY_WEB_ALGORITHM,
+        "selected_evidence": selected_audit,
+        "side_evidence": side_audit,
+        "new_algorithm_sources": [item for item in raw_values if item["algorithm_group"] == NEW_ALGORITHM_GROUP],
+        "legacy_sources": [item for item in raw_values if item["algorithm_group"] == LEGACY_WEB_ALGORITHM],
+        "contributing_sources": [selected_source],
+        "consensus_value": _decimal_text(selected_value),
+        "median": _decimal_text(selected_value),
+        "mad": "0",
+        "relative_dispersion": "0",
+        "hard_guard": {
+            "blocked": False,
+            "direction_allowed": True,
+            "reason": (
+                "legacy Web 自身方向可展示但必须醒目标注旧算法"
+                if selected_group == LEGACY_WEB_ALGORITHM
+                else "首个优先级来源字段、日期、单位和有效值校验通过"
+            ),
+        },
+    })
+    return base
 
 
 def _median(values: list[Decimal]) -> Decimal:
@@ -1134,7 +1652,7 @@ def _aggregate_daily_field_results(
     }
 
 
-def build_consensus_evidence(
+def _build_consensus_evidence_legacy(
     records: Iterable[Mapping[str, Any]],
     *,
     symbol: str | None = None,
@@ -1305,28 +1823,61 @@ def build_consensus_evidence(
     return base
 
 
-# Public aliases keep callers concise and make the source-consensus contract
-# discoverable without changing the provider-facing legacy names.
+def build_consensus_evidence(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    symbol: str | None = None,
+    requested_as_of: str | None = None,
+    field: str | None = None,
+    relative_dispersion_threshold: Decimal = DEFAULT_RELATIVE_DISPERSION,
+) -> dict[str, Any]:
+    """Compatibility envelope for deterministic priority selection.
+
+    The public name remains for callers and serialized reports, but the
+    direction gate no longer depends on a median/MAD consensus or source count.
+    ``relative_dispersion_threshold`` is accepted for API compatibility and is
+    retained in the result as audit metadata.
+    """
+    result = select_fund_flow_source(
+        records,
+        symbol=symbol,
+        requested_as_of=requested_as_of,
+        field=field,
+    )
+    result["relative_dispersion_threshold"] = _decimal_text(relative_dispersion_threshold)
+    return result
+
+
+# Public aliases keep callers concise and make the source-selection contract
+# discoverable without changing provider-facing legacy names.
 summarize_source_consensus = build_consensus_evidence
 build_consensus = build_consensus_evidence
 
 
 def consensus_prompt_instruction(consensus: Mapping[str, Any] | None) -> str:
-    """Render a deterministic instruction for the smart-money analyst prompt."""
+    """Render source-selection rules for the smart-money analyst prompt."""
     if not isinstance(consensus, Mapping):
         return (
-            "未提供新算法组共识 evidence；不得把任一旧 Web 值写成主力方向，"
-            "也不得跨日期、窗口或字段回填。"
+            "未提供可验证资金流来源；不得跨日期、窗口、字段或单位回填，"
+            "也不得把未经选择的旁证值写成方向结论。"
         )
-    if consensus.get("status") == "consensus" and consensus.get("direction_allowed"):
+    if consensus.get("direction_allowed"):
+        source = consensus.get("selected_source") or consensus.get("source") or "unknown"
+        field = consensus.get("selected_field") or consensus.get("field") or "unknown"
+        rank = consensus.get("fallback_rank")
+        legacy_note = (
+            "该值来自 Sina legacy Web，方向只能按其自身字段展示，并必须醒目标注 legacy/旧算法/仅供参考。"
+            if consensus.get("legacy_reference") or consensus.get("legacy_web_algorithm")
+            else "较低优先级来源只能作为旁证，不得改写已选来源方向。"
+        )
         return (
-            "新算法组已形成可解释低离散度共识；主结论优先采用新算法组 median，"
-            f"MAD={consensus.get('mad')}、相对离散度={consensus.get('relative_dispersion')}。"
-            "legacy_web_algorithm 仅作旁证，不得覆盖新算法组结论。"
+            f"已按固定优先级选择来源 {source}（fallback_rank={rank}）、字段 {field}；"
+            "单一字段/日期/单位合格即可允许该来源自身方向，不要求多源共识。"
+            f"{legacy_note} 不得跨字段、日期、窗口或单位混算。"
         )
     return (
-        "新算法组 evidence 标记 data_conflict（来源不足、字段/日期/窗口不可比或离散度无法解释）；"
-        "必须保留各源原值，禁止输出增持、减持、吸筹等方向摘要。"
+        "没有字段、日期、单位和有效值均合格的来源；必须保留失败链和各源原值，"
+        "禁止输出增持、减持、吸筹等方向摘要。"
     )
 
 
@@ -1364,9 +1915,18 @@ def validate_model_summary(
     *,
     window_days: int = DEFAULT_WINDOW_DAYS,
     tolerance: Decimal = Decimal("0.01"),
+    selected_source: str | None = None,
+    selected_field: str | None = None,
+    requested_as_of: str | None = None,
 ) -> dict[str, Any]:
-    """Mark model cumulative totals that disagree with exact structured totals."""
-    structured = summarize_evidence(records, window_days=window_days)
+    """Validate model totals against the selected source, never side evidence."""
+    structured = summarize_evidence(
+        records,
+        window_days=window_days,
+        selected_source=selected_source,
+        selected_field=selected_field,
+        requested_as_of=requested_as_of,
+    )
     model = extract_model_totals(model_text)
     mismatches: list[dict[str, str]] = []
     for field, model_value_text in model.items():

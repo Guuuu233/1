@@ -5,6 +5,7 @@ import re
 import time
 import threading
 import contextvars
+from typing import Any
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -23,6 +24,7 @@ from ..trade_calendar import (
     is_cn_trading_day,
     is_historical_analysis_date,
     snapshot_historical_refusal,
+    unavailable_analysis_date_reason,
 )
 from ..utils import (
     chronological,
@@ -47,6 +49,7 @@ from ..fund_flow_evidence import (
     build_provider_text,
     build_sina_evidence,
     build_ths_evidence,
+    select_fund_flow_source,
 )
 from ..financial_announce import (
     build_effective_announce_map,
@@ -1535,10 +1538,10 @@ class CnAkshareProvider(BaseMarketDataProvider):
 
         try:
             payload = response.json()
-        except (AttributeError, TypeError, ValueError):
+        except Exception:
             try:
                 payload = json.loads(getattr(response, "text", "") or "")
-            except (TypeError, ValueError):
+            except Exception:
                 return (
                     None,
                     CnAkshareProvider._tushare_error(api_name, "json_error"),
@@ -1857,6 +1860,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 },
                 "vendor_normalized_fields": normalized_fields,
                 "vendor_raw_field_status": "audited",
+                "fallback_rank": 1 if is_dc else 2,
+                "selected": False,
             }
         )
         if not is_dc and row.get("net_d5_amount") is not None:
@@ -2002,17 +2007,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
     def _tushare_consensus(
         dc_records: list[dict], ths_records: list[dict]
     ) -> dict:
-        if dc_records and ths_records:
-            return CnAkshareProvider._tushare_incomparable_consensus(
-                dc_records, ths_records
-            )
-        records = dc_records or ths_records
-        field = "r0_net" if dc_records else "netamount"
-        return build_consensus_evidence(
+        records = [*dc_records, *ths_records]
+        return select_fund_flow_source(
             records,
             symbol=records[0].get("symbol") if records else None,
             requested_as_of=records[0].get("requested_as_of") if records else None,
-            field=field,
         )
 
     @staticmethod
@@ -2052,20 +2051,33 @@ class CnAkshareProvider(BaseMarketDataProvider):
         metadata = {
             "symbol": symbol,
             "requested_as_of": requested_as_of or requested_date,
-            "actual_as_of": requested_date,
-            "as_of": requested_date,
+            "actual_as_of": consensus.get("actual_as_of") or requested_date,
+            "as_of": consensus.get("as_of") or requested_date,
             "retrieved_at": retrieved_at,
-            "source": "tushare_moneyflow",
+            "source": consensus.get("selected_source") or "tushare_moneyflow",
             "transport_provider": "tushare",
             "source_families": sorted(
                 {record.get("source_family", "unknown") for record in records}
             ),
-            "algorithm_group": "new_algorithm_group",
-            "period_kind": "historical_daily",
-            "window": "1d",
+            "algorithm_group": consensus.get("selected_algorithm_group") or "new_algorithm_group",
+            "period_kind": consensus.get("period_kind") or "historical_daily",
+            "window": consensus.get("time_window") or "1d",
             "unit": "亿元",
             "raw_unit": "万元",
-            "status": status,
+            "field": consensus.get("selected_field"),
+            "selected_source": consensus.get("selected_source"),
+            "selected_source_family": consensus.get("selected_source_family"),
+            "selected_algorithm_group": consensus.get("selected_algorithm_group"),
+            "selected_field": consensus.get("selected_field"),
+            "selected_value": consensus.get("selected_value"),
+            "selected_direction": consensus.get("selected_direction"),
+            "selection_reason": consensus.get("selection_reason"),
+            "fallback_rank": consensus.get("fallback_rank"),
+            "legacy_reference": consensus.get("legacy_reference", False),
+            "legacy_web_algorithm": consensus.get("legacy_web_algorithm", False),
+            "direction": consensus.get("direction", "blocked"),
+            "direction_allowed": bool(consensus.get("direction_allowed")),
+            "status": status if not consensus.get("direction_allowed") else "available",
             "consensus": consensus,
             "tushare_failures": list(failures),
             "failure_categories": sorted({item["category"] for item in failures}),
@@ -2170,8 +2182,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
         )
         return value, errors, value.fund_flow_evidence_meta
 
-    def get_individual_fund_flow(self, symbol: str, curr_date: str = None) -> str:
-        """获取个股近期主力资金净流向，并按 curr_date 截断。
+    def _get_individual_fund_flow_legacy(self, symbol: str, curr_date: str = None) -> str:
+        """Legacy fallback-chain implementation retained for comparison only.
 
         资金流路径按“AkShare EM → 东财公开直连 → Tushare DC/THS →
         新浪历史 legacy Web → 当前日同花顺总净额快照”的顺序尝试。东财直连只
@@ -2575,6 +2587,471 @@ class CnAkshareProvider(BaseMarketDataProvider):
         )
         return _attach_chain(gap, "unavailable")
 
+    def _fetch_ths_instant_snapshot_fund_flow(
+        self,
+        ak,
+        symbol: str,
+        curr_date: str,
+        code: str,
+    ) -> FundFlowText | None:
+        """Build a same-day THS total-net candidate with explicit semantics."""
+        with AKSHARE_CALL_LOCK:
+            frame = ak.stock_fund_flow_individual(symbol="即时")
+        if frame is None or frame.empty or "股票代码" not in frame.columns:
+            return None
+        matched = frame[frame["股票代码"].astype(str).str.zfill(6) == code.zfill(6)]
+        if matched.empty or "净额" not in matched.columns:
+            return None
+        row = matched.iloc[0]
+        net_amount = _usable_fund_amount_text(row.get("净额"))
+        if net_amount is None:
+            return None
+        def _value(column: str) -> str:
+            if column not in frame.columns:
+                return ""
+            value = row.get(column)
+            return "" if pd.isna(value) else str(value)
+        retrieved_at = self._sina_retrieved_at()
+        evidence = build_ths_evidence(
+            [{
+                "股票代码": code,
+                "日期": curr_date,
+                "净额": row.get("净额"),
+                "单位": "亿元",
+                "period_kind": "realtime_single_day",
+                "window": "1d",
+            }],
+            symbol=symbol,
+            requested_as_of=curr_date,
+            retrieved_at=retrieved_at,
+        )
+        if not evidence:
+            return None
+        return FundFlowText(
+            (
+                f"【备用数据源：同花顺即时资金流净额快照】{symbol} 当日资金流净额快照"
+                f"（{curr_date}，最新价 {_value('最新价')}，涨跌幅 {_value('涨跌幅')}）：\n"
+                f"资金净额: {net_amount} | 流入资金: {_value('流入资金')} | "
+                f"流出资金: {_value('流出资金')} | 换手率: {_value('换手率')}\n"
+                "（同花顺总净额字段仅按其自身语义选择，不等同于主力 r0_net；"
+            "不是新浪历史 netamount/r0_net 同口径主力序列）"
+            ),
+            evidence=evidence,
+            evidence_meta={
+                "symbol": symbol,
+                "requested_as_of": curr_date,
+                "retrieved_at": retrieved_at,
+                "source": "ths_instant_snapshot",
+                "source_family": "ths",
+                "transport_provider": "akshare",
+                "algorithm_group": "new_algorithm_group",
+                "period_kind": "realtime_single_day",
+                "field": "netamount",
+                "raw_unit": "亿元",
+                "unit": "亿元",
+                "as_of": curr_date,
+                "actual_as_of": curr_date,
+                "status": "available",
+            },
+        )
+
+    def _finalize_fund_flow_candidates(
+        self,
+        candidates: list[FundFlowText],
+        *,
+        symbol: str,
+        requested_as_of: str,
+        attempted_sources: list[str],
+        errors: list[str],
+        failure_chain: list[dict[str, Any]],
+        tushare_meta: dict[str, Any] | None = None,
+    ) -> FundFlowText | None:
+        """Select one candidate and retain all valid side evidence."""
+        all_records: list[dict[str, Any]] = []
+        candidate_meta: list[dict[str, Any]] = []
+        for candidate in candidates:
+            meta = dict(getattr(candidate, "fund_flow_evidence_meta", {}) or {})
+            candidate_meta.append(meta)
+            source = str(meta.get("source") or "").strip()
+            transport = meta.get("transport_provider") or {
+                "eastmoney_direct": "eastmoney_http",
+                "eastmoney_individual_fund_flow": "akshare",
+                "ths_instant_snapshot": "akshare",
+                "sina_historical": "sina_http",
+            }.get(source)
+            for raw_record in list(getattr(candidate, "fund_flow_evidence", []) or []):
+                record = dict(raw_record)
+                if source and not record.get("source"):
+                    record["source"] = source
+                if transport and not record.get("transport_provider"):
+                    record["transport_provider"] = transport
+                all_records.append(record)
+        selection = select_fund_flow_source(
+            all_records,
+            symbol=symbol,
+            requested_as_of=requested_as_of,
+            failure_chain=failure_chain,
+        )
+        if not selection.get("direction_allowed") or not selection.get("selected_source"):
+            return None
+        selected_source = selection["selected_source"]
+        selected_candidate = next(
+            (
+                candidate
+                for candidate, meta in zip(candidates, candidate_meta)
+                if selected_source in {
+                    str(meta.get("source") or ""),
+                    *{
+                        str(record.get("source") or "")
+                        for record in getattr(candidate, "fund_flow_evidence", []) or []
+                    },
+                }
+            ),
+            candidates[0] if candidates else None,
+        )
+        if selected_candidate is None:
+            return None
+        selected_meta = dict(getattr(selected_candidate, "fund_flow_evidence_meta", {}) or {})
+        selected_field = selection.get("selected_field") or selected_meta.get("field")
+        selected_dates = {
+            str(item.get("date"))
+            for item in selection.get("selected_evidence", [])
+        }
+        for record in all_records:
+            record_source = str(record.get("source") or "")
+            record_group = record.get("algorithm_group") or (
+                "legacy_web_algorithm" if "sina" in record_source else "new_algorithm_group"
+            )
+            record["fallback_rank"] = (
+                1 if record_source == "tushare_eastmoney_moneyflow_dc"
+                else 2 if record_source == "tushare_ths_moneyflow_ths"
+                else 4 if record_group == "legacy_web_algorithm" else 3
+            )
+            record["legacy_web_algorithm"] = record_group == "legacy_web_algorithm"
+            record["selected"] = bool(
+                record_source == selection.get("selected_source")
+                and selected_field
+                and record.get(selected_field) is not None
+                and str(record.get("date")) in selected_dates
+            )
+        source_note = (
+            "（Sina legacy/旧算法，仅供参考；方向为该来源自身字段语义，不得冒充新算法；"
+            "新浪旧 Web 参考值：仅作降级参考）"
+            if selection.get("legacy_reference")
+            else "（已按固定优先级选择；其他来源仅作旁证，不参与混算）"
+        )
+        selected_text = (
+            f"{selected_candidate}\n"
+            f"【资金流优先级选择】source={selected_source}；"
+            f"as-of={selection.get('selected_as_of')}；field={selected_field}；"
+            f"unit=亿元；transport_provider={selection.get('transport_provider')}；"
+            f"fallback_rank={selection.get('fallback_rank')}；"
+            f"direction={selection.get('selected_direction')} {source_note}"
+        )
+        metadata = dict(selected_meta)
+        metadata.update(selection)
+        metadata["consensus"] = dict(selection)
+        metadata.update({
+            "symbol": symbol,
+            "requested_as_of": requested_as_of,
+            "source": selected_source,
+            "source_family": selection.get("selected_source_family"),
+            "algorithm_group": selection.get("selected_algorithm_group"),
+            "selected_algorithm_group": selection.get("selected_algorithm_group"),
+            "field": selected_field,
+            "selected_field": selected_field,
+            "unit": "亿元",
+            "as_of": selection.get("selected_as_of"),
+            "actual_as_of": selection.get("selected_as_of"),
+            "attempted_sources": list(attempted_sources),
+            "fallback_errors": list(errors),
+            "failure_chain": list(selection.get("failure_chain") or failure_chain),
+            "em_typed_gap": "；".join(
+                error for error in errors
+                if error.startswith("stock_individual_fund_flow:")
+            ),
+            "failure_categories": sorted({
+                _fund_flow_failure_category(error) for error in errors
+            }),
+            "final_source": selected_source,
+            "last_attempted_source": attempted_sources[-1] if attempted_sources else None,
+        })
+        if tushare_meta:
+            metadata["tushare_provider"] = dict(tushare_meta)
+        if selection.get("legacy_reference"):
+            metadata.update({
+                "legacy_web_algorithm": True,
+                "legacy_reference_only": True,
+                "legacy_web_reference_only": True,
+            })
+        return FundFlowText(
+            selected_text,
+            evidence=all_records,
+            evidence_meta=metadata,
+        )
+
+    def get_individual_fund_flow(self, symbol: str, curr_date: str = None) -> str:
+        """Select fund-flow evidence deterministically by source priority."""
+        errors: list[str] = []
+        attempted_sources: list[str] = []
+        failure_chain: list[dict[str, Any]] = []
+        candidates: list[FundFlowText] = []
+        tushare_meta: dict[str, Any] = {}
+
+        def record_failure(source: str, error: str, category: str | None = None) -> None:
+            errors.append(error)
+            failure_chain.append({
+                "source": source,
+                "fallback_rank": 1 if "moneyflow_dc" in source else 2 if "moneyflow_ths" in source else 4 if "sina" in source else 3,
+                "category": category or _fund_flow_failure_category(error),
+                "error": error,
+            })
+
+        if not curr_date:
+            error = "fund_flow_individual: curr_date_missing"
+            record_failure("fund_flow_individual", error, "validation")
+            return FundFlowText(
+                "【数据获取失败】个股资金流向缺少 curr_date，拒绝使用 live 数据。",
+                evidence=[],
+                evidence_meta=build_gap_meta(
+                    symbol=symbol,
+                    requested_as_of=curr_date,
+                    source="fund_flow_individual",
+                    status="unavailable",
+                    reason=error,
+                    field="r0_net",
+                    raw_unit="元",
+                    failure_category="validation",
+                ),
+            )
+        cutoff = parse_yyyymmdd(curr_date)
+        if cutoff is None:
+            error = f"fund_flow_individual: curr_date_invalid:{curr_date!r}"
+            record_failure("fund_flow_individual", error, "validation")
+            return FundFlowText(
+                f"【数据获取失败】个股资金流向 curr_date 无法解析：{curr_date!r}",
+                evidence=[],
+                evidence_meta=build_gap_meta(
+                    symbol=symbol,
+                    requested_as_of=curr_date,
+                    source="fund_flow_individual",
+                    status="unavailable",
+                    reason=error,
+                    field="r0_net",
+                    raw_unit="元",
+                    failure_category="validation",
+                ),
+            )
+        future_reason = unavailable_analysis_date_reason(curr_date)
+        if future_reason:
+            record_failure("fund_flow_individual", "curr_date_future", "validation")
+            return FundFlowText(
+                future_reason,
+                evidence=[],
+                evidence_meta=build_gap_meta(
+                    symbol=symbol,
+                    requested_as_of=curr_date,
+                    source="fund_flow_individual",
+                    status="unavailable",
+                    reason="curr_date_future",
+                    field="r0_net",
+                    raw_unit="元",
+                    failure_category="validation",
+                ),
+            )
+        code = self._normalize_symbol(symbol)
+        requested_date = cutoff.isoformat()
+        is_historical = is_historical_analysis_date(curr_date)
+        ak = None
+
+        # Rank 1/2: Tushare DC then THS.  Both are fetched so the lower-ranked
+        # valid record can remain as side evidence without affecting selection.
+        if os.getenv("TUSHARE_TOKEN", "").strip():
+            attempted_sources.extend(["tushare.moneyflow_dc", "tushare.moneyflow_ths"])
+        tushare_text, tushare_errors, tushare_meta = self._fetch_tushare_fund_flow(
+            symbol,
+            requested_date,
+            requested_as_of=curr_date,
+        )
+        for error in tushare_errors:
+            source = "tushare.moneyflow_dc" if "moneyflow_dc" in error else "tushare.moneyflow_ths"
+            record_failure(source, error)
+        if tushare_text is not None:
+            candidates.append(tushare_text)
+
+        # Rank 3: all other new-algorithm sources.  Never return early: valid
+        # lower-ranked values are retained as audit side evidence.
+        attempted_sources.append("akshare.stock_individual_fund_flow")
+        try:
+            ak = self._ak()
+            with AKSHARE_CALL_LOCK:
+                market = "sh" if code[:1] in ("5", "6", "9") else "sz"
+                frame = ak.stock_individual_fund_flow(stock=code, market=market)
+            if frame is None or frame.empty:
+                record_failure("akshare.stock_individual_fund_flow", "stock_individual_fund_flow: empty dataframe")
+            else:
+                candidate = self._format_individual_fund_flow_em(
+                    frame, symbol, curr_date, cutoff
+                )
+                evidence = list(getattr(candidate, "fund_flow_evidence", []) or [])
+                actual_as_of = (getattr(candidate, "fund_flow_evidence_meta", {}) or {}).get("actual_as_of")
+                if evidence and (is_historical or actual_as_of == curr_date):
+                    candidates.append(candidate)
+                elif evidence:
+                    record_failure(
+                        "akshare.stock_individual_fund_flow",
+                        "stock_individual_fund_flow: no_current_day_row",
+                        "validation",
+                    )
+                else:
+                    candidate_reason = (
+                        getattr(candidate, "fund_flow_evidence_meta", {}) or {}
+                    ).get("reason")
+                    candidate_text = str(candidate or "").strip()
+                    detail = candidate_reason or candidate_text or "structured evidence unavailable"
+                    record_failure(
+                        "akshare.stock_individual_fund_flow",
+                        f"stock_individual_fund_flow: {detail}",
+                    )
+        except Exception as exc:
+            record_failure(
+                "akshare.stock_individual_fund_flow",
+                f"stock_individual_fund_flow: {type(exc).__name__}",
+            )
+
+        attempted_sources.append("eastmoney_direct")
+        try:
+            direct_text, direct_error = self._fetch_eastmoney_direct_fund_flow(
+                symbol,
+                curr_date,
+                cutoff,
+                require_curr_date=not is_historical,
+            )
+            if direct_text is not None:
+                candidates.append(direct_text)
+            elif direct_error:
+                record_failure("eastmoney_direct", direct_error)
+        except Exception as exc:
+            record_failure("eastmoney_direct", f"eastmoney_direct: {type(exc).__name__}")
+
+        if not is_historical:
+            attempted_sources.append("ths_instant_snapshot")
+            try:
+                if ak is None:
+                    ak = self._ak()
+                snapshot = self._fetch_ths_instant_snapshot_fund_flow(
+                    ak, symbol, curr_date, code
+                )
+                if snapshot is not None:
+                    candidates.append(snapshot)
+                else:
+                    record_failure(
+                        "ths_instant_snapshot",
+                        "ths_instant_snapshot: no_usable_rows；同花顺即时资金流净额快照不可用",
+                        "validation",
+                    )
+            except Exception as exc:
+                error_type = type(exc).__name__
+                record_failure(
+                    "ths_instant_snapshot",
+                    f"ths_instant_snapshot: {error_type}；stock_fund_flow_individual: {error_type}",
+                )
+
+        # Do not call legacy when a new-algorithm source is already valid.  This
+        # makes the priority contract observable and avoids presenting legacy as
+        # a peer source when it is not needed.
+        selected_new = self._finalize_fund_flow_candidates(
+            candidates,
+            symbol=symbol,
+            requested_as_of=curr_date,
+            attempted_sources=attempted_sources,
+            errors=errors,
+            failure_chain=failure_chain,
+            tushare_meta=tushare_meta,
+        )
+        if selected_new is not None:
+            return selected_new
+
+        # Rank 4: Sina legacy is selected only after every new-algorithm
+        # candidate has been inspected, but its own valid direction is allowed.
+        attempted_sources.append("sina_historical")
+        try:
+            legacy = self._fetch_sina_historical_fund_flow(
+                symbol,
+                curr_date,
+                cutoff,
+                require_curr_date=not is_historical,
+            )
+            if legacy is not None:
+                candidates.append(legacy)
+            else:
+                record_failure(
+                    "sina_historical",
+                    "sina historical fund flow: no usable row",
+                    "availability",
+                )
+        except Exception as exc:
+            record_failure("sina_historical", f"sina historical fund flow: {type(exc).__name__}")
+
+        selected = self._finalize_fund_flow_candidates(
+            candidates,
+            symbol=symbol,
+            requested_as_of=curr_date,
+            attempted_sources=attempted_sources,
+            errors=errors,
+            failure_chain=failure_chain,
+            tushare_meta=tushare_meta,
+        )
+        if selected is not None:
+            return selected
+        reason = (
+            "historical new-algorithm and legacy sources unavailable"
+            if is_historical
+            else "all fund-flow sources unavailable or failed field/date/unit validation"
+        )
+        gap_label = (
+            f"历史日期 {curr_date}"
+            if is_historical
+            else f"{symbol} 在 {curr_date}"
+        )
+        source_gap_labels = []
+        if "ths_instant_snapshot" in attempted_sources:
+            source_gap_labels.append("同花顺即时资金流净额快照")
+        if "sina_historical" in attempted_sources:
+            source_gap_labels.append("新浪历史/legacy Web")
+        source_gap_suffix = (
+            f"（{'、'.join(source_gap_labels)}均无可用结果）"
+            if source_gap_labels else ""
+        )
+        gap = build_provider_text(
+            f"【数据获取失败】{gap_label} 无可验证资金流来源，本项不可用。"
+            f"{source_gap_suffix}（{'；'.join(errors)}）",
+            symbol=symbol,
+            requested_as_of=curr_date,
+            source="fund_flow_individual",
+            reason=f"{reason}；{'；'.join(errors)}" if errors else reason,
+            field="r0_net",
+            raw_unit="元",
+            failure_category="source_unavailable",
+        )
+        metadata = dict(getattr(gap, "fund_flow_evidence_meta", {}) or {})
+        metadata.update({
+            "attempted_sources": attempted_sources,
+            "fallback_errors": errors,
+            "failure_chain": failure_chain,
+            "failure_categories": sorted({
+                _fund_flow_failure_category(error) for error in errors
+            }),
+            "em_typed_gap": "；".join(
+                error for error in errors
+                if error.startswith("stock_individual_fund_flow:")
+            ),
+            "last_attempted_source": attempted_sources[-1] if attempted_sources else None,
+        })
+        if tushare_meta:
+            metadata["tushare_provider"] = tushare_meta
+        return FundFlowText(str(gap), evidence=[], evidence_meta=metadata)
+
     def _fetch_eastmoney_direct_fund_flow(
         self,
         symbol: str,
@@ -2972,7 +3449,6 @@ class CnAkshareProvider(BaseMarketDataProvider):
             evidence,
             symbol=symbol,
             requested_as_of=curr_date,
-            field="r0_net",
         )
         return FundFlowText(
             header,

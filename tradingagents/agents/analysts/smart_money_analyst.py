@@ -94,7 +94,6 @@ def create_smart_money_analyst(llm, data_collector=None):
         )
         consensus_blocked = bool(
             not isinstance(consensus, dict)
-            or consensus.get("status") != "consensus"
             or not consensus.get("direction_allowed")
             or consensus.get("hard_guard", {}).get("blocked")
             or validation.get("status") in {"blocked", "mismatch"}
@@ -120,7 +119,7 @@ def create_smart_money_analyst(llm, data_collector=None):
                 "不得将其视为新浪历史 netamount/r0_net 同口径的主力序列。\n\n"
                 f"【资金流数据（来源、日期与口径见数据）】\n{fund_flow}\n\n"
                 f"【资金流结构化 evidence（仅用于精确累计，不得从展示文本反推）】\n{evidence_text}\n\n"
-                f"【新算法组共识规则】\n{consensus_instruction}\n\n"
+                f"【资金流来源优先级与字段规则】\n{consensus_instruction}\n\n"
                 f"【龙虎榜数据】\n{lhb}\n\n"
                 f"【成交量指标(vwma)】\n{volume}"
             )),
@@ -194,7 +193,18 @@ def create_smart_money_analyst(llm, data_collector=None):
             fund_flow_evidence = market_data_context.get("fund_flow_evidence", fund_flow_evidence)
         if isinstance(fund_flow_evidence, dict) and fund_flow_evidence.get("records"):
             fund_flow_evidence["validation"] = validate_model_summary(
-                fund_flow_evidence.get("records", []), full_content, window_days=5
+                fund_flow_evidence.get("records", []),
+                full_content,
+                window_days=5,
+                selected_source=(
+                    fund_flow_evidence.get("selected_source")
+                    or fund_flow_evidence.get("source")
+                ),
+                selected_field=(
+                    fund_flow_evidence.get("selected_field")
+                    or fund_flow_evidence.get("field")
+                ),
+                requested_as_of=current_date,
             )
             if not fund_flow_evidence.get("consensus"):
                 fund_flow_evidence["consensus"] = build_consensus_evidence(
@@ -208,7 +218,6 @@ def create_smart_money_analyst(llm, data_collector=None):
             validation = fund_flow_evidence.get("validation", validation)
             consensus_blocked = bool(
                 not isinstance(consensus, dict)
-                or consensus.get("status") != "consensus"
                 or not consensus.get("direction_allowed")
                 or consensus.get("hard_guard", {}).get("blocked")
                 or validation.get("status") in {"blocked", "mismatch"}
@@ -218,8 +227,8 @@ def create_smart_money_analyst(llm, data_collector=None):
             full_content = "主力资金分析生成异常（输出退化），本项不可用"
         if consensus_blocked:
             full_content = (
-                "资金流新算法组共识不可用或存在口径冲突；已阻断增持、减持、吸筹方向摘要。"
-                "请保留各来源原值，待同一股票、日期、窗口、单位和字段可比后复核。"
+                "资金流来源选择不可用或存在字段、日期、窗口、单位冲突；"
+                "已阻断方向摘要并保留失败链与各来源原值。"
             )
         _elapsed = _time.monotonic() - _t0
         _meta = getattr(_last_chunk, "response_metadata", {}) or {}

@@ -91,9 +91,12 @@ def valid_fund_flow_consensus_guard() -> dict[str, Any]:
 
 
 def blocked_fund_flow_consensus_guard() -> dict[str, Any]:
-    """Return a production-shaped guard for an unexplained source conflict."""
+    """Return a production-shaped guard for invalid source units."""
+    records = _new_algorithm_records("r0_net", ("1.0", "10.0"))
+    for record in records:
+        record["unit"] = "美元"
     consensus = build_consensus_evidence(
-        _new_algorithm_records("r0_net", ("1.0", "10.0")),
+        records,
         symbol=_SYMBOL,
         requested_as_of=_AS_OF,
         field="r0_net",
@@ -118,12 +121,12 @@ def mismatched_fund_flow_consensus_guard() -> dict[str, Any]:
 
 
 def direction_disallowed_fund_flow_consensus_guard() -> dict[str, Any]:
-    """Return a production-shaped non-main-force guard with direction blocked."""
+    """Return a production-shaped guard for a semantically invalid field."""
     consensus = build_consensus_evidence(
-        _new_algorithm_records("netamount", ("1.0", "1.1")),
+        _new_algorithm_records("unsupported_field", ("1.0", "1.1")),
         symbol=_SYMBOL,
         requested_as_of=_AS_OF,
-        field="netamount",
+        field="unsupported_field",
     )
     validation = validate_model_summary(_validation_records(), model_text=None)
     return _guard_from_production_outputs(consensus, validation)

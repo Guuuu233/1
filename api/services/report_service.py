@@ -445,7 +445,11 @@ def _validate_fund_flow_evidence(result_data: Dict[str, Any]) -> None:
                         contexts.append(item_context["fund_flow_evidence"])
     for context in contexts:
         guard = context.get("consensus") or context.get("fund_flow_consensus_guard")
-        if isinstance(guard, dict) and guard.get("blocked") is False:
+        if (
+            isinstance(guard, dict)
+            and guard.get("blocked") is False
+            and guard.get("direction_allowed") is True
+        ):
             continue
         unit = context.get("unit")
         if unit is not None and unit != "亿元":
