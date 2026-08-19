@@ -125,8 +125,11 @@ def test_fundamentals_system_message_deep_framework():
     """
     prompt = ZH_PROMPTS["fundamentals_system_message"]
 
-    # 1. 产业链议价权与竞争壁垒
+    # 1. 产业链议价权与竞争壁垒（A. 上游议价权与成本传导、B. 下游需求与订单质量）
     assert any(term in prompt for term in ("产业链", "议价权", "供应商", "客户", "定价权"))
+    assert "上游议价权与成本传导" in prompt or "上游议价权" in prompt
+    assert "下游需求与订单质量" in prompt or "下游需求" in prompt
+    assert "国际对标" in prompt
 
     # 2. 行业周期与供需定位
     assert any(term in prompt for term in ("产能周期", "库存周期", "供需", "Capex", "资本开支"))
@@ -137,9 +140,12 @@ def test_fundamentals_system_message_deep_framework():
     # 4. 宏观敏感度与极端情景压力测试
     assert any(term in prompt for term in ("敏感度", "敏感性", "极端情景", "压力测试", "Stress Test"))
 
-    # 5. 数据缺失规范保留
+    # 5. 输出强制要求（数据缺失、对比、议价权定性、敏感性）
+    assert "【输出强制要求】" in prompt or "输出强制要求" in prompt
     assert "数据缺失" in prompt
-    assert any(term in prompt for term in ("置信度下降", "明确指出是哪个报表"))
+    assert any(term in prompt for term in ("置信度下降", "明确指出是哪个报表", "【数据缺失】"))
+    assert "同比/环比" in prompt or "同比" in prompt
+    assert "成本敏感性" in prompt or "敏感性分析" in prompt
 
     # 6. 项目符号列表要求
     assert "项目符号列表" in prompt
