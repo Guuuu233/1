@@ -422,6 +422,47 @@ def _fund_flow_failure_category(error: object) -> str:
 class CnAkshareProvider(BaseMarketDataProvider):
     """A-share provider backed by AkShare."""
 
+    # Thread-safe in-memory TTL cache for macro market data (CN indices, global indices, major assets)
+    _MACRO_CACHE_TTL: float = 600.0  # 10 minutes (5-15 min range)
+    _macro_cache: dict[str, tuple[float, str]] = {}
+    _macro_cache_lock: threading.Lock = threading.Lock()
+
+    @classmethod
+    def clear_macro_cache(cls) -> None:
+        """Test helper: clear in-memory macro cache."""
+        with cls._macro_cache_lock:
+            cls._macro_cache.clear()
+
+    @classmethod
+    def _get_macro_cache(cls, key: str) -> "str | None":
+        with cls._macro_cache_lock:
+            hit = cls._macro_cache.get(key)
+            if hit is not None:
+                ts, val = hit
+                if time.monotonic() - ts < cls._MACRO_CACHE_TTL:
+                    return val
+                del cls._macro_cache[key]
+        return None
+
+    @classmethod
+    def _set_macro_cache(cls, key: str, val: str) -> None:
+        if not val or val.startswith("【数据获取失败】"):
+            return
+        with cls._macro_cache_lock:
+            if len(cls._macro_cache) > 128:
+                now = time.monotonic()
+                expired = [
+                    k
+                    for k, (t, _) in cls._macro_cache.items()
+                    if now - t >= cls._MACRO_CACHE_TTL
+                ]
+                for k in expired:
+                    del cls._macro_cache[k]
+                if len(cls._macro_cache) > 128:
+                    for k in list(cls._macro_cache.keys())[:32]:
+                        del cls._macro_cache[k]
+            cls._macro_cache[key] = (time.monotonic(), val)
+
     INDICATOR_DESCRIPTIONS = {
         "close_50_sma": (
             "50 日均线（SMA）：中期趋势指标。"
@@ -4127,6 +4168,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
         except Exception:
             return f"【数据获取失败】国内核心大盘指数 — 原因：非法日期格式 {curr_date} (来源: cn_akshare)"
 
+        cache_key = f"cn_indices:{curr_date}:{look_back_days}"
+        cached = self._get_macro_cache(cache_key)
+        if cached is not None:
+            return cached
+
         start_dt = end_dt - timedelta(days=max(look_back_days * 2, 90))
         start_yyyymmdd = start_dt.strftime("%Y%m%d")
         end_yyyymmdd = end_dt.strftime("%Y%m%d")
@@ -4142,40 +4188,45 @@ class CnAkshareProvider(BaseMarketDataProvider):
         ]
 
         results = {}
-        with AKSHARE_CALL_LOCK:
-            ak = self._ak()
-            for name, code, em_symbol in cn_indices:
+        ak = self._ak()
+        for name, code, em_symbol in cn_indices:
+            df = None
+            try:
+                if hasattr(ak, "index_zh_a_hist"):
+                    with AKSHARE_CALL_LOCK:
+                        df = ak.index_zh_a_hist(
+                            symbol=code,
+                            period="daily",
+                            start_date=start_yyyymmdd,
+                            end_date=end_yyyymmdd,
+                        )
+            except Exception:
                 df = None
+
+            if df is None or df.empty:
                 try:
-                    if hasattr(ak, "index_zh_a_hist"):
-                        df = ak.index_zh_a_hist(symbol=code, period="daily", start_date=start_yyyymmdd, end_date=end_yyyymmdd)
+                    if hasattr(ak, "stock_zh_index_daily_em"):
+                        with AKSHARE_CALL_LOCK:
+                            df = ak.stock_zh_index_daily_em(
+                                symbol=em_symbol,
+                                start_date=start_yyyymmdd,
+                                end_date=end_yyyymmdd,
+                            )
                 except Exception:
                     df = None
 
-                if df is None or df.empty:
-                    try:
-                        if hasattr(ak, "stock_zh_index_daily_em"):
-                            df = ak.stock_zh_index_daily_em(symbol=em_symbol)
-                    except Exception:
-                        df = None
-
-                if df is None or df.empty:
-                    try:
-                        if hasattr(ak, "stock_zh_index_daily_tx"):
-                            df = ak.stock_zh_index_daily_tx(symbol=em_symbol)
-                    except Exception:
-                        df = None
-
-                if df is not None and not df.empty:
-                    metrics = calculate_series_metrics(df, curr_date)
-                    if metrics:
-                        metrics["code"] = em_symbol.upper()
-                        results[name] = metrics
+            if df is not None and not df.empty:
+                metrics = calculate_series_metrics(df, curr_date)
+                if metrics:
+                    metrics["code"] = em_symbol.upper()
+                    results[name] = metrics
 
         if not results:
             return "【数据获取失败】国内核心大盘指数 — 原因：所有国内指数接口调用失败或无有效数据 (来源: cn_akshare)"
 
-        return build_cn_indices_markdown(results, curr_date, source="cn_akshare")
+        result_md = build_cn_indices_markdown(results, curr_date, source="cn_akshare")
+        self._set_macro_cache(cache_key, result_md)
+        return result_md
 
     def get_global_indices(self, curr_date: str = None, look_back_days: int = 30) -> str:
         if curr_date is None:
@@ -4187,6 +4238,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
             end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
         except Exception:
             return f"【数据获取失败】全球核心指数 — 原因：非法日期格式 {curr_date} (来源: cn_akshare)"
+
+        cache_key = f"global_indices:{curr_date}:{look_back_days}"
+        cached = self._get_macro_cache(cache_key)
+        if cached is not None:
+            return cached
 
         global_targets = [
             ("标普500", ".INX", "标普500"),
@@ -4201,33 +4257,36 @@ class CnAkshareProvider(BaseMarketDataProvider):
         ]
 
         results = {}
-        with AKSHARE_CALL_LOCK:
-            ak = self._ak()
-            for name, code, ak_name in global_targets:
-                df = None
-                try:
-                    if hasattr(ak, "index_global_hist_em"):
+        ak = self._ak()
+        for name, code, ak_name in global_targets:
+            df = None
+            try:
+                if hasattr(ak, "index_global_hist_em"):
+                    with AKSHARE_CALL_LOCK:
                         df = ak.index_global_hist_em(symbol=ak_name)
+            except Exception:
+                df = None
+
+            if df is None or df.empty:
+                try:
+                    if hasattr(ak, "stock_hk_index_daily_em") and code in ("HSI", "HSTECH"):
+                        with AKSHARE_CALL_LOCK:
+                            df = ak.stock_hk_index_daily_em(symbol=code)
                 except Exception:
                     df = None
 
-                if df is None or df.empty:
-                    try:
-                        if hasattr(ak, "stock_hk_index_daily_em") and code in ("HSI", "HSTECH"):
-                            df = ak.stock_hk_index_daily_em(symbol=code)
-                    except Exception:
-                        df = None
-
-                if df is not None and not df.empty:
-                    metrics = calculate_series_metrics(df, curr_date)
-                    if metrics:
-                        metrics["code"] = code
-                        results[name] = metrics
+            if df is not None and not df.empty:
+                metrics = calculate_series_metrics(df, curr_date)
+                if metrics:
+                    metrics["code"] = code
+                    results[name] = metrics
 
         if not results:
             return "【数据获取失败】全球核心指数 — 原因：所有全球指数接口调用失败或无有效数据 (来源: cn_akshare)"
 
-        return build_global_indices_markdown(results, curr_date, source="cn_akshare")
+        result_md = build_global_indices_markdown(results, curr_date, source="cn_akshare")
+        self._set_macro_cache(cache_key, result_md)
+        return result_md
 
     def get_major_assets(self, curr_date: str = None, look_back_days: int = 30) -> str:
         if curr_date is None:
@@ -4240,6 +4299,11 @@ class CnAkshareProvider(BaseMarketDataProvider):
         except Exception:
             return f"【数据获取失败】全球大类资产 — 原因：非法日期格式 {curr_date} (来源: cn_akshare)"
 
+        cache_key = f"major_assets:{curr_date}:{look_back_days}"
+        cached = self._get_macro_cache(cache_key)
+        if cached is not None:
+            return cached
+
         assets_targets = [
             ("COMEX黄金", "GC", "futures_foreign", "贵金属", "避险资产 / 真实利率反向指标"),
             ("WTI原油", "CL", "futures_foreign", "能源商品", "通胀预期 / 工业能源基准"),
@@ -4250,41 +4314,46 @@ class CnAkshareProvider(BaseMarketDataProvider):
         ]
 
         results = {}
-        with AKSHARE_CALL_LOCK:
-            ak = self._ak()
-            for name, code, kind, cat, sig in assets_targets:
-                df = None
-                try:
-                    if kind == "futures_foreign":
-                        if hasattr(ak, "futures_foreign_hist"):
+        ak = self._ak()
+        for name, code, kind, cat, sig in assets_targets:
+            df = None
+            try:
+                if kind == "futures_foreign":
+                    if hasattr(ak, "futures_foreign_hist"):
+                        with AKSHARE_CALL_LOCK:
                             df = ak.futures_foreign_hist(symbol=code)
-                        if (df is None or df.empty) and hasattr(ak, "futures_global_hist_em"):
+                    if (df is None or df.empty) and hasattr(ak, "futures_global_hist_em"):
+                        with AKSHARE_CALL_LOCK:
                             df = ak.futures_global_hist_em(symbol=name)
-                    elif kind == "bond_us":
-                        if hasattr(ak, "bond_zh_us_rate"):
+                elif kind == "bond_us":
+                    if hasattr(ak, "bond_zh_us_rate"):
+                        with AKSHARE_CALL_LOCK:
                             df_raw = ak.bond_zh_us_rate()
-                            if df_raw is not None and not df_raw.empty:
-                                cols_map = {str(c): c for c in df_raw.columns}
-                                date_col = next((cols_map[c] for c in ("日期", "date") if c in cols_map), None)
-                                rate_col = next((cols_map[c] for c in ("美国国债收益率10年", "美国国债收益率2年", "us10y", "US10Y") if c in cols_map), None)
-                                if date_col and rate_col:
-                                    df = df_raw[[date_col, rate_col]].rename(columns={date_col: "date", rate_col: "close"})
-                        if (df is None or df.empty) and hasattr(ak, "bond_gb_us_sina"):
+                        if df_raw is not None and not df_raw.empty:
+                            cols_map = {str(c): c for c in df_raw.columns}
+                            date_col = next((cols_map[c] for c in ("日期", "date") if c in cols_map), None)
+                            rate_col = next((cols_map[c] for c in ("美国国债收益率10年", "美国国债收益率2年", "us10y", "US10Y") if c in cols_map), None)
+                            if date_col and rate_col:
+                                df = df_raw[[date_col, rate_col]].rename(columns={date_col: "date", rate_col: "close"})
+                    if (df is None or df.empty) and hasattr(ak, "bond_gb_us_sina"):
+                        with AKSHARE_CALL_LOCK:
                             df = ak.bond_gb_us_sina(symbol="10")
-                except Exception:
-                    df = None
+            except Exception:
+                df = None
 
-                if df is not None and not df.empty:
-                    metrics = calculate_series_metrics(df, curr_date)
-                    if metrics:
-                        metrics["code"] = code
-                        metrics["category"] = cat
-                        metrics["macro_signal"] = sig
-                        if kind == "bond_us":
-                            metrics["unit"] = "%"
-                        results[name] = metrics
+            if df is not None and not df.empty:
+                metrics = calculate_series_metrics(df, curr_date)
+                if metrics:
+                    metrics["code"] = code
+                    metrics["category"] = cat
+                    metrics["macro_signal"] = sig
+                    if kind == "bond_us":
+                        metrics["unit"] = "%"
+                    results[name] = metrics
 
         if not results:
             return "【数据获取失败】全球大类资产 — 原因：所有大类资产接口调用失败或无有效数据 (来源: cn_akshare)"
 
-        return build_major_assets_markdown(results, curr_date, source="cn_akshare")
+        result_md = build_major_assets_markdown(results, curr_date, source="cn_akshare")
+        self._set_macro_cache(cache_key, result_md)
+        return result_md
