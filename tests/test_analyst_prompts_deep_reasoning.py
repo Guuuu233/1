@@ -88,6 +88,36 @@ def test_macro_system_message_deep_framework():
     assert any(term in prompt for term in ("情景推演", "Scenario Analysis", "基准情景", "乐观情景", "悲观情景"))
 
 
+def test_macro_system_message_mandatory_association_list_and_transmission():
+    """DAV-194 (T2): Verify 5 major industries transmission list and mandatory output requirements."""
+    prompt = ZH_PROMPTS["macro_system_message"]
+
+    # 1. 强制联想清单标题与5大行业覆盖
+    assert "【强制联想清单】" in prompt
+    assert "消费电子/半导体显示" in prompt and "京东方" in prompt
+    assert "新能源车/动力电池" in prompt and "宁德时代" in prompt
+    assert "石油化工" in prompt and "万华化学" in prompt
+    assert "金融/地产" in prompt and "招商银行" in prompt
+    assert "其他行业（通用框架）" in prompt or "通用框架" in prompt
+
+    # 2. 具体传导链路
+    assert "玻璃基板/驱动IC成本" in prompt or "驱动IC" in prompt
+    assert "碳酸锂/钴/镍价格" in prompt
+    assert "布伦特原油/WTI" in prompt
+    assert "MLF/LPR利率" in prompt
+
+    # 3. 输出强制要求
+    assert "每条传导链路必须有**方向**" in prompt or "方向（正相关/负相关）" in prompt
+    assert "量级（强/中/弱）" in prompt
+    assert "【数据缺失】" in prompt
+    assert "时滞" in prompt
+    assert "已发生" in prompt and "预期中" in prompt
+
+    # 4. 正反面案例
+    assert "【反面案例（禁止）】" in prompt
+    assert "【正面案例（必须）】" in prompt
+
+
 def test_fundamentals_system_message_deep_framework():
     """T3: fundamentals_system_message must include supply chain bargaining power,
 
