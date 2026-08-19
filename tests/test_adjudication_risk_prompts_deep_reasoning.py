@@ -69,6 +69,47 @@ def test_research_manager_prompt_deep_framework():
     assert "【输出纪律】只输出正式报告正文" in prompt
 
 
+def test_research_manager_five_step_framework_and_output_discipline():
+    """DAV-198 (DAV-192-T6): Verify research_manager_prompt covers five-step adjudication framework and output discipline."""
+    prompt = ZH_PROMPTS["research_manager_prompt"]
+
+    # 五步深度裁决框架
+    # 第一步：证据链完整性审查 - 标注"证据充分/薄弱/缺失"
+    assert "第一步：证据链完整性审查" in prompt
+    assert any(term in prompt for term in ("证据充分/薄弱/缺失", "证据充分", "证据薄弱", "证据缺失"))
+
+    # 第二步：传导路径验证 - 检查时滞/量化/历史验证是否合理
+    assert "第二步：传导路径验证" in prompt
+    assert "时滞" in prompt
+    assert "量化" in prompt
+    assert "历史验证" in prompt
+
+    # 第三步：焦点分歧裁决 - 逐个裁决哪方证据更强、逻辑更严密，明确判定"多头胜/空头胜/势均力敌"
+    assert "第三步：焦点分歧裁决" in prompt
+    assert "多头胜/空头胜/势均力敌" in prompt
+
+    # 第四步：极端情景测试 - 推演多空双方的极端情景是否合理
+    assert "第四步：极端情景测试" in prompt
+    assert "极端情景" in prompt
+
+    # 第五步：风险收益比量化 - 综合给出上涨空间/下跌风险/赔率
+    assert "第五步：风险收益比量化" in prompt
+    assert "上涨空间" in prompt
+    assert any(term in prompt for term in ("下跌风险", "回撤风险"))
+    assert "赔率" in prompt
+
+    # 输出纪律
+    # 1. 总字数800-1200字
+    assert any(term in prompt for term in ("800-1200", "800-1200字"))
+    # 2. 必须有明确的"多头胜/空头胜/势均力敌"结论
+    assert "多头胜/空头胜/势均力敌" in prompt
+    # 3. 必须给出"建议仓位"（0-100%）和"止损位"（具体价格/跌幅）
+    assert "建议仓位" in prompt
+    assert "0-100%" in prompt
+    assert "止损位" in prompt
+    assert "具体价格/跌幅" in prompt or ("具体价格" in prompt and "跌幅" in prompt)
+
+
 def test_trader_system_prompt_deep_framework():
     """T10: trader_system_prompt must enforce direction anchoring, global macro calibration,
 
