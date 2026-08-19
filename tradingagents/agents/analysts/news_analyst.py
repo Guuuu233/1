@@ -6,7 +6,13 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
 from tradingagents.graph.intent_parser import build_horizon_context
-from tradingagents.agents.utils.agent_states import current_tracker_var, extract_verdict, check_llm_output_degraded, check_stream_chunk_degraded
+from tradingagents.agents.utils.agent_states import (
+    current_tracker_var,
+    extract_verdict,
+    check_llm_output_degraded,
+    check_stream_chunk_degraded,
+)
+from tradingagents.agents.utils.knowledge_context import resolve_macro_event_context
 from api.database import log_llm_call
 
 logger = logging.getLogger(__name__)
@@ -15,7 +21,11 @@ logger = logging.getLogger(__name__)
 def create_news_analyst(llm, data_collector=None):
     async def _safe(tool, payload):
         try:
-            return await asyncio.to_thread(tool.invoke, payload)
+            if hasattr(tool, "invoke"):
+                return await asyncio.to_thread(tool.invoke, payload)
+            elif callable(tool):
+                return await asyncio.to_thread(tool, **payload)
+            return str(tool)
         except Exception as exc:
             return f"调用失败：{exc}"
 
@@ -32,7 +42,7 @@ def create_news_analyst(llm, data_collector=None):
         specific_questions = user_intent.get("specific_questions", [])
 
         config = get_config()
-        system_message = get_prompt("news_system_message", config=config)
+        system_message = get_prompt("news_system_message", config=config) or ""
         horizon_ctx = build_horizon_context(horizon, focus_areas, specific_questions, agent_type="news")
 
         pool = data_collector.get(ticker, current_date) if data_collector else None
@@ -47,7 +57,7 @@ def create_news_analyst(llm, data_collector=None):
             days = 14 if horizon == "short" else 30
             end_dt = datetime.strptime(current_date, "%Y-%m-%d")
             start_dt = end_dt - timedelta(days=days)
-            
+
             # Parallelize fallback fetches
             results = await asyncio.gather(
                 _safe(get_news, {
@@ -60,81 +70,55 @@ def create_news_analyst(llm, data_collector=None):
             stock_news, global_news = results
             data_window = f"{days}天"
 
+        # ── 宏观事件情景图谱挂载 ──────────────────
+        _, macro_event_ctx = resolve_macro_event_context(
+            text=f"{stock_news}\n{global_news}",
+            max_events=2,
+        )
+
+        human_content_blocks = [
+            horizon_ctx + "\n" + f"以下是 {ticker_display} 在 {current_date} 的新闻资料（{data_window}）。",
+            f"【get_news】\n{stock_news}",
+            f"【get_global_news】\n{global_news}",
+        ]
+        if macro_event_ctx:
+            human_content_blocks.append(f"【宏观事件传导图谱】\n{macro_event_ctx}")
+
         messages = [
             SystemMessage(content=(
                 system_message
                 + "\n\n请严格基于提供的新闻资料输出报告，全程使用中文。"
             )),
-            HumanMessage(content=(
-                horizon_ctx + "\n"
-                f"以下是 {ticker_display} 在 {current_date} 的新闻资料（{data_window}）。\n\n"
-                f"【get_news】\n{stock_news}\n\n"
-                f"【get_global_news】\n{global_news}\n"
-            )),
+            HumanMessage(content="\n\n".join(human_content_blocks)),
         ]
 
         # ── 实现 Token 级流式输出（含降级保障） ──────────────────
-
-
         tracker = current_tracker_var.get()
-
-
         import time as _time
         full_content = ""
         _last_chunk = None
         _t0 = _time.monotonic()
 
-
         try:
-
-
             async for chunk in llm.astream(messages):
                 _last_chunk = chunk
                 content = chunk.content if hasattr(chunk, "content") else str(chunk)
-
-
                 full_content += content
                 if check_stream_chunk_degraded(full_content, "News Analyst"):
                     break
-
-
                 if tracker:
-
-
                     tracker._emit_token("News Analyst", "news_report", content)
-
-
         except Exception as exc:
-
-
             logger.debug("[News Analyst] Stream error: %s", exc)
 
-
-
         if not full_content.strip():
-
-
             logger.debug("[News Analyst] Stream yielded empty text, attempting invoke fallback...")
-
-
             try:
-
-
                 res = await asyncio.to_thread(llm.invoke, messages)
-
-
                 full_content = res.content if hasattr(res, "content") else str(res)
-
-
                 if tracker:
-
-
                     tracker._emit_token("News Analyst", "news_report", full_content)
-
-
             except Exception as exc:
-
-
                 full_content = f"分析报告生成失败：{exc}"
 
         if check_llm_output_degraded(full_content, "News Analyst"):

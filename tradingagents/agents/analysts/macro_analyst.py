@@ -1,12 +1,23 @@
 import logging
-from tradingagents.agents.utils.context_utils import get_cn_stock_name
 import asyncio
+import time as _time
+from datetime import datetime, timedelta
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
 from tradingagents.graph.intent_parser import build_horizon_context
-from tradingagents.agents.utils.agent_states import current_tracker_var, extract_verdict, check_llm_output_degraded, check_stream_chunk_degraded
+from tradingagents.agents.utils.agent_states import (
+    current_tracker_var,
+    extract_verdict,
+    check_llm_output_degraded,
+    check_stream_chunk_degraded,
+)
+from tradingagents.agents.utils.context_utils import get_cn_stock_name
+from tradingagents.agents.utils.knowledge_context import (
+    resolve_industry_context,
+    resolve_macro_event_context,
+)
 from api.database import log_llm_call
 
 logger = logging.getLogger(__name__)
@@ -15,9 +26,26 @@ logger = logging.getLogger(__name__)
 def create_macro_analyst(llm, data_collector=None):
     async def _safe(tool, payload):
         try:
-            return await asyncio.to_thread(tool.invoke, payload)
+            if hasattr(tool, "invoke"):
+                return await asyncio.to_thread(tool.invoke, payload)
+            elif callable(tool):
+                return await asyncio.to_thread(tool, **payload)
+            return str(tool)
         except Exception as exc:
             return f"调用失败：{exc}"
+
+    async def _fetch_optional_tool(tool_name: str, payload: dict) -> str:
+        try:
+            from tradingagents.agents.utils import agent_utils
+            tool = getattr(agent_utils, tool_name, None)
+            if tool is None:
+                from tradingagents.dataflows import interface
+                tool = getattr(interface, tool_name, None)
+            if tool is not None:
+                return await _safe(tool, payload)
+        except Exception as exc:
+            return f"调用失败：{exc}"
+        return "无数据"
 
     async def macro_analyst_node(state):
         current_date = state["trade_date"]
@@ -41,97 +69,123 @@ def create_macro_analyst(llm, data_collector=None):
         if pool is not None:
             board_flow = pool.get("fund_flow_board", "无数据")
             recent_news = pool.get("news", "无数据")
+            global_news = pool.get("global_news", "无数据")
+            global_indices = pool.get("global_indices", "无数据")
+            major_assets = pool.get("major_assets", "无数据")
+            cn_indices = pool.get("cn_indices", "无数据")
+            northbound_flow = pool.get("northbound_flow", "无数据")
         else:
-            from datetime import datetime, timedelta
-            from tradingagents.agents.utils.agent_utils import get_board_fund_flow, get_news
             days = 7
             end_dt = datetime.strptime(current_date, "%Y-%m-%d")
             start_dt = end_dt - timedelta(days=days)
-            
+            from tradingagents.agents.utils.agent_utils import (
+                get_board_fund_flow,
+                get_news,
+                get_global_news,
+                get_northbound_flow,
+            )
+
             # Parallelize fallback fetches
             results = await asyncio.gather(
                 _safe(get_board_fund_flow, {"curr_date": current_date}),
                 _safe(get_news, {
                     "ticker": ticker, "start_date": start_dt.strftime("%Y-%m-%d"), "end_date": current_date,
-                })
+                }),
+                _safe(get_global_news, {
+                    "curr_date": current_date, "look_back_days": 14, "limit": 15,
+                }),
+                _safe(get_northbound_flow, {"symbol": ticker, "curr_date": current_date}),
+                _fetch_optional_tool("get_global_indices", {"curr_date": current_date}),
+                _fetch_optional_tool("get_major_assets", {"curr_date": current_date}),
+                _fetch_optional_tool("get_cn_indices", {"curr_date": current_date}),
             )
-            board_flow, recent_news = results
+            (
+                board_flow,
+                recent_news,
+                global_news,
+                northbound_flow,
+                global_indices,
+                major_assets,
+                cn_indices,
+            ) = results
+
+        # ── 知识库与宏观情景图谱挂载 ──────────────────
+        combined_text = f"{board_flow}\n{recent_news}\n{global_news}"
+        _, industry_ctx = resolve_industry_context(
+            ticker=ticker,
+            stock_name=stock_name,
+            extra_text=combined_text,
+            state=state,
+        )
+        _, macro_event_ctx = resolve_macro_event_context(
+            text=f"{recent_news}\n{global_news}",
+            max_events=2,
+        )
+
+        # ── 组装 HumanMessage ────────────────────────
+        human_content_lines = [
+            horizon_ctx + "\n" + f"请分析 {ticker_display} 在 {current_date} 的宏观与板块环境。",
+            f"【今日行业板块资金流向】\n{board_flow}",
+            f"【近期相关新闻】\n{recent_news}",
+        ]
+
+        if global_indices != "无数据" or major_assets != "无数据" or cn_indices != "无数据":
+            macro_view_blocks = []
+            if global_indices != "无数据":
+                macro_view_blocks.append(f"【全球核心指数】\n{global_indices}")
+            if major_assets != "无数据":
+                macro_view_blocks.append(f"【大类资产与宏观商品】\n{major_assets}")
+            if cn_indices != "无数据":
+                macro_view_blocks.append(f"【国内大盘核心指数】\n{cn_indices}")
+            if macro_view_blocks:
+                human_content_lines.append("\n\n".join(macro_view_blocks))
+
+        if northbound_flow != "无数据":
+            human_content_lines.append(f"【北向资金与跨市场流动性】\n{northbound_flow}")
+
+        if global_news != "无数据":
+            human_content_lines.append(f"【全球与宏观要闻】\n{global_news}")
+
+        if industry_ctx:
+            human_content_lines.append(f"{industry_ctx}")
+
+        if macro_event_ctx:
+            human_content_lines.append(f"{macro_event_ctx}")
 
         messages = [
             SystemMessage(content=(
                 system_message
                 + "\n\n请严格基于提供的数据输出报告，全程使用中文。"
             )),
-            HumanMessage(content=(
-                horizon_ctx + "\n"
-                f"请分析 {ticker_display} 在 {current_date} 的宏观与板块环境。\n\n"
-                f"【今日行业板块资金流向】\n{board_flow}\n\n"
-                f"【近期相关新闻】\n{recent_news}"
-            )),
+            HumanMessage(content="\n\n".join(human_content_lines)),
         ]
 
         # ── 实现 Token 级流式输出（含降级保障） ──────────────────
-
-
         tracker = current_tracker_var.get()
-
-
-        import time as _time
         full_content = ""
         _last_chunk = None
         _t0 = _time.monotonic()
 
-
         try:
-
-
             async for chunk in llm.astream(messages):
                 _last_chunk = chunk
                 content = chunk.content if hasattr(chunk, "content") else str(chunk)
-
-
                 full_content += content
                 if check_stream_chunk_degraded(full_content, "Macro Analyst"):
                     break
-
-
                 if tracker:
-
-
                     tracker._emit_token("Macro Analyst", "macro_report", content)
-
-
         except Exception as exc:
-
-
             logger.debug("[Macro Analyst] Stream error: %s", exc)
 
-
-
         if not full_content.strip():
-
-
             logger.debug("[Macro Analyst] Stream yielded empty text, attempting invoke fallback...")
-
-
             try:
-
-
                 res = await asyncio.to_thread(llm.invoke, messages)
-
-
                 full_content = res.content if hasattr(res, "content") else str(res)
-
-
                 if tracker:
-
-
                     tracker._emit_token("Macro Analyst", "macro_report", full_content)
-
-
             except Exception as exc:
-
-
                 full_content = f"分析报告生成失败：{exc}"
 
         logger.debug("[Macro Analyst] DONE %s, report length=%s", ticker_display, len(full_content))
