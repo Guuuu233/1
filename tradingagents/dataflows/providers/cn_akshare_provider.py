@@ -423,7 +423,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
     """A-share provider backed by AkShare."""
 
     # Thread-safe in-memory TTL cache for macro market data (CN indices, global indices, major assets)
-    _MACRO_CACHE_TTL: float = 600.0  # 10 minutes (5-15 min range)
+    _MACRO_CACHE_TTL: float = 900.0  # 15 minutes (5-15 min range)
     _macro_cache: dict[str, tuple[float, str]] = {}
     _macro_cache_lock: threading.Lock = threading.Lock()
 

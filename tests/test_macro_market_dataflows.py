@@ -171,8 +171,8 @@ class TestMacroMarketDataflows(unittest.TestCase):
         import time as _time
         real_monotonic = _time.monotonic
         with patch.object(provider, "_ak", return_value=mock_ak):
-            # Advance time by 601s (past 600s TTL)
-            with patch("time.monotonic", side_effect=lambda: real_monotonic() + 601.0):
+            # Advance time by 901s (past 900s / 15-min TTL)
+            with patch("time.monotonic", side_effect=lambda: real_monotonic() + 901.0):
                 res3 = provider.get_cn_indices(curr_date="2026-08-10", look_back_days=30)
                 assert res3 == res1
                 # Should have fetched again
