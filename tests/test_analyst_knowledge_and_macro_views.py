@@ -259,15 +259,22 @@ def test_macro_analyst_node_fallback_without_collector():
     mock_llm.astream = _mock_astream
 
     # 模拟 tool 的返回值
-    with patch("tradingagents.agents.utils.agent_utils.get_board_fund_flow") as mock_board, \
+    with patch("tradingagents.agents.analysts.macro_analyst.get_cn_stock_name", return_value="中芯国际"), \
+         patch("tradingagents.agents.utils.agent_utils.get_board_fund_flow") as mock_board, \
          patch("tradingagents.agents.utils.agent_utils.get_news") as mock_news, \
          patch("tradingagents.agents.utils.agent_utils.get_global_news") as mock_gnews, \
-         patch("tradingagents.agents.utils.agent_utils.get_northbound_flow") as mock_nb:
+         patch("tradingagents.agents.utils.agent_utils.get_northbound_flow") as mock_nb, \
+         patch("tradingagents.agents.utils.agent_utils.get_global_indices", create=True) as mock_gidx, \
+         patch("tradingagents.agents.utils.agent_utils.get_major_assets", create=True) as mock_masset, \
+         patch("tradingagents.agents.utils.agent_utils.get_cn_indices", create=True) as mock_cnidx:
 
         mock_board.invoke.return_value = "板块资金净流入：半导体 +10亿"
         mock_news.invoke.return_value = "2026-07-31 688981 中芯国际 产能利用率大幅提升"
         mock_gnews.invoke.return_value = "2026-07-31 国家大力支持集成电路与半导体自主可控战略"
         mock_nb.invoke.return_value = "北向资金净买入 +2000万元"
+        mock_gidx.invoke.return_value = "纳斯达克: +1.2%"
+        mock_masset.invoke.return_value = "黄金: $2400/oz"
+        mock_cnidx.invoke.return_value = "沪深300: +0.8%"
 
         node = create_macro_analyst(mock_llm, data_collector=None)
         state = {
@@ -376,15 +383,20 @@ def test_fundamentals_analyst_node_fallback_without_collector():
 
     mock_llm.astream = _mock_astream
 
-    with patch("tradingagents.agents.utils.agent_utils.get_fundamentals") as mock_fund, \
+    with patch("tradingagents.agents.analysts.fundamentals_analyst.get_cn_stock_name", return_value="宁德时代"), \
+         patch("tradingagents.agents.utils.agent_utils.get_fundamentals") as mock_fund, \
          patch("tradingagents.agents.utils.agent_utils.get_balance_sheet") as mock_bs, \
          patch("tradingagents.agents.utils.agent_utils.get_cashflow") as mock_cf, \
-         patch("tradingagents.agents.utils.agent_utils.get_income_statement") as mock_is:
+         patch("tradingagents.agents.utils.agent_utils.get_income_statement") as mock_is, \
+         patch("tradingagents.agents.utils.agent_utils.get_major_assets", create=True) as mock_masset, \
+         patch("tradingagents.agents.utils.agent_utils.get_cn_indices", create=True) as mock_cnidx:
 
         mock_fund.invoke.return_value = "2026Q2 动力电池与储能电池营收高增 25%"
         mock_bs.invoke.return_value = "资产负债率 55%，流动比率 1.6"
         mock_cf.invoke.return_value = "经营现金流净额 120 亿元"
         mock_is.invoke.return_value = "净利润 130 亿元"
+        mock_masset.invoke.return_value = "黄金: $2400/oz"
+        mock_cnidx.invoke.return_value = "沪深300: +0.8%"
 
         node = create_fundamentals_analyst(mock_llm, data_collector=None)
         state = {
