@@ -221,7 +221,6 @@ def _stub_collector_pool():
     }
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "analyst_factory, report_key, expected_agent",
     [
@@ -233,7 +232,7 @@ def _stub_collector_pool():
         (create_smart_money_analyst, "smart_money_report", "smart_money_analyst"),
     ],
 )
-async def test_analyst_nodes_end_to_end_with_new_prompts(analyst_factory, report_key, expected_agent):
+def test_analyst_nodes_end_to_end_with_new_prompts(analyst_factory, report_key, expected_agent):
     """Verify that each analyst node loads the updated prompt from zh.py, executes, and extracts verdict."""
     received_messages = []
     sample_verdict = '<!-- VERDICT: {"direction": "偏多", "reason": "深度思考推演结论偏多"} -->'
@@ -252,7 +251,7 @@ async def test_analyst_nodes_end_to_end_with_new_prompts(analyst_factory, report
 
     node = analyst_factory(mock_llm, collector)
     state = _make_analyst_state()
-    result = await node(state)
+    result = asyncio.run(node(state))
 
     assert report_key in result
     assert sample_verdict in result[report_key]
