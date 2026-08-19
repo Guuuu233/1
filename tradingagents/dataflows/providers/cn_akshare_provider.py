@@ -4173,7 +4173,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
         if cached is not None:
             return cached
 
-        start_dt = end_dt - timedelta(days=max(look_back_days * 2, 90))
+        # 至少拉取 1 年历史，用于计算 200SMA 等长期均线
+        start_dt = end_dt - timedelta(days=max(look_back_days, 365))
         start_yyyymmdd = start_dt.strftime("%Y%m%d")
         end_yyyymmdd = end_dt.strftime("%Y%m%d")
 
@@ -4191,18 +4192,29 @@ class CnAkshareProvider(BaseMarketDataProvider):
         ak = self._ak()
         for name, code, em_symbol in cn_indices:
             df = None
+            # 首选腾讯源（stock_zh_index_daily_tx）— 当前网络环境最稳定，带全历史
             try:
-                if hasattr(ak, "index_zh_a_hist"):
+                if hasattr(ak, "stock_zh_index_daily_tx"):
                     with AKSHARE_CALL_LOCK:
-                        df = ak.index_zh_a_hist(
-                            symbol=code,
-                            period="daily",
-                            start_date=start_yyyymmdd,
-                            end_date=end_yyyymmdd,
-                        )
+                        df = ak.stock_zh_index_daily_tx(symbol=em_symbol)
             except Exception:
                 df = None
 
+            # 备选东财历史接口（index_zh_a_hist）— 带日期窗口过滤
+            if df is None or df.empty:
+                try:
+                    if hasattr(ak, "index_zh_a_hist"):
+                        with AKSHARE_CALL_LOCK:
+                            df = ak.index_zh_a_hist(
+                                symbol=code,
+                                period="daily",
+                                start_date=start_yyyymmdd,
+                                end_date=end_yyyymmdd,
+                            )
+                except Exception:
+                    df = None
+
+            # 三级备选东财日线接口
             if df is None or df.empty:
                 try:
                     if hasattr(ak, "stock_zh_index_daily_em"):

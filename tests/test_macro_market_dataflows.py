@@ -200,29 +200,29 @@ class TestMacroMarketDataflows(unittest.TestCase):
             assert "## 国内核心大盘指数行情" in res_success
 
     def test_akshare_get_cn_indices_windowed_request(self):
+        """腾讯源（stock_zh_index_daily_tx）作为首选接口，验证 7 个指数均调用一次。"""
         provider = CnAkshareProvider()
         mock_ak = MagicMock()
 
         dates = ["2026-08-01", "2026-08-05", "2026-08-10"]
         prices = [3000.0, 3050.0, 3100.0]
         df_hist = pd.DataFrame({"日期": dates, "开盘": prices, "收盘": prices, "最高": prices, "最低": prices, "成交量": [1000]*3})
-        mock_ak.index_zh_a_hist.return_value = df_hist
+        mock_ak.stock_zh_index_daily_tx.return_value = df_hist
 
         with patch.object(provider, "_ak", return_value=mock_ak):
-            provider.get_cn_indices(curr_date="2026-08-10", look_back_days=30)
+            res = provider.get_cn_indices(curr_date="2026-08-10", look_back_days=30)
 
-        # Check call arguments for index_zh_a_hist
-        assert mock_ak.index_zh_a_hist.call_count == 7
-        for call_args in mock_ak.index_zh_a_hist.call_args_list:
-            _, kwargs = call_args
-            assert kwargs["period"] == "daily"
-            assert kwargs["start_date"] == "20260512"
-            assert kwargs["end_date"] == "20260810"
+        # 首选腾讯源应被调用 7 次（每个指数一次）
+        assert mock_ak.stock_zh_index_daily_tx.call_count == 7
+        assert "## 国内核心大盘指数行情" in res
 
     def test_akshare_get_cn_indices_fallback_windowed_request(self):
+        """腾讯源和东财历史接口都失败时，三级备选 stock_zh_index_daily_em 应带 1 年窗口参数。"""
         provider = CnAkshareProvider()
         mock_ak = MagicMock()
-        mock_ak.index_zh_a_hist.return_value = None  # Force fallback
+        # 腾讯源和东财历史接口均失败
+        mock_ak.stock_zh_index_daily_tx.return_value = None
+        mock_ak.index_zh_a_hist.return_value = None
 
         dates = ["2026-08-01", "2026-08-05", "2026-08-10"]
         prices = [3000.0, 3050.0, 3100.0]
@@ -234,12 +234,14 @@ class TestMacroMarketDataflows(unittest.TestCase):
 
         assert "## 国内核心大盘指数行情" in res
         assert mock_ak.stock_zh_index_daily_em.call_count == 7
+        # 窗口为 max(look_back_days=30, 365) = 365 天，start = 2026-08-10 - 365 = 2025-08-10
         for call_args in mock_ak.stock_zh_index_daily_em.call_args_list:
             _, kwargs = call_args
-            assert kwargs["start_date"] == "20260512"
+            assert kwargs["start_date"] == "20250810"
             assert kwargs["end_date"] == "20260810"
 
     def test_akshare_macro_lock_granularity(self):
+        """验证锁粒度为单次网络请求级别：7 个指数 × 首选接口 = 7 次 lock enter/exit。"""
         from tradingagents.dataflows.providers.cn_akshare_provider import AKSHARE_CALL_LOCK
 
         provider = CnAkshareProvider()
@@ -248,7 +250,8 @@ class TestMacroMarketDataflows(unittest.TestCase):
         dates = ["2026-08-01", "2026-08-05", "2026-08-10"]
         prices = [3000.0, 3050.0, 3100.0]
         df_hist = pd.DataFrame({"日期": dates, "开盘": prices, "收盘": prices, "最高": prices, "最低": prices, "成交量": [1000]*3})
-        mock_ak.index_zh_a_hist.return_value = df_hist
+        # 腾讯源首选接口成功返回，每个指数只进一次锁
+        mock_ak.stock_zh_index_daily_tx.return_value = df_hist
 
         enter_count = 0
         exit_count = 0
@@ -270,7 +273,7 @@ class TestMacroMarketDataflows(unittest.TestCase):
              patch.object(provider, "_ak", return_value=mock_ak):
             provider.get_cn_indices(curr_date="2026-08-10", look_back_days=30)
 
-        # Lock was entered and exited 7 separate times (once per index call), NOT once around entire batch
+        # 首选腾讯源成功：7 个指数各进锁一次，不超过 7
         assert enter_count == 7
         assert exit_count == 7
 
