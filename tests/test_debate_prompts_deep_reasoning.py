@@ -166,6 +166,32 @@ def test_debate_prompts_strict_mirror_symmetry():
     assert "DEBATE_STATE" in bull and "DEBATE_STATE" in bear
 
 
+def test_three_round_progressive_framework_symmetry():
+    """DAV-197: Both bull_prompt and bear_prompt must strictly define the 3-round progressive framework."""
+    for key in DEBATE_PROMPT_KEYS:
+        prompt = ZH_PROMPTS[key]
+        assert "【辩论三轮递进推进框架】" in prompt, f"3-round header missing in {key}"
+        assert "第1轮（开场立论）" in prompt, f"Round 1 missing in {key}"
+        assert "第2轮（攻防回应）" in prompt, f"Round 2 missing in {key}"
+        assert "第3轮（收官深化）" in prompt, f"Round 3 missing in {key}"
+        assert "responded_claim_ids不得为空" in prompt, f"responded_claim_ids constraint missing in {key}"
+        assert "极端情景推演" in prompt, f"Extreme scenario simulation missing in {key}"
+        assert "0.00-1.00" in prompt, f"Confidence range missing in {key}"
+        assert "量化风险收益比" in prompt, f"Risk-reward quantification missing in {key}"
+
+
+def test_evidence_citation_and_conflict_resolution_constraints():
+    """DAV-197: Both bull_prompt and bear_prompt must strictly enforce citation format and conflict weighting."""
+    for key in DEBATE_PROMPT_KEYS:
+        prompt = ZH_PROMPTS[key]
+        assert "【论证与引用纪律】" in prompt, f"Citation header missing in {key}"
+        assert '根据XX分析师报告，YY数据显示ZZ' in prompt, f"Citation template missing in {key}"
+        assert "禁止机械重复分析师已陈述的表面内容" in prompt, f"Anti-repetition rule missing in {key}"
+        assert "二阶深度推理" in prompt, f"Second-order reasoning rule missing in {key}"
+        assert "当多个分析师结论矛盾时" in prompt, f"Analyst conflict rule missing in {key}"
+        assert "明确说明如何权衡取舍并给出权重依据" in prompt, f"Weight explanation rule missing in {key}"
+
+
 def test_researcher_nodes_end_to_end_execution():
     """Verify that create_bull_researcher and create_bear_researcher execute cleanly with new prompts."""
     debate_payload = '<!-- DEBATE_STATE: {"responded_claim_ids": ["INV-1"], "new_claims": [{"claim": "宏观与产业链博弈论证", "evidence": ["宏观流动性宽松", "上下游定价权稳固"], "confidence": 0.85}], "resolved_claim_ids": [], "unresolved_claim_ids": [], "next_focus_claim_ids": [], "round_summary": "完成宏观与产业链论证", "round_goal": "下轮验证极端情景"} -->'
