@@ -16,6 +16,14 @@ from tradingagents.graph.data_collector import (
 
 class TestMacroMarketDataflows(unittest.TestCase):
 
+    def setUp(self):
+        super().setUp()
+        CnAkshareProvider.clear_macro_cache()
+
+    def tearDown(self):
+        super().tearDown()
+        CnAkshareProvider.clear_macro_cache()
+
     def test_akshare_get_cn_indices_success_and_anti_lookahead(self):
         provider = CnAkshareProvider()
         mock_ak = MagicMock()
@@ -137,3 +145,168 @@ class TestMacroMarketDataflows(unittest.TestCase):
         assert provenance["cn_indices"]["status"] == "available"
         assert provenance["major_assets"]["as_of"] == "2026-08-10"
         assert provenance["global_indices"]["status"] == "failed"
+
+    def test_akshare_macro_cache_hit_and_ttl(self):
+        provider = CnAkshareProvider()
+        mock_ak = MagicMock()
+
+        dates = ["2026-08-01", "2026-08-05", "2026-08-10"]
+        prices = [3000.0, 3050.0, 3100.0]
+        df_hist = pd.DataFrame({"日期": dates, "开盘": prices, "收盘": prices, "最高": prices, "最低": prices, "成交量": [1000]*3})
+        mock_ak.index_zh_a_hist.return_value = df_hist
+
+        with patch.object(provider, "_ak", return_value=mock_ak):
+            # First call: populates cache
+            res1 = provider.get_cn_indices(curr_date="2026-08-10", look_back_days=30)
+            assert "## 国内核心大盘指数行情" in res1
+            call_count_1 = mock_ak.index_zh_a_hist.call_count
+            assert call_count_1 > 0
+
+            # Second call: should hit cache without calling _ak
+            res2 = provider.get_cn_indices(curr_date="2026-08-10", look_back_days=30)
+            assert res1 == res2
+            assert mock_ak.index_zh_a_hist.call_count == call_count_1
+
+        # Test TTL expiration
+        import time as _time
+        real_monotonic = _time.monotonic
+        with patch.object(provider, "_ak", return_value=mock_ak):
+            # Advance time by 601s (past 600s TTL)
+            with patch("time.monotonic", side_effect=lambda: real_monotonic() + 601.0):
+                res3 = provider.get_cn_indices(curr_date="2026-08-10", look_back_days=30)
+                assert res3 == res1
+                # Should have fetched again
+                assert mock_ak.index_zh_a_hist.call_count > call_count_1
+
+    def test_akshare_macro_cache_does_not_cache_failure(self):
+        provider = CnAkshareProvider()
+        mock_ak = MagicMock()
+        mock_ak.index_zh_a_hist.side_effect = RuntimeError("network error")
+        mock_ak.stock_zh_index_daily_em.side_effect = RuntimeError("network error")
+
+        with patch.object(provider, "_ak", return_value=mock_ak):
+            res_fail = provider.get_cn_indices(curr_date="2026-08-10")
+            assert res_fail.startswith("【数据获取失败】")
+
+        # Now mock succeeds
+        dates = ["2026-08-01", "2026-08-05", "2026-08-10"]
+        prices = [3000.0, 3050.0, 3100.0]
+        df_hist = pd.DataFrame({"日期": dates, "开盘": prices, "收盘": prices, "最高": prices, "最低": prices, "成交量": [1000]*3})
+        mock_ak.index_zh_a_hist.side_effect = None
+        mock_ak.index_zh_a_hist.return_value = df_hist
+
+        with patch.object(provider, "_ak", return_value=mock_ak):
+            res_success = provider.get_cn_indices(curr_date="2026-08-10")
+            assert "## 国内核心大盘指数行情" in res_success
+
+    def test_akshare_get_cn_indices_windowed_request(self):
+        provider = CnAkshareProvider()
+        mock_ak = MagicMock()
+
+        dates = ["2026-08-01", "2026-08-05", "2026-08-10"]
+        prices = [3000.0, 3050.0, 3100.0]
+        df_hist = pd.DataFrame({"日期": dates, "开盘": prices, "收盘": prices, "最高": prices, "最低": prices, "成交量": [1000]*3})
+        mock_ak.index_zh_a_hist.return_value = df_hist
+
+        with patch.object(provider, "_ak", return_value=mock_ak):
+            provider.get_cn_indices(curr_date="2026-08-10", look_back_days=30)
+
+        # Check call arguments for index_zh_a_hist
+        assert mock_ak.index_zh_a_hist.call_count == 7
+        for call_args in mock_ak.index_zh_a_hist.call_args_list:
+            _, kwargs = call_args
+            assert kwargs["period"] == "daily"
+            assert kwargs["start_date"] == "20260512"
+            assert kwargs["end_date"] == "20260810"
+
+    def test_akshare_get_cn_indices_fallback_windowed_request(self):
+        provider = CnAkshareProvider()
+        mock_ak = MagicMock()
+        mock_ak.index_zh_a_hist.return_value = None  # Force fallback
+
+        dates = ["2026-08-01", "2026-08-05", "2026-08-10"]
+        prices = [3000.0, 3050.0, 3100.0]
+        df_hist = pd.DataFrame({"日期": dates, "开盘": prices, "收盘": prices, "最高": prices, "最低": prices, "成交量": [1000]*3})
+        mock_ak.stock_zh_index_daily_em.return_value = df_hist
+
+        with patch.object(provider, "_ak", return_value=mock_ak):
+            res = provider.get_cn_indices(curr_date="2026-08-10", look_back_days=30)
+
+        assert "## 国内核心大盘指数行情" in res
+        assert mock_ak.stock_zh_index_daily_em.call_count == 7
+        for call_args in mock_ak.stock_zh_index_daily_em.call_args_list:
+            _, kwargs = call_args
+            assert kwargs["start_date"] == "20260512"
+            assert kwargs["end_date"] == "20260810"
+
+    def test_akshare_macro_lock_granularity(self):
+        from tradingagents.dataflows.providers.cn_akshare_provider import AKSHARE_CALL_LOCK
+
+        provider = CnAkshareProvider()
+        mock_ak = MagicMock()
+
+        dates = ["2026-08-01", "2026-08-05", "2026-08-10"]
+        prices = [3000.0, 3050.0, 3100.0]
+        df_hist = pd.DataFrame({"日期": dates, "开盘": prices, "收盘": prices, "最高": prices, "最低": prices, "成交量": [1000]*3})
+        mock_ak.index_zh_a_hist.return_value = df_hist
+
+        enter_count = 0
+        exit_count = 0
+        orig_enter = AKSHARE_CALL_LOCK.__class__.__enter__
+        orig_exit = AKSHARE_CALL_LOCK.__class__.__exit__
+
+        def tracked_enter(self_lock):
+            nonlocal enter_count
+            enter_count += 1
+            return orig_enter(self_lock)
+
+        def tracked_exit(self_lock, *args):
+            nonlocal exit_count
+            exit_count += 1
+            return orig_exit(self_lock, *args)
+
+        with patch.object(AKSHARE_CALL_LOCK.__class__, "__enter__", tracked_enter), \
+             patch.object(AKSHARE_CALL_LOCK.__class__, "__exit__", tracked_exit), \
+             patch.object(provider, "_ak", return_value=mock_ak):
+            provider.get_cn_indices(curr_date="2026-08-10", look_back_days=30)
+
+        # Lock was entered and exited 7 separate times (once per index call), NOT once around entire batch
+        assert enter_count == 7
+        assert exit_count == 7
+
+    def test_akshare_macro_concurrent_threads_and_cache_sharing(self):
+        import concurrent.futures
+
+        provider = CnAkshareProvider()
+        mock_ak = MagicMock()
+
+        dates = ["2026-08-01", "2026-08-05", "2026-08-10"]
+        prices = [3000.0, 3050.0, 3100.0]
+        df_hist = pd.DataFrame({"日期": dates, "开盘": prices, "收盘": prices, "最高": prices, "最低": prices, "成交量": [1000]*3})
+        mock_ak.index_zh_a_hist.return_value = df_hist
+        mock_ak.index_global_hist_em.return_value = pd.DataFrame({"date": dates, "close": prices})
+        mock_ak.futures_foreign_hist.return_value = pd.DataFrame({"date": dates, "close": prices})
+        mock_ak.bond_zh_us_rate.return_value = pd.DataFrame({"日期": dates, "美国国债收益率10年": [4.3, 4.28, 4.25]})
+
+        with patch.object(CnAkshareProvider, "_ak", return_value=mock_ak):
+            # Run 10 parallel queries across 3 methods
+            def _fetch_all_macro():
+                p = CnAkshareProvider()
+                return (
+                    p.get_cn_indices(curr_date="2026-08-10", look_back_days=30),
+                    p.get_global_indices(curr_date="2026-08-10", look_back_days=30),
+                    p.get_major_assets(curr_date="2026-08-10", look_back_days=30),
+                )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+                futures = [pool.submit(_fetch_all_macro) for _ in range(10)]
+                results = [f.result() for f in futures]
+
+            # All 10 results should be identical and successful
+            for cn, gl, ma in results:
+                assert "## 国内核心大盘指数行情" in cn
+                assert "## 全球核心市场指数行情" in gl
+                assert "## 全球大类资产与宏观大宗商品" in ma
+                assert cn == results[0][0]
+                assert gl == results[0][1]
+                assert ma == results[0][2]
