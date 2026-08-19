@@ -1,0 +1,64 @@
+"""tradingagents.knowledge 包导出接口。
+
+提供金融领域常识知识库：
+1. 行业产业链上下游、宏观驱动、周期与多维风险图谱 (industry_linkage)；
+2. 宏观事件三级传导链路与跨市场情景图谱 (macro_events)。
+"""
+
+from tradingagents.knowledge.industry_linkage import (
+    CycleProfile,
+    IndustryProfile,
+    MacroSensitivity,
+    RiskMatrix,
+    INDUSTRY_PROFILES,
+    format_industry_deep_context,
+    get_all_industries,
+    get_all_industry_names,
+    get_industry_profile,
+    get_industry_risk_profile,
+    get_macro_sensitivity_matrix,
+    get_upstream_downstream_chain,
+    search_industries,
+)
+from tradingagents.knowledge.macro_events import (
+    MacroEventScenario,
+    SectorImpact,
+    MACRO_EVENT_SCENARIOS,
+    format_macro_event_context,
+    get_all_macro_event_ids,
+    get_all_macro_event_names,
+    get_macro_event_scenario,
+    get_sector_macro_exposure,
+    get_transmission_path,
+    match_events_from_text,
+    search_macro_events,
+)
+
+__all__ = [
+    # 行业知识库
+    "CycleProfile",
+    "IndustryProfile",
+    "MacroSensitivity",
+    "RiskMatrix",
+    "INDUSTRY_PROFILES",
+    "format_industry_deep_context",
+    "get_all_industries",
+    "get_all_industry_names",
+    "get_industry_profile",
+    "get_industry_risk_profile",
+    "get_macro_sensitivity_matrix",
+    "get_upstream_downstream_chain",
+    "search_industries",
+    # 宏观事件知识库
+    "MacroEventScenario",
+    "SectorImpact",
+    "MACRO_EVENT_SCENARIOS",
+    "format_macro_event_context",
+    "get_all_macro_event_ids",
+    "get_all_macro_event_names",
+    "get_macro_event_scenario",
+    "get_sector_macro_exposure",
+    "get_transmission_path",
+    "match_events_from_text",
+    "search_macro_events",
+]
