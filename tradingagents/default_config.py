@@ -46,6 +46,7 @@ DEFAULT_CONFIG = {
         "news_data": "cn_akshare,cn_baostock,cn_investoday,yfinance",
         "realtime_data": "cn_akshare,cn_investoday,cn_fuyao",
         "cn_market_data": "cn_akshare,cn_fuyao",
+        "macro_market_data": "cn_akshare,yfinance",
     },
     "tool_vendors": {
         "get_zt_pool": "cn_akshare,cn_fuyao",

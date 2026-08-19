@@ -4115,3 +4115,176 @@ class CnAkshareProvider(BaseMarketDataProvider):
             as_of="2024-08-16",
         )
         return res.to_prompt()
+
+    def get_cn_indices(self, curr_date: str = None, look_back_days: int = 30) -> str:
+        if curr_date is None:
+            return "【数据获取失败】国内核心大盘指数 — 原因：缺少分析基准日期 (来源: cn_akshare)"
+        from datetime import datetime, timedelta
+        from ..macro_market_utils import calculate_series_metrics, build_cn_indices_markdown
+
+        try:
+            end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+        except Exception:
+            return f"【数据获取失败】国内核心大盘指数 — 原因：非法日期格式 {curr_date} (来源: cn_akshare)"
+
+        start_dt = end_dt - timedelta(days=max(look_back_days * 2, 90))
+        start_yyyymmdd = start_dt.strftime("%Y%m%d")
+        end_yyyymmdd = end_dt.strftime("%Y%m%d")
+
+        cn_indices = [
+            ("上证指数", "000001", "sh000001"),
+            ("深证成指", "399001", "sz399001"),
+            ("沪深300", "000300", "sh000300"),
+            ("创业板指", "399006", "sz399006"),
+            ("科创50", "000688", "sh000688"),
+            ("中证500", "000905", "sh000905"),
+            ("中证1000", "000852", "sh000852"),
+        ]
+
+        results = {}
+        with AKSHARE_CALL_LOCK:
+            ak = self._ak()
+            for name, code, em_symbol in cn_indices:
+                df = None
+                try:
+                    if hasattr(ak, "index_zh_a_hist"):
+                        df = ak.index_zh_a_hist(symbol=code, period="daily", start_date=start_yyyymmdd, end_date=end_yyyymmdd)
+                except Exception:
+                    df = None
+
+                if df is None or df.empty:
+                    try:
+                        if hasattr(ak, "stock_zh_index_daily_em"):
+                            df = ak.stock_zh_index_daily_em(symbol=em_symbol)
+                    except Exception:
+                        df = None
+
+                if df is None or df.empty:
+                    try:
+                        if hasattr(ak, "stock_zh_index_daily_tx"):
+                            df = ak.stock_zh_index_daily_tx(symbol=em_symbol)
+                    except Exception:
+                        df = None
+
+                if df is not None and not df.empty:
+                    metrics = calculate_series_metrics(df, curr_date)
+                    if metrics:
+                        metrics["code"] = em_symbol.upper()
+                        results[name] = metrics
+
+        if not results:
+            return "【数据获取失败】国内核心大盘指数 — 原因：所有国内指数接口调用失败或无有效数据 (来源: cn_akshare)"
+
+        return build_cn_indices_markdown(results, curr_date, source="cn_akshare")
+
+    def get_global_indices(self, curr_date: str = None, look_back_days: int = 30) -> str:
+        if curr_date is None:
+            return "【数据获取失败】全球核心指数 — 原因：缺少分析基准日期 (来源: cn_akshare)"
+        from datetime import datetime, timedelta
+        from ..macro_market_utils import calculate_series_metrics, build_global_indices_markdown
+
+        try:
+            end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+        except Exception:
+            return f"【数据获取失败】全球核心指数 — 原因：非法日期格式 {curr_date} (来源: cn_akshare)"
+
+        global_targets = [
+            ("标普500", ".INX", "标普500"),
+            ("纳斯达克", ".IXIC", "纳斯达克"),
+            ("道琼斯", ".DJI", "道琼斯"),
+            ("恒生指数", "HSI", "恒生指数"),
+            ("恒生科技指数", "HSTECH", "恒生科技指数"),
+            ("日经225", "N225", "日经225"),
+            ("德国DAX", "GDAXI", "德国DAX30"),
+            ("法国CAC40", "FCHI", "法国CAC40"),
+            ("英国富时100", "FTSE", "英国富时100"),
+        ]
+
+        results = {}
+        with AKSHARE_CALL_LOCK:
+            ak = self._ak()
+            for name, code, ak_name in global_targets:
+                df = None
+                try:
+                    if hasattr(ak, "index_global_hist_em"):
+                        df = ak.index_global_hist_em(symbol=ak_name)
+                except Exception:
+                    df = None
+
+                if df is None or df.empty:
+                    try:
+                        if hasattr(ak, "stock_hk_index_daily_em") and code in ("HSI", "HSTECH"):
+                            df = ak.stock_hk_index_daily_em(symbol=code)
+                    except Exception:
+                        df = None
+
+                if df is not None and not df.empty:
+                    metrics = calculate_series_metrics(df, curr_date)
+                    if metrics:
+                        metrics["code"] = code
+                        results[name] = metrics
+
+        if not results:
+            return "【数据获取失败】全球核心指数 — 原因：所有全球指数接口调用失败或无有效数据 (来源: cn_akshare)"
+
+        return build_global_indices_markdown(results, curr_date, source="cn_akshare")
+
+    def get_major_assets(self, curr_date: str = None, look_back_days: int = 30) -> str:
+        if curr_date is None:
+            return "【数据获取失败】全球大类资产 — 原因：缺少分析基准日期 (来源: cn_akshare)"
+        from datetime import datetime, timedelta
+        from ..macro_market_utils import calculate_series_metrics, build_major_assets_markdown
+
+        try:
+            end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+        except Exception:
+            return f"【数据获取失败】全球大类资产 — 原因：非法日期格式 {curr_date} (来源: cn_akshare)"
+
+        assets_targets = [
+            ("COMEX黄金", "GC", "futures_foreign", "贵金属", "避险资产 / 真实利率反向指标"),
+            ("WTI原油", "CL", "futures_foreign", "能源商品", "通胀预期 / 工业能源基准"),
+            ("布伦特原油", "OIL", "futures_foreign", "能源商品", "全球原油基准"),
+            ("美元指数", "DXY", "futures_foreign", "外汇货币", "非美资产汇率与流动性定价锚"),
+            ("LME铜", "CAD", "futures_foreign", "工业金属", "全球制造业需求与经济晴雨表"),
+            ("美债10年期收益率", "US10Y", "bond_us", "主权债券", "全球资产定价之锚 / 无风险折现率"),
+        ]
+
+        results = {}
+        with AKSHARE_CALL_LOCK:
+            ak = self._ak()
+            for name, code, kind, cat, sig in assets_targets:
+                df = None
+                try:
+                    if kind == "futures_foreign":
+                        if hasattr(ak, "futures_foreign_hist"):
+                            df = ak.futures_foreign_hist(symbol=code)
+                        if (df is None or df.empty) and hasattr(ak, "futures_global_hist_em"):
+                            df = ak.futures_global_hist_em(symbol=name)
+                    elif kind == "bond_us":
+                        if hasattr(ak, "bond_zh_us_rate"):
+                            df_raw = ak.bond_zh_us_rate()
+                            if df_raw is not None and not df_raw.empty:
+                                cols_map = {str(c): c for c in df_raw.columns}
+                                date_col = next((cols_map[c] for c in ("日期", "date") if c in cols_map), None)
+                                rate_col = next((cols_map[c] for c in ("美国国债收益率10年", "美国国债收益率2年", "us10y", "US10Y") if c in cols_map), None)
+                                if date_col and rate_col:
+                                    df = df_raw[[date_col, rate_col]].rename(columns={date_col: "date", rate_col: "close"})
+                        if (df is None or df.empty) and hasattr(ak, "bond_gb_us_sina"):
+                            df = ak.bond_gb_us_sina(symbol="10")
+                except Exception:
+                    df = None
+
+                if df is not None and not df.empty:
+                    metrics = calculate_series_metrics(df, curr_date)
+                    if metrics:
+                        metrics["code"] = code
+                        metrics["category"] = cat
+                        metrics["macro_signal"] = sig
+                        if kind == "bond_us":
+                            metrics["unit"] = "%"
+                        results[name] = metrics
+
+        if not results:
+            return "【数据获取失败】全球大类资产 — 原因：所有大类资产接口调用失败或无有效数据 (来源: cn_akshare)"
+
+        return build_major_assets_markdown(results, curr_date, source="cn_akshare")

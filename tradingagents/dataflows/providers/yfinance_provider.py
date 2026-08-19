@@ -100,3 +100,153 @@ class YFinanceProvider(BaseMarketDataProvider):
             empty_prefixes=("No insider transactions data found",),
             fail_prefixes=("Error retrieving insider transactions",),
         )
+
+    def get_global_indices(
+        self, curr_date: str = None, look_back_days: int = 30
+    ) -> str:
+        if curr_date is None:
+            return "【数据获取失败】全球核心指数 — 原因：缺少分析基准日期 (来源: yfinance)"
+        import yfinance as yf
+        from datetime import datetime, timedelta
+        from ..macro_market_utils import calculate_series_metrics, build_global_indices_markdown
+
+        try:
+            end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+        except Exception:
+            return f"【数据获取失败】全球核心指数 — 原因：非法日期格式 {curr_date} (来源: yfinance)"
+
+        start_dt = end_dt - timedelta(days=max(look_back_days * 2, 90))
+        start_str = start_dt.strftime("%Y-%m-%d")
+        end_inclusive = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        indices_map = {
+            "标普500": {"symbol": "^GSPC", "code": "^GSPC"},
+            "纳斯达克": {"symbol": "^IXIC", "code": "^IXIC"},
+            "道琼斯": {"symbol": "^DJI", "code": "^DJI"},
+            "恒生指数": {"symbol": "^HSI", "code": "^HSI"},
+            "日经225": {"symbol": "^N225", "code": "^N225"},
+            "德国DAX": {"symbol": "^GDAXI", "code": "^GDAXI"},
+            "法国CAC40": {"symbol": "^FCHI", "code": "^FCHI"},
+            "英国富时100": {"symbol": "^FTSE", "code": "^FTSE"},
+        }
+
+        results = {}
+        for name, meta in indices_map.items():
+            sym = meta["symbol"]
+            try:
+                ticker = yf.Ticker(sym)
+                data = ticker.history(start=start_str, end=end_inclusive)
+                if data is not None and not data.empty:
+                    if data.index.tz is not None:
+                        data.index = data.index.tz_localize(None)
+                    df = data.reset_index()
+                    metrics = calculate_series_metrics(df, curr_date, price_col="Close")
+                    if metrics:
+                        metrics["code"] = meta["code"]
+                        results[name] = metrics
+            except Exception:
+                continue
+
+        if not results:
+            return "【数据获取失败】全球核心指数 — 原因：yfinance 接口无可用数据 (来源: yfinance)"
+        return build_global_indices_markdown(results, curr_date, source="yfinance")
+
+    def get_major_assets(
+        self, curr_date: str = None, look_back_days: int = 30
+    ) -> str:
+        if curr_date is None:
+            return "【数据获取失败】全球大类资产 — 原因：缺少分析基准日期 (来源: yfinance)"
+        import yfinance as yf
+        from datetime import datetime, timedelta
+        from ..macro_market_utils import calculate_series_metrics, build_major_assets_markdown
+
+        try:
+            end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+        except Exception:
+            return f"【数据获取失败】全球大类资产 — 原因：非法日期格式 {curr_date} (来源: yfinance)"
+
+        start_dt = end_dt - timedelta(days=max(look_back_days * 2, 90))
+        start_str = start_dt.strftime("%Y-%m-%d")
+        end_inclusive = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        assets_map = {
+            "COMEX黄金": {"symbol": "GC=F", "code": "GC=F", "category": "贵金属", "macro_signal": "避险情绪 / 实际利率映射"},
+            "WTI原油": {"symbol": "CL=F", "code": "CL=F", "category": "能源商品", "macro_signal": "通胀预期 / 工业能源基准"},
+            "布伦特原油": {"symbol": "BZ=F", "code": "BZ=F", "category": "能源商品", "macro_signal": "全球原油基准价格"},
+            "美债10年期收益率": {"symbol": "^TNX", "code": "^TNX", "category": "主权债券", "unit": "%", "macro_signal": "无风险利率锚 / 资产折现率"},
+            "美元指数": {"symbol": "DX-Y.NYB", "code": "DXY", "category": "外汇货币", "macro_signal": "全球流动性与非美汇率压力"},
+            "COMEX铜": {"symbol": "HG=F", "code": "HG=F", "category": "工业金属", "macro_signal": "全球制造业需求晴雨表"},
+            "比特币": {"symbol": "BTC-USD", "code": "BTC-USD", "category": "数字资产", "macro_signal": "全球高贝塔流动性风险偏好"},
+        }
+
+        results = {}
+        for name, meta in assets_map.items():
+            sym = meta["symbol"]
+            try:
+                ticker = yf.Ticker(sym)
+                data = ticker.history(start=start_str, end=end_inclusive)
+                if data is not None and not data.empty:
+                    if data.index.tz is not None:
+                        data.index = data.index.tz_localize(None)
+                    df = data.reset_index()
+                    metrics = calculate_series_metrics(df, curr_date, price_col="Close")
+                    if metrics:
+                        metrics["code"] = meta["code"]
+                        metrics["category"] = meta["category"]
+                        metrics["macro_signal"] = meta.get("macro_signal", "")
+                        if "unit" in meta:
+                            metrics["unit"] = meta["unit"]
+                        results[name] = metrics
+            except Exception:
+                continue
+
+        if not results:
+            return "【数据获取失败】全球大类资产 — 原因：yfinance 接口无可用数据 (来源: yfinance)"
+        return build_major_assets_markdown(results, curr_date, source="yfinance")
+
+    def get_cn_indices(
+        self, curr_date: str = None, look_back_days: int = 30
+    ) -> str:
+        if curr_date is None:
+            return "【数据获取失败】国内核心大盘指数 — 原因：缺少分析基准日期 (来源: yfinance)"
+        import yfinance as yf
+        from datetime import datetime, timedelta
+        from ..macro_market_utils import calculate_series_metrics, build_cn_indices_markdown
+
+        try:
+            end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+        except Exception:
+            return f"【数据获取失败】国内核心大盘指数 — 原因：非法日期格式 {curr_date} (来源: yfinance)"
+
+        start_dt = end_dt - timedelta(days=max(look_back_days * 2, 90))
+        start_str = start_dt.strftime("%Y-%m-%d")
+        end_inclusive = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        cn_map = {
+            "上证指数": {"symbol": "000001.SS", "code": "000001.SH"},
+            "深证成指": {"symbol": "399001.SZ", "code": "399001.SZ"},
+            "沪深300": {"symbol": "000300.SS", "code": "000300.SH"},
+            "创业板指": {"symbol": "399006.SZ", "code": "399006.SZ"},
+            "科创50": {"symbol": "000688.SS", "code": "000688.SH"},
+        }
+
+        results = {}
+        for name, meta in cn_map.items():
+            sym = meta["symbol"]
+            try:
+                ticker = yf.Ticker(sym)
+                data = ticker.history(start=start_str, end=end_inclusive)
+                if data is not None and not data.empty:
+                    if data.index.tz is not None:
+                        data.index = data.index.tz_localize(None)
+                    df = data.reset_index()
+                    metrics = calculate_series_metrics(df, curr_date, price_col="Close")
+                    if metrics:
+                        metrics["code"] = meta["code"]
+                        results[name] = metrics
+            except Exception:
+                continue
+
+        if not results:
+            return "【数据获取失败】国内核心大盘指数 — 原因：yfinance 接口无可用数据 (来源: yfinance)"
+        return build_cn_indices_markdown(results, curr_date, source="yfinance")

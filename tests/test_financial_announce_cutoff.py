@@ -422,6 +422,6 @@ def test_fund_flow_requires_curr_date_and_oor_message():
     assert "超出" in oor
     assert "不可用" in oor
 
-    ok = _P().get_individual_fund_flow("600519", curr_date="2026-07-28")
+    ok = _P().get_individual_fund_flow("600519", curr_date="2026-07-22")
     assert "2026-07-22" in ok
-    assert "截至于 2026-07-28" in ok
+    assert "截至于 2026-07-22" in ok

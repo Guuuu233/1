@@ -83,9 +83,12 @@ def test_yfinance_stock_header_has_no_wallclock():
         },
         index=pd.to_datetime(["2026-04-30"]),
     )
-    with patch.object(yf_mod.yf, "download", return_value=df):
-        # get_YFin_data_online may have different name; call internal path if needed
+    mock_ticker = patch("tradingagents.dataflows.y_finance.yf.Ticker").start()
+    mock_ticker.return_value.history.return_value = df
+    try:
         text = yf_mod.get_YFin_data_online("AAPL", "2026-04-01", "2026-04-30")
+    finally:
+        patch.stopall()
     for marker in WALLCLOCK_MARKERS:
         assert marker not in text
     assert now_cn().date().isoformat() not in text

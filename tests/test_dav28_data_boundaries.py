@@ -271,7 +271,8 @@ def test_fetch_all_filters_dedupes_and_sorts_before_prompt_and_vpa():
     patch_targets = {
         name: (lambda **kwargs: "safe")
         for name in [
-            "get_stock_data", "get_indicators", "get_fundamentals", "get_balance_sheet",
+            "get_stock_data", "get_cn_indices", "get_global_indices", "get_major_assets",
+            "get_indicators", "get_fundamentals", "get_balance_sheet",
             "get_cashflow", "get_income_statement", "get_news", "get_global_news",
             "get_insider_transactions", "get_board_fund_flow", "get_individual_fund_flow",
             "get_lhb_detail", "get_zt_pool", "get_hot_stocks_xq", "get_restricted_release",
@@ -318,7 +319,8 @@ def _fetch_all_with_csv(
     patch_targets = {
         name: (lambda **kwargs: "safe")
         for name in [
-            "get_stock_data", "get_indicators", "get_fundamentals", "get_balance_sheet",
+            "get_stock_data", "get_cn_indices", "get_global_indices", "get_major_assets",
+            "get_indicators", "get_fundamentals", "get_balance_sheet",
             "get_cashflow", "get_income_statement", "get_news", "get_global_news",
             "get_insider_transactions", "get_board_fund_flow", "get_individual_fund_flow",
             "get_lhb_detail", "get_zt_pool", "get_hot_stocks_xq", "get_restricted_release",

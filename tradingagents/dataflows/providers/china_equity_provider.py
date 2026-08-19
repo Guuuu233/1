@@ -52,3 +52,18 @@ class CnStubProvider(BaseMarketDataProvider):
 
     def get_insider_transactions(self, symbol: str, curr_date: str = None) -> str:
         return self._not_implemented()
+
+    def get_global_indices(
+        self, curr_date: str = None, look_back_days: int = 30
+    ) -> str:
+        return self._not_implemented()
+
+    def get_major_assets(
+        self, curr_date: str = None, look_back_days: int = 30
+    ) -> str:
+        return self._not_implemented()
+
+    def get_cn_indices(
+        self, curr_date: str = None, look_back_days: int = 30
+    ) -> str:
+        return self._not_implemented()

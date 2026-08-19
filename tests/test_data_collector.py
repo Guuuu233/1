@@ -392,4 +392,28 @@ def test_fetch_all_completes_executor_with_fast_tools():
         result = _fetch_all("600519", "2025-01-02")
 
     assert "stock_data" in result
+    assert "cn_indices" in result
+    assert "global_indices" in result
+    assert "major_assets" in result
     assert "market_data_context" in result
+
+
+def test_source_provenance_records_macro_market_sources():
+    results = {
+        "stock_data": "Date,Open,High,Low,Close,Volume\n2026-08-11,1,1,1,1,1",
+        "cn_indices": "## 国内核心大盘指数行情（数据基准日：2026-08-11，来源：cn_akshare）\n【数据日期】2026-08-11",
+        "global_indices": "## 全球核心市场指数行情（数据基准日：2026-08-11，来源：yfinance）\n【数据日期】2026-08-11",
+        "major_assets": "## 全球大类资产与宏观大宗商品（数据基准日：2026-08-11，来源：yfinance）\n【数据日期】2026-08-11",
+    }
+    provenance = _build_source_provenance(
+        results,
+        "2026-08-11",
+        daily_as_of="2026-08-11",
+    )
+    assert provenance["cn_indices"]["as_of"] == "2026-08-11"
+    assert provenance["cn_indices"]["status"] == "available"
+    assert provenance["global_indices"]["as_of"] == "2026-08-11"
+    assert provenance["global_indices"]["status"] == "available"
+    assert provenance["major_assets"]["as_of"] == "2026-08-11"
+    assert provenance["major_assets"]["status"] == "available"
+

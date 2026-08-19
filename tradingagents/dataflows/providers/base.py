@@ -146,3 +146,21 @@ class BaseMarketDataProvider(ABC):
     def get_northbound_flow(self, symbol: str, curr_date: str = None) -> str:
         """Return northbound / HK connect holding details."""
         raise NotImplementedError
+
+    def get_global_indices(
+        self, curr_date: str = None, look_back_days: int = 30
+    ) -> str:
+        """Return historical and latest daily series for global core indices."""
+        raise NotImplementedError
+
+    def get_major_assets(
+        self, curr_date: str = None, look_back_days: int = 30
+    ) -> str:
+        """Return historical and latest daily series for major macro assets."""
+        raise NotImplementedError
+
+    def get_cn_indices(
+        self, curr_date: str = None, look_back_days: int = 30
+    ) -> str:
+        """Return historical and latest daily series for China core market indices."""
+        raise NotImplementedError

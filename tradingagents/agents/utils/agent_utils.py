@@ -2,7 +2,10 @@ from langchain_core.messages import HumanMessage, RemoveMessage
 
 # Import tools from separate utility files
 from tradingagents.agents.utils.core_stock_tools import (
-    get_stock_data
+    get_stock_data,
+    get_cn_indices,
+    get_global_indices,
+    get_major_assets,
 )
 from tradingagents.agents.utils.technical_indicators_tools import (
     get_indicators

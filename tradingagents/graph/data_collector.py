@@ -18,6 +18,9 @@ import re
 
 from tradingagents.agents.utils.agent_utils import (
     get_stock_data,
+    get_cn_indices,
+    get_global_indices,
+    get_major_assets,
     get_indicators,
     get_fundamentals,
     get_balance_sheet,
@@ -467,6 +470,9 @@ def _fetch_realtime_context(ticker: str, trade_date: str) -> Dict[str, Any]:
 
 _DATA_FAILURE_SOURCE_ORDER = (
     "stock_data",
+    "cn_indices",
+    "global_indices",
+    "major_assets",
     "news",
     "global_news",
     "fund_flow_board",
@@ -589,6 +595,7 @@ _SOURCE_AS_OF_PATTERNS = (
     r"最新发布时间\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"【数据日期】\s*(20\d{2}-\d{2}-\d{2})",
     r"实际数据日期\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
+    r"数据基准日\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"数据日期[】：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"日期\s*[：:]\s*(20\d{2}-\d{2}-\d{2})",
     r"龙虎榜明细[（(]\s*(20\d{2}-\d{2}-\d{2})",
@@ -660,6 +667,9 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
 
     tasks: Dict[str, tuple] = {
         "stock_data": (get_stock_data, {"symbol": ticker, "start_date": start_str, "end_date": trade_date}),
+        "cn_indices": (get_cn_indices, {"curr_date": trade_date, "look_back_days": lookback}),
+        "global_indices": (get_global_indices, {"curr_date": trade_date, "look_back_days": lookback}),
+        "major_assets": (get_major_assets, {"curr_date": trade_date, "look_back_days": lookback}),
         "realtime": (_fetch_realtime_context, {"ticker": ticker, "trade_date": trade_date}),
         "news": (get_news, {"ticker": ticker, "start_date": (end_dt - timedelta(days=lookback)).strftime("%Y-%m-%d"), "end_date": trade_date}),
         "global_news": (get_global_news, {"curr_date": trade_date, "look_back_days": lookback, "limit": 30}),
