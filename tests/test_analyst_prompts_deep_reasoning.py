@@ -133,6 +133,61 @@ def test_news_system_message_deep_framework():
     assert "明确区分\"事实\"与\"推断\"" in prompt or "明确区分'事实'与'推断'" in prompt
 
 
+def test_news_system_message_three_layer_transmission_framework():
+    """DAV-192-T4: news_system_message must enforce three-layer transmission analysis.
+
+    - Layer 1: Event itself (What) - title, time, source credibility, core facts.
+    - Layer 2: Direct impact (Why + So What) - fundamentals / market sentiment.
+    - Layer 3: Indirect transmission (What Next) - upstream, downstream, peers, international linkage.
+    """
+    prompt = ZH_PROMPTS["news_system_message"]
+
+    # 1. 强制三层传导分析标记
+    assert "三层传导分析" in prompt
+
+    # 2. 第一层：事件本身 (What)
+    assert "第一层" in prompt and "事件本身" in prompt
+    assert any(term in prompt for term in ("新闻标题", "标题"))
+    assert any(term in prompt for term in ("发布时间", "时间"))
+    assert any(term in prompt for term in ("信息源可信度", "可信度"))
+    assert any(term in prompt for term in ("核心事实", "事实数据"))
+
+    # 3. 第二层：直接影响 (Why + So What)
+    assert "第二层" in prompt and "直接影响" in prompt
+    assert any(term in prompt for term in ("基本面", "营收", "毛利率", "订单", "成本"))
+    assert any(term in prompt for term in ("市场情绪", "情绪"))
+    assert any(term in prompt for term in ("预期差", "定价", "Priced-in"))
+
+    # 4. 第三层：间接传导 (What Next)
+    assert "第三层" in prompt and "间接传导" in prompt
+    assert "上游" in prompt and "下游" in prompt
+    assert any(term in prompt for term in ("同行", "同行竞争"))
+    assert any(term in prompt for term in ("国际联动", "海外对标", "海外对标企业"))
+
+
+def test_news_system_message_output_requirements():
+    """DAV-192-T4: news_system_message must mandate quantitative logic, latency/certainty, and avoid vague descriptions."""
+    prompt = ZH_PROMPTS["news_system_message"]
+
+    # 1. 量化推导链路（数据测算与渗透率/订单/稼动率推演）
+    assert "量化推导链路" in prompt or "量化推演" in prompt
+    assert any(term in prompt for term in ("数据测算", "测算"))
+    assert "渗透率" in prompt
+    assert "订单" in prompt
+    assert any(term in prompt for term in ("稼动率", "产能利用率"))
+
+    # 2. 明确时滞与确定性（区分已发生 vs 预期中）
+    assert any(term in prompt for term in ("时滞", "时滞窗口"))
+    assert any(term in prompt for term in ("确定性", "区分\"已发生事实\"与\"预期中推演\"", "区分已发生 vs 预期中", "已发生事实", "预期中"))
+
+    # 3. 避免泛泛而谈的板块利好描述
+    assert any(term in prompt for term in ("避免泛泛而谈", "杜绝简单定性", "板块利好", "传导逻辑"))
+
+    # 4. 传导案例对照
+    assert "反面案例" in prompt and "正面案例" in prompt
+
+
+
 def test_social_system_message_deep_framework():
     """T4: social_system_message must include sentiment quantification, sentiment life cycle, and reflexivity risk."""
     prompt = ZH_PROMPTS["social_system_message"]
