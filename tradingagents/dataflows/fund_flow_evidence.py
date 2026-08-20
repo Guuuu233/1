@@ -1298,7 +1298,7 @@ def _selection_group_summary(
     *,
     rank: int,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Validate one source/field group and aggregate only that source's daily rows."""
+    """Validate one source/field group and select requested/latest daily row."""
     if not candidates:
         return None, "no_candidates"
     source = candidates[0]["source"]
@@ -1316,12 +1316,28 @@ def _selection_group_summary(
     ordered = [by_date[key] for key in sorted(by_date)][-DEFAULT_WINDOW_DAYS:]
     if candidates[0]["period_kind"] == "realtime_single_day" and len(ordered) != 1:
         return None, "realtime_multiple_dates"
-    try:
-        value = sum((item["value"] for item in ordered), Decimal("0"))
-    except (DecimalException, OverflowError, ValueError):
-        return None, "aggregate_value_invalid"
+
     selected = ordered[-1]
-    direction = _direction_for_field(field, value)
+    day_value = selected["value"]
+    day_direction = _direction_for_field(field, day_value)
+
+    five_day_summary = None
+    if len(ordered) > 1:
+        try:
+            cum_val = sum((item["value"] for item in ordered), Decimal("0"))
+            five_day_summary = {
+                "value": _decimal_text(cum_val),
+                "direction": _direction_for_field(field, cum_val),
+                "window_days": len(ordered),
+                "time_window": f"{len(ordered)}d" if len(ordered) != 5 else "5d",
+                "period_kind": "five_day_aggregate" if len(ordered) == 5 else f"{len(ordered)}_day_aggregate",
+                "dates": [item["date"] for item in ordered],
+                "field": field,
+                "unit": "亿元",
+            }
+        except (DecimalException, OverflowError, ValueError):
+            five_day_summary = None
+
     selected_records = [
         {
             "source": item["source"],
@@ -1343,25 +1359,26 @@ def _selection_group_summary(
         }
         for item in ordered
     ]
-    return (
-        {
-            "source": source,
-            "source_family": selected["source_family"],
-            "algorithm_group": selected["algorithm_group"],
-            "legacy_web_algorithm": bool(selected["legacy_web_algorithm"]),
-            "field": field,
-            "value": _decimal_text(value),
-            "direction": direction,
-            "fallback_rank": rank,
-            "as_of": selected["date"],
-            "window_days": len(ordered),
-            "period_kind": selected["period_kind"],
-            "time_window": selected["time_window"],
-            "records": selected_records,
-            "source_values": {item["date"]: item["value_text"] for item in ordered},
-        },
-        None,
-    )
+    summary_data = {
+        "source": source,
+        "source_family": selected["source_family"],
+        "algorithm_group": selected["algorithm_group"],
+        "legacy_web_algorithm": bool(selected["legacy_web_algorithm"]),
+        "field": field,
+        "value": _decimal_text(day_value),
+        "direction": day_direction,
+        "fallback_rank": rank,
+        "as_of": selected["date"],
+        "window_days": 1,
+        "period_kind": selected["period_kind"],
+        "time_window": "1d",
+        "records": selected_records,
+        "source_values": {item["date"]: item["value_text"] for item in ordered},
+    }
+    if five_day_summary is not None:
+        summary_data["five_day_summary"] = five_day_summary
+        summary_data["summary_5d"] = five_day_summary
+    return summary_data, None
 
 
 def select_fund_flow_source(
@@ -1911,12 +1928,23 @@ def consensus_prompt_instruction(consensus: Mapping[str, Any] | None) -> str:
 
 _MODEL_TOTAL_PATTERNS = {
     "r0_net": (
-        re.compile(r"主力(?:资金)?净(?:流入|流出|额)[^\n。；;]{0,40}?(?:累计|合计|总计)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
-        re.compile(r"(?:累计|合计|总计)[^\n。；;]{0,20}?主力(?:资金)?净(?:流入|流出|额)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
+        re.compile(r"主力(?:资金)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,40}?(?:累计|合计|总计)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
+        re.compile(r"(?:累计|合计|总计|5日累计|5日合计)[^\n。；;]{0,20}?主力(?:资金)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
     ),
     "netamount": (
-        re.compile(r"(?<!主力)(?:总)?净(?:流入额|流出额|流入|流出|额)[^\n。；;]{0,40}?(?:累计|合计|总计)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
-        re.compile(r"(?:累计|合计|总计)[^\n。；;]{0,20}?(?<!主力)(?:总)?净(?:流入额|流出额|流入|流出|额)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
+        re.compile(r"(?<!主力)(?:总)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,40}?(?:累计|合计|总计)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
+        re.compile(r"(?:累计|合计|总计|5日累计|5日合计)[^\n。；;]{0,20}?(?<!主力)(?:总)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
+    ),
+}
+
+_MODEL_DAILY_PATTERNS = {
+    "r0_net": (
+        re.compile(r"(?:当日|当天|单日|今日|\b20\d{2}-\d{2}-\d{2}\b)[^\n。；;]{0,20}?主力(?:资金)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
+        re.compile(r"主力(?:资金)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,20}?(?:为|达|为约|约)?\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
+    ),
+    "netamount": (
+        re.compile(r"(?:当日|当天|单日|今日|\b20\d{2}-\d{2}-\d{2}\b)[^\n。；;]{0,20}?(?<!主力)(?:总)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
+        re.compile(r"(?<!主力)(?:总)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,20}?(?:为|达|为约|约)?\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
     ),
 }
 
@@ -1930,9 +1958,6 @@ def extract_model_totals(text: str | None) -> dict[str, str]:
         for pattern in patterns:
             for match in pattern.finditer(text):
                 if field == "netamount":
-                    # ``主力资金净额`` contains the generic ``净额`` token,
-                    # but it is not a total-net claim. Inspect the local
-                    # clause instead of relying on a fixed-width lookbehind.
                     clause_start = max(
                         (text.rfind(marker, 0, match.start()) for marker in ("。", "；", ";", "，", ",", "\n")),
                         default=-1,
@@ -1940,8 +1965,47 @@ def extract_model_totals(text: str | None) -> dict[str, str]:
                     clause = text[clause_start:match.start()]
                     if "主力" in clause:
                         continue
-                value = decimal_value(match.group(1))
+                matched_prefix = text[match.start():match.end()]
+                num_str = match.groups()[-1]
+                value = decimal_value(num_str)
                 if value is not None:
+                    if "流出" in matched_prefix and value > 0 and not num_str.startswith("+") and not num_str.startswith("-"):
+                        value = -value
+                    found[field] = _decimal_text(value) or ""
+                    break
+            if field in found:
+                break
+    return found
+
+
+def extract_model_daily_values(text: str | None) -> dict[str, str]:
+    """Extract daily (single-day) 亿元 values from model text."""
+    if not isinstance(text, str) or not text.strip():
+        return {}
+    found: dict[str, str] = {}
+    for field, patterns in _MODEL_DAILY_PATTERNS.items():
+        for pattern in patterns:
+            for match in pattern.finditer(text):
+                clause_start = max(
+                    (text.rfind(marker, 0, match.start()) for marker in ("。", "；", ";", "，", ",", "\n")),
+                    default=-1,
+                ) + 1
+                clause_end = min(
+                    (pos for marker in ("。", "；", ";", "\n") if (pos := text.find(marker, match.end())) != -1),
+                    default=len(text),
+                )
+                full_clause = text[clause_start:clause_end]
+                if any(kw in full_clause for kw in ("累计", "合计", "总计", "5日", "五日", "近5", "近五")):
+                    continue
+                if field == "netamount":
+                    if "主力" in text[clause_start:match.start()]:
+                        continue
+                matched_prefix = text[match.start():match.end()]
+                num_str = match.groups()[-1]
+                value = decimal_value(num_str)
+                if value is not None:
+                    if "流出" in matched_prefix and value > 0 and not num_str.startswith("+") and not num_str.startswith("-"):
+                        value = -value
                     found[field] = _decimal_text(value) or ""
                     break
             if field in found:
@@ -1959,26 +2023,30 @@ def validate_model_summary(
     selected_source: str | None = None,
     requested_as_of: str | None = None,
 ) -> dict[str, Any]:
-    """Mark model totals against the selected source field when one is known.
-
-    A source may legitimately expose only ``r0_net`` or only ``netamount``.
-    Without a selected field that remains a partial two-field summary; with a
-    selected field, an absent complementary field is not itself a blocker.
-    An explicit model total is still blocked when the selected source cannot
-    verify it.
-    """
-    structured = summarize_evidence(
+    """Mark model totals and daily values against structured evidence."""
+    structured_cum = summarize_evidence(
         records,
-        window_days=window_days,
+        window_days=window_days if window_days > 1 else DEFAULT_WINDOW_DAYS,
         field=selected_field,
         source=selected_source,
         requested_as_of=requested_as_of,
     )
-    model = extract_model_totals(model_text)
+    structured_daily = summarize_evidence(
+        records,
+        window_days=1,
+        field=selected_field,
+        source=selected_source,
+        requested_as_of=requested_as_of,
+    )
+
+    model_totals = extract_model_totals(model_text)
+    model_daily = extract_model_daily_values(model_text)
+
     mismatches: list[dict[str, str]] = []
     unverifiable: list[str] = []
-    for model_field, model_value_text in model.items():
-        structured_value = decimal_value(structured.get(model_field))
+
+    for model_field, model_value_text in model_totals.items():
+        structured_value = decimal_value(structured_cum.get(model_field))
         model_value = decimal_value(model_value_text)
         if structured_value is None or model_value is None:
             if structured_value is None:
@@ -1994,29 +2062,54 @@ def validate_model_summary(
                     "reason": "model cumulative total differs from structured evidence",
                 }
             )
-    if mismatches:
+
+    for model_field, model_value_text in model_daily.items():
+        structured_value = decimal_value(structured_daily.get(model_field))
+        model_value = decimal_value(model_value_text)
+        if structured_value is None or model_value is None:
+            if structured_value is None:
+                unverifiable.append(model_field)
+            continue
+        if abs(structured_value - model_value) > tolerance:
+            mismatches.append(
+                {
+                    "field": model_field,
+                    "structured": _decimal_text(structured_value) or "",
+                    "model": _decimal_text(model_value) or "",
+                    "unit": "亿元",
+                    "reason": "model daily value differs from structured evidence",
+                }
+            )
+
+    combined_model = {**model_daily, **model_totals}
+    primary_structured = structured_daily if window_days == 1 else structured_cum
+
+    if primary_structured.get("status") == "data_conflict":
+        status = "blocked"
+    elif mismatches:
         status = "mismatch"
-    elif model:
+    elif combined_model and (primary_structured.get("status") == "partial" or unverifiable):
+        status = "blocked"
+    elif combined_model:
         status = "matched"
     else:
         status = "not_checked"
-    if structured.get("status") == "data_conflict":
-        status = "blocked"
-    elif model and (structured.get("status") == "partial" or unverifiable):
-        status = "blocked"
+
     return {
         "status": status,
         "hard_guard": {
             "blocked": status not in {"matched", "not_checked"},
-            "reason": "模型累计值与结构化 evidence 不一致或结构化窗口不可用"
-            if status == "blocked" or status == "mismatch"
+            "reason": "模型数值（单日或累计）与结构化 evidence 不一致或结构化窗口不可用"
+            if status in {"blocked", "mismatch"}
             else "no explicit model total",
         },
-        "structured": structured,
+        "structured": primary_structured,
         "selected_field": selected_field,
         "selected_source": selected_source,
         "requested_as_of": requested_as_of,
-        "model": model,
+        "model": combined_model,
+        "model_totals": model_totals,
+        "model_daily": model_daily,
         "unverifiable_fields": unverifiable,
         "mismatches": mismatches,
         "tolerance": _decimal_text(tolerance),

@@ -304,3 +304,156 @@ def test_component_only_field_cannot_authorize_direction():
 
 def test_model_parser_does_not_duplicate_main_force_net_as_total_net():
     assert extract_model_totals("主力资金净额累计 1.25 亿") == {"r0_net": "1.25"}
+
+
+def test_five_eastmoney_daily_records_selects_target_day_1d_value_and_direction():
+    records = [
+        _selection_record("eastmoney_direct", "-1.0", date="2026-08-16"),
+        _selection_record("eastmoney_direct", "-1.0", date="2026-08-17"),
+        _selection_record("eastmoney_direct", "-0.5", date="2026-08-18"),
+        _selection_record("eastmoney_direct", "-0.4280142", date="2026-08-19"),
+        _selection_record("eastmoney_direct", "2.21197136", date="2026-08-20"),
+    ]
+    result = select_fund_flow_source(
+        records,
+        symbol="600519",
+        requested_as_of="2026-08-20",
+    )
+
+    assert result["selected_source"] == "eastmoney_direct"
+    assert result["selected_field"] == "r0_net"
+    assert result["selected_value"] == "2.21197136"
+    assert result["selected_direction"] == "inflow"
+    assert result["selected_time_window"] == "1d"
+    assert result["selected_window_days"] == 1
+    assert result["selected_as_of"] == "2026-08-20"
+    assert result["direction_allowed"] is True
+    assert result["hard_guard"]["blocked"] is False
+
+
+def test_independent_five_day_summary_is_separate_and_does_not_pollute_1d_selection():
+    records = [
+        _selection_record("eastmoney_direct", "-1.0", date="2026-08-16"),
+        _selection_record("eastmoney_direct", "-1.0", date="2026-08-17"),
+        _selection_record("eastmoney_direct", "-0.5", date="2026-08-18"),
+        _selection_record("eastmoney_direct", "-0.4280142", date="2026-08-19"),
+        _selection_record("eastmoney_direct", "2.21197136", date="2026-08-20"),
+    ]
+    result = select_fund_flow_source(
+        records,
+        symbol="600519",
+        requested_as_of="2026-08-20",
+    )
+
+    # 1d selection is pure 1d
+    assert result["selected_value"] == "2.21197136"
+    assert result["selected_time_window"] == "1d"
+    assert result["selected_window_days"] == 1
+
+    # 5d summary if present must be labeled 5d and have 5d cumulative value
+    if "five_day_summary" in result:
+        five_d = result["five_day_summary"]
+        assert five_d["time_window"] == "5d"
+        assert five_d["window_days"] == 5
+        assert Decimal(five_d["value"]) == Decimal("-0.71604284")
+        assert five_d["direction"] == "outflow"
+
+
+def test_single_tushare_dc_source_allows_direction_despite_insufficient_sources_consensus_audit():
+    records = [
+        _selection_record(
+            "tushare_eastmoney_moneyflow_dc",
+            "2.21197136",
+            date="2026-08-20",
+        )
+    ]
+    result = select_fund_flow_source(
+        records,
+        symbol="600519",
+        requested_as_of="2026-08-20",
+    )
+
+    assert result["selected_source"] == "tushare_eastmoney_moneyflow_dc"
+    assert result["selected_field"] == "r0_net"
+    assert result["selected_value"] == "2.21197136"
+    assert result["selected_direction"] == "inflow"
+    assert result["direction_allowed"] is True
+    assert result["hard_guard"]["blocked"] is False
+
+
+def test_dc_r0_net_and_ths_netamount_opposite_directions_selects_dc_without_cross_field_conflict():
+    records = [
+        _selection_record(
+            "tushare_eastmoney_moneyflow_dc",
+            "2.21197136",
+            date="2026-08-20",
+            field="r0_net",
+        ),
+        _selection_record(
+            "tushare_ths_moneyflow_ths",
+            "-1.928246",
+            date="2026-08-20",
+            field="netamount",
+        ),
+    ]
+    result = select_fund_flow_source(
+        records,
+        symbol="600519",
+        requested_as_of="2026-08-20",
+    )
+
+    assert result["selected_source"] == "tushare_eastmoney_moneyflow_dc"
+    assert result["selected_field"] == "r0_net"
+    assert result["selected_value"] == "2.21197136"
+    assert result["selected_direction"] == "inflow"
+    assert result["direction_allowed"] is True
+    assert len(result["alternative_sources"]) == 1
+    assert result["alternative_sources"][0]["source"] == "tushare_ths_moneyflow_ths"
+    assert result["alternative_sources"][0]["field"] == "netamount"
+    assert result["alternative_sources"][0]["value"] == "-1.928246"
+    assert result["alternative_sources"][0]["direction"] == "outflow"
+
+
+def test_ths_netamount_only_allows_total_fund_flow_direction_summary():
+    records = [
+        _selection_record(
+            "tushare_ths_moneyflow_ths",
+            "2.0",
+            date="2026-08-20",
+            field="netamount",
+        )
+    ]
+    result = select_fund_flow_source(
+        records,
+        symbol="600519",
+        requested_as_of="2026-08-20",
+    )
+
+    assert result["selected_source"] == "tushare_ths_moneyflow_ths"
+    assert result["selected_field"] == "netamount"
+    assert result["selected_value"] == "2"
+    assert result["selected_direction"] == "inflow"
+    assert result["direction_summary"] == "总资金（非主力口径）偏流入"
+
+
+def test_model_text_mistaking_five_day_sum_as_daily_value_is_blocked_by_validation():
+    records = [
+        _selection_record("eastmoney_direct", "-1.0", date="2026-08-16"),
+        _selection_record("eastmoney_direct", "-1.0", date="2026-08-17"),
+        _selection_record("eastmoney_direct", "-0.5", date="2026-08-18"),
+        _selection_record("eastmoney_direct", "-0.4280142", date="2026-08-19"),
+        _selection_record("eastmoney_direct", "2.21197136", date="2026-08-20"),
+    ]
+    # Model text incorrectly quotes the 5-day sum (-0.716 亿) as the daily value
+    validation = validate_model_summary(
+        records,
+        "当日主力资金净额 -0.716 亿",
+        selected_field="r0_net",
+        selected_source="eastmoney_direct",
+        requested_as_of="2026-08-20",
+        window_days=1,
+    )
+
+    assert validation["status"] == "mismatch"
+    assert validation["hard_guard"]["blocked"] is True
+
