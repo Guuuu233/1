@@ -4,7 +4,7 @@ from tradingagents.agents.utils.agent_states import current_tracker_var
 from tradingagents.agents.utils.debate_utils import (
     format_claim_subset_for_prompt,
     format_claims_for_prompt,
-    strip_tagged_json,
+    sanitize_debate_response,
     update_debate_state_with_payload,
 )
 
@@ -63,7 +63,7 @@ def create_conservative_debator(llm):
                     round_num=debate_round, token=content, model_name=model_name,
                 )
 
-        clean_response = strip_tagged_json(full_content, "RISK_STATE")
+        clean_response = sanitize_debate_response(full_content, "RISK_STATE")
         new_risk_debate_state = update_debate_state_with_payload(
             state=risk_debate_state,
             raw_response=full_content,
@@ -76,6 +76,7 @@ def create_conservative_debator(llm):
             domain="risk",
             speaker_field="latest_speaker",
             store_current_response=False,
+            current_response_key="current_conservative_response",
         )
         if tracker:
             tracker.emit_debate_message(
@@ -86,7 +87,6 @@ def create_conservative_debator(llm):
         new_risk_debate_state["current_aggressive_response"] = risk_debate_state.get(
             "current_aggressive_response", ""
         )
-        new_risk_debate_state["current_conservative_response"] = f"Conservative Analyst: {clean_response}"
         new_risk_debate_state["current_neutral_response"] = risk_debate_state.get(
             "current_neutral_response", ""
         )

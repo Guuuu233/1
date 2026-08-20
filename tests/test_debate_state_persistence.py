@@ -640,3 +640,264 @@ def test_8_direct_report_with_bad_machine_blocks_fails_closed():
     }
     with pytest.raises(ValueError, match="RISK_STATE machine block contains invalid JSON"):
         report_service.validate_report_machine_blocks(risk_bad_report)
+
+
+# ============================================================================
+# DAV-214: RISK_STATE machine block quarantine for current_*_response
+# ============================================================================
+
+
+class _FakeRiskStreamLLM:
+    def __init__(self, response_text: str):
+        self.response_text = response_text
+        self.model_name = "mock-risk-llm"
+
+    async def astream(self, prompt):
+        yield self.response_text
+
+
+def _make_graph_risk_state(risk_debate_state=None) -> dict:
+    return {
+        "company_of_interest": "600519",
+        "market_report": "市场 RSI 48.2",
+        "sentiment_report": "情绪中性",
+        "news_report": "新闻利好",
+        "fundamentals_report": "基本面 +15%",
+        "trader_investment_plan": "交易员方案：买入 20% 仓位",
+        "risk_debate_state": risk_debate_state if risk_debate_state is not None else debate_utils.build_empty_risk_debate_state(),
+    }
+
+
+def test_dav214_aggressive_debator_quarantines_truncated_block():
+    """Aggressive debator: 截断块不污染 current_aggressive_response 与 history，最终 report 校验通过"""
+    from tradingagents.agents.risk_mgmt.aggressive_debator import create_aggressive_debator
+
+    raw_response = "风控分析：激进方认为下行风险有限。\n<!-- RISK_STATE: {\"new_claims\": [{\"claim\": \"截断未完\""
+    node = create_aggressive_debator(_FakeRiskStreamLLM(raw_response))
+    result = asyncio.run(node(_make_graph_risk_state()))
+
+    rds = result["risk_debate_state"]
+    assert rds["count"] == 1
+    assert rds["claims"] == []
+    assert rds["latest_speaker"] == "Aggressive"
+    assert "RISK_STATE" not in rds["current_aggressive_response"]
+    assert "<!--" not in rds["current_aggressive_response"]
+    assert "风控分析：激进方认为下行风险有限。" in rds["current_aggressive_response"]
+    assert rds["current_aggressive_response"].startswith("Aggressive Analyst: ")
+    assert "RISK_STATE" not in rds["history"]
+    assert "RISK_STATE" not in rds["aggressive_history"]
+
+    mock_report = {"risk_debate_state": rds}
+    report_service.validate_report_machine_blocks(mock_report)
+
+
+def test_dav214_conservative_debator_quarantines_malformed_json():
+    """Conservative debator: malformed JSON 不污染 current_conservative_response 与 history"""
+    from tradingagents.agents.risk_mgmt.conservative_debator import create_conservative_debator
+
+    raw_response = "风控分析：保守方认为存在较大回撤风险。\n<!-- RISK_STATE: {\"new_claims\": [bad json} -->"
+    node = create_conservative_debator(_FakeRiskStreamLLM(raw_response))
+    result = asyncio.run(node(_make_graph_risk_state()))
+
+    rds = result["risk_debate_state"]
+    assert rds["count"] == 1
+    assert rds["claims"] == []
+    assert rds["latest_speaker"] == "Conservative"
+    assert "RISK_STATE" not in rds["current_conservative_response"]
+    assert "<!--" not in rds["current_conservative_response"]
+    assert "风控分析：保守方认为存在较大回撤风险。" in rds["current_conservative_response"]
+    assert rds["current_conservative_response"].startswith("Conservative Analyst: ")
+    assert "RISK_STATE" not in rds["history"]
+    assert "RISK_STATE" not in rds["conservative_history"]
+
+    mock_report = {"risk_debate_state": rds}
+    report_service.validate_report_machine_blocks(mock_report)
+
+
+def test_dav214_neutral_debator_quarantines_missing_colon():
+    """Neutral debator: 缺少冒号标签不污染 current_neutral_response 与 history"""
+    from tradingagents.agents.risk_mgmt.neutral_debator import create_neutral_debator
+
+    raw_response = "风控分析：中性方建议平衡收益与风险。\n<!-- RISK_STATE {\"new_claims\": []} -->\n尾随观点。"
+    node = create_neutral_debator(_FakeRiskStreamLLM(raw_response))
+    result = asyncio.run(node(_make_graph_risk_state()))
+
+    rds = result["risk_debate_state"]
+    assert rds["count"] == 1
+    assert rds["claims"] == []
+    assert rds["latest_speaker"] == "Neutral"
+    assert "RISK_STATE" not in rds["current_neutral_response"]
+    assert "<!--" not in rds["current_neutral_response"]
+    assert "风控分析：中性方建议平衡收益与风险。" in rds["current_neutral_response"]
+    assert "尾随观点。" in rds["current_neutral_response"]
+    assert rds["current_neutral_response"].startswith("Neutral Analyst: ")
+    assert "RISK_STATE" not in rds["history"]
+    assert "RISK_STATE" not in rds["neutral_history"]
+
+    mock_report = {"risk_debate_state": rds}
+    report_service.validate_report_machine_blocks(mock_report)
+
+
+def test_dav214_three_risk_debators_trailing_and_duplicate_blocks():
+    """三个风险节点处理 trailing prose 与 duplicate blocks 行为一致"""
+    from tradingagents.agents.risk_mgmt.aggressive_debator import create_aggressive_debator
+    from tradingagents.agents.risk_mgmt.conservative_debator import create_conservative_debator
+    from tradingagents.agents.risk_mgmt.neutral_debator import create_neutral_debator
+
+    payload = {"new_claims": [{"claim": "测试claim", "evidence": [], "confidence": 0.8, "target_claim_ids": []}]}
+    block = f"<!-- RISK_STATE: {json.dumps(payload, ensure_ascii=False)} -->"
+    trailing_response = f"前导正文。\n{block}\n尾随正文补充。"
+    dup_response = f"前导正文。\n{block}\n中间正文。\n{block}\n总结正文。"
+
+    for factory, response, resp_key in [
+        (create_aggressive_debator, trailing_response, "current_aggressive_response"),
+        (create_conservative_debator, dup_response, "current_conservative_response"),
+        (create_neutral_debator, trailing_response, "current_neutral_response"),
+    ]:
+        node = factory(_FakeRiskStreamLLM(response))
+        result = asyncio.run(node(_make_graph_risk_state()))
+        rds = result["risk_debate_state"]
+        assert rds["count"] == 1
+        assert rds["claims"] == []
+        assert "RISK_STATE" not in rds[resp_key]
+        assert "<!--" not in rds[resp_key]
+        assert "前导正文。" in rds[resp_key]
+        assert "RISK_STATE" not in rds["history"]
+        mock_report = {"risk_debate_state": rds}
+        report_service.validate_report_machine_blocks(mock_report)
+
+
+def test_dav214_valid_risk_state_parsed_and_cleared_from_current_responses():
+    """合法 RISK_STATE 正常解析 claims 且 current_*_response 中不含标签"""
+    from tradingagents.agents.risk_mgmt.aggressive_debator import create_aggressive_debator
+
+    payload = {
+        "new_claims": [
+            {
+                "claim": "回调击穿止损导致超额亏损",
+                "evidence": ["RSI 48.2", "止损 1780"],
+                "confidence": 0.85,
+                "target_claim_ids": [],
+            }
+        ],
+        "responded_claim_ids": [],
+        "resolved_claim_ids": [],
+        "unresolved_claim_ids": [],
+        "next_focus_claim_ids": ["RISK-1"],
+        "round_summary": "激进方提出止损风险",
+        "round_goal": "评估止损合理性",
+    }
+    block = f"<!-- RISK_STATE: {json.dumps(payload, ensure_ascii=False)} -->"
+    raw_response = f"激进方核心论证。\n{block}"
+
+    node = create_aggressive_debator(_FakeRiskStreamLLM(raw_response))
+    result = asyncio.run(node(_make_graph_risk_state()))
+
+    rds = result["risk_debate_state"]
+    assert rds["count"] == 1
+    assert len(rds["claims"]) == 1
+    assert rds["claims"][0]["claim"] == "回调击穿止损导致超额亏损"
+    assert rds["claims"][0]["confidence"] == 0.85
+    assert rds["claims"][0]["claim_id"] == "RISK-1"
+    assert "RISK_STATE" not in rds["current_aggressive_response"]
+    assert "<!--" not in rds["current_aggressive_response"]
+    assert "激进方核心论证。" in rds["current_aggressive_response"]
+    assert rds["current_aggressive_response"] == "Aggressive Analyst: 激进方核心论证。"
+
+    mock_report = {"risk_debate_state": rds}
+    report_service.validate_report_machine_blocks(mock_report)
+
+
+def test_dav214_sequential_risk_debate_round_with_bad_blocks():
+    """多轮连续风险辩论出现坏块：每轮 current_*_response 与 history 均无污染，最终 report 校验通过"""
+    from tradingagents.agents.risk_mgmt.aggressive_debator import create_aggressive_debator
+    from tradingagents.agents.risk_mgmt.conservative_debator import create_conservative_debator
+    from tradingagents.agents.risk_mgmt.neutral_debator import create_neutral_debator
+
+    agg_raw = "激进论点。\n<!-- RISK_STATE: {\"new_claims\": [{\"claim\": \"截断未完\""
+    cons_raw = "保守论点。\n<!-- RISK_STATE: {\"new_claims\": [invalid json} -->"
+    neut_raw = "中性论点。\n<!-- RISK_STATE {\"new_claims\": []} -->\n补充建议。"
+
+    state = _make_graph_risk_state()
+
+    # Step 1: Aggressive
+    agg_node = create_aggressive_debator(_FakeRiskStreamLLM(agg_raw))
+    res1 = asyncio.run(agg_node(state))
+    state["risk_debate_state"] = res1["risk_debate_state"]
+
+    # Step 2: Conservative
+    cons_node = create_conservative_debator(_FakeRiskStreamLLM(cons_raw))
+    res2 = asyncio.run(cons_node(state))
+    state["risk_debate_state"] = res2["risk_debate_state"]
+
+    # Step 3: Neutral
+    neut_node = create_neutral_debator(_FakeRiskStreamLLM(neut_raw))
+    res3 = asyncio.run(neut_node(state))
+    state["risk_debate_state"] = res3["risk_debate_state"]
+
+    rds = state["risk_debate_state"]
+    assert rds["count"] == 3
+    assert rds["claims"] == []
+
+    assert "RISK_STATE" not in rds["current_aggressive_response"]
+    assert "RISK_STATE" not in rds["current_conservative_response"]
+    assert "RISK_STATE" not in rds["current_neutral_response"]
+    assert "激进论点。" in rds["current_aggressive_response"]
+    assert "保守论点。" in rds["current_conservative_response"]
+    assert "中性论点。" in rds["current_neutral_response"]
+    assert "补充建议。" in rds["current_neutral_response"]
+
+    assert "RISK_STATE" not in rds["history"]
+    assert "RISK_STATE" not in rds["aggressive_history"]
+    assert "RISK_STATE" not in rds["conservative_history"]
+    assert "RISK_STATE" not in rds["neutral_history"]
+
+    mock_report = {"risk_debate_state": rds}
+    report_service.validate_report_machine_blocks(mock_report)
+
+
+def test_dav214_sanitize_debate_response_utilities():
+    """sanitize_debate_response 公共辅助函数：支持字符串与序列 tag，正确移除坏块与好块并保留正文"""
+    # 截断块
+    assert debate_utils.sanitize_debate_response(
+        "正文观点\n<!-- RISK_STATE: {\"new_claims\": [", "RISK_STATE"
+    ) == "正文观点"
+
+    # malformed JSON 块
+    assert debate_utils.sanitize_debate_response(
+        "前导正文\n<!-- DEBATE_STATE: {invalid} -->\n尾随正文", ("DEBATE_STATE",)
+    ) == "前导正文\n\n尾随正文"
+
+    # 无任何块
+    assert debate_utils.sanitize_debate_response("纯正文分析") == "纯正文分析"
+
+    # 非字符串容错
+    assert debate_utils.sanitize_debate_response(None) is None
+
+
+def test_dav214_update_debate_state_with_current_response_key():
+    """update_debate_state_with_payload: current_response_key 正确设置对应响应字段"""
+    initial_state = _make_risk_debate_state()
+    raw_response = "激进论证\n<!-- RISK_STATE: {\"new_claims\": [bad json} -->"
+
+    result = debate_utils.update_debate_state_with_payload(
+        state=initial_state,
+        raw_response=raw_response,
+        speaker_label="Aggressive Analyst",
+        speaker_key="Aggressive",
+        stance="aggressive",
+        history_key="aggressive_history",
+        marker="RISK_STATE",
+        claim_prefix="RISK",
+        domain="risk",
+        speaker_field="latest_speaker",
+        store_current_response=False,
+        current_response_key="current_aggressive_response",
+    )
+
+    assert result["count"] == 1
+    assert result["current_aggressive_response"] == "Aggressive Analyst: 激进论证"
+    assert "current_response" not in result or result["current_response"] == ""
+    assert "RISK_STATE" not in result["history"]
+    assert "RISK_STATE" not in result["current_aggressive_response"]
+

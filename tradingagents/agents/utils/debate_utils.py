@@ -415,14 +415,16 @@ def default_round_goal(domain: str, next_count: int) -> str:
 
 def _quarantine_rejected_machine_blocks(
     text: str,
-    tags: Iterable[str] = ("DEBATE_STATE", "RISK_STATE"),
+    tags: str | Iterable[str] = ("DEBATE_STATE", "RISK_STATE"),
 ) -> str:
     """Isolate rejected machine blocks from transcript history while keeping prose."""
     if not isinstance(text, str):
         return text
 
+    tag_list = (tags,) if isinstance(tags, str) else tuple(tags)
+
     spans: list[tuple[int, int]] = []
-    for tag in tags:
+    for tag in tag_list:
         for match in _tagged_occurrences(text, tag):
             start = match.start()
             close_idx = _find_machine_block_close(text, match.end())
@@ -454,6 +456,14 @@ def _quarantine_rejected_machine_blocks(
     return cleaned.strip()
 
 
+def sanitize_debate_response(
+    text: str,
+    tags: str | Iterable[str] = ("DEBATE_STATE", "RISK_STATE"),
+) -> str:
+    """Isolate rejected or malformed machine blocks from debate responses while preserving prose."""
+    return _quarantine_rejected_machine_blocks(text, tags)
+
+
 def _record_unstructured_response(
     *,
     state: Mapping[str, Any],
@@ -463,6 +473,7 @@ def _record_unstructured_response(
     history_key: str,
     speaker_field: str,
     store_current_response: bool,
+    current_response_key: str | None = None,
 ) -> dict[str, Any]:
     """Advance transcript metadata without accepting a rejected machine block."""
     cleaned_response = _quarantine_rejected_machine_blocks(raw_response)
@@ -475,7 +486,9 @@ def _record_unstructured_response(
         speaker_field: speaker_key,
         "count": safe_int(state.get("count", 0), 0) + 1,
     }
-    if store_current_response:
+    if current_response_key:
+        updates[current_response_key] = argument
+    if store_current_response and current_response_key != "current_response":
         updates["current_response"] = argument
     new_state.update(updates)
     return new_state
@@ -494,6 +507,7 @@ def update_debate_state_with_payload(
     domain: str,
     speaker_field: str,
     store_current_response: bool = True,
+    current_response_key: str | None = None,
 ) -> dict[str, Any]:
     parsed_payload = _parse_tagged_json(raw_response, marker, warn=True)
     if parsed_payload is None:
@@ -505,6 +519,7 @@ def update_debate_state_with_payload(
             history_key=history_key,
             speaker_field=speaker_field,
             store_current_response=store_current_response,
+            current_response_key=current_response_key,
         )
 
     payload = _sanitize_machine_payload(parsed_payload, marker)
@@ -517,6 +532,7 @@ def update_debate_state_with_payload(
             history_key=history_key,
             speaker_field=speaker_field,
             store_current_response=store_current_response,
+            current_response_key=current_response_key,
         )
 
     cleaned_response = strip_tagged_json(raw_response, marker)
@@ -610,7 +626,9 @@ def update_debate_state_with_payload(
         "round_summary": summary,
         "round_goal": round_goal,
     }
-    if store_current_response:
+    if current_response_key:
+        updates[current_response_key] = argument
+    if store_current_response and current_response_key != "current_response":
         updates["current_response"] = argument
     new_state.update(updates)
     return new_state
