@@ -900,4 +900,3 @@ def test_dav214_update_debate_state_with_current_response_key():
     assert "current_response" not in result or result["current_response"] == ""
     assert "RISK_STATE" not in result["history"]
     assert "RISK_STATE" not in result["current_aggressive_response"]
-

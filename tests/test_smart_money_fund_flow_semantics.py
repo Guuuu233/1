@@ -154,4 +154,3 @@ def test_smart_money_ths_netamount_blocks_main_force_accumulation_claims():
     assert guard["blocked"] is True
     assert guard["direction_allowed"] is False
     assert "已阻断增持、减持、吸筹方向摘要" in result["smart_money_report"]
-

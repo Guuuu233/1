@@ -456,4 +456,3 @@ def test_model_text_mistaking_five_day_sum_as_daily_value_is_blocked_by_validati
 
     assert validation["status"] == "mismatch"
     assert validation["hard_guard"]["blocked"] is True
-
