@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import threading
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 from api.job_store import InMemoryJobStore
 from api import main
+from api.services import report_service
 
 
 def _request() -> main.AnalyzeRequest:
@@ -250,3 +253,201 @@ def test_report_save_failure_is_raised_to_the_job_failure_boundary():
             raise AssertionError("report persistence errors must not be swallowed")
 
     asyncio.run(scenario())
+
+class _FakePropagator:
+    def create_initial_state(self, *args, **kwargs):
+        return {
+            "company_of_interest": "600519.SH",
+            "trade_date": "2026-08-20",
+            "horizon": "short",
+            "final_trade_decision": "BUY",
+        }
+
+    def get_graph_args(self):
+        return {}
+
+
+class _FakeGraphStream:
+    def __init__(self, exc: Exception | None = None):
+        self.exc = exc
+
+    async def astream(self, init_state, **_kwargs):
+        yield {
+            "company_of_interest": "600519.SH",
+            "trade_date": "2026-08-20",
+            "horizon": "short",
+            "market_report": "market report content",
+        }
+        if self.exc is not None:
+            raise self.exc
+        yield {
+            "final_trade_decision": "BUY",
+            "investment_debate_state": {"judge_decision": "多头胜", "count": 6},
+            "risk_debate_state": {"judge_decision": "风控通过", "count": 9},
+        }
+
+
+class _FakeTradingGraphForStream:
+    def __init__(self, exc: Exception | None = None):
+        self.data_collector = MagicMock()
+        self.data_collector.collect.return_value = {}
+        self.propagator = _FakePropagator()
+        self.graph = _FakeGraphStream(exc)
+        self.role_resolved_configs = {}
+        self.quick_thinking_llm = object()
+        self.config = {}
+
+    def process_signal(self, decision):
+        return "BUY"
+
+
+def test_single_horizon_astream_quota_error_fails_job_and_report():
+    store = InMemoryJobStore()
+    events: list[tuple[str, dict]] = []
+    job_id = f"job-{uuid4().hex}"
+    db = MagicMock()
+    marked_failed: list[tuple[str, str]] = []
+
+    def capture_mark_failed(_db, rep_id, err):
+        marked_failed.append((rep_id, err))
+
+    def capture_event(j_id: str, event: str, data: dict) -> None:
+        events.append((event, data))
+        store.emit_event(j_id, event, data)
+
+    fake_graph = _FakeTradingGraphForStream(RuntimeError("insufficient_quota: 403 Forbidden"))
+    mock_create_report = MagicMock()
+    request = main.AnalyzeRequest(
+        symbol="600519.SH",
+        trade_date="2026-08-20",
+        horizons=["short"],
+        selected_analysts=["market"],
+    )
+
+    async def scenario():
+        with (
+            patch.object(main, "_job_store_instance", store),
+            patch.object(main, "TradingAgentsGraph", return_value=fake_graph),
+            patch.object(main, "_resolve_and_freeze_custom_prompts", return_value=({}, False)),
+            patch.object(main, "get_db_ctx", return_value=nullcontext(db)),
+            patch.object(report_service, "init_report"),
+            patch.object(report_service, "update_report_partial"),
+            patch.object(report_service, "mark_report_failed", side_effect=capture_mark_failed),
+            patch.object(report_service, "create_report", mock_create_report),
+            patch.object(main, "_emit_job_event", side_effect=capture_event),
+        ):
+            await main._run_job_inner(job_id, request, stream_events=True, save_report=True)
+
+    asyncio.run(scenario())
+
+    job = store.get_job(job_id)
+    assert job["status"] == "failed"
+    assert "insufficient_quota: 403 Forbidden" in job["error"]
+    assert "RuntimeError" in job["error"]
+    assert any(event == "job.failed" for event, _ in events)
+    assert not any(event == "job.completed" for event, _ in events)
+    assert len(marked_failed) == 1
+    assert marked_failed[0][0] == job_id
+    assert "insufficient_quota: 403 Forbidden" in marked_failed[0][1]
+    assert "RuntimeError" in marked_failed[0][1]
+    mock_create_report.assert_not_called()
+
+
+def test_single_horizon_astream_connection_error_fails_job_and_report():
+    store = InMemoryJobStore()
+    events: list[tuple[str, dict]] = []
+    job_id = f"job-{uuid4().hex}"
+    db = MagicMock()
+    marked_failed: list[tuple[str, str]] = []
+
+    def capture_mark_failed(_db, rep_id, err):
+        marked_failed.append((rep_id, err))
+
+    def capture_event(j_id: str, event: str, data: dict) -> None:
+        events.append((event, data))
+        store.emit_event(j_id, event, data)
+
+    fake_graph = _FakeTradingGraphForStream(ConnectionError("connection reset by peer"))
+    mock_create_report = MagicMock()
+    request = main.AnalyzeRequest(
+        symbol="600519.SH",
+        trade_date="2026-08-20",
+        horizons=["short"],
+        selected_analysts=["market"],
+    )
+
+    async def scenario():
+        with (
+            patch.object(main, "_job_store_instance", store),
+            patch.object(main, "TradingAgentsGraph", return_value=fake_graph),
+            patch.object(main, "_resolve_and_freeze_custom_prompts", return_value=({}, False)),
+            patch.object(main, "get_db_ctx", return_value=nullcontext(db)),
+            patch.object(report_service, "init_report"),
+            patch.object(report_service, "update_report_partial"),
+            patch.object(report_service, "mark_report_failed", side_effect=capture_mark_failed),
+            patch.object(report_service, "create_report", mock_create_report),
+            patch.object(main, "_emit_job_event", side_effect=capture_event),
+        ):
+            await main._run_job_inner(job_id, request, stream_events=True, save_report=True)
+
+    asyncio.run(scenario())
+
+    job = store.get_job(job_id)
+    assert job["status"] == "failed"
+    assert "connection reset by peer" in job["error"]
+    assert "ConnectionError" in job["error"]
+    assert any(event == "job.failed" for event, _ in events)
+    assert not any(event == "job.completed" for event, _ in events)
+    assert len(marked_failed) == 1
+    assert marked_failed[0][0] == job_id
+    assert "connection reset by peer" in marked_failed[0][1]
+    assert "ConnectionError" in marked_failed[0][1]
+    mock_create_report.assert_not_called()
+
+
+def test_single_horizon_astream_success_path_completes_normally():
+    store = InMemoryJobStore()
+    events: list[tuple[str, dict]] = []
+    job_id = f"job-{uuid4().hex}"
+    db = MagicMock()
+    saved_reports: list[dict] = []
+
+    def capture_create_report(**kwargs):
+        saved_reports.append(kwargs)
+
+    def capture_event(j_id: str, event: str, data: dict) -> None:
+        events.append((event, data))
+        store.emit_event(j_id, event, data)
+
+    fake_graph = _FakeTradingGraphForStream(exc=None)
+    mock_create_report = MagicMock()
+    request = main.AnalyzeRequest(
+        symbol="600519.SH",
+        trade_date="2026-08-20",
+        horizons=["short"],
+        selected_analysts=["market"],
+    )
+
+    async def scenario():
+        with (
+            patch.object(main, "_job_store_instance", store),
+            patch.object(main, "TradingAgentsGraph", return_value=fake_graph),
+            patch.object(main, "_resolve_and_freeze_custom_prompts", return_value=({}, False)),
+            patch.object(main, "get_db_ctx", return_value=nullcontext(db)),
+            patch.object(report_service, "init_report"),
+            patch.object(report_service, "update_report_partial"),
+            patch.object(report_service, "extract_structured_data", return_value=None),
+            patch.object(report_service, "create_report", side_effect=capture_create_report),
+            patch.object(main, "_emit_job_event", side_effect=capture_event),
+        ):
+            await main._run_job_inner(job_id, request, stream_events=True, save_report=True)
+
+    asyncio.run(scenario())
+
+    job = store.get_job(job_id)
+    assert job["status"] == "completed"
+    assert job["error"] is None
+    assert any(event == "job.completed" for event, _ in events)
+    assert not any(event == "job.failed" for event, _ in events)
+    assert len(saved_reports) == 1
+    assert saved_reports[0]["symbol"] == "600519.SH"
