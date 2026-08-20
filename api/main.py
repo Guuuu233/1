@@ -1912,6 +1912,8 @@ def _build_result_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
         "analyst_traces": final_state.get("analyst_traces"),
         "investment_plan": final_state.get("investment_plan"),
         "trader_investment_plan": final_state.get("trader_investment_plan"),
+        "investment_debate_state": final_state.get("investment_debate_state"),
+        "risk_debate_state": final_state.get("risk_debate_state"),
         "risk_feedback_state": final_state.get("risk_feedback_state"),
         "final_trade_decision": final_state.get("final_trade_decision"),
     }
@@ -3120,6 +3122,8 @@ async def _run_job_inner(
                 "final_trade_decision": primary_r.get("final_trade_decision", ""),
                 "investment_plan": primary_r.get("investment_plan", ""),
                 "trader_investment_plan": primary_r.get("trader_investment_plan", ""),
+                "investment_debate_state": primary_r.get("investment_debate_state"),
+                "risk_debate_state": primary_r.get("risk_debate_state"),
                 "market_report": primary_r.get("market_report", ""),
                 "sentiment_report": primary_r.get("sentiment_report", ""),
                 "news_report": primary_r.get("news_report", ""),
