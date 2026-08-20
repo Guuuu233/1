@@ -207,6 +207,77 @@ class TestIndustryLinkageProvider:
             assert samsung["confidence"] == "低（接口异常）"
             assert "Rate limited" in samsung["note"]
 
+    def test_as_of_historical_beyond_3_months(self):
+        """测试超过3个月的超长历史 as_of 请求能正确构建历史查询窗口并计算指标。"""
+        provider = IndustryLinkageProvider()
+
+        # 构造 2024 年 6 月至 10 月的历史数据（上涨趋势）
+        hist_dates = pd.date_range("2024-06-01", "2024-10-15", freq="B")
+        hist_prices = [45000.0 + (i * 50.0) for i in range(len(hist_dates))]
+        mock_df = pd.DataFrame({"Close": hist_prices}, index=hist_dates)
+        mock_df.index.name = "Date"
+
+        with patch("yfinance.Ticker") as mock_yf:
+            mock_ticker_instance = MagicMock()
+            mock_ticker_instance.history.return_value = mock_df
+            mock_yf.return_value = mock_ticker_instance
+
+            ind = IndustryLinkageIndicator(
+                name="三星电子股价",
+                source="yfinance",
+                symbol="005930.KS",
+            )
+            result = provider._fetch_indicator(ind, as_of="2024-10-15")
+
+            # 验证 yfinance.history 被调用时带有明确的历史 start 与 end 日期
+            mock_ticker_instance.history.assert_called_once()
+            call_kwargs = mock_ticker_instance.history.call_args.kwargs
+            assert "start" in call_kwargs and "end" in call_kwargs
+            assert "2024" in call_kwargs["start"]
+            assert "2024" in call_kwargs["end"]
+
+            assert result["current_value"] == hist_prices[-1]
+            assert result["confidence"] == "高"
+            assert result["trend"] == "上升"
+
+    def test_as_of_future_rows_strictly_discarded(self, mock_copper_dataframe):
+        """测试未来日期数据被严格截断丢弃，杜绝前视偏差。"""
+        provider = IndustryLinkageProvider()
+
+        with patch("akshare.futures_foreign_hist", return_value=mock_copper_dataframe):
+            # 将 as_of 设定在第 15 个交易日（后面有 50+ 个未来交易日数据）
+            cutoff_date = mock_copper_dataframe.iloc[15]["date"].strftime("%Y-%m-%d")
+            cutoff_price = float(mock_copper_dataframe.iloc[15]["close"])
+            future_price = float(mock_copper_dataframe.iloc[-1]["close"])
+            assert cutoff_price != future_price
+
+            ind = IndustryLinkageIndicator(
+                name="LME铜价",
+                source="akshare",
+                symbol="铜",
+            )
+            result = provider._fetch_indicator(ind, as_of=cutoff_date)
+
+            assert result["current_value"] == cutoff_price
+            assert result["current_value"] != future_price
+
+    def test_empty_dataframe_or_no_data_before_as_of(self, mock_copper_dataframe):
+        """测试当 as_of 处于数据源起始日期之前时，安全返回数据缺失而不崩溃。"""
+        provider = IndustryLinkageProvider()
+
+        with patch("akshare.futures_foreign_hist", return_value=mock_copper_dataframe):
+            # as_of 早于 mock 数据集的起始日期 2026-05-01
+            ind = IndustryLinkageIndicator(
+                name="LME铜价",
+                source="akshare",
+                symbol="铜",
+            )
+            result = provider._fetch_indicator(ind, as_of="2020-01-01")
+
+            assert result["current_value"] is None
+            assert result["trend"] == "数据缺失"
+            assert result["confidence"] == "低（有效数据不足）"
+
     def test_unknown_industry_returns_none(self):
         """测试查询未配置的未知行业时返回 None。"""
         provider = IndustryLinkageProvider()

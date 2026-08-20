@@ -600,4 +600,3 @@ class TestIndustryLinkageSuite:
         assert res["current_value"] is None
         assert res["trend"] == "数据缺失"
         assert res["confidence"] == "低（待实现）"
-

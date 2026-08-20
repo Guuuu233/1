@@ -275,7 +275,19 @@ class IndustryLinkageProvider:
             import yfinance as yf
 
             ticker = yf.Ticker(symbol)
-            data = ticker.history(period="3mo")
+            if as_of:
+                try:
+                    as_of_dt = pd.to_datetime(as_of)
+                    start_dt = as_of_dt - pd.Timedelta(days=120)
+                    end_dt = as_of_dt + pd.Timedelta(days=1)
+                    data = ticker.history(
+                        start=start_dt.strftime("%Y-%m-%d"),
+                        end=end_dt.strftime("%Y-%m-%d"),
+                    )
+                except Exception:
+                    data = ticker.history(period="3mo")
+            else:
+                data = ticker.history(period="3mo")
 
             if data is None or data.empty:
                 result.update({
