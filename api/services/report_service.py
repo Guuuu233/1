@@ -422,6 +422,19 @@ def validate_report_machine_blocks(result_data: Optional[Dict[str, Any]]) -> Non
             _validate_report_machine_payload(payload, tag)
 
 
+def _parse_iso_date(raw_date: Any) -> Optional[date]:
+    """Parse a strict ISO date (YYYY-MM-DD), returning None if invalid."""
+    if not isinstance(raw_date, str):
+        return None
+    text = raw_date.strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
 def _validate_fund_flow_evidence(result_data: Dict[str, Any]) -> None:
     """Validate serialized funding evidence and preserve mismatch markers."""
     contexts: list[dict[str, Any]] = []
@@ -506,15 +519,38 @@ def _validate_fund_flow_evidence(result_data: Dict[str, Any]) -> None:
             selected_source = selection_guard.get("selected_source")
             selected_field = selection_guard.get("selected_field")
             selected_as_of = selection_guard.get("selected_as_of") or context.get("selected_as_of")
-            selected_window_days = selection_guard.get("selected_window_days")
-            if selected_window_days is None:
-                selected_window_days = selection_guard.get("window_days") or context.get("selected_window_days")
-            try:
-                selected_window_days = int(selected_window_days or 1)
-            except (TypeError, ValueError):
-                raise ValueError("selected fund-flow window is invalid") from None
-            if selected_window_days < 1:
-                raise ValueError("selected fund-flow window is invalid")
+            raw_window = selection_guard.get("selected_window_days")
+            if raw_window is None:
+                raw_window = selection_guard.get("window_days")
+            if raw_window is None:
+                raw_window = context.get("selected_window_days")
+
+            if raw_window is None:
+                selected_window_days = 1
+            else:
+                if isinstance(raw_window, bool):
+                    raise ValueError("selected fund-flow window is invalid")
+                if isinstance(raw_window, int):
+                    if raw_window < 1:
+                        raise ValueError("selected fund-flow window is invalid")
+                    selected_window_days = raw_window
+                elif isinstance(raw_window, str):
+                    stripped = raw_window.strip()
+                    if not stripped or not re.fullmatch(r"\+?\d+", stripped):
+                        raise ValueError("selected fund-flow window is invalid")
+                    try:
+                        val = int(stripped)
+                    except (TypeError, ValueError):
+                        raise ValueError("selected fund-flow window is invalid") from None
+                    if val < 1:
+                        raise ValueError("selected fund-flow window is invalid")
+                    selected_window_days = val
+                else:
+                    raise ValueError("selected fund-flow window is invalid")
+
+            parsed_as_of = _parse_iso_date(selected_as_of)
+            if parsed_as_of is None:
+                raise ValueError("selected fund-flow as_of date is invalid")
 
             matching_records = [
                 record
@@ -529,40 +565,13 @@ def _validate_fund_flow_evidence(result_data: Dict[str, Any]) -> None:
             if not matching_records:
                 raise ValueError("selected fund-flow source/field not present in records")
 
-            # ``records`` is an evidence history, not necessarily the selected
-            # aggregation window.  A 1d selection must validate the requested
-            # day's row only; otherwise a 20-day Sina history is incorrectly
-            # summed against a single-day selected_value.
-            if selected_window_days == 1:
-                matching_records = [
-                    record
-                    for record in matching_records
-                    if record.get("date") == selected_as_of
-                    or record.get("as_of") == selected_as_of
-                ]
-            else:
-                dated_records = [
-                    record
-                    for record in matching_records
-                    if record.get("date") or record.get("as_of")
-                ]
-                dates = sorted(
-                    {
-                        str(record.get("date") or record.get("as_of"))
-                        for record in dated_records
-                        if str(record.get("date") or record.get("as_of")) <= str(selected_as_of)
-                    }
-                )[-selected_window_days:]
-                matching_records = [
-                    record
-                    for record in matching_records
-                    if str(record.get("date") or record.get("as_of")) in dates
-                ]
-            if not matching_records:
-                raise ValueError("selected fund-flow source/field window not present in records")
-
-            values: list[Decimal] = []
+            by_date: dict[date, Decimal] = {}
             for record in matching_records:
+                raw_date = record.get("date") or record.get("as_of")
+                parsed_rec_date = _parse_iso_date(raw_date)
+                if parsed_rec_date is None:
+                    raise ValueError("selected fund-flow record date is invalid")
+
                 raw_value = (
                     record.get("value")
                     if record.get("field") == selected_field
@@ -574,7 +583,30 @@ def _validate_fund_flow_evidence(result_data: Dict[str, Any]) -> None:
                     raise ValueError("selected fund-flow value is invalid") from None
                 if not value.is_finite():
                     raise ValueError("selected fund-flow value is non-finite")
-                values.append(value)
+
+                if parsed_rec_date in by_date:
+                    if by_date[parsed_rec_date] != value:
+                        raise ValueError(
+                            f"selected fund-flow records contain conflicting values for date {parsed_rec_date}"
+                        )
+                else:
+                    by_date[parsed_rec_date] = value
+
+            valid_dates_up_to_as_of = sorted([d for d in by_date.keys() if d <= parsed_as_of])
+
+            if selected_window_days == 1:
+                if parsed_as_of not in by_date:
+                    raise ValueError("selected fund-flow source/field window not present in records")
+                selected_dates = [parsed_as_of]
+            else:
+                if len(valid_dates_up_to_as_of) < selected_window_days:
+                    raise ValueError("selected fund-flow source/field window not present in records")
+                selected_dates = valid_dates_up_to_as_of[-selected_window_days:]
+
+            values = [by_date[d] for d in selected_dates]
+            if not values:
+                raise ValueError("selected fund-flow source/field window not present in records")
+
             try:
                 selected_value = Decimal(str(selection_guard.get("selected_value")))
                 total_value = sum(values, Decimal("0"))
@@ -598,6 +630,8 @@ def _validate_fund_flow_evidence(result_data: Dict[str, Any]) -> None:
                 raise ValueError("fund_flow_evidence record unit must be 亿元")
             if "date" not in record or "source" not in record or "status" not in record:
                 raise ValueError("fund_flow_evidence record requires date, source, status")
+            if _parse_iso_date(record.get("date")) is None:
+                raise ValueError("fund_flow_evidence record date is invalid")
             if record.get("netamount") is not None and record.get("r0_net") is not None:
                 if record.get("netamount") == record.get("r0_net") and record.get("netamount_semantics") != record.get("r0_net_semantics"):
                     raise ValueError("fund_flow_evidence netamount and r0_net semantics cannot be collapsed")
