@@ -502,8 +502,20 @@ def _validate_fund_flow_evidence(result_data: Dict[str, Any]) -> None:
         if guard_allowed and is_selection and not records:
             raise ValueError("selected fund-flow records are required")
         if guard_allowed and is_selection and records:
-            selected_source = guard.get("selected_source")
-            selected_field = guard.get("selected_field")
+            selection_guard = guard if isinstance(guard, dict) else {}
+            selected_source = selection_guard.get("selected_source")
+            selected_field = selection_guard.get("selected_field")
+            selected_as_of = selection_guard.get("selected_as_of") or context.get("selected_as_of")
+            selected_window_days = selection_guard.get("selected_window_days")
+            if selected_window_days is None:
+                selected_window_days = selection_guard.get("window_days") or context.get("selected_window_days")
+            try:
+                selected_window_days = int(selected_window_days or 1)
+            except (TypeError, ValueError):
+                raise ValueError("selected fund-flow window is invalid") from None
+            if selected_window_days < 1:
+                raise ValueError("selected fund-flow window is invalid")
+
             matching_records = [
                 record
                 for record in records
@@ -516,6 +528,39 @@ def _validate_fund_flow_evidence(result_data: Dict[str, Any]) -> None:
             ]
             if not matching_records:
                 raise ValueError("selected fund-flow source/field not present in records")
+
+            # ``records`` is an evidence history, not necessarily the selected
+            # aggregation window.  A 1d selection must validate the requested
+            # day's row only; otherwise a 20-day Sina history is incorrectly
+            # summed against a single-day selected_value.
+            if selected_window_days == 1:
+                matching_records = [
+                    record
+                    for record in matching_records
+                    if record.get("date") == selected_as_of
+                    or record.get("as_of") == selected_as_of
+                ]
+            else:
+                dated_records = [
+                    record
+                    for record in matching_records
+                    if record.get("date") or record.get("as_of")
+                ]
+                dates = sorted(
+                    {
+                        str(record.get("date") or record.get("as_of"))
+                        for record in dated_records
+                        if str(record.get("date") or record.get("as_of")) <= str(selected_as_of)
+                    }
+                )[-selected_window_days:]
+                matching_records = [
+                    record
+                    for record in matching_records
+                    if str(record.get("date") or record.get("as_of")) in dates
+                ]
+            if not matching_records:
+                raise ValueError("selected fund-flow source/field window not present in records")
+
             values: list[Decimal] = []
             for record in matching_records:
                 raw_value = (
@@ -531,7 +576,7 @@ def _validate_fund_flow_evidence(result_data: Dict[str, Any]) -> None:
                     raise ValueError("selected fund-flow value is non-finite")
                 values.append(value)
             try:
-                selected_value = Decimal(str(guard.get("selected_value")))
+                selected_value = Decimal(str(selection_guard.get("selected_value")))
                 total_value = sum(values, Decimal("0"))
             except (InvalidOperation, TypeError, ValueError, OverflowError):
                 raise ValueError("selected fund-flow value is invalid") from None
