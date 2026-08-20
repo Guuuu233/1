@@ -18,6 +18,10 @@ from tradingagents.agents.utils.knowledge_context import (
     resolve_industry_context,
     resolve_macro_event_context,
 )
+from tradingagents.dataflows.industry_linkage import (
+    format_industry_linkage_for_prompt,
+)
+from tradingagents.graph.data_collector import _map_stock_to_industry
 from api.database import log_llm_call
 
 logger = logging.getLogger(__name__)
@@ -74,6 +78,7 @@ def create_macro_analyst(llm, data_collector=None):
             major_assets = pool.get("major_assets", "无数据")
             cn_indices = pool.get("cn_indices", "无数据")
             northbound_flow = pool.get("northbound_flow", "无数据")
+            industry_linkage_data = pool.get("industry_linkage")
         else:
             days = 7
             end_dt = datetime.strptime(current_date, "%Y-%m-%d")
@@ -109,6 +114,21 @@ def create_macro_analyst(llm, data_collector=None):
                 cn_indices,
             ) = results
 
+            # Fallback 获取产业链数据
+            mapped_ind = _map_stock_to_industry(ticker)
+            if mapped_ind:
+                try:
+                    from tradingagents.dataflows.providers.industry_linkage_provider import (
+                        IndustryLinkageProvider,
+                    )
+                    _provider = IndustryLinkageProvider()
+                    industry_linkage_data = _provider.get_industry_linkage(mapped_ind, as_of=current_date)
+                except Exception as exc:
+                    logger.warning("[Macro Analyst] 获取产业链数据异常: %s", exc)
+                    industry_linkage_data = None
+            else:
+                industry_linkage_data = None
+
         # ── 知识库与宏观情景图谱挂载 ──────────────────
         combined_text = f"{board_flow}\n{recent_news}\n{global_news}"
         _, industry_ctx = resolve_industry_context(
@@ -122,12 +142,18 @@ def create_macro_analyst(llm, data_collector=None):
             max_events=2,
         )
 
+        # ── 产业链联想数据段落 ──────────────────────
+        industry_linkage_text = format_industry_linkage_for_prompt(industry_linkage_data)
+
         # ── 组装 HumanMessage ────────────────────────
         human_content_lines = [
             horizon_ctx + "\n" + f"请分析 {ticker_display} 在 {current_date} 的宏观与板块环境。",
             f"【今日行业板块资金流向】\n{board_flow}",
             f"【近期相关新闻】\n{recent_news}",
         ]
+
+        if industry_linkage_text:
+            human_content_lines.append(f"{industry_linkage_text}")
 
         if global_indices != "无数据" or major_assets != "无数据" or cn_indices != "无数据":
             macro_view_blocks = []

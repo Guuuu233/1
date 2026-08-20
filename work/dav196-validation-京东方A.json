@@ -1,0 +1,159 @@
+{
+  "validation_metadata": {
+    "task_id": "DAV-201",
+    "milestone": "M6",
+    "ticker": "000725.SZ",
+    "stock_name": "京东方A",
+    "as_of_date": "2026-08-20",
+    "executed_at": "2026-08-20 16:42:48",
+    "runner_script": "scripts/run_dav196_e2e_validation.py",
+    "elapsed_seconds": 71.26
+  },
+  "data_collection_provenance": {
+    "industry_linkage_raw": {
+      "industry_name": "消费电子/半导体显示",
+      "upstream_cost": [
+        {
+          "name": "LME铜价",
+          "source": "akshare",
+          "symbol": "铜",
+          "frequency": "daily",
+          "unit": "美元/吨",
+          "role": "upstream",
+          "status": "active",
+          "transmission_logic": "核心导电、引线框架与连接件原材料成本传导",
+          "current_value": 14019.5,
+          "mom_change": 0.82,
+          "qoq_change": 3.07,
+          "yoy_change": null,
+          "trend": "平稳",
+          "confidence": "高",
+          "note": "数据源: akshare (代码: CAD)",
+          "metadata": {}
+        }
+      ],
+      "downstream_demand": [
+        {
+          "name": "全球智能手机出货量",
+          "source": "manual",
+          "symbol": null,
+          "frequency": "quarterly",
+          "unit": "万部",
+          "role": "downstream",
+          "status": "manual",
+          "transmission_logic": "下游终端消费电子需求与换机周期景气度验证",
+          "current_value": null,
+          "mom_change": null,
+          "qoq_change": null,
+          "yoy_change": null,
+          "trend": "数据缺失",
+          "confidence": "低（待手动录入）",
+          "note": "手动",
+          "metadata": {}
+        }
+      ],
+      "international_benchmark": [
+        {
+          "name": "三星电子股价",
+          "source": "yfinance",
+          "symbol": "005930.KS",
+          "frequency": "daily",
+          "unit": "韩元",
+          "role": "benchmark",
+          "status": "active",
+          "transmission_logic": "全球消费电子、存储半导体与显示面板龙头估值与景气度对标",
+          "current_value": null,
+          "mom_change": null,
+          "qoq_change": null,
+          "yoy_change": null,
+          "trend": "数据缺失",
+          "confidence": "低（接口异常）",
+          "note": "数据获取失败: Too Many Requests. Rate limited. Try after a while.",
+          "metadata": {}
+        }
+      ],
+      "policy_catalysts": [
+        "消费品以旧换新",
+        "超高清视频产业发展",
+        "新型显示产业支持政策"
+      ],
+      "description": "消费电子/半导体显示行业产业链指标映射（上游铜价成本、下游智能手机出货量、国际对标三星电子）",
+      "as_of": "2026-08-20",
+      "cached_at": 1787215440.086275
+    },
+    "total_keys_collected": [
+      "hot_stocks",
+      "cn_indices",
+      "major_assets",
+      "restricted_release",
+      "share_pledge",
+      "earnings_forecast",
+      "lhb",
+      "shareholder_count",
+      "stock_data",
+      "margin_trading",
+      "fund_flow_board",
+      "global_indices",
+      "northbound_flow",
+      "fundamentals",
+      "balance_sheet",
+      "global_news",
+      "fund_flow_individual",
+      "insider_transactions",
+      "cashflow",
+      "news",
+      "zt_pool",
+      "income_statement",
+      "market_data_context",
+      "indicators",
+      "vpa_indicators",
+      "industry_linkage"
+    ]
+  },
+  "data_failure_ledger": [
+    {
+      "category": "upstream_cost",
+      "name": "LME铜价",
+      "source": "akshare",
+      "symbol": "铜",
+      "current_value": 14019.5,
+      "trend": "平稳",
+      "confidence": "高",
+      "status": "active",
+      "note": "数据源: akshare (代码: CAD)"
+    },
+    {
+      "category": "downstream_demand",
+      "name": "全球智能手机出货量",
+      "source": "manual",
+      "symbol": null,
+      "current_value": null,
+      "trend": "数据缺失",
+      "confidence": "低（待手动录入）",
+      "status": "manual",
+      "note": "手动"
+    },
+    {
+      "category": "international_benchmark",
+      "name": "三星电子股价",
+      "source": "yfinance",
+      "symbol": "005930.KS",
+      "current_value": null,
+      "trend": "数据缺失",
+      "confidence": "低（接口异常）",
+      "status": "active",
+      "note": "数据获取失败: Too Many Requests. Rate limited. Try after a while."
+    }
+  ],
+  "prompt_injection_evidence": {
+    "formatted_prompt_length": 365,
+    "formatted_prompt_preview": "【产业链联想数据】：消费电子/半导体显示\n- 上游成本端核心指标：\n  * LME铜价：14019.50 美元/吨，月环比 +0.82%，季度环比 +3.07%，趋势：平稳（置信度：高）\n    - 传导逻辑：核心导电、引线框架与连接件原材料成本传导\n- 下游需求端核心指标：\n  * 【数据缺失】全球智能手机出货量：手动\n    - 传导逻辑：下游终端消费电子需求与换机周期景气度验证\n- 国际对标核心标的/指标：\n  * 【数据缺失】三星电子股价：数据获取失败: Too Many Requests. Rate limited. Try after a while.\n    - 传导逻辑：全球消费电子、存储半导体与显示面板龙头估值与景气度对标\n- 行业政策催化关键词：消费品以旧换新、超高清视频产业发展、新型显示产业支持政策",
+    "contains_expected_headers": true
+  },
+  "llm_execution_evidence": {
+    "status": "BLOCKED_NO_API_KEY",
+    "reason": "运行环境未配置有效的大模型 API Key，按零幻觉纪律明确标记为 BLOCKED，严禁伪造虚假分析报告与数据指标。",
+    "real_macro_prompt_input": "【产业链联想数据】：消费电子/半导体显示\n- 上游成本端核心指标：\n  * LME铜价：14019.50 美元/吨，月环比 +0.82%，季度环比 +3.07%，趋势：平稳（置信度：高）\n    - 传导逻辑：核心导电、引线框架与连接件原材料成本传导\n- 下游需求端核心指标：\n  * 【数据缺失】全球智能手机出货量：手动\n    - 传导逻辑：下游终端消费电子需求与换机周期景气度验证\n- 国际对标核心标的/指标：\n  * 【数据缺失】三星电子股价：数据获取失败: Too Many Requests. Rate limited. Try after a while.\n    - 传导逻辑：全球消费电子、存储半导体与显示面板龙头估值与景气度对标\n- 行业政策催化关键词：消费品以旧换新、超高清视频产业发展、新型显示产业支持政策",
+    "live_call_skipped": true
+  }
+}
