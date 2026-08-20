@@ -413,6 +413,47 @@ def default_round_goal(domain: str, next_count: int) -> str:
     return goal_list[index]
 
 
+def _quarantine_rejected_machine_blocks(
+    text: str,
+    tags: Iterable[str] = ("DEBATE_STATE", "RISK_STATE"),
+) -> str:
+    """Isolate rejected machine blocks from transcript history while keeping prose."""
+    if not isinstance(text, str):
+        return text
+
+    spans: list[tuple[int, int]] = []
+    for tag in tags:
+        for match in _tagged_occurrences(text, tag):
+            start = match.start()
+            close_idx = _find_machine_block_close(text, match.end())
+            if close_idx >= 0:
+                end = close_idx + 3
+            else:
+                raw_close = text.find("-->", match.end())
+                if raw_close >= 0:
+                    end = raw_close + 3
+                else:
+                    end = len(text)
+            spans.append((start, end))
+
+    if not spans:
+        return text.strip()
+
+    spans.sort(key=lambda item: item[0])
+    merged_spans: list[list[int]] = []
+    for s, e in spans:
+        if not merged_spans or s > merged_spans[-1][1]:
+            merged_spans.append([s, e])
+        else:
+            merged_spans[-1][1] = max(merged_spans[-1][1], e)
+
+    cleaned = text
+    for s, e in reversed(merged_spans):
+        cleaned = cleaned[:s] + cleaned[e:]
+
+    return cleaned.strip()
+
+
 def _record_unstructured_response(
     *,
     state: Mapping[str, Any],
@@ -424,8 +465,7 @@ def _record_unstructured_response(
     store_current_response: bool,
 ) -> dict[str, Any]:
     """Advance transcript metadata without accepting a rejected machine block."""
-    cleaned_response = strip_tagged_json(raw_response, "DEBATE_STATE")
-    cleaned_response = strip_tagged_json(cleaned_response, "RISK_STATE")
+    cleaned_response = _quarantine_rejected_machine_blocks(raw_response)
     argument = f"{speaker_label}: {cleaned_response}"
     new_state = dict(state)
     updates = {
