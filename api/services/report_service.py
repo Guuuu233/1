@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation
 from numbers import Real
 
 logger = logging.getLogger(__name__)
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import List, Optional, Dict, Any, Iterable
 from uuid import uuid4
 
