@@ -154,3 +154,64 @@ def test_smart_money_ths_netamount_blocks_main_force_accumulation_claims():
     assert guard["blocked"] is True
     assert guard["direction_allowed"] is False
     assert "已阻断增持、减持、吸筹方向摘要" in result["smart_money_report"]
+
+
+class _StructuredDCCollector:
+    def get(self, ticker, curr_date):
+        record = {
+            "source": "tushare_eastmoney_moneyflow_dc",
+            "source_family": "eastmoney",
+            "algorithm_group": "new_algorithm_group",
+            "status": "available",
+            "symbol": ticker,
+            "date": curr_date,
+            "period_kind": "historical_daily",
+            "time_window": "1d",
+            "field": "r0_net",
+            "value": "2.211971",
+            "unit": "亿元",
+            "field_semantics": {"r0_net": "主力净额（负值表示净流出）"},
+        }
+        return {
+            "fund_flow_individual": "东方财富主力资金净额 2.21 亿",
+            "market_data_context": {
+                "fund_flow_evidence": {
+                    "records": [record],
+                    "symbol": ticker,
+                    "requested_as_of": curr_date,
+                }
+            },
+            "lhb": "无龙虎榜数据",
+            "indicators": {"vwma": "100"},
+        }
+
+
+def test_smart_money_dc_r0_net_allows_main_force_direction_when_model_matches():
+    llm = _YieldingLLM("当日主力资金净额为 2.21 亿，主力偏增持。")
+    module = __import__(
+        "tradingagents.agents.analysts.smart_money_analyst",
+        fromlist=["smart_money_analyst"],
+    )
+    state = {
+        "trade_date": "2026-08-20",
+        "company_of_interest": "600036",
+        "user_intent": {"focus_areas": [], "specific_questions": []},
+    }
+
+    with (
+        patch.object(module, "get_cn_stock_name", return_value="招商银行"),
+        patch.object(module, "get_config", return_value={}),
+        patch.object(module, "get_prompt", return_value="固定系统提示"),
+        patch.object(module, "build_horizon_context", return_value="固定上下文"),
+        patch.object(module, "log_llm_call"),
+    ):
+        result = asyncio.run(
+            create_smart_money_analyst(llm, _StructuredDCCollector())(state)
+        )
+
+    assert "当日主力资金净额为 2.21 亿" in result["smart_money_report"]
+    guard = result["fund_flow_consensus_guard"]
+    assert guard["blocked"] is False
+    assert guard["direction_allowed"] is True
+    assert guard["selected_field"] == "r0_net"
+    assert guard["selected_value"] == "2.211971"
