@@ -812,6 +812,8 @@ def _fetch_all(
         }
         if summary.get("status") == "available":
             fund_flow_context["status"] = "available"
+        elif fund_flow_evidence_meta and fund_flow_evidence_meta.get("status") in ("selected", "consensus"):
+            fund_flow_context["status"] = fund_flow_evidence_meta["status"]
         else:
             fund_flow_context["status"] = "partial"
     else:

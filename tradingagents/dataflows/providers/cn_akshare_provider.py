@@ -2372,6 +2372,8 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 "legacy_reference",
                 "legacy_web_algorithm",
                 "selection_reason",
+                "five_day_summary",
+                "summary_5d",
             ):
                 if key in selection:
                     metadata[key] = selection[key]

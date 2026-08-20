@@ -218,7 +218,7 @@ def create_smart_money_analyst(llm, data_collector=None):
             selection = current_selection
             selected_field = selection.get("selected_field")
             selected_source = selection.get("selected_source")
-            validation_window = int(selection.get("selected_window_days") or 5)
+            validation_window = int(selection.get("selected_window_days") or 1)
             fund_flow_evidence["validation"] = validate_model_summary(
                 fund_flow_evidence.get("records", []),
                 full_content,
@@ -243,6 +243,22 @@ def create_smart_money_analyst(llm, data_collector=None):
                 and isinstance(selection.get("hard_guard"), dict)
                 and not selection.get("hard_guard", {}).get("blocked")
             )
+            if selection_allowed and selected_field == "netamount":
+                non_main_force_violations = [
+                    kw for kw in (
+                        "主力吸筹", "主力建仓", "主力增持", "主力减持", "主力派发",
+                        "主力悄然吸筹", "主力大幅增持", "主力大幅减持",
+                        "主力资金吸筹", "主力资金建仓", "主力资金增持", "主力资金减持", "主力资金派发",
+                    )
+                    if kw in full_content
+                ]
+                if non_main_force_violations:
+                    if isinstance(validation, dict):
+                        validation["hard_guard"] = {
+                            "blocked": True,
+                            "reason": f"仅有总资金净额(netamount)，严禁表述为主力吸筹/增持/减持（违规词：{', '.join(non_main_force_violations)}）",
+                        }
+                        validation["status"] = "blocked"
             consensus_blocked = bool(
                 not selection_allowed
                 or validation.get("status") in {"blocked", "mismatch"}
