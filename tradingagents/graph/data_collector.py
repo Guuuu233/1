@@ -51,6 +51,9 @@ from tradingagents.dataflows.trade_calendar import (
     dedupe_daily_bars,
     is_historical_analysis_date,
 )
+from tradingagents.dataflows.providers.industry_linkage_provider import (
+    IndustryLinkageProvider,
+)
 
 INDICATORS = [
     "close_50_sma", "close_200_sma", "close_10_ema",
@@ -653,46 +656,110 @@ def _build_source_provenance(
     return provenance
 
 
-def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
+def _map_stock_to_industry(ticker: Optional[str]) -> Optional[str]:
+    """根据股票代码映射到核心行业（硬编码，MVP）。
+
+    Args:
+        ticker: 股票代码，如 "000725.SZ", "000725", "300750.SZ", "600036.SH" 等
+
+    Returns:
+        匹配到的核心行业名称（如 "消费电子", "新能源车"），未配置或不识别则返回 None
+    """
+    if not ticker or not isinstance(ticker, str):
+        return None
+
+    clean_ticker = ticker.strip().upper()
+
+    # 硬编码映射表 (MVP: 消费电子、新能源车 等核心股票)
+    industry_map: Dict[str, str] = {
+        # 消费电子 / 半导体显示
+        "000725.SZ": "消费电子",  # 京东方A
+        "000725": "消费电子",
+        "000100.SZ": "消费电子",  # TCL科技
+        "000100": "消费电子",
+        "002475.SZ": "消费电子",  # 立讯精密
+        "002475": "消费电子",
+        "002241.SZ": "消费电子",  # 歌尔股份
+        "002241": "消费电子",
+        "300433.SZ": "消费电子",  # 蓝思科技
+        "300433": "消费电子",
+        # 新能源车 / 动力电池
+        "300750.SZ": "新能源车",  # 宁德时代
+        "300750": "新能源车",
+        "002594.SZ": "新能源车",  # 比亚迪
+        "002594": "新能源车",
+        "601633.SH": "新能源车",  # 长城汽车
+        "601633": "新能源车",
+        "002460.SZ": "新能源车",  # 赣锋锂业
+        "002460": "新能源车",
+        "002466.SZ": "新能源车",  # 天齐锂业
+        "002466": "新能源车",
+    }
+
+    return industry_map.get(clean_ticker)
+
+
+_DEFAULT_INDUSTRY_LINKAGE_PROVIDER = IndustryLinkageProvider()
+
+
+def _fetch_all(
+    ticker: str,
+    trade_date: str,
+    industry_provider: Optional[IndustryLinkageProvider] = None,
+) -> Dict[str, Any]:
     """Fetch all data sources in parallel.
 
     Always fetches full data including financial statements, regardless of horizon.
     The horizon only affects the analysis window, not data collection.
     """
     lookback = LONG_DAYS
-    end_dt = datetime.strptime(trade_date, "%Y-%m-%d")
+    if "-" in trade_date:
+        end_dt = datetime.strptime(trade_date, "%Y-%m-%d")
+        norm_trade_date = trade_date
+    elif len(trade_date) == 8 and trade_date.isdigit():
+        end_dt = datetime.strptime(trade_date, "%Y%m%d")
+        norm_trade_date = end_dt.strftime("%Y-%m-%d")
+    else:
+        dt = pd.to_datetime(trade_date, errors="coerce")
+        if pd.isna(dt):
+            end_dt = datetime.now()
+            norm_trade_date = end_dt.strftime("%Y-%m-%d")
+        else:
+            end_dt = dt.to_pydatetime()
+            norm_trade_date = end_dt.strftime("%Y-%m-%d")
+
     # 为了计算指标准确（如 200 SMA），需要比分析窗口更长的历史数据
     fetch_lookback = 365
     start_str = (end_dt - timedelta(days=fetch_lookback)).strftime("%Y-%m-%d")
 
     tasks: Dict[str, tuple] = {
-        "stock_data": (get_stock_data, {"symbol": ticker, "start_date": start_str, "end_date": trade_date}),
-        "cn_indices": (get_cn_indices, {"curr_date": trade_date, "look_back_days": lookback}),
-        "global_indices": (get_global_indices, {"curr_date": trade_date, "look_back_days": lookback}),
-        "major_assets": (get_major_assets, {"curr_date": trade_date, "look_back_days": lookback}),
-        "realtime": (_fetch_realtime_context, {"ticker": ticker, "trade_date": trade_date}),
-        "news": (get_news, {"ticker": ticker, "start_date": (end_dt - timedelta(days=lookback)).strftime("%Y-%m-%d"), "end_date": trade_date}),
-        "global_news": (get_global_news, {"curr_date": trade_date, "look_back_days": lookback, "limit": 30}),
-        "fund_flow_board": (get_board_fund_flow, {"curr_date": trade_date}),
-        "fund_flow_individual": (get_individual_fund_flow, {"symbol": ticker, "curr_date": trade_date}),
-        "lhb": (get_lhb_detail, {"symbol": ticker, "date": trade_date}),
-        "insider_transactions": (get_insider_transactions, {"ticker": ticker, "curr_date": trade_date}),
-        "zt_pool": (get_zt_pool, {"date": trade_date}),
-        "hot_stocks": (get_hot_stocks_xq, {"curr_date": trade_date}),
-        "restricted_release": (get_restricted_release, {"symbol": ticker, "curr_date": trade_date}),
-        "share_pledge": (get_share_pledge, {"symbol": ticker, "curr_date": trade_date}),
-        "earnings_forecast": (get_earnings_forecast, {"symbol": ticker, "curr_date": trade_date}),
-        "shareholder_count": (get_shareholder_count, {"symbol": ticker, "curr_date": trade_date}),
-        "margin_trading": (get_margin_trading, {"symbol": ticker, "curr_date": trade_date}),
-        "northbound_flow": (get_northbound_flow, {"symbol": ticker, "curr_date": trade_date}),
+        "stock_data": (get_stock_data, {"symbol": ticker, "start_date": start_str, "end_date": norm_trade_date}),
+        "cn_indices": (get_cn_indices, {"curr_date": norm_trade_date, "look_back_days": lookback}),
+        "global_indices": (get_global_indices, {"curr_date": norm_trade_date, "look_back_days": lookback}),
+        "major_assets": (get_major_assets, {"curr_date": norm_trade_date, "look_back_days": lookback}),
+        "realtime": (_fetch_realtime_context, {"ticker": ticker, "trade_date": norm_trade_date}),
+        "news": (get_news, {"ticker": ticker, "start_date": (end_dt - timedelta(days=lookback)).strftime("%Y-%m-%d"), "end_date": norm_trade_date}),
+        "global_news": (get_global_news, {"curr_date": norm_trade_date, "look_back_days": lookback, "limit": 30}),
+        "fund_flow_board": (get_board_fund_flow, {"curr_date": norm_trade_date}),
+        "fund_flow_individual": (get_individual_fund_flow, {"symbol": ticker, "curr_date": norm_trade_date}),
+        "lhb": (get_lhb_detail, {"symbol": ticker, "date": norm_trade_date}),
+        "insider_transactions": (get_insider_transactions, {"ticker": ticker, "curr_date": norm_trade_date}),
+        "zt_pool": (get_zt_pool, {"date": norm_trade_date}),
+        "hot_stocks": (get_hot_stocks_xq, {"curr_date": norm_trade_date}),
+        "restricted_release": (get_restricted_release, {"symbol": ticker, "curr_date": norm_trade_date}),
+        "share_pledge": (get_share_pledge, {"symbol": ticker, "curr_date": norm_trade_date}),
+        "earnings_forecast": (get_earnings_forecast, {"symbol": ticker, "curr_date": norm_trade_date}),
+        "shareholder_count": (get_shareholder_count, {"symbol": ticker, "curr_date": norm_trade_date}),
+        "margin_trading": (get_margin_trading, {"symbol": ticker, "curr_date": norm_trade_date}),
+        "northbound_flow": (get_northbound_flow, {"symbol": ticker, "curr_date": norm_trade_date}),
     }
 
     # 财务报表类数据始终拉取，Research Manager 根据 horizon 自行判断权重
     tasks.update({
-        "fundamentals": (get_fundamentals, {"ticker": ticker, "curr_date": trade_date}),
-        "balance_sheet": (get_balance_sheet, {"ticker": ticker, "freq": "quarterly", "curr_date": trade_date}),
-        "cashflow": (get_cashflow, {"ticker": ticker, "freq": "quarterly", "curr_date": trade_date}),
-        "income_statement": (get_income_statement, {"ticker": ticker, "freq": "quarterly", "curr_date": trade_date}),
+        "fundamentals": (get_fundamentals, {"ticker": ticker, "curr_date": norm_trade_date}),
+        "balance_sheet": (get_balance_sheet, {"ticker": ticker, "freq": "quarterly", "curr_date": norm_trade_date}),
+        "cashflow": (get_cashflow, {"ticker": ticker, "freq": "quarterly", "curr_date": norm_trade_date}),
+        "income_statement": (get_income_statement, {"ticker": ticker, "freq": "quarterly", "curr_date": norm_trade_date}),
     })
 
     results: Dict[str, Any] = {}
@@ -898,6 +965,20 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
     except Exception as e:
         results["vpa_indicators"] = f"VPA 计算失败：{e}"
 
+    # ── 产业链数据层采集 (MVP: 消费电子 / 新能源车) ─────────────
+    industry = _map_stock_to_industry(ticker)
+    if industry:
+        provider = industry_provider or _DEFAULT_INDUSTRY_LINKAGE_PROVIDER
+        try:
+            results["industry_linkage"] = provider.get_industry_linkage(
+                industry, as_of=norm_trade_date
+            )
+        except Exception as exc:
+            logger.warning("  [Warning] 产业链数据采集异常 (%s, %s): %s", ticker, industry, exc)
+            results["industry_linkage"] = None
+    else:
+        results["industry_linkage"] = None
+
     logger.debug("[Timer] Total Data Collection for %s took %.2fs", ticker, time.time() - fetch_start)
     return results
 
@@ -905,11 +986,16 @@ def _fetch_all(ticker: str, trade_date: str) -> Dict[str, Any]:
 class DataCollector:
     """Collect and cache data, thread-safe and shareable across jobs."""
 
-    def __init__(self):
+    def __init__(self, industry_linkage_provider: Optional[IndustryLinkageProvider] = None):
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._locks: Dict[str, threading.Lock] = {}
         self._meta_lock = threading.Lock()
         self._refcounts: Dict[str, int] = {}
+        self.industry_linkage_provider: IndustryLinkageProvider = (
+            industry_linkage_provider or IndustryLinkageProvider()
+        )
+
+    _map_stock_to_industry = staticmethod(_map_stock_to_industry)
 
     def _get_key_lock(self, key: str) -> threading.Lock:
         with self._meta_lock:
@@ -934,7 +1020,11 @@ class DataCollector:
             )
         try:
             if key not in self._cache:
-                self._cache[key] = _fetch_all(ticker, trade_date)
+                self._cache[key] = _fetch_all(
+                    ticker,
+                    trade_date,
+                    industry_provider=self.industry_linkage_provider,
+                )
             return copy.deepcopy(self._cache[key])
         finally:
             key_lock.release()
