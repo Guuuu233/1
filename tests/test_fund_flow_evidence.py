@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from tradingagents.dataflows.fund_flow_evidence import (
     build_sina_evidence,
+    extract_model_daily_values,
     extract_model_totals,
     select_fund_flow_source,
     summarize_evidence,
@@ -456,3 +457,109 @@ def test_model_text_mistaking_five_day_sum_as_daily_value_is_blocked_by_validati
 
     assert validation["status"] == "mismatch"
     assert validation["hard_guard"]["blocked"] is True
+
+
+def test_model_parser_does_not_extract_netamount_from_main_force_clauses():
+    assert extract_model_daily_values("主力资金净额 +2.21亿") == {"r0_net": "2.21"}
+    assert extract_model_daily_values("单日主力净流入 2.21 亿元") == {"r0_net": "2.21"}
+    assert extract_model_daily_values("当日主力资金净额为 2.21 亿") == {"r0_net": "2.21"}
+    assert extract_model_daily_values("2026-08-20 主力净流入 2.21 亿") == {"r0_net": "2.21"}
+
+
+def test_validate_model_summary_single_source_r0_net_with_model_text_is_matched():
+    records = [
+        _selection_record(
+            "tushare_eastmoney_moneyflow_dc",
+            "2.211971",
+            date="2026-08-20",
+            field="r0_net",
+        )
+    ]
+    validation = validate_model_summary(
+        records,
+        "单日主力净流入 2.21 亿元",
+        selected_field="r0_net",
+        selected_source="tushare_eastmoney_moneyflow_dc",
+        requested_as_of="2026-08-20",
+        window_days=1,
+    )
+
+    assert validation["status"] == "matched"
+    assert validation["hard_guard"]["blocked"] is False
+    assert validation["mismatches"] == []
+    assert validation["unverifiable_fields"] == []
+
+
+def test_validate_model_summary_does_not_block_when_extra_netamount_is_unverifiable():
+    records = [
+        _selection_record(
+            "tushare_eastmoney_moneyflow_dc",
+            "2.211971",
+            date="2026-08-20",
+            field="r0_net",
+        )
+    ]
+    validation = validate_model_summary(
+        records,
+        "单日主力净流入 2.21 亿元，总净流入 1.50 亿元",
+        selected_field="r0_net",
+        selected_source="tushare_eastmoney_moneyflow_dc",
+        requested_as_of="2026-08-20",
+        window_days=1,
+    )
+
+    assert validation["status"] == "matched"
+    assert validation["hard_guard"]["blocked"] is False
+    assert validation["mismatches"] == []
+
+
+def test_model_total_net_does_not_impersonate_main_force_and_does_not_block_selected_r0_net():
+    text = "总净流入 2.21 亿"
+    daily = extract_model_daily_values(text)
+    assert daily == {"netamount": "2.21"}
+    assert "r0_net" not in daily
+
+    records = [
+        _selection_record(
+            "tushare_eastmoney_moneyflow_dc",
+            "2.211971",
+            date="2026-08-20",
+            field="r0_net",
+        )
+    ]
+    validation = validate_model_summary(
+        records,
+        text,
+        selected_field="r0_net",
+        selected_source="tushare_eastmoney_moneyflow_dc",
+        requested_as_of="2026-08-20",
+        window_days=1,
+    )
+
+    assert validation["status"] != "blocked"
+    assert validation["hard_guard"]["blocked"] is False
+    assert validation["mismatches"] == []
+
+
+def test_model_r0_net_diff_exceeding_tolerance_is_mismatched():
+    records = [
+        _selection_record(
+            "tushare_eastmoney_moneyflow_dc",
+            "2.211971",
+            date="2026-08-20",
+            field="r0_net",
+        )
+    ]
+    validation = validate_model_summary(
+        records,
+        "单日主力净流入 2.25 亿元",
+        selected_field="r0_net",
+        selected_source="tushare_eastmoney_moneyflow_dc",
+        requested_as_of="2026-08-20",
+        window_days=1,
+    )
+
+    assert validation["status"] == "mismatch"
+    assert validation["hard_guard"]["blocked"] is True
+    assert len(validation["mismatches"]) == 1
+    assert validation["mismatches"][0]["field"] == "r0_net"

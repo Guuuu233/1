@@ -1926,27 +1926,16 @@ def consensus_prompt_instruction(consensus: Mapping[str, Any] | None) -> str:
     )
 
 
-_MODEL_TOTAL_PATTERNS = {
+_FIELD_VALUE_PATTERNS = {
     "r0_net": (
-        re.compile(r"主力(?:资金)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,40}?(?:累计|合计|总计)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
-        re.compile(r"(?:累计|合计|总计|5日累计|5日合计)[^\n。；;]{0,20}?主力(?:资金)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
+        re.compile(r"主力(?:资金)?(?:净)?(?:流入额?|流出额?|流入|流出|额|资金净额)[^\n。；;，,]{0,20}?(?:为|达|为约|约|：|:)?\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
     ),
     "netamount": (
-        re.compile(r"(?<!主力)(?:总)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,40}?(?:累计|合计|总计)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
-        re.compile(r"(?:累计|合计|总计|5日累计|5日合计)[^\n。；;]{0,20}?(?<!主力)(?:总)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
+        re.compile(r"(?<!主力)(?:总资金|全市场总资金|全市场资金|全市场|总)?(?:净)?(?:流入额?|流出额?|流入|流出|净额)[^\n。；;，,]{0,20}?(?:为|达|为约|约|：|:)?\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
     ),
 }
 
-_MODEL_DAILY_PATTERNS = {
-    "r0_net": (
-        re.compile(r"(?:当日|当天|单日|今日|\b20\d{2}-\d{2}-\d{2}\b)[^\n。；;]{0,20}?主力(?:资金)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
-        re.compile(r"主力(?:资金)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,20}?(?:为|达|为约|约)?\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
-    ),
-    "netamount": (
-        re.compile(r"(?:当日|当天|单日|今日|\b20\d{2}-\d{2}-\d{2}\b)[^\n。；;]{0,20}?(?<!主力)(?:总)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,20}?([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
-        re.compile(r"(?<!主力)(?:总)?(?:净)?(?:流入额?|流出额?|流入|流出|额)[^\n。；;]{0,20}?(?:为|达|为约|约)?\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*亿"),
-    ),
-}
+_CUMULATIVE_KEYWORDS = ("累计", "合计", "总计", "5日", "五日", "近5", "近五")
 
 
 def extract_model_totals(text: str | None) -> dict[str, str]:
@@ -1954,17 +1943,21 @@ def extract_model_totals(text: str | None) -> dict[str, str]:
     if not isinstance(text, str) or not text.strip():
         return {}
     found: dict[str, str] = {}
-    for field, patterns in _MODEL_TOTAL_PATTERNS.items():
+    for field, patterns in _FIELD_VALUE_PATTERNS.items():
         for pattern in patterns:
             for match in pattern.finditer(text):
-                if field == "netamount":
-                    clause_start = max(
-                        (text.rfind(marker, 0, match.start()) for marker in ("。", "；", ";", "，", ",", "\n")),
-                        default=-1,
-                    ) + 1
-                    clause = text[clause_start:match.start()]
-                    if "主力" in clause:
-                        continue
+                sent_start = max((text.rfind(m, 0, match.start()) for m in ("。", "；", ";", "\n")), default=-1) + 1
+                sent_end = min((pos for m in ("。", "；", ";", "\n") if (pos := text.find(m, match.end())) != -1), default=len(text))
+                sentence = text[sent_start:sent_end]
+
+                clause_start = max((text.rfind(m, 0, match.start()) for m in ("。", "；", ";", "，", ",", "\n")), default=-1) + 1
+                clause_end = min((pos for m in ("。", "；", ";", "，", ",", "\n") if (pos := text.find(m, match.end())) != -1), default=len(text))
+                clause = text[clause_start:clause_end]
+
+                if not any(kw in sentence for kw in _CUMULATIVE_KEYWORDS):
+                    continue
+                if field == "netamount" and "主力" in clause:
+                    continue
                 matched_prefix = text[match.start():match.end()]
                 num_str = match.groups()[-1]
                 value = decimal_value(num_str)
@@ -1983,23 +1976,21 @@ def extract_model_daily_values(text: str | None) -> dict[str, str]:
     if not isinstance(text, str) or not text.strip():
         return {}
     found: dict[str, str] = {}
-    for field, patterns in _MODEL_DAILY_PATTERNS.items():
+    for field, patterns in _FIELD_VALUE_PATTERNS.items():
         for pattern in patterns:
             for match in pattern.finditer(text):
-                clause_start = max(
-                    (text.rfind(marker, 0, match.start()) for marker in ("。", "；", ";", "，", ",", "\n")),
-                    default=-1,
-                ) + 1
-                clause_end = min(
-                    (pos for marker in ("。", "；", ";", "\n") if (pos := text.find(marker, match.end())) != -1),
-                    default=len(text),
-                )
-                full_clause = text[clause_start:clause_end]
-                if any(kw in full_clause for kw in ("累计", "合计", "总计", "5日", "五日", "近5", "近五")):
+                sent_start = max((text.rfind(m, 0, match.start()) for m in ("。", "；", ";", "\n")), default=-1) + 1
+                sent_end = min((pos for m in ("。", "；", ";", "\n") if (pos := text.find(m, match.end())) != -1), default=len(text))
+                sentence = text[sent_start:sent_end]
+
+                clause_start = max((text.rfind(m, 0, match.start()) for m in ("。", "；", ";", "，", ",", "\n")), default=-1) + 1
+                clause_end = min((pos for m in ("。", "；", ";", "，", ",", "\n") if (pos := text.find(m, match.end())) != -1), default=len(text))
+                clause = text[clause_start:clause_end]
+
+                if any(kw in sentence for kw in _CUMULATIVE_KEYWORDS):
                     continue
-                if field == "netamount":
-                    if "主力" in text[clause_start:match.start()]:
-                        continue
+                if field == "netamount" and "主力" in clause:
+                    continue
                 matched_prefix = text[match.start():match.end()]
                 num_str = match.groups()[-1]
                 value = decimal_value(num_str)
@@ -2044,6 +2035,7 @@ def validate_model_summary(
 
     mismatches: list[dict[str, str]] = []
     unverifiable: list[str] = []
+    matched_fields: list[str] = []
 
     for model_field, model_value_text in model_totals.items():
         structured_value = decimal_value(structured_cum.get(model_field))
@@ -2062,6 +2054,8 @@ def validate_model_summary(
                     "reason": "model cumulative total differs from structured evidence",
                 }
             )
+        else:
+            matched_fields.append(model_field)
 
     for model_field, model_value_text in model_daily.items():
         structured_value = decimal_value(structured_daily.get(model_field))
@@ -2080,6 +2074,8 @@ def validate_model_summary(
                     "reason": "model daily value differs from structured evidence",
                 }
             )
+        else:
+            matched_fields.append(model_field)
 
     combined_model = {**model_daily, **model_totals}
     primary_structured = structured_daily if window_days == 1 else structured_cum
@@ -2088,6 +2084,19 @@ def validate_model_summary(
         status = "blocked"
     elif mismatches:
         status = "mismatch"
+    elif selected_field:
+        canonical_selected = _canonical_field(selected_field) or str(selected_field)
+        if canonical_selected in (model_daily.keys() | model_totals.keys()):
+            if canonical_selected in unverifiable or primary_structured.get("status") == "partial":
+                status = "blocked"
+            else:
+                status = "matched"
+        elif matched_fields:
+            status = "blocked" if primary_structured.get("status") == "partial" else "matched"
+        else:
+            status = "not_checked"
+    elif matched_fields:
+        status = "blocked" if primary_structured.get("status") == "partial" else "matched"
     elif combined_model and (primary_structured.get("status") == "partial" or unverifiable):
         status = "blocked"
     elif combined_model:
