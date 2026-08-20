@@ -11,7 +11,7 @@
 - 容错降级：显式标注数据源状态 (如 active, manual, pending_api 等)，支持缺失与手动数据标识。
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 
@@ -248,3 +248,88 @@ def get_industry_linkage_config(industry: str) -> Optional[IndustryLinkage]:
 def list_supported_industries() -> List[str]:
     """返回当前已支持配置的行业列表。"""
     return list(INDUSTRY_LINKAGE_MAP.keys())
+
+
+def _format_indicator_item(ind: Dict[str, Any]) -> str:
+    """格式化单个产业链指标为 Markdown 行。"""
+    name = ind.get("name", "未命名指标")
+    val = ind.get("current_value")
+    unit = ind.get("unit") or ""
+    trend = ind.get("trend")
+    confidence = ind.get("confidence")
+    note = ind.get("note")
+    logic = ind.get("transmission_logic")
+    mom = ind.get("mom_change")
+    qoq = ind.get("qoq_change")
+
+    if val is not None and trend != "数据缺失":
+        val_str = f"{val:.2f}" if isinstance(val, (int, float)) else str(val)
+        unit_str = f" {unit}" if unit else ""
+        mom_str = f"，月环比 {mom:+.2f}%" if isinstance(mom, (int, float)) else ""
+        qoq_str = f"，季度环比 {qoq:+.2f}%" if isinstance(qoq, (int, float)) else ""
+        trend_str = f"，趋势：{trend}" if trend else ""
+        conf_str = f"（置信度：{confidence}）" if confidence else ""
+        line = f"  * {name}：{val_str}{unit_str}{mom_str}{qoq_str}{trend_str}{conf_str}"
+    else:
+        reason = note or confidence or "数据缺失"
+        line = f"  * 【数据缺失】{name}：{reason}"
+
+    if logic:
+        line += f"\n    - 传导逻辑：{logic}"
+    return line
+
+
+def format_industry_linkage_for_prompt(
+    industry_linkage: Optional[Union[Dict[str, Any], IndustryLinkage]]
+) -> str:
+    """将产业链联动数据格式化为可直接注入 Prompt 的结构化文本。
+
+    Args:
+        industry_linkage: 产业链数据字典或 IndustryLinkage 模型实例，若为 None 则返回空字符串
+
+    Returns:
+        结构化 Markdown 文本段落；若无数据或未映射则返回空字符串
+    """
+    if not industry_linkage:
+        return ""
+
+    if hasattr(industry_linkage, "model_dump"):
+        data = industry_linkage.model_dump()
+    elif isinstance(industry_linkage, dict):
+        data = industry_linkage
+    else:
+        return ""
+
+    industry_name = data.get("industry_name")
+    if not industry_name:
+        return ""
+
+    lines = [f"【产业链联想数据】：{industry_name}"]
+
+    upstream = data.get("upstream_cost") or []
+    if upstream:
+        lines.append("- 上游成本端核心指标：")
+        for ind in upstream:
+            ind_dict = ind if isinstance(ind, dict) else ind.model_dump()
+            lines.append(_format_indicator_item(ind_dict))
+
+    downstream = data.get("downstream_demand") or []
+    if downstream:
+        lines.append("- 下游需求端核心指标：")
+        for ind in downstream:
+            ind_dict = ind if isinstance(ind, dict) else ind.model_dump()
+            lines.append(_format_indicator_item(ind_dict))
+
+    benchmark = data.get("international_benchmark") or []
+    if benchmark:
+        lines.append("- 国际对标核心标的/指标：")
+        for ind in benchmark:
+            ind_dict = ind if isinstance(ind, dict) else ind.model_dump()
+            lines.append(_format_indicator_item(ind_dict))
+
+    catalysts = data.get("policy_catalysts") or []
+    if catalysts:
+        cat_str = "、".join(str(c) for c in catalysts)
+        lines.append(f"- 行业政策催化关键词：{cat_str}")
+
+    return "\n".join(lines)

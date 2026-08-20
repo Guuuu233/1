@@ -17,6 +17,10 @@ from tradingagents.agents.utils.knowledge_context import (
     resolve_industry_context,
     resolve_macro_event_context,
 )
+from tradingagents.dataflows.industry_linkage import (
+    format_industry_linkage_for_prompt,
+)
+from tradingagents.graph.data_collector import _map_stock_to_industry
 from api.database import log_llm_call
 
 logger = logging.getLogger(__name__)
@@ -73,6 +77,7 @@ def create_fundamentals_analyst(llm, data_collector=None):
             global_indices = pool.get("global_indices", "无数据")
             major_assets = pool.get("major_assets", "无数据")
             cn_indices = pool.get("cn_indices", "无数据")
+            industry_linkage_data = pool.get("industry_linkage")
         else:
             from tradingagents.agents.utils.agent_utils import (
                 get_fundamentals,
@@ -97,21 +102,43 @@ def create_fundamentals_analyst(llm, data_collector=None):
             major_assets = res_dict.get("major_assets", "无数据")
             cn_indices = res_dict.get("cn_indices", "无数据")
 
+            # Fallback 获取产业链数据
+            mapped_ind = _map_stock_to_industry(ticker)
+            if mapped_ind:
+                try:
+                    from tradingagents.dataflows.providers.industry_linkage_provider import (
+                        IndustryLinkageProvider,
+                    )
+                    _provider = IndustryLinkageProvider()
+                    industry_linkage_data = _provider.get_industry_linkage(mapped_ind, as_of=current_date)
+                except Exception as exc:
+                    logger.warning("[Fundamentals Analyst] 获取产业链数据异常: %s", exc)
+                    industry_linkage_data = None
+            else:
+                industry_linkage_data = None
+
         # ── 行业常识知识库与宏观情景挂载 ──────────────────
+        combined_text = f"{outputs.get('fundamentals', '')}"
         _, industry_ctx = resolve_industry_context(
             ticker=ticker,
             stock_name=stock_name,
-            extra_text=outputs.get("fundamentals", ""),
+            extra_text=combined_text,
             state=state,
         )
         _, macro_event_ctx = resolve_macro_event_context(
-            text=outputs.get("fundamentals", ""),
+            text=combined_text,
             max_events=1,
         )
+
+        # ── 产业链联想数据段落 ──────────────────────
+        industry_linkage_text = format_industry_linkage_for_prompt(industry_linkage_data)
 
         human_content_blocks = [
             horizon_ctx + "\n" + f"以下是 {ticker_display} 在 {current_date} 的基本面资料与产业链/宏观背景。",
         ]
+
+        if industry_linkage_text:
+            human_content_blocks.append(f"{industry_linkage_text}")
 
         if industry_ctx:
             human_content_blocks.append(f"{industry_ctx}")
