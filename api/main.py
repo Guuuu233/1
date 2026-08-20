@@ -1871,6 +1871,36 @@ def _apply_user_context_to_request(request: "AnalyzeRequest", user_context: Dict
     return request
 
 
+def _is_empty_debate_state(state: Any) -> bool:
+    """Return True if state is None, not a dict, or an unpopulated debate state."""
+    if not isinstance(state, dict) or not state:
+        return True
+    count = state.get("count")
+    try:
+        count_int = int(count) if count is not None else 0
+    except (ValueError, TypeError):
+        count_int = 0
+    if count_int > 0:
+        return False
+    for text_key in (
+        "history",
+        "bull_history",
+        "bear_history",
+        "aggressive_history",
+        "conservative_history",
+        "neutral_history",
+        "judge_decision",
+        "latest_risk_verdict",
+        "current_speaker",
+        "latest_speaker",
+    ):
+        if str(state.get(text_key) or "").strip():
+            return False
+    if state.get("claims"):
+        return False
+    return True
+
+
 def _build_result_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
     market_context = final_state.get("market_context") or {}
     market_data_context = final_state.get("market_data_context") or {}
@@ -3258,10 +3288,24 @@ async def _run_job_inner(
             last_report: Dict[str, str] = {}
             seen: Dict[str, bool] = {}
 
+            accumulated_state: Dict[str, Any] = dict(init_state) if isinstance(init_state, dict) else {}
+            final_state = accumulated_state
             _tracker_token = current_tracker_var.set(tracker)
             try:
                 async for chunk in graph.graph.astream(init_state, **args):
-                    final_state = chunk
+                    if isinstance(chunk, dict):
+                        for k, v in chunk.items():
+                            if k in ("investment_debate_state", "risk_debate_state", "risk_feedback_state"):
+                                if _is_empty_debate_state(v) and not _is_empty_debate_state(accumulated_state.get(k)):
+                                    continue
+                                accumulated_state[k] = v
+                            else:
+                                if v is None and k in accumulated_state and accumulated_state[k] is not None:
+                                    continue
+                                accumulated_state[k] = v
+                        final_state = accumulated_state
+                    else:
+                        final_state = chunk
                     # ── 并行感知的状态推进 ──────────────────
                     # 1. 每个 analyst 报告首次出现 → completed
                     for analyst_key in ANALYST_ORDER:

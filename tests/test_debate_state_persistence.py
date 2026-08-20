@@ -139,6 +139,11 @@ class _FakePropagator:
 
 
 class _FakeGraphStream:
+    multi_chunk: bool = False
+
+    def __init__(self, multi_chunk: bool = False):
+        self.multi_chunk = multi_chunk
+
     @staticmethod
     def _state(init_state):
         horizon = init_state.get("horizon", "short")
@@ -151,15 +156,19 @@ class _FakeGraphStream:
             "investment_plan": f"{horizon} 投资计划",
             "trader_investment_plan": f"{horizon} 交易计划",
             "investment_debate_state": {
+                "count": 6,
                 "bull_history": f"{horizon} 多头观点",
                 "bear_history": f"{horizon} 空头观点",
                 "judge_decision": f"{horizon} 多头胜",
+                "claims": [{"claim_id": "INV-1", "claim": "多头主张", "confidence": 0.85}],
             },
             "risk_debate_state": {
+                "count": 9,
                 "aggressive_history": f"{horizon} 激进观点",
                 "conservative_history": f"{horizon} 保守观点",
                 "neutral_history": f"{horizon} 中性观点",
                 "judge_decision": f"{horizon} 风控通过",
+                "claims": [{"claim_id": "RISK-1", "claim": "风控主张", "confidence": 0.8}],
             },
             "risk_feedback_state": {
                 "latest_risk_verdict": "pass",
@@ -171,16 +180,85 @@ class _FakeGraphStream:
         }
 
     async def astream(self, init_state, **_kwargs):
-        yield self._state(init_state)
+        horizon = init_state.get("horizon", "short")
+        if self.multi_chunk:
+            # 1. analyst/report chunk
+            yield {
+                "company_of_interest": "600519.SH",
+                "trade_date": "2026-08-20",
+                "horizon": horizon,
+                "news_report": f"{horizon} news",
+                "market_report": f"{horizon} market",
+                "market_data_context": init_state.get("market_data_context"),
+                "analyst_traces": [{"horizon": horizon, "analyst": "news"}],
+            }
+            # 2. investment_debate_state count=6, Bull/Bear history/judge/claims
+            yield {
+                "investment_plan": f"{horizon} 投资计划",
+                "investment_debate_state": {
+                    "count": 6,
+                    "history": f"{horizon} 多空辩论历史",
+                    "bull_history": f"{horizon} 多头观点",
+                    "bear_history": f"{horizon} 空头观点",
+                    "judge_decision": f"{horizon} 多头胜",
+                    "claims": [{"claim_id": "INV-1", "claim": "多头主张", "confidence": 0.85}],
+                },
+            }
+            # 3. risk_debate_state count=9, 三方 history/judge/claims
+            yield {
+                "trader_investment_plan": f"{horizon} 交易计划",
+                "risk_debate_state": {
+                    "count": 9,
+                    "history": f"{horizon} 风控辩论历史",
+                    "aggressive_history": f"{horizon} 激进观点",
+                    "conservative_history": f"{horizon} 保守观点",
+                    "neutral_history": f"{horizon} 中性观点",
+                    "judge_decision": f"{horizon} 风控通过",
+                    "claims": [{"claim_id": "RISK-1", "claim": "风控主张", "confidence": 0.8}],
+                },
+                "risk_feedback_state": {
+                    "latest_risk_verdict": "pass",
+                    "retry_count": 0,
+                    "max_retries": 1,
+                },
+            }
+            # 4. final chunk 只含 final_trade_decision，或带空初始 debate dict
+            yield {
+                "final_trade_decision": f"{horizon} decision 买入",
+                "investment_debate_state": {
+                    "count": 0,
+                    "history": "",
+                    "bull_history": "",
+                    "bear_history": "",
+                    "judge_decision": "",
+                    "claims": [],
+                },
+                "risk_debate_state": {
+                    "count": 0,
+                    "history": "",
+                    "aggressive_history": "",
+                    "conservative_history": "",
+                    "neutral_history": "",
+                    "judge_decision": "",
+                    "claims": [],
+                },
+            }
+        else:
+            yield self._state(init_state)
 
 
 class _FakeTradingGraphForJob:
-    def __init__(self, selected_analysts, data_collector, **_kwargs):
+    captured_instances = []
+    multi_chunk: bool = False
+
+    def __init__(self, selected_analysts, data_collector, **kwargs):
         self.data_collector = data_collector
         self.propagator = _FakePropagator("unknown")
-        self.graph = _FakeGraphStream()
+        self.graph = _FakeGraphStream(multi_chunk=getattr(self, "multi_chunk", False))
         self.role_resolved_configs = {}
         self.quick_thinking_llm = object()
+        self.config = kwargs.get("config", {})
+        _FakeTradingGraphForJob.captured_instances.append(self)
 
     def process_signal(self, decision):
         return "BUY"
@@ -327,11 +405,15 @@ class TestJobExecutionDebatePersistence:
         saved_reports = []
         db = MagicMock()
 
+        _FakeTradingGraphForJob.captured_instances.clear()
+        _FakeTradingGraphForJob.multi_chunk = True
+
         request = main.AnalyzeRequest(
             symbol="600519.SH",
             trade_date="2026-08-20",
             horizons=["short"],
             selected_analysts=[],
+            config_overrides={"max_debate_rounds": 3, "max_risk_discuss_rounds": 3},
         )
 
         def capture_create_report(**kwargs):
@@ -349,33 +431,46 @@ class TestJobExecutionDebatePersistence:
             await task
             await stream.aclose()
 
-        with (
-            patch.object(main, "_job_store_instance", store),
-            patch.object(main, "_shared_data_collector", collector),
-            patch.object(main, "TradingAgentsGraph", _FakeTradingGraphForJob),
-            patch.object(main, "_build_runtime_config", return_value={}),
-            patch.object(main, "_resolve_and_freeze_custom_prompts", return_value=({}, False)),
-            patch.object(main, "get_db_ctx", return_value=nullcontext(db)),
-            patch.object(report_service, "init_report"),
-            patch.object(report_service, "update_report_partial"),
-            patch.object(report_service, "extract_structured_data", return_value=None),
-            patch.object(report_service, "create_report", side_effect=capture_create_report),
-        ):
-            asyncio.run(run_job())
+        try:
+            with (
+                patch.object(main, "_job_store_instance", store),
+                patch.object(main, "_shared_data_collector", collector),
+                patch.object(main, "TradingAgentsGraph", _FakeTradingGraphForJob),
+                patch.object(main, "_resolve_and_freeze_custom_prompts", return_value=({}, False)),
+                patch.object(main, "get_db_ctx", return_value=nullcontext(db)),
+                patch.object(report_service, "init_report"),
+                patch.object(report_service, "update_report_partial"),
+                patch.object(report_service, "extract_structured_data", return_value=None),
+                patch.object(report_service, "create_report", side_effect=capture_create_report),
+            ):
+                asyncio.run(run_job())
 
-        job = store.get_job(job_id)
-        assert job["status"] == "completed"
-        result_data = job["result"]
+            assert len(_FakeTradingGraphForJob.captured_instances) == 1
+            graph_inst = _FakeTradingGraphForJob.captured_instances[0]
+            assert graph_inst.config.get("max_debate_rounds") == 3
+            assert graph_inst.config.get("max_risk_discuss_rounds") == 3
 
-        assert result_data["investment_debate_state"]["judge_decision"] == "short 多头胜"
-        assert result_data["risk_debate_state"]["judge_decision"] == "short 风控通过"
-        assert result_data["risk_feedback_state"]["latest_risk_verdict"] == "pass"
+            job = store.get_job(job_id)
+            assert job["status"] == "completed"
+            result_data = job["result"]
 
-        assert len(saved_reports) == 1
-        saved = saved_reports[0]["result_data"]
-        assert saved["investment_debate_state"]["judge_decision"] == "short 多头胜"
-        assert saved["risk_debate_state"]["judge_decision"] == "short 风控通过"
-        assert saved["risk_feedback_state"]["latest_risk_verdict"] == "pass"
+            assert result_data["investment_debate_state"]["judge_decision"] == "short 多头胜"
+            assert result_data["investment_debate_state"]["count"] == 6
+            assert len(result_data["investment_debate_state"]["claims"]) == 1
+            assert result_data["risk_debate_state"]["judge_decision"] == "short 风控通过"
+            assert result_data["risk_debate_state"]["count"] == 9
+            assert len(result_data["risk_debate_state"]["claims"]) == 1
+            assert result_data["risk_feedback_state"]["latest_risk_verdict"] == "pass"
+
+            assert len(saved_reports) == 1
+            saved = saved_reports[0]["result_data"]
+            assert saved["investment_debate_state"]["judge_decision"] == "short 多头胜"
+            assert saved["investment_debate_state"]["count"] == 6
+            assert saved["risk_debate_state"]["judge_decision"] == "short 风控通过"
+            assert saved["risk_debate_state"]["count"] == 9
+            assert saved["risk_feedback_state"]["latest_risk_verdict"] == "pass"
+        finally:
+            _FakeTradingGraphForJob.multi_chunk = False
 
 
 # ============================================================================
