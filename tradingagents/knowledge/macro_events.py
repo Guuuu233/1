@@ -255,7 +255,7 @@ MACRO_EVENT_SCENARIOS: Dict[str, MacroEventScenario] = {
         event_id="rmb_depreciation",
         event_name="人民币大幅贬值与汇率承压",
         category="外汇与国际收支",
-        aliases=["人民币贬值", "汇率破7", "汇率贬值", "美元走强人民币走弱", "外汇贬值", "结售汇逆差"],
+        aliases=["人民币贬值", "汇率破7", "汇率贬值", "美元走强人民币走弱", "外汇贬值", "结售汇逆差", "贬值压力", "汇率承压", "人民币贬值压力"],
         description="受中美利差走阔、美元指数强势或国内经济复苏节奏影响，人民币对美元汇率发生较大幅度贬值。",
         transmission_mechanism=[
             "一级直接冲击：以美元计价的出口商品折算人民币收入增加，进口商品折算人民币采购成本同步上升。",
@@ -714,7 +714,7 @@ MACRO_EVENT_SCENARIOS: Dict[str, MacroEventScenario] = {
         event_id="export_tariffs_trade_friction",
         event_name="全球贸易摩擦与海外关税加征",
         category="地缘与国际贸易",
-        aliases=["加征关税", "贸易摩擦", "贸易战", "反倾销调查", "实体清单", "出口管制", "301调查", "关税壁垒"],
+        aliases=["加征关税", "贸易摩擦", "贸易战", "反倾销调查", "实体清单", "出口管制", "301调查", "关税壁垒", "惩罚性关税", "海外关税", "关税制裁"],
         description="欧美等海外主要经济体对中国出口的高附加值产品(如新能源汽车、光伏、锂电池、钢铝制品、消费电子)加征高额惩罚性关税或设置技术贸易壁垒。",
         transmission_mechanism=[
             "一级直接冲击：目标国进口关税税率大幅调高，中国出口产品在当地市场的到岸含税售价大幅上涨，直接削弱终端价格竞争力。",

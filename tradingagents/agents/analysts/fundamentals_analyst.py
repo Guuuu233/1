@@ -126,10 +126,12 @@ def create_fundamentals_analyst(llm, data_collector=None):
             stock_name=stock_name,
             extra_text=combined_text,
             state=state,
+            fallback_on_miss=False,
         )
         _, macro_event_ctx = resolve_macro_event_context(
             text=combined_text,
             max_events=1,
+            fallback_on_miss=False,
         )
 
         # ── 产业链联想数据段落 ──────────────────────
@@ -147,6 +149,8 @@ def create_fundamentals_analyst(llm, data_collector=None):
 
         if industry_ctx:
             human_content_blocks.append(f"{industry_ctx}")
+        else:
+            human_content_blocks.append("【行业常识知识库】\n【知识库未命中】")
 
         if global_indices != "无数据" or major_assets != "无数据" or cn_indices != "无数据":
             macro_blocks = []
@@ -161,6 +165,8 @@ def create_fundamentals_analyst(llm, data_collector=None):
 
         if macro_event_ctx:
             human_content_blocks.append(f"{macro_event_ctx}")
+        else:
+            human_content_blocks.append("【宏观事件传导图谱】\n【知识库未命中】")
 
         human_content_blocks.extend([
             f"【get_fundamentals】\n{outputs['fundamentals']}",

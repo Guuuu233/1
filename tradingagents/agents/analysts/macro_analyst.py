@@ -136,10 +136,12 @@ def create_macro_analyst(llm, data_collector=None):
             stock_name=stock_name,
             extra_text=combined_text,
             state=state,
+            fallback_on_miss=False,
         )
         _, macro_event_ctx = resolve_macro_event_context(
             text=f"{recent_news}\n{global_news}",
             max_events=2,
+            fallback_on_miss=False,
         )
 
         # ── 产业链联想数据段落 ──────────────────────
@@ -174,9 +176,13 @@ def create_macro_analyst(llm, data_collector=None):
 
         if industry_ctx:
             human_content_lines.append(f"{industry_ctx}")
+        else:
+            human_content_lines.append("【行业常识知识库】\n【知识库未命中】")
 
         if macro_event_ctx:
             human_content_lines.append(f"{macro_event_ctx}")
+        else:
+            human_content_lines.append("【宏观事件传导图谱】\n【知识库未命中】")
 
         messages = [
             SystemMessage(content=(

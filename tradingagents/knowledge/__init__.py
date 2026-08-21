@@ -33,6 +33,18 @@ from tradingagents.knowledge.macro_events import (
     match_events_from_text,
     search_macro_events,
 )
+from tradingagents.knowledge.rag import (
+    INDUSTRY_KNOWLEDGE_MISSING_BLOCK,
+    KNOWLEDGE_MISSING_FALLBACK,
+    MACRO_EVENT_MISSING_BLOCK,
+    KnowledgeRAGIndex,
+    format_rag_industry_context,
+    format_rag_macro_context,
+    get_global_rag_index,
+    retrieve_industry_knowledge,
+    retrieve_macro_event_knowledge,
+    tokenize_cn_en,
+)
 
 __all__ = [
     # 行业知识库
@@ -61,4 +73,15 @@ __all__ = [
     "get_transmission_path",
     "match_events_from_text",
     "search_macro_events",
+    # 动态知识库 RAG 检索与索引
+    "INDUSTRY_KNOWLEDGE_MISSING_BLOCK",
+    "KNOWLEDGE_MISSING_FALLBACK",
+    "MACRO_EVENT_MISSING_BLOCK",
+    "KnowledgeRAGIndex",
+    "format_rag_industry_context",
+    "format_rag_macro_context",
+    "get_global_rag_index",
+    "retrieve_industry_knowledge",
+    "retrieve_macro_event_knowledge",
+    "tokenize_cn_en",
 ]

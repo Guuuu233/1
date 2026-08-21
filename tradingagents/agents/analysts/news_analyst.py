@@ -12,7 +12,10 @@ from tradingagents.agents.utils.agent_states import (
     check_llm_output_degraded,
     check_stream_chunk_degraded,
 )
-from tradingagents.agents.utils.knowledge_context import resolve_macro_event_context
+from tradingagents.agents.utils.knowledge_context import (
+    resolve_industry_context,
+    resolve_macro_event_context,
+)
 from api.database import log_llm_call
 
 logger = logging.getLogger(__name__)
@@ -70,7 +73,7 @@ def create_news_analyst(llm, data_collector=None):
             stock_news, global_news = results
             data_window = f"{days}天"
 
-        # ── 宏观事件情景图谱挂载 ──────────────────
+        # ── 宏观事件情景图谱与行业知识库挂载 ──────────────────
         extra_event_text = f"{stock_news}\n{global_news}"
         macro_report = state.get("macro_report", "")
         if macro_report and macro_report != "无数据":
@@ -78,6 +81,14 @@ def create_news_analyst(llm, data_collector=None):
         _, macro_event_ctx = resolve_macro_event_context(
             text=extra_event_text,
             max_events=2,
+            fallback_on_miss=False,
+        )
+        _, industry_ctx = resolve_industry_context(
+            ticker=ticker,
+            stock_name=stock_name,
+            extra_text=extra_event_text,
+            state=state,
+            fallback_on_miss=False,
         )
 
         phase1_reports_text = format_phase1_reports(state)
@@ -88,8 +99,16 @@ def create_news_analyst(llm, data_collector=None):
             f"【get_news】\n{stock_news}",
             f"【get_global_news】\n{global_news}",
         ]
+
+        if industry_ctx:
+            human_content_blocks.append(f"{industry_ctx}")
+        else:
+            human_content_blocks.append("【行业常识知识库】\n【知识库未命中】")
+
         if macro_event_ctx:
-            human_content_blocks.append(f"【宏观事件传导图谱】\n{macro_event_ctx}")
+            human_content_blocks.append(f"{macro_event_ctx}")
+        else:
+            human_content_blocks.append("【宏观事件传导图谱】\n【知识库未命中】")
 
         messages = [
             SystemMessage(content=(

@@ -25,6 +25,15 @@ from tradingagents.knowledge.macro_events import (
     get_macro_event_scenario,
     match_events_from_text,
 )
+from tradingagents.knowledge.rag import (
+    INDUSTRY_KNOWLEDGE_MISSING_BLOCK,
+    KNOWLEDGE_MISSING_FALLBACK,
+    MACRO_EVENT_MISSING_BLOCK,
+    format_rag_industry_context,
+    format_rag_macro_context,
+    retrieve_industry_knowledge,
+    retrieve_macro_event_knowledge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -832,6 +841,12 @@ def resolve_industry_profile(
                 if len(alias) >= 2 and alias in extra_text:
                     return p
 
+    # 9. 动态 RAG 检索回退（基于 BM25 加权倒排索引）
+    if clean_name:
+        rag_matched = retrieve_industry_knowledge(clean_name, top_k=1, min_score=1.0)
+        if rag_matched:
+            return rag_matched[0][0]
+
     return None
 
 
@@ -840,11 +855,14 @@ def resolve_industry_context(
     stock_name: str = "",
     extra_text: str = "",
     state: Optional[dict] = None,
+    fallback_on_miss: bool = False,
 ) -> Tuple[Optional[IndustryProfile], str]:
     """获取标的的行业深度常识图谱文本。
 
     若成功匹配行业，返回 (profile, formatted_industry_context)；
-    若未匹配到行业，返回 (None, "")。
+    若未匹配到行业：
+      - fallback_on_miss=True 时返回 (None, '【行业常识知识库】\\n【知识库未命中】')；
+      - fallback_on_miss=False 时返回 (None, '')。
     """
     profile = resolve_industry_profile(
         ticker=ticker,
@@ -853,7 +871,7 @@ def resolve_industry_context(
         state=state,
     )
     if not profile:
-        return None, ""
+        return None, (INDUSTRY_KNOWLEDGE_MISSING_BLOCK if fallback_on_miss else "")
 
     formatted = format_industry_deep_context(profile.industry_name)
     return profile, formatted
@@ -862,32 +880,89 @@ def resolve_industry_context(
 def resolve_macro_event_context(
     text: str = "",
     max_events: int = 2,
+    fallback_on_miss: bool = False,
+    min_score: float = 0.5,
 ) -> Tuple[List[MacroEventScenario], str]:
     """从输入的文本（新闻、大盘描述、宏观背景）中自动匹配宏观事件并生成三级传导图谱。
 
     若匹配到事件，返回 (matched_scenarios, formatted_macro_event_context)；
-    若未匹配到事件，返回 ([], "")。
+    若未匹配到事件：
+      - fallback_on_miss=True 时返回 ([], '【宏观事件传导图谱】\\n【知识库未命中】')；
+      - fallback_on_miss=False 时返回 ([], '')。
     """
-    if not text or not isinstance(text, str):
-        return [], ""
+    if not text or not isinstance(text, str) or not text.strip():
+        return [], (MACRO_EVENT_MISSING_BLOCK if fallback_on_miss else "")
 
-    scenarios = match_events_from_text(text)
-    if not scenarios:
-        return [], ""
+    # 1. 结合文本直接匹配与 RAG 检索
+    scenarios: List[MacroEventScenario] = []
+    seen: Set[str] = set()
 
-    # 去重保留前 max_events 个
-    seen = set()
-    selected: List[MacroEventScenario] = []
-    for s in scenarios:
+    # 优先直接命中
+    direct_matches = match_events_from_text(text)
+    for s in direct_matches:
         if s.event_id not in seen:
             seen.add(s.event_id)
-            selected.append(s)
-            if len(selected) >= max_events:
+            scenarios.append(s)
+            if len(scenarios) >= max_events:
                 break
 
-    blocks = [format_macro_event_context(s.event_name) for s in selected]
+    # 若未满 max_events，使用 RAG 检索补充
+    if len(scenarios) < max_events:
+        rag_matches = retrieve_macro_event_knowledge(text, top_k=max_events, min_score=min_score)
+        for s, _score in rag_matches:
+            if s.event_id not in seen:
+                seen.add(s.event_id)
+                scenarios.append(s)
+                if len(scenarios) >= max_events:
+                    break
+
+    if not scenarios:
+        return [], (MACRO_EVENT_MISSING_BLOCK if fallback_on_miss else "")
+
+    blocks = [format_macro_event_context(s.event_name) for s in scenarios]
     formatted = "\n\n".join(b for b in blocks if b)
-    return selected, formatted
+    if not formatted:
+        return [], (MACRO_EVENT_MISSING_BLOCK if fallback_on_miss else "")
+
+    return scenarios, formatted
+
+
+def resolve_dynamic_knowledge_context(
+    ticker: str = "",
+    stock_name: str = "",
+    extra_text: str = "",
+    state: Optional[dict] = None,
+    max_macro_events: int = 2,
+    fallback_on_miss: bool = True,
+) -> Dict[str, Any]:
+    """统一动态解析标的行业知识图谱与宏观事件传导情景。
+
+    返回结构：
+    {
+        'industry_profile': Optional[IndustryProfile],
+        'industry_context': str,
+        'macro_scenarios': List[MacroEventScenario],
+        'macro_event_context': str,
+    }
+    """
+    profile, ind_ctx = resolve_industry_context(
+        ticker=ticker,
+        stock_name=stock_name,
+        extra_text=extra_text,
+        state=state,
+        fallback_on_miss=fallback_on_miss,
+    )
+    scenarios, macro_ctx = resolve_macro_event_context(
+        text=extra_text,
+        max_events=max_macro_events,
+        fallback_on_miss=fallback_on_miss,
+    )
+    return {
+        "industry_profile": profile,
+        "industry_context": ind_ctx,
+        "macro_scenarios": scenarios,
+        "macro_event_context": macro_ctx,
+    }
 
 
 def format_macro_market_view(
