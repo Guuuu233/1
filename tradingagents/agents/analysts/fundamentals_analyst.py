@@ -118,7 +118,9 @@ def create_fundamentals_analyst(llm, data_collector=None):
                 industry_linkage_data = None
 
         # ── 行业常识知识库与宏观情景挂载 ──────────────────
-        combined_text = f"{outputs.get('fundamentals', '')}"
+        combined_text = "\n".join(
+            str(v) for v in outputs.values() if v and v != "无数据"
+        )
         _, industry_ctx = resolve_industry_context(
             ticker=ticker,
             stock_name=stock_name,
