@@ -77,6 +77,50 @@ def test_resolve_industry_profile_by_stock_name_dict():
         assert p.industry_id == expected_id, f"Expected {expected_id}, got {p.industry_id} for {name}"
 
 
+def test_resolve_industry_profile_by_ticker_code_only():
+    """验证仅提供 6 位证券代码（无 stock_name 或 stock_name 为代码）时可精准匹配行业。"""
+    cases = [
+        ("600519", "liquor_beverage"),
+        ("600519.SH", "liquor_beverage"),
+        ("300750", "lithium_battery"),
+        ("300750.SZ", "lithium_battery"),
+        ("688981", "semiconductor"),
+        ("002594", "nev_auto"),
+        ("600036", "banking"),
+        ("601318", "insurance_financials"),
+        ("601088", "coal_energy"),
+        ("600900", "power_utilities"),
+        ("601899", "precious_metals"),
+        ("600276", "biopharma"),
+        ("300760", "medical_devices"),
+        ("002475", "consumer_electronics"),
+        ("002230", "ai_computing"),
+        ("601012", "photovoltaic_storage"),
+        ("600030", "securities"),
+        ("600019", "steel_ferrous"),
+        ("601857", "petrochemicals"),
+        ("000002", "real_estate"),
+        ("600585", "construction_materials"),
+        ("600031", "industrial_machinery"),
+        ("600760", "defense_military"),
+        ("601919", "logistics_shipping"),
+        ("000063", "telecom_optical"),
+        ("002714", "agriculture_breeding"),
+        ("000333", "home_appliances"),
+        ("600887", "food_beverage"),
+    ]
+    for ticker_code, expected_id in cases:
+        # 1. 仅传 ticker
+        p = resolve_industry_profile(ticker=ticker_code)
+        assert p is not None, f"Failed for ticker={ticker_code}"
+        assert p.industry_id == expected_id
+
+        # 2. stock_name 传入 ticker_code（回退场景）
+        p_fallback = resolve_industry_profile(ticker=ticker_code, stock_name=ticker_code)
+        assert p_fallback is not None, f"Failed for fallback stock_name={ticker_code}"
+        assert p_fallback.industry_id == expected_id
+
+
 def test_resolve_industry_profile_by_generic_keywords():
     """通用行业后缀与关键词规则匹配。"""
     cases = [
