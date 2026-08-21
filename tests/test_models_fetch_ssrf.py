@@ -4,9 +4,11 @@ import http.client
 import json
 import socket
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 from api import main as api_main
@@ -65,7 +67,9 @@ def _endpoint_client():
         return dummy_user
 
     def override_db():
-        yield MagicMock()
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = None
+        yield db
 
     app.dependency_overrides[api_main._require_api_user] = override_user
     app.dependency_overrides[api_main.get_db] = override_db
@@ -278,7 +282,7 @@ def test_https_connection_pins_ip_and_keeps_sni_host(monkeypatch):
 
 
 def test_endpoint_hides_rejection_details(monkeypatch):
-    def blocked(base_url, api_key):
+    def blocked(base_url, api_key, **kwargs):
         raise api_main._ModelsFetchError("resolved to 10.0.0.5")
 
     monkeypatch.setattr(api_main, "_fetch_available_models", blocked)
@@ -299,15 +303,16 @@ def test_endpoint_hides_rejection_details(monkeypatch):
 
 
 def test_endpoint_success_shape_is_preserved(monkeypatch):
+    sync_calls = []
     monkeypatch.setattr(
         api_main,
         "_fetch_available_models",
-        lambda base_url, api_key: (["a", "b"], "http://allowed.example.com/v1/models"),
+        lambda base_url, api_key, **kwargs: (["a", "b"], "http://allowed.example.com/v1/models"),
     )
     monkeypatch.setattr(
         api_main.role_routing_service,
         "sync_model_profiles_from_names",
-        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: sync_calls.append((args, kwargs)),
     )
 
     with _endpoint_client() as client:
@@ -323,6 +328,7 @@ def test_endpoint_success_shape_is_preserved(monkeypatch):
         "count": 2,
         "url": "http://allowed.example.com/v1/models",
     }
+    assert sync_calls == []
 
 
 # --- 受信本地默认（host.docker.internal / 回环）+ 白名单 + 钉端口 ---
@@ -411,7 +417,9 @@ def _endpoint_client_with_user(user, client_addr=("testclient", 50000)):
         return user
 
     def override_db():
-        yield MagicMock()
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = None
+        yield db
 
     app.dependency_overrides[api_main._require_api_user] = override_user
     app.dependency_overrides[api_main.get_db] = override_db
@@ -431,24 +439,231 @@ def test_anonymous_fetch_from_non_loopback_rejected():
     assert resp.status_code == 401
 
 
-def test_anonymous_fetch_from_loopback_allowed():
-    """默认本地账号从回环来源调用 fetch → 继续（白名单未配置 → 通用错误）。"""
+def test_anonymous_fetch_from_loopback_allowed(monkeypatch):
+    """默认本地账号从回环调用时可继续，但不获得用户 URL 绕过权。"""
+    captured = {}
+
+    def fake_fetch(base_url, api_key, *, allow_user_url=False):
+        captured.update(
+            base_url=base_url,
+            api_key=api_key,
+            allow_user_url=allow_user_url,
+        )
+        return ["model-a"], "http://public.example.com/v1/models"
+
+    monkeypatch.setattr(api_main, "_fetch_available_models", fake_fetch)
     with _endpoint_client_with_user(
         _default_local_user(), client_addr=("127.0.0.1", 50000)
     ) as client:
         resp = client.post("/v1/models/fetch", json={"base_url": "http://public.example.com/v1"})
 
     assert resp.status_code == 200
-    assert resp.json()["ok"] is False
-    assert resp.json()["error"] == api_main._MODELS_FETCH_GENERIC_ERROR
+    assert resp.json()["ok"] is True
+    assert captured == {
+        "base_url": "http://public.example.com/v1",
+        "api_key": "",
+        "allow_user_url": False,
+    }
 
 
-def test_authenticated_fetch_from_non_loopback_allowed():
-    """非默认本地账号从非回环来源调用 → 不受匿名回退限制。"""
+def test_authenticated_fetch_from_non_loopback_uses_user_url_policy(monkeypatch):
+    """真实用户从非回环来源调用时，HTTP 路由启用用户 URL 政策。"""
+    captured = {}
+
+    def fake_fetch(base_url, api_key, *, allow_user_url=False):
+        captured.update(
+            base_url=base_url,
+            api_key=api_key,
+            allow_user_url=allow_user_url,
+        )
+        return ["model-a"], "http://public.example.com/v1/models"
+
+    monkeypatch.setattr(api_main, "_fetch_available_models", fake_fetch)
     user = MagicMock()
     user.id = "real-user-1"
     with _endpoint_client_with_user(user, client_addr=("192.168.1.5", 50000)) as client:
         resp = client.post("/v1/models/fetch", json={"base_url": "http://public.example.com/v1"})
 
     assert resp.status_code == 200
-    assert resp.json()["ok"] is False  # 白名单未配置 → 通用错误
+    assert resp.json()["ok"] is True
+    assert captured == {
+        "base_url": "http://public.example.com/v1",
+        "api_key": "",
+        "allow_user_url": True,
+    }
+
+
+def test_authenticated_user_cgnat_url_bypasses_allowlist(monkeypatch):
+    """已登录用户的自有 Tailscale URL 不应被主机白名单拒绝。"""
+    monkeypatch.delenv(api_main._MODELS_FETCH_ALLOWLIST_ENV, raising=False)
+    monkeypatch.setattr(
+        api_main.socket,
+        "getaddrinfo",
+        _getaddrinfo_for("100.65.130.33"),
+    )
+    fake_conn = _FakeConnection(
+        response=_FakeResponse(body=json.dumps({"data": [{"id": "model-a"}]}).encode("utf-8"))
+    )
+    monkeypatch.setattr(api_main, "_build_models_fetch_connection", lambda *args, **kwargs: fake_conn)
+
+    models, url = api_main._fetch_available_models(
+        "http://100.65.130.33:8317/v1",
+        "",
+        allow_user_url=True,
+    )
+
+    assert models == ["model-a"]
+    assert url == "http://100.65.130.33:8317/v1/models"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://169.254.169.254/latest",
+        "http://[fd00:ec2::254]/latest",
+        "http://[::ffff:169.254.169.254]/latest",
+    ],
+)
+def test_authenticated_user_url_still_rejects_cloud_metadata(monkeypatch, url):
+    """用户 URL 放行不能覆盖云元数据硬拦截。"""
+    parsed = api_main._parse_models_fetch_url(url)
+    monkeypatch.setattr(
+        api_main.socket,
+        "getaddrinfo",
+        _getaddrinfo_for(parsed.hostname),
+    )
+    monkeypatch.setattr(api_main, "_build_models_fetch_connection", _unexpected)
+
+    with pytest.raises(api_main._ModelsFetchError):
+        api_main._fetch_available_models(url, "", allow_user_url=True)
+
+
+def _call_authenticated_fetch_endpoint(monkeypatch, *, payload, user_cfg=None, provider=None):
+    captured = {}
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = provider
+    user = SimpleNamespace(id="real-user-1")
+    request = Request({"type": "http", "client": ("192.168.1.5", 50000)})
+
+    monkeypatch.setattr(
+        api_main.auth_service,
+        "get_user_llm_config",
+        lambda db_arg, user_id: user_cfg,
+    )
+    monkeypatch.setattr(
+        api_main.auth_service,
+        "decrypt_secret",
+        lambda value: f"decrypted:{value}" if value else None,
+    )
+
+    def fake_fetch(base_url, api_key, *, allow_user_url=False):
+        captured.update(
+            base_url=base_url,
+            api_key=api_key,
+            allow_user_url=allow_user_url,
+        )
+        return ["model-a"], f"{base_url.rstrip('/')}/models"
+
+    monkeypatch.setattr(api_main, "_fetch_available_models", fake_fetch)
+    monkeypatch.setattr(
+        api_main.role_routing_service,
+        "sync_model_profiles_from_names",
+        lambda *args, **kwargs: None,
+    )
+
+    response = api_main.fetch_available_models(
+        api_main.FetchModelsRequest(**payload),
+        request,
+        db,
+        user,
+    )
+    assert response["ok"] is True
+    return captured
+
+
+def test_request_body_url_wins_over_saved_and_provider_urls(monkeypatch):
+    """设置页未保存的输入值必须是本次拉取的目标。"""
+    user_cfg = SimpleNamespace(
+        backend_url="http://saved.example.com/v1",
+        api_key_encrypted="user-key",
+    )
+    provider = SimpleNamespace(
+        base_url="http://provider.example.com/v1",
+        api_key_encrypted="provider-key",
+    )
+
+    captured = _call_authenticated_fetch_endpoint(
+        monkeypatch,
+        payload={
+            "base_url": "http://input.example.com/v1",
+            "provider_id": "provider-1",
+        },
+        user_cfg=user_cfg,
+        provider=provider,
+    )
+
+    assert captured == {
+        "base_url": "http://input.example.com/v1",
+        "api_key": "decrypted:provider-key",
+        "allow_user_url": True,
+    }
+
+
+def test_saved_backend_url_precedes_provider_url_and_uses_real_key_fields(monkeypatch):
+    """请求体为空时先用用户 backend_url，Key 仍优先选中 provider。"""
+    user_cfg = SimpleNamespace(
+        backend_url="http://saved.example.com/v1",
+        api_key_encrypted="user-key",
+    )
+    provider = SimpleNamespace(
+        base_url="http://provider.example.com/v1",
+        api_key_encrypted="provider-key",
+    )
+
+    captured = _call_authenticated_fetch_endpoint(
+        monkeypatch,
+        payload={"provider_id": "provider-1"},
+        user_cfg=user_cfg,
+        provider=provider,
+    )
+
+    assert captured == {
+        "base_url": "http://saved.example.com/v1",
+        "api_key": "decrypted:provider-key",
+        "allow_user_url": True,
+    }
+
+
+def test_user_key_then_environment_key_fallback(monkeypatch):
+    """无 provider Key 时读 api_key_encrypted，再回退 TA_API_KEY。"""
+    user_cfg = SimpleNamespace(
+        backend_url="http://saved.example.com/v1",
+        api_key_encrypted="user-key",
+    )
+    captured = _call_authenticated_fetch_endpoint(
+        monkeypatch,
+        payload={},
+        user_cfg=user_cfg,
+    )
+    assert captured["api_key"] == "decrypted:user-key"
+
+    monkeypatch.setenv("TA_API_KEY", "environment-key")
+    captured = _call_authenticated_fetch_endpoint(
+        monkeypatch,
+        payload={"base_url": "http://input.example.com/v1"},
+        user_cfg=None,
+    )
+    assert captured["api_key"] == "environment-key"
+
+
+def test_authenticated_fetch_without_user_url_uses_localhost_default(monkeypatch):
+    """已登录用户没有任何自有 URL 时使用可解析的 localhost 默认值。"""
+    captured = _call_authenticated_fetch_endpoint(
+        monkeypatch,
+        payload={},
+        user_cfg=None,
+        provider=None,
+    )
+
+    assert captured["base_url"] == "http://localhost:8317/v1"
+    assert captured["allow_user_url"] is False

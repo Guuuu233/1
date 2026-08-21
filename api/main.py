@@ -5699,7 +5699,7 @@ def update_runtime_config(
 
 _MODELS_FETCH_ALLOWLIST_ENV = "TA_MODELS_FETCH_ALLOWLIST"
 _MODELS_FETCH_TIMEOUT_SECONDS = 8.0
-_MODELS_FETCH_DEFAULT_URL = "http://host.docker.internal:8317/v1"
+_MODELS_FETCH_DEFAULT_URL = "http://localhost:8317/v1"
 _MODELS_FETCH_GENERIC_ERROR = "无法获取模型列表"
 _MODELS_FETCH_METADATA_IPS = frozenset({"169.254.169.254", "fd00:ec2::254"})
 # 受信本地默认主机：Docker host-gateway + 裸机回环。仅当这些主机显式写入
@@ -5816,8 +5816,18 @@ def _models_fetch_host_allowed(
     return None in allowed_ports or port in allowed_ports
 
 
+def _is_models_fetch_metadata_ip(ip_text: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return str(ip) in _MODELS_FETCH_METADATA_IPS
+
+
 def _is_models_fetch_ip_blocked(ip_text: str) -> bool:
-    if ip_text in _MODELS_FETCH_METADATA_IPS:
+    if _is_models_fetch_metadata_ip(ip_text):
         return True
     try:
         ip = ipaddress.ip_address(ip_text)
@@ -5847,7 +5857,13 @@ def _is_models_fetch_local_ip(ip_text: str) -> bool:
     return ip.is_loopback or ip.is_private
 
 
-def _resolve_models_fetch_target(host: str, port: int, *, trust_local: bool = False) -> str:
+def _resolve_models_fetch_target(
+    host: str,
+    port: int,
+    *,
+    trust_local: bool = False,
+    allow_user_url: bool = False,
+) -> str:
     try:
         addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
@@ -5856,12 +5872,14 @@ def _resolve_models_fetch_target(host: str, port: int, *, trust_local: bool = Fa
     for address in addresses:
         ip_text = address[4][0]
         # 云元数据地址无条件拦截，受信本地放行也不覆盖。
-        if ip_text in _MODELS_FETCH_METADATA_IPS:
+        if _is_models_fetch_metadata_ip(ip_text):
             raise _ModelsFetchError("resolved address is blocked")
         if _is_models_fetch_ip_blocked(ip_text):
-            # 仅受信本地主机（host.docker.internal / 回环）在已通过白名单时，
-            # 放行其解析出的回环/私网地址；其余主机一律 fail-closed。
-            if not (trust_local and _is_models_fetch_local_ip(ip_text)):
+            # 已登录用户明确提供/保存的 URL 是用户自有上游，可以是
+            # Tailscale、回环或其他非公网地址；云元数据地址仍在上方硬拦截。
+            if not allow_user_url and not (
+                trust_local and _is_models_fetch_local_ip(ip_text)
+            ):
                 raise _ModelsFetchError("resolved address is blocked")
         if safe_ip is None:
             safe_ip = ip_text
@@ -5957,18 +5975,34 @@ def _extract_models_from_payload(body: str) -> list[str]:
     return models
 
 
-def _fetch_available_models(base_url: str, api_key: str) -> tuple[list[str], str]:
-    allowlist = _parse_models_fetch_allowlist()
-    if allowlist is None:
-        raise _ModelsFetchError("models fetch allowlist is not configured")
+def _fetch_available_models(
+    base_url: str,
+    api_key: str,
+    *,
+    allow_user_url: bool = False,
+) -> tuple[list[str], str]:
     parsed = _parse_models_fetch_url(base_url)
     host = (parsed.hostname or "").casefold().rstrip(".")
     port = _models_fetch_port(parsed)
     trust_local = host in _MODELS_FETCH_TRUSTED_LOCAL_HOSTS
-    # 受信本地主机必须钉死端口（require_explicit_port），防止裸 host 变任意端口可探。
-    if not _models_fetch_host_allowed(host, port, allowlist, require_explicit_port=trust_local):
-        raise _ModelsFetchError("host is not allowlisted")
-    safe_ip = _resolve_models_fetch_target(host, port, trust_local=trust_local)
+    if not allow_user_url:
+        allowlist = _parse_models_fetch_allowlist()
+        if allowlist is None:
+            raise _ModelsFetchError("models fetch allowlist is not configured")
+        # 受信本地主机必须钉死端口（require_explicit_port），防止裸 host 变任意端口可探。
+        if not _models_fetch_host_allowed(
+            host,
+            port,
+            allowlist,
+            require_explicit_port=trust_local,
+        ):
+            raise _ModelsFetchError("host is not allowlisted")
+    safe_ip = _resolve_models_fetch_target(
+        host,
+        port,
+        trust_local=trust_local,
+        allow_user_url=allow_user_url,
+    )
     path = _models_fetch_path(parsed)
     headers = {}
     if api_key:
@@ -6026,7 +6060,7 @@ def fetch_available_models(
     db: Session = Depends(get_db),
     current_user: UserDB = Depends(_require_api_user),
 ):
-    """从白名单允许的 Base URL 抓取可用模型列表。"""
+    """从用户自有或默认白名单 Base URL 抓取可用模型列表。"""
     # 匿名回退收窄：默认本地账号(local@tradingagents.local)仅在回环来源下可用。
     # 非回环来源（局域网/暴露端口）必须提供登录或 API Token，否则拒绝匿名调用。
     # 判定用 request.client 真实对端，不信任可伪造的代理头。
@@ -6034,30 +6068,44 @@ def fetch_available_models(
         request.client.host if request.client else None
     ):
         raise HTTPException(status_code=401, detail="authentication required")
-    base_url = (payload.base_url or "").strip()
+    requested_base_url = (payload.base_url or "").strip()
     api_key = (payload.api_key or "").strip()
+    provider = None
 
     if payload.provider_id:
         provider = db.query(ProviderDB).filter(
             ProviderDB.id == payload.provider_id,
             ProviderDB.user_id == current_user.id
         ).first()
-        if provider:
-            base_url = base_url or provider.base_url
-            if not api_key and provider.api_key_ciphertext:
-                api_key = auth_service.decrypt_secret(provider.api_key_ciphertext) or ""
+    user_cfg = auth_service.get_user_llm_config(db, current_user.id)
 
-    if not base_url:
-        user_cfg = auth_service.get_user_llm_config(db, current_user.id)
-        if user_cfg:
-            base_url = user_cfg.custom_base_url or ""
-            if not api_key and user_cfg.llm_api_key_ciphertext:
-                api_key = auth_service.decrypt_secret(user_cfg.llm_api_key_ciphertext) or ""
+    saved_base_url = (user_cfg.backend_url or "").strip() if user_cfg else ""
+    provider_base_url = (provider.base_url or "").strip() if provider else ""
+    base_url = (
+        requested_base_url
+        or saved_base_url
+        or provider_base_url
+        or _MODELS_FETCH_DEFAULT_URL
+    )
+    user_url_selected = bool(
+        requested_base_url or saved_base_url or provider_base_url
+    )
+    allow_user_url = (
+        current_user.id != _DEFAULT_LOCAL_USER_ID and user_url_selected
+    )
 
-    if not base_url:
-        base_url = _MODELS_FETCH_DEFAULT_URL
+    if not api_key and provider and provider.api_key_encrypted:
+        api_key = auth_service.decrypt_secret(provider.api_key_encrypted) or ""
+    if not api_key and user_cfg and user_cfg.api_key_encrypted:
+        api_key = auth_service.decrypt_secret(user_cfg.api_key_encrypted) or ""
+    if not api_key:
+        api_key = os.getenv("TA_API_KEY", "").strip()
     try:
-        models_sorted, target_url = _fetch_available_models(base_url, api_key)
+        models_sorted, target_url = _fetch_available_models(
+            base_url,
+            api_key,
+            allow_user_url=allow_user_url,
+        )
     except Exception as exc:
         logger.warning("[fetch_available_models] rejected: %s", exc)
         return {
@@ -6066,11 +6114,6 @@ def fetch_available_models(
             "models": [],
             "count": 0,
         }
-    if models_sorted and current_user:
-        try:
-            role_routing_service.sync_model_profiles_from_names(db, current_user.id, models_sorted)
-        except Exception as sync_err:
-            logger.warning("[fetch_available_models] model profile sync failed: %s", sync_err)
     return {
         "ok": True,
         "models": models_sorted,
