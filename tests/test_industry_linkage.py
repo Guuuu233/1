@@ -328,7 +328,7 @@ def test_unknown_industry():
     """测试未配置行业安全返回与异常优雅降级 (M5 核心用例 4).
 
     验证点：
-    1. 查询未配置行业（如 '未知行业'、'房地产'、'银行业'）安全返回 None，不抛出异常；
+    1. 查询未配置行业（如 '未知行业'、'采掘服务'、'养殖业'）安全返回 None，不抛出异常；
     2. 空字符串、纯空白、非法类型 (None, 数字) 安全返回 None；
     3. 外部数据源（akshare / yfinance）网络超时、429 报错或接口崩溃时，Provider 自动捕获并降级为结构化缺失状态；
     4. format_industry_linkage_for_prompt 面对空数据、None 与非预期输入安全返回空字符串。
@@ -337,8 +337,8 @@ def test_unknown_industry():
 
     # 1. 未配置或非法行业输入
     assert provider.get_industry_linkage("未知行业") is None
-    assert provider.get_industry_linkage("房地产") is None
-    assert provider.get_industry_linkage("银行业") is None
+    assert provider.get_industry_linkage("采掘服务") is None
+    assert provider.get_industry_linkage("养殖业") is None
     assert provider.get_industry_linkage("") is None
     assert provider.get_industry_linkage("   ") is None
     assert provider.get_industry_linkage(None) is None  # type: ignore
@@ -384,10 +384,10 @@ def test_data_collector_integration():
     """测试 DataCollector 股票映射与产业链数据注入全流程 (M5 核心用例 5).
 
     验证点：
-    1. _map_stock_to_industry 映射逻辑（消费电子标的、新能源车标的、未映射银行白酒标的、大小写与代码后缀容错）；
+    1. _map_stock_to_industry 映射逻辑（消费电子、新能源车、半导体、石油化工、金融地产标的及未映射标的）；
     2. DataCollector 实例初始化与 industry_linkage_provider 依赖注入；
-    3. _fetch_all 针对已映射标的（京东方A、宁德时代）正确注入 industry_linkage；
-    4. _fetch_all 针对未映射标的（招商银行）将 industry_linkage 置为 None 且不发起多余调用；
+    3. _fetch_all 针对已映射标的（京东方A、中芯国际、中国石油、招商银行等）正确注入 industry_linkage；
+    4. _fetch_all 针对未映射标的（贵州茅台 600519.SH）将 industry_linkage 置为 None 且不发起多余调用；
     5. _fetch_all 兼容 YYYY-MM-DD 与 YYYYMMDD 两种日期格式；
     6. DataCollector.collect() 具备全局缓存与深拷贝安全。
     """
@@ -410,10 +410,31 @@ def test_data_collector_integration():
     assert _map_stock_to_industry("002460.SZ") == "新能源车"  # 赣锋锂业
     assert _map_stock_to_industry("002466.SZ") == "新能源车"  # 天齐锂业
 
+    # 半导体
+    assert _map_stock_to_industry("688981.SH") == "半导体"  # 中芯国际
+    assert _map_stock_to_industry("688981") == "半导体"
+    assert _map_stock_to_industry("688981.sh") == "半导体"
+    assert _map_stock_to_industry("603501.SH") == "半导体"  # 韦尔股份
+    assert _map_stock_to_industry("603501") == "半导体"
+
+    # 石油化工
+    assert _map_stock_to_industry("601857.SH") == "石油化工"  # 中国石油
+    assert _map_stock_to_industry("601857") == "石油化工"
+    assert _map_stock_to_industry("601857.sh") == "石油化工"
+    assert _map_stock_to_industry("600309.SH") == "石油化工"  # 万华化学
+    assert _map_stock_to_industry("600309") == "石油化工"
+
+    # 金融地产
+    assert _map_stock_to_industry("600036.SH") == "金融地产"  # 招商银行
+    assert _map_stock_to_industry("600036") == "金融地产"
+    assert _map_stock_to_industry("600036.sh") == "金融地产"
+    assert _map_stock_to_industry("000002.SZ") == "金融地产"  # 万科A
+    assert _map_stock_to_industry("000002") == "金融地产"
+    assert _map_stock_to_industry("000002.sz") == "金融地产"
+
     # 未映射股票与非法输入
-    assert _map_stock_to_industry("600036.SH") is None  # 招商银行
     assert _map_stock_to_industry("600519.SH") is None  # 贵州茅台
-    assert _map_stock_to_industry("000001.SZ") is None  # 平安银行
+    assert _map_stock_to_industry("601318.SH") is None  # 中国平安
     assert _map_stock_to_industry(None) is None
     assert _map_stock_to_industry("") is None
     assert _map_stock_to_industry(12345) is None  # type: ignore
@@ -449,11 +470,11 @@ def test_data_collector_integration():
         assert res_boe["industry_linkage"]["industry_name"] == "消费电子/半导体显示"
         mock_provider.get_industry_linkage.assert_called_with("消费电子", as_of="2026-08-20")
 
-        # 4. _fetch_all 对未映射标的 (招商银行)
+        # 4. _fetch_all 对未映射标的 (贵州茅台 600519.SH)
         mock_provider.reset_mock()
-        res_cmb = _fetch_all("600036.SH", "2026-08-20", industry_provider=mock_provider)
-        assert "industry_linkage" in res_cmb
-        assert res_cmb["industry_linkage"] is None
+        res_moutai = _fetch_all("600519.SH", "2026-08-20", industry_provider=mock_provider)
+        assert "industry_linkage" in res_moutai
+        assert res_moutai["industry_linkage"] is None
         mock_provider.get_industry_linkage.assert_not_called()
 
         # 5. 日期格式归一化 (YYYYMMDD -> 2026-08-20)
@@ -483,7 +504,7 @@ def test_data_collector_integration():
 
 
 # ---------------------------------------------------------------------------
-# 补充测试类 (Structural & Boundary Checks)
+# 补充测试类 (Structural & Boundary Checks & DAV-256 Multi-industry)
 # ---------------------------------------------------------------------------
 
 
@@ -491,10 +512,14 @@ class TestIndustryLinkageSuite:
     """产业链数据层完整性与边界回归测试类。"""
 
     def test_linkage_map_and_helper_functions(self):
-        """测试 INDUSTRY_LINKAGE_MAP 配置结构与辅助查询函数。"""
+        """测试 INDUSTRY_LINKAGE_MAP 配置结构与辅助查询函数（验证 5 个支持行业）。"""
         supported = list_supported_industries()
         assert "消费电子" in supported
         assert "新能源车" in supported
+        assert "半导体" in supported
+        assert "石油化工" in supported
+        assert "金融地产" in supported
+        assert len(supported) == 5
 
         ce_config = get_industry_linkage_config("消费电子")
         assert ce_config is not None
@@ -505,8 +530,267 @@ class TestIndustryLinkageSuite:
         assert ce_fuzzy is not None
         assert ce_fuzzy.industry_name == "消费电子/半导体显示"
 
+        semi_fuzzy = get_industry_linkage_config("半导体/集成电路")
+        assert semi_fuzzy is not None
+        assert semi_fuzzy.industry_name == "半导体/集成电路"
+
+        bank_fuzzy = get_industry_linkage_config("银行")
+        assert bank_fuzzy is not None
+        assert bank_fuzzy.industry_name == "金融地产/商业银行与房地产"
+
+        re_fuzzy = get_industry_linkage_config("房地产")
+        assert re_fuzzy is not None
+        assert re_fuzzy.industry_name == "金融地产/商业银行与房地产"
+
         unknown_config = get_industry_linkage_config("未知赛道")
         assert unknown_config is None
+
+    def test_get_industry_linkage_semiconductor(self):
+        """测试半导体行业动态产业链采集与指标结构 (DAV-256)."""
+        provider = IndustryLinkageProvider()
+
+        # 构造 yfinance 模拟数据
+        dates = pd.date_range("2026-05-01", periods=70, freq="B")
+        prices_sox = [5000.0 + (i * 10.0) for i in range(70)]
+        df_sox = pd.DataFrame({"Open": prices_sox, "High": prices_sox, "Low": prices_sox, "Close": prices_sox, "Volume": [1000000] * 70}, index=dates)
+        df_sox.index.name = "Date"
+
+        prices_tsm = [150.0 + (i * 0.5) for i in range(70)]
+        df_tsm = pd.DataFrame({"Open": prices_tsm, "High": prices_tsm, "Low": prices_tsm, "Close": prices_tsm, "Volume": [5000000] * 70}, index=dates)
+        df_tsm.index.name = "Date"
+
+        with patch("yfinance.Ticker") as mock_yf:
+            def side_effect_yf(symbol):
+                instance = MagicMock()
+                if symbol == "^SOX":
+                    instance.history.return_value = df_sox
+                elif symbol == "TSM":
+                    instance.history.return_value = df_tsm
+                else:
+                    instance.history.return_value = pd.DataFrame()
+                return instance
+
+            mock_yf.side_effect = side_effect_yf
+
+            data = provider.get_industry_linkage("半导体", as_of="2026-08-20", use_cache=False)
+
+            assert data is not None
+            assert data["industry_name"] == "半导体/集成电路"
+            assert "国家大基金产业投资" in data["policy_catalysts"]
+
+            # 上游指标（待接入API）
+            assert len(data["upstream_cost"]) >= 1
+            silicon = data["upstream_cost"][0]
+            assert silicon["name"] == "半导体硅片价格"
+            assert silicon["current_value"] is None
+            assert silicon["trend"] == "数据缺失"
+            assert silicon["confidence"] == "低（待接入API）"
+
+            # 下游指标（手动 + 待接入）
+            assert len(data["downstream_demand"]) >= 2
+            sia = [d for d in data["downstream_demand"] if d["name"] == "全球半导体销售额"][0]
+            assert sia["current_value"] is None
+            assert sia["trend"] == "数据缺失"
+            assert sia["confidence"] == "低（待手动录入）"
+
+            dram = [d for d in data["downstream_demand"] if d["name"] == "DRAM存储芯片现货价"][0]
+            assert dram["current_value"] is None
+            assert dram["trend"] == "数据缺失"
+            assert dram["confidence"] == "低（待接入API）"
+
+            # 国际对标（yfinance）
+            assert len(data["international_benchmark"]) >= 2
+            sox = [b for b in data["international_benchmark"] if b["symbol"] == "^SOX"][0]
+            assert sox["current_value"] is not None and sox["current_value"] > 0
+            assert sox["trend"] == "上升"
+            assert sox["confidence"] == "高"
+
+            tsm = [b for b in data["international_benchmark"] if b["symbol"] == "TSM"][0]
+            assert tsm["current_value"] is not None and tsm["current_value"] > 0
+            assert tsm["trend"] == "上升"
+            assert tsm["confidence"] == "高"
+
+            # Prompt 渲染
+            prompt = format_industry_linkage_for_prompt(data)
+            assert "【产业链联想数据】：半导体/集成电路" in prompt
+            assert "费城半导体指数" in prompt
+            assert "台积电股价" in prompt
+            assert "【数据缺失】半导体硅片价格" in prompt
+
+    def test_get_industry_linkage_petrochemicals(self):
+        """测试石油化工行业动态产业链采集与指标结构 (DAV-256)."""
+        provider = IndustryLinkageProvider()
+
+        dates = pd.date_range("2026-05-01", periods=70, freq="B")
+        prices_brent = [80.0 + (i * 0.2) for i in range(70)]
+        df_brent = pd.DataFrame({"Open": prices_brent, "High": prices_brent, "Low": prices_brent, "Close": prices_brent, "Volume": [200000] * 70}, index=dates)
+        df_brent.index.name = "Date"
+
+        prices_xom = [115.0 - (i * 0.3) for i in range(70)]
+        df_xom = pd.DataFrame({"Open": prices_xom, "High": prices_xom, "Low": prices_xom, "Close": prices_xom, "Volume": [3000000] * 70}, index=dates)
+        df_xom.index.name = "Date"
+
+        with patch("yfinance.Ticker") as mock_yf:
+            def side_effect_yf(symbol):
+                instance = MagicMock()
+                if symbol == "BZ=F":
+                    instance.history.return_value = df_brent
+                elif symbol == "XOM":
+                    instance.history.return_value = df_xom
+                else:
+                    instance.history.return_value = pd.DataFrame()
+                return instance
+
+            mock_yf.side_effect = side_effect_yf
+
+            data = provider.get_industry_linkage("石油化工", as_of="2026-08-20", use_cache=False)
+
+            assert data is not None
+            assert data["industry_name"] == "石油化工/基础化工"
+            assert "能耗双控向碳排放双控转变" in data["policy_catalysts"]
+
+            # 上游原油
+            assert len(data["upstream_cost"]) >= 1
+            brent = data["upstream_cost"][0]
+            assert brent["name"] == "布伦特原油价格"
+            assert brent["current_value"] is not None and brent["current_value"] > 0
+            assert brent["trend"] == "上升"
+            assert brent["confidence"] == "高"
+
+            # 下游成品油与聚酯
+            assert len(data["downstream_demand"]) >= 2
+            oil_demand = [d for d in data["downstream_demand"] if d["name"] == "国内成品油消费量"][0]
+            assert oil_demand["current_value"] is None
+            assert oil_demand["trend"] == "数据缺失"
+
+            # 国际对标
+            xom = data["international_benchmark"][0]
+            assert xom["symbol"] == "XOM"
+            assert xom["current_value"] is not None and xom["current_value"] > 0
+            assert xom["trend"] == "下降"
+            assert xom["confidence"] == "高"
+
+            # Prompt 渲染
+            prompt = format_industry_linkage_for_prompt(data)
+            assert "【产业链联想数据】：石油化工/基础化工" in prompt
+            assert "布伦特原油价格" in prompt
+            assert "埃克森美孚股价" in prompt
+
+    def test_get_industry_linkage_finance_real_estate(self):
+        """测试金融地产行业动态产业链采集与指标结构 (DAV-256)."""
+        provider = IndustryLinkageProvider()
+
+        dates = pd.date_range("2026-05-01", periods=70, freq="B")
+        prices_jpm = [190.0 + (i * 0.4) for i in range(70)]
+        df_jpm = pd.DataFrame({"Open": prices_jpm, "High": prices_jpm, "Low": prices_jpm, "Close": prices_jpm, "Volume": [2000000] * 70}, index=dates)
+        df_jpm.index.name = "Date"
+
+        prices_xlf = [40.0 + (i * 0.1) for i in range(70)]
+        df_xlf = pd.DataFrame({"Open": prices_xlf, "High": prices_xlf, "Low": prices_xlf, "Close": prices_xlf, "Volume": [10000000] * 70}, index=dates)
+        df_xlf.index.name = "Date"
+
+        with patch("yfinance.Ticker") as mock_yf:
+            def side_effect_yf(symbol):
+                instance = MagicMock()
+                if symbol == "JPM":
+                    instance.history.return_value = df_jpm
+                elif symbol == "XLF":
+                    instance.history.return_value = df_xlf
+                else:
+                    instance.history.return_value = pd.DataFrame()
+                return instance
+
+            mock_yf.side_effect = side_effect_yf
+
+            data = provider.get_industry_linkage("金融地产", as_of="2026-08-20", use_cache=False)
+
+            assert data is not None
+            assert data["industry_name"] == "金融地产/商业银行与房地产"
+            assert "存量房贷利率调降政策" in data["policy_catalysts"]
+
+            # 上游指标（待接入/手动）
+            assert len(data["upstream_cost"]) >= 2
+            shibor = [u for u in data["upstream_cost"] if "同业拆借" in u["name"]][0]
+            assert shibor["current_value"] is None
+            assert shibor["trend"] == "数据缺失"
+
+            # 下游指标（待接入/手动）
+            assert len(data["downstream_demand"]) >= 2
+            re_sales = [d for d in data["downstream_demand"] if "商品房成交" in d["name"]][0]
+            assert re_sales["current_value"] is None
+            assert re_sales["trend"] == "数据缺失"
+
+            # 国际对标
+            assert len(data["international_benchmark"]) >= 2
+            jpm = [b for b in data["international_benchmark"] if b["symbol"] == "JPM"][0]
+            assert jpm["current_value"] is not None and jpm["current_value"] > 0
+            assert jpm["confidence"] == "高"
+
+            xlf = [b for b in data["international_benchmark"] if b["symbol"] == "XLF"][0]
+            assert xlf["current_value"] is not None and xlf["current_value"] > 0
+            assert xlf["confidence"] == "高"
+
+            prompt = format_industry_linkage_for_prompt(data)
+            assert "【产业链联想数据】：金融地产/商业银行与房地产" in prompt
+            assert "摩根大通股价" in prompt
+            assert "标普500金融行业指数" in prompt
+
+    def test_all_five_industries_return_non_empty_linkage(self):
+        """验收标准2：5个行业都能 get_industry_linkage 返回非空结构；缺指标显式「数据缺失」，禁止臆造数值。"""
+        provider = IndustryLinkageProvider()
+        five_industries = ["消费电子", "新能源车", "半导体", "石油化工", "金融地产"]
+
+        with patch("akshare.futures_foreign_hist", return_value=pd.DataFrame()), \
+             patch("yfinance.Ticker", side_effect=Exception("Offline test")):
+            for ind_name in five_industries:
+                data = provider.get_industry_linkage(ind_name, as_of="2026-08-20", use_cache=False)
+                assert data is not None, f"行业 {ind_name} 应返回非空产业链结构"
+                assert "industry_name" in data and len(data["industry_name"]) > 0
+                assert "upstream_cost" in data and isinstance(data["upstream_cost"], list)
+                assert "downstream_demand" in data and isinstance(data["downstream_demand"], list)
+                assert "international_benchmark" in data and isinstance(data["international_benchmark"], list)
+                assert "policy_catalysts" in data and len(data["policy_catalysts"]) > 0
+                assert "description" in data
+
+                # 验证离线/异常时所有指标均为「数据缺失」，零臆造数值
+                all_indicators = (
+                    data["upstream_cost"] + data["downstream_demand"] + data["international_benchmark"]
+                )
+                assert len(all_indicators) > 0
+                for ind in all_indicators:
+                    assert ind["current_value"] is None, f"{ind['name']} 异常/离线时 current_value 必须为 None"
+                    assert ind["trend"] == "数据缺失", f"{ind['name']} trend 必须为「数据缺失」"
+
+    def test_free_sources_typed_gap_on_failure(self):
+        """验收标准4：免费源（Yahoo/LME 等）失败必须 typed gap，不得假成功。"""
+        provider = IndustryLinkageProvider()
+
+        # akshare 失败
+        with patch("akshare.futures_foreign_hist", side_effect=Exception("LME connection failed")):
+            ind_lme = IndustryLinkageIndicator(name="LME铜价", source="akshare", symbol="铜")
+            res_lme = provider._fetch_indicator(ind_lme)
+            assert res_lme["current_value"] is None
+            assert res_lme["trend"] == "数据缺失"
+            assert res_lme["confidence"] == "低（接口异常）"
+            assert "LME connection failed" in res_lme["note"]
+
+        # yfinance 失败
+        with patch("yfinance.Ticker", side_effect=Exception("Yahoo 429 Too Many Requests")):
+            ind_yf = IndustryLinkageIndicator(name="台积电股价", source="yfinance", symbol="TSM")
+            res_yf = provider._fetch_indicator(ind_yf)
+            assert res_yf["current_value"] is None
+            assert res_yf["trend"] == "数据缺失"
+            assert res_yf["confidence"] == "低（接口异常）"
+            assert "Yahoo 429" in res_yf["note"]
+
+    def test_data_collector_maps_required_six_stocks(self):
+        """验收标准3：DataCollector 能把 6 只股票映射到正确行业。"""
+        assert _map_stock_to_industry("688981.SH") == "半导体"  # 中芯国际
+        assert _map_stock_to_industry("603501.SH") == "半导体"  # 韦尔股份
+        assert _map_stock_to_industry("601857.SH") == "石油化工"  # 中国石油
+        assert _map_stock_to_industry("600309.SH") == "石油化工"  # 万华化学
+        assert _map_stock_to_industry("600036.SH") == "金融地产"  # 招商银行
+        assert _map_stock_to_industry("000002.SZ") == "金融地产"  # 万科A
 
     def test_as_of_lookahead_filtering(self, mock_copper_dataframe: pd.DataFrame):
         """测试 as_of 截止日期过滤，防止未来数据泄露。"""

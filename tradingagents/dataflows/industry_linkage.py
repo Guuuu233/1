@@ -124,7 +124,7 @@ class IndustryLinkage(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 行业产业链指标配置映射 (MVP 阶段支持核心 2 个行业)
+# 行业产业链指标配置映射 (支持核心 5 个行业: 消费电子、新能源车、半导体、石油化工、金融地产)
 # ---------------------------------------------------------------------------
 
 INDUSTRY_LINKAGE_MAP: Dict[str, IndustryLinkage] = {
@@ -222,6 +222,213 @@ INDUSTRY_LINKAGE_MAP: Dict[str, IndustryLinkage] = {
         ],
         description="新能源车/动力电池行业产业链指标映射（上游碳酸锂成本、下游新能源车渗透率、国际对标特斯拉交付量）",
     ),
+    "半导体": IndustryLinkage(
+        industry_name="半导体/集成电路",
+        upstream_cost=[
+            IndustryLinkageIndicator(
+                name="半导体硅片价格",
+                source="pending_api",
+                symbol=None,
+                frequency="monthly",
+                unit="美元/片",
+                role="upstream",
+                status="pending_api",
+                note="待接入API",
+                transmission_logic="晶圆制造核心大硅片衬底原材料成本传导",
+            ),
+        ],
+        downstream_demand=[
+            IndustryLinkageIndicator(
+                name="全球半导体销售额",
+                source="manual",
+                symbol=None,
+                frequency="monthly",
+                unit="亿美元",
+                role="downstream",
+                status="manual",
+                note="手动",
+                transmission_logic="SIA月度全球半导体产业销售总额与终端景气度验证",
+            ),
+            IndustryLinkageIndicator(
+                name="DRAM存储芯片现货价",
+                source="pending_api",
+                symbol=None,
+                frequency="daily",
+                unit="美元",
+                role="downstream",
+                status="pending_api",
+                note="待接入API",
+                transmission_logic="存储芯片现货价格走势与半导体周期供需拐点风向标",
+            ),
+        ],
+        international_benchmark=[
+            IndustryLinkageIndicator(
+                name="费城半导体指数",
+                source="yfinance",
+                symbol="^SOX",
+                frequency="daily",
+                unit="点",
+                role="benchmark",
+                status="active",
+                transmission_logic="全球半导体行业景气度、估值体系与技术周期核心风向标",
+            ),
+            IndustryLinkageIndicator(
+                name="台积电股价",
+                source="yfinance",
+                symbol="TSM",
+                frequency="daily",
+                unit="美元",
+                role="benchmark",
+                status="active",
+                transmission_logic="全球先进制程晶圆代工龙头业绩、产能利用率与资本开支对标",
+            ),
+        ],
+        policy_catalysts=[
+            "国家大基金产业投资",
+            "集成电路重大专项支持",
+            "半导体关键设备与材料国产替代",
+            "先进制程自主可控政策",
+        ],
+        description="半导体/集成电路行业产业链指标映射（上游硅片成本、下游全球半导体销售额与存储现货价、国际对标费城半导体指数SOX与台积电TSM）",
+    ),
+    "石油化工": IndustryLinkage(
+        industry_name="石油化工/基础化工",
+        upstream_cost=[
+            IndustryLinkageIndicator(
+                name="布伦特原油价格",
+                source="yfinance",
+                symbol="BZ=F",
+                frequency="daily",
+                unit="美元/桶",
+                role="upstream",
+                status="active",
+                transmission_logic="石油化工产业链最源头大宗原油原材料成本传导",
+            ),
+        ],
+        downstream_demand=[
+            IndustryLinkageIndicator(
+                name="国内成品油消费量",
+                source="manual",
+                symbol=None,
+                frequency="monthly",
+                unit="万吨",
+                role="downstream",
+                status="manual",
+                note="手动",
+                transmission_logic="下游交通运输与工业基础燃料终端消费需求景气度",
+            ),
+            IndustryLinkageIndicator(
+                name="聚酯长丝开工率",
+                source="pending_api",
+                symbol=None,
+                frequency="weekly",
+                unit="%",
+                role="downstream",
+                status="pending_api",
+                note="待接入API",
+                transmission_logic="下游纺织服装与聚酯化纤织造端开工与补库需求验证",
+            ),
+        ],
+        international_benchmark=[
+            IndustryLinkageIndicator(
+                name="埃克森美孚股价",
+                source="yfinance",
+                symbol="XOM",
+                frequency="daily",
+                unit="美元",
+                role="benchmark",
+                status="active",
+                transmission_logic="全球综合性一体化石油石化龙头估值、油气开采与炼化盈利对标",
+            ),
+        ],
+        policy_catalysts=[
+            "能耗双控向碳排放双控转变",
+            "成品油出口配额优化",
+            "石化产业布局规划方案",
+            "绿色石化与高端新材料支持",
+        ],
+        description="石油化工/基础化工行业产业链指标映射（上游布伦特原油成本、下游成品油消费与聚酯开工率、国际对标埃克森美孚XOM）",
+    ),
+    "金融地产": IndustryLinkage(
+        industry_name="金融地产/商业银行与房地产",
+        upstream_cost=[
+            IndustryLinkageIndicator(
+                name="银行间同业拆借利率",
+                source="pending_api",
+                symbol="Shibor_3M",
+                frequency="daily",
+                unit="%",
+                role="upstream",
+                status="pending_api",
+                note="待接入API",
+                transmission_logic="商业银行批发性资金获取与同业负债综合成本传导",
+            ),
+            IndustryLinkageIndicator(
+                name="房企综合融资成本",
+                source="manual",
+                symbol=None,
+                frequency="quarterly",
+                unit="%",
+                role="upstream",
+                status="manual",
+                note="手动",
+                transmission_logic="房地产企业境内外债务融资利率、利息资本化与现金流压力",
+            ),
+        ],
+        downstream_demand=[
+            IndustryLinkageIndicator(
+                name="30大中城市商品房成交面积",
+                source="pending_api",
+                symbol=None,
+                frequency="weekly",
+                unit="万平方米",
+                role="downstream",
+                status="pending_api",
+                note="待接入API",
+                transmission_logic="终端商品房销售高频周度景气度与居民部门购房加杠杆意愿",
+            ),
+            IndustryLinkageIndicator(
+                name="社会融资规模增量",
+                source="manual",
+                symbol=None,
+                frequency="monthly",
+                unit="万亿元",
+                role="downstream",
+                status="manual",
+                note="手动",
+                transmission_logic="实体经济全社会信贷投放与有效融资需求扩张验证",
+            ),
+        ],
+        international_benchmark=[
+            IndustryLinkageIndicator(
+                name="摩根大通股价",
+                source="yfinance",
+                symbol="JPM",
+                frequency="daily",
+                unit="美元",
+                role="benchmark",
+                status="active",
+                transmission_logic="全球系统重要性商业银行龙头估值中枢与净息差对标",
+            ),
+            IndustryLinkageIndicator(
+                name="标普500金融行业指数",
+                source="yfinance",
+                symbol="XLF",
+                frequency="daily",
+                unit="美元",
+                role="benchmark",
+                status="active",
+                transmission_logic="海外成熟市场多元金融与银行地产板块整体周期景气度风向标",
+            ),
+        ],
+        policy_catalysts=[
+            "存量房贷利率调降政策",
+            "地方政府隐性债务化解置换",
+            "房地产保交房与收储支持政策",
+            "降准降息与结构性货币政策工具支持",
+        ],
+        description="金融地产/商业银行与房地产行业产业链指标映射（资金端同业负债与融资成本、资产端社融与地产销售、国际对标摩根大通JPM与金融ETF XLF）",
+    ),
 }
 
 
@@ -229,17 +436,24 @@ def get_industry_linkage_config(industry: str) -> Optional[IndustryLinkage]:
     """获取指定行业的产业链指标配置对象。
 
     Args:
-        industry: 行业名称或行业关键词 (如 "消费电子", "新能源车")
+        industry: 行业名称或行业关键词 (如 "消费电子", "新能源车", "半导体", "石油化工", "金融地产", "银行", "房地产")
 
     Returns:
         匹配到的 IndustryLinkage 配置对象，未匹配则返回 None
     """
-    if industry in INDUSTRY_LINKAGE_MAP:
-        return INDUSTRY_LINKAGE_MAP[industry]
+    if not industry or not isinstance(industry, str):
+        return None
 
-    # 支持模糊匹配（如 "消费电子/半导体显示" -> "消费电子"）
+    clean_industry = industry.strip()
+    if not clean_industry:
+        return None
+
+    if clean_industry in INDUSTRY_LINKAGE_MAP:
+        return INDUSTRY_LINKAGE_MAP[clean_industry]
+
+    # 支持模糊匹配（如 "消费电子/半导体显示" -> "消费电子"，"银行" -> "金融地产"）
     for key, config in INDUSTRY_LINKAGE_MAP.items():
-        if key in industry or industry in config.industry_name:
+        if key in clean_industry or clean_industry in key or clean_industry in config.industry_name or config.industry_name in clean_industry:
             return config
 
     return None
