@@ -45,6 +45,18 @@ from tradingagents.knowledge.rag import (
     retrieve_macro_event_knowledge,
     tokenize_cn_en,
 )
+from tradingagents.knowledge.historical_cases import (
+    DATA_MISSING_PLACEHOLDER,
+    HISTORICAL_CASE_MISSING_BLOCK,
+    HISTORICAL_CASE_MISSING_FALLBACK,
+    calculate_t1_return,
+    extract_claims_from_report,
+    format_historical_cases_context,
+    get_current_run_sha,
+    get_next_cn_trading_day,
+    record_historical_case,
+    retrieve_similar_historical_cases,
+)
 
 __all__ = [
     # 行业知识库
@@ -84,4 +96,15 @@ __all__ = [
     "retrieve_industry_knowledge",
     "retrieve_macro_event_knowledge",
     "tokenize_cn_en",
+    # 历史案例学习闭环
+    "DATA_MISSING_PLACEHOLDER",
+    "HISTORICAL_CASE_MISSING_BLOCK",
+    "HISTORICAL_CASE_MISSING_FALLBACK",
+    "calculate_t1_return",
+    "extract_claims_from_report",
+    "format_historical_cases_context",
+    "get_current_run_sha",
+    "get_next_cn_trading_day",
+    "record_historical_case",
+    "retrieve_similar_historical_cases",
 ]

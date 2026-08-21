@@ -926,6 +926,14 @@ def update_report_partial(
     except Exception:
         db.rollback()
         raise
+
+    if db_report.status == "completed":
+        try:
+            from tradingagents.knowledge.historical_cases import record_historical_case
+            record_historical_case(db=db, report=db_report)
+        except Exception as exc:
+            logger.warning("[report_service] record_historical_case failed in update_report_partial: %s", exc)
+
     return db_report
 
 
@@ -1109,6 +1117,15 @@ def create_report(
     except Exception:
         db.rollback()
         raise
+
+    # 落库历史案例学习闭环（只在 completed 时落库）
+    if db_report.status == "completed":
+        try:
+            from tradingagents.knowledge.historical_cases import record_historical_case
+            record_historical_case(db=db, report=db_report)
+        except Exception as exc:
+            logger.warning("[report_service] record_historical_case failed in create_report: %s", exc)
+
     return db_report
 
 

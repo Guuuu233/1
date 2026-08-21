@@ -17,6 +17,7 @@ from tradingagents.agents.utils.context_utils import get_cn_stock_name
 from tradingagents.agents.utils.knowledge_context import (
     resolve_industry_context,
     resolve_macro_event_context,
+    resolve_historical_cases_context,
 )
 from tradingagents.dataflows.industry_linkage import (
     format_industry_linkage_for_prompt,
@@ -143,6 +144,14 @@ def create_macro_analyst(llm, data_collector=None):
             max_events=2,
             fallback_on_miss=False,
         )
+        _, historical_cases_ctx = resolve_historical_cases_context(
+            ticker=ticker,
+            stock_name=stock_name,
+            trade_date=current_date,
+            state=state,
+            max_cases=3,
+            fallback_on_miss=False,
+        )
 
         # ── 产业链联想数据段落 ──────────────────────
         industry_linkage_text = format_industry_linkage_for_prompt(industry_linkage_data)
@@ -183,6 +192,11 @@ def create_macro_analyst(llm, data_collector=None):
             human_content_lines.append(f"{macro_event_ctx}")
         else:
             human_content_lines.append("【宏观事件传导图谱】\n【知识库未命中】")
+
+        if historical_cases_ctx:
+            human_content_lines.append(f"{historical_cases_ctx}")
+        else:
+            human_content_lines.append("【历史案例复盘】\n【历史案例未命中】")
 
         messages = [
             SystemMessage(content=(

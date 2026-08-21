@@ -34,6 +34,12 @@ from tradingagents.knowledge.rag import (
     retrieve_industry_knowledge,
     retrieve_macro_event_knowledge,
 )
+from tradingagents.knowledge.historical_cases import (
+    HISTORICAL_CASE_MISSING_BLOCK,
+    HISTORICAL_CASE_MISSING_FALLBACK,
+    format_historical_cases_context,
+    retrieve_similar_historical_cases,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -927,15 +933,96 @@ def resolve_macro_event_context(
     return scenarios, formatted
 
 
+def resolve_historical_cases_context(
+    ticker: str = "",
+    stock_name: str = "",
+    trade_date: str = "",
+    state: Optional[dict] = None,
+    max_cases: int = 3,
+    fallback_on_miss: bool = False,
+    db: Optional[Any] = None,
+) -> Tuple[List[Any], str]:
+    """根据标的、行业及日期检索历史相似案例并生成 Prompt 上下文。
+
+    若检索到案例，返回 (cases, formatted_context)；
+    若未命中：
+      - fallback_on_miss=True 时返回 ([], '【历史案例复盘】\n【历史案例未命中】')；
+      - fallback_on_miss=False 时返回 ([], '')。
+    """
+    clean_ticker = (ticker or "").strip().upper()
+    if not clean_ticker and state and "company_of_interest" in state:
+        clean_ticker = str(state["company_of_interest"] or "").strip().upper()
+
+    clean_trade_date = (trade_date or "").strip()
+    if not clean_trade_date and state and "trade_date" in state:
+        clean_trade_date = str(state["trade_date"] or "").strip()
+
+    if not clean_ticker:
+        return [], (HISTORICAL_CASE_MISSING_BLOCK if fallback_on_miss else "")
+
+    profile = resolve_industry_profile(
+        ticker=clean_ticker,
+        stock_name=stock_name,
+        state=state,
+    )
+    industry_id = profile.industry_id if profile else None
+
+    try:
+        cases = retrieve_similar_historical_cases(
+            symbol=clean_ticker,
+            industry=industry_id,
+            before_date=clean_trade_date or None,
+            max_cases=max_cases,
+            db=db,
+        )
+    except Exception as exc:
+        logger.warning("Failed to retrieve historical cases: %s", exc)
+        cases = []
+
+    if not cases:
+        return [], (HISTORICAL_CASE_MISSING_BLOCK if fallback_on_miss else "")
+
+    formatted = format_historical_cases_context(
+        cases_or_query=cases,
+        max_cases=max_cases,
+        fallback_on_miss=fallback_on_miss,
+    )
+    return cases, formatted
+
+
+def format_rag_historical_cases_context(
+    cases_or_query: Any,
+    symbol: str = "",
+    industry: Optional[str] = None,
+    before_date: Optional[str] = None,
+    max_cases: int = 3,
+    fallback_on_miss: bool = True,
+    db: Optional[Any] = None,
+) -> str:
+    """将历史案例格式化为 Prompt 注入文本（兼容 RAG 格式化风格）。"""
+    return format_historical_cases_context(
+        cases_or_query=cases_or_query,
+        symbol=symbol,
+        industry=industry,
+        before_date=before_date,
+        max_cases=max_cases,
+        fallback_on_miss=fallback_on_miss,
+        db=db,
+    )
+
+
 def resolve_dynamic_knowledge_context(
     ticker: str = "",
     stock_name: str = "",
     extra_text: str = "",
+    trade_date: str = "",
     state: Optional[dict] = None,
     max_macro_events: int = 2,
+    max_historical_cases: int = 3,
     fallback_on_miss: bool = True,
+    db: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """统一动态解析标的行业知识图谱与宏观事件传导情景。
+    """统一动态解析标的行业知识图谱、宏观事件传导情景与历史相似案例。
 
     返回结构：
     {
@@ -943,6 +1030,8 @@ def resolve_dynamic_knowledge_context(
         'industry_context': str,
         'macro_scenarios': List[MacroEventScenario],
         'macro_event_context': str,
+        'historical_cases': List[Any],
+        'historical_cases_context': str,
     }
     """
     profile, ind_ctx = resolve_industry_context(
@@ -957,11 +1046,22 @@ def resolve_dynamic_knowledge_context(
         max_events=max_macro_events,
         fallback_on_miss=fallback_on_miss,
     )
+    cases, cases_ctx = resolve_historical_cases_context(
+        ticker=ticker,
+        stock_name=stock_name,
+        trade_date=trade_date,
+        state=state,
+        max_cases=max_historical_cases,
+        fallback_on_miss=fallback_on_miss,
+        db=db,
+    )
     return {
         "industry_profile": profile,
         "industry_context": ind_ctx,
         "macro_scenarios": scenarios,
         "macro_event_context": macro_ctx,
+        "historical_cases": cases,
+        "historical_cases_context": cases_ctx,
     }
 
 

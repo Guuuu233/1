@@ -88,6 +88,7 @@ def init_db() -> None:
     _ensure_user_schema()
     _ensure_scheduled_schema()
     _ensure_llm_call_log_schema()
+    _ensure_historical_cases_schema()
 
 
 def _ensure_report_schema() -> None:
@@ -271,6 +272,14 @@ def _ensure_llm_call_log_schema() -> None:
         Base.metadata.create_all(bind=engine, tables=[LLMCallLogDB.__table__], checkfirst=True)
     except Exception as e:
         logger.error("Failed to ensure llm_call_log schema: %s", e)
+
+
+def _ensure_historical_cases_schema() -> None:
+    """Create historical_cases table on first boot (safe for existing deployments)."""
+    try:
+        Base.metadata.create_all(bind=engine, tables=[HistoricalCaseDB.__table__], checkfirst=True)
+    except Exception as e:
+        logger.error("Failed to ensure historical_cases schema: %s", e)
 
 
 def log_llm_call(
@@ -659,3 +668,46 @@ class LLMCallLogDB(Base):
     response_chars = Column(Integer, nullable=True)
     degraded = Column(Boolean, nullable=False, default=False, server_default="0")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+
+class HistoricalCaseDB(Base):
+    """Historical case model for post-analysis review and learning loop."""
+    __tablename__ = "historical_cases"
+
+    id = Column(String(36), primary_key=True, index=True)
+    report_id = Column(String(36), index=True, nullable=True)
+    symbol = Column(String(20), index=True, nullable=False)
+    industry = Column(String(50), index=True, nullable=True)
+    trade_date = Column(String(10), index=True, nullable=False)
+    decision = Column(String(50), nullable=True)
+    direction = Column(String(50), nullable=True)
+    confidence = Column(Integer, nullable=True)
+    claims = Column(JSON, nullable=False, default=list, server_default="[]")
+    run_sha = Column(String(64), nullable=True)
+    eval_date = Column(String(10), nullable=True)
+    actual_change_pct = Column(Float, nullable=True)
+    actual_outcome = Column(String(50), nullable=True)
+    is_error = Column(Boolean, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "report_id": self.report_id,
+            "symbol": self.symbol,
+            "industry": self.industry,
+            "trade_date": self.trade_date,
+            "decision": self.decision,
+            "direction": self.direction,
+            "confidence": self.confidence,
+            "claims": self.claims or [],
+            "run_sha": self.run_sha,
+            "eval_date": self.eval_date,
+            "actual_change_pct": self.actual_change_pct,
+            "actual_outcome": self.actual_outcome,
+            "is_error": self.is_error,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
