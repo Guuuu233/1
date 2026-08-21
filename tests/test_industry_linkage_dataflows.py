@@ -87,13 +87,13 @@ class TestIndustryLinkageDataStructures:
 
 
 class TestIndustryLinkageMap:
-    """测试 INDUSTRY_LINKAGE_MAP 预设映射的完整性与准确性。"""
+    """测试 INDUSTRY_LINKAGE_MAP 预设映射的完整性与准确性 (DAV-256 支持 5 行业)。"""
 
-    def test_map_contains_two_mvp_industries(self):
-        """验证 MVP 阶段准确包含 '消费电子' 和 '新能源车' 两个核心行业。"""
+    def test_map_contains_five_industries(self):
+        """验证准确包含 5 个核心行业: 消费电子、新能源车、半导体、石油化工、金融地产。"""
         keys = list(INDUSTRY_LINKAGE_MAP.keys())
-        assert set(keys) == {"消费电子", "新能源车"}
-        assert len(keys) == 2
+        assert set(keys) == {"消费电子", "新能源车", "半导体", "石油化工", "金融地产"}
+        assert len(keys) == 5
 
     def test_consumer_electronics_configuration(self):
         """验证消费电子行业配置的指标定义、上下游传导与对标。"""
@@ -173,6 +173,74 @@ class TestIndustryLinkageMap:
         # 政策催化
         assert "新能源汽车购置税减免" in config.policy_catalysts
 
+    def test_semiconductor_configuration(self):
+        """验证半导体行业配置的指标定义、上下游传导与对标 (DAV-256)."""
+        config = INDUSTRY_LINKAGE_MAP["半导体"]
+        assert isinstance(config, IndustryLinkage)
+        assert config.industry_name == "半导体/集成电路"
+        assert len(config.upstream_cost) >= 1
+        assert len(config.downstream_demand) >= 1
+        assert len(config.international_benchmark) >= 2
+        assert len(config.policy_catalysts) >= 1
+
+        # 上游：半导体硅片价格（pending_api）
+        upstream = config.upstream_cost[0]
+        assert upstream.name == "半导体硅片价格"
+        assert upstream.source == "pending_api"
+        assert upstream.current_value is None
+
+        # 国际对标：费城半导体指数SOX与台积电TSM
+        symbols = [b.symbol for b in config.international_benchmark]
+        assert "^SOX" in symbols
+        assert "TSM" in symbols
+
+        # 政策催化
+        assert "国家大基金产业投资" in config.policy_catalysts
+
+    def test_petrochemical_configuration(self):
+        """验证石油化工行业配置的指标定义、上下游传导与对标 (DAV-256)."""
+        config = INDUSTRY_LINKAGE_MAP["石油化工"]
+        assert isinstance(config, IndustryLinkage)
+        assert config.industry_name == "石油化工/基础化工"
+        assert len(config.upstream_cost) >= 1
+        assert len(config.downstream_demand) >= 1
+        assert len(config.international_benchmark) >= 1
+        assert len(config.policy_catalysts) >= 1
+
+        # 上游：布伦特原油价格
+        upstream = config.upstream_cost[0]
+        assert upstream.name == "布伦特原油价格"
+        assert upstream.source == "yfinance"
+        assert upstream.symbol == "BZ=F"
+        assert upstream.current_value is None
+
+        # 国际对标：埃克森美孚XOM
+        benchmark = config.international_benchmark[0]
+        assert benchmark.name == "埃克森美孚股价"
+        assert benchmark.source == "yfinance"
+        assert benchmark.symbol == "XOM"
+
+        # 政策催化
+        assert "能耗双控向碳排放双控转变" in config.policy_catalysts
+
+    def test_finance_real_estate_configuration(self):
+        """验证金融地产行业配置的指标定义、上下游传导与对标 (DAV-256)."""
+        config = INDUSTRY_LINKAGE_MAP["金融地产"]
+        assert isinstance(config, IndustryLinkage)
+        assert config.industry_name == "金融地产/商业银行与房地产"
+        assert len(config.upstream_cost) >= 1
+        assert len(config.downstream_demand) >= 1
+        assert len(config.international_benchmark) >= 1
+        assert len(config.policy_catalysts) >= 1
+
+        # 国际对标：摩根大通JPM与金融ETF XLF
+        symbols = [b.symbol for b in config.international_benchmark]
+        assert "JPM" in symbols
+        assert "XLF" in symbols
+
+        # 政策催化
+        assert "存量房贷利率调降政策" in config.policy_catalysts
+
     def test_helper_get_industry_linkage_config(self):
         """验证配置查询辅助函数与模糊匹配逻辑。"""
         ce = get_industry_linkage_config("消费电子")
@@ -187,9 +255,25 @@ class TestIndustryLinkageMap:
         assert nev is not None
         assert nev.industry_name == "新能源车/动力电池"
 
-        nev_full = get_industry_linkage_config("新能源车/动力电池")
-        assert nev_full is not None
-        assert nev_full.industry_name == "新能源车/动力电池"
+        semi = get_industry_linkage_config("半导体")
+        assert semi is not None
+        assert semi.industry_name == "半导体/集成电路"
+
+        petro = get_industry_linkage_config("石油化工")
+        assert petro is not None
+        assert petro.industry_name == "石油化工/基础化工"
+
+        fin = get_industry_linkage_config("金融地产")
+        assert fin is not None
+        assert fin.industry_name == "金融地产/商业银行与房地产"
+
+        bank = get_industry_linkage_config("银行")
+        assert bank is not None
+        assert bank.industry_name == "金融地产/商业银行与房地产"
+
+        re_conf = get_industry_linkage_config("房地产")
+        assert re_conf is not None
+        assert re_conf.industry_name == "金融地产/商业银行与房地产"
 
         unknown = get_industry_linkage_config("未知行业XYZ")
         assert unknown is None
@@ -198,4 +282,4 @@ class TestIndustryLinkageMap:
         """验证支持行业列表辅助函数。"""
         industries = list_supported_industries()
         assert isinstance(industries, list)
-        assert set(industries) == {"消费电子", "新能源车"}
+        assert set(industries) == {"消费电子", "新能源车", "半导体", "石油化工", "金融地产"}

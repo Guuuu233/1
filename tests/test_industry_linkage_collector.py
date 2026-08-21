@@ -52,12 +52,55 @@ class TestMapStockToIndustry:
         assert _map_stock_to_industry("002460.SZ") == "新能源车"
         assert _map_stock_to_industry("002466.SZ") == "新能源车"
 
+    def test_semiconductor_stocks(self):
+        """测试半导体赛道核心标的映射 (DAV-256)."""
+        # 中芯国际
+        assert _map_stock_to_industry("688981.SH") == "半导体"
+        assert _map_stock_to_industry("688981") == "半导体"
+        assert _map_stock_to_industry("688981.sh") == "半导体"
+        # 韦尔股份
+        assert _map_stock_to_industry("603501.SH") == "半导体"
+        assert _map_stock_to_industry("603501") == "半导体"
+        # 其他半导体标的
+        assert _map_stock_to_industry("002049.SZ") == "半导体"
+        assert _map_stock_to_industry("600584.SH") == "半导体"
+        assert _map_stock_to_industry("688012.SH") == "半导体"
+        assert _map_stock_to_industry("002371.SZ") == "半导体"
+
+    def test_petrochemical_stocks(self):
+        """测试石油化工赛道核心标的映射 (DAV-256)."""
+        # 中国石油
+        assert _map_stock_to_industry("601857.SH") == "石油化工"
+        assert _map_stock_to_industry("601857") == "石油化工"
+        assert _map_stock_to_industry("601857.sh") == "石油化工"
+        # 万华化学
+        assert _map_stock_to_industry("600309.SH") == "石油化工"
+        assert _map_stock_to_industry("600309") == "石油化工"
+        # 其他石化标的
+        assert _map_stock_to_industry("600028.SH") == "石油化工"
+        assert _map_stock_to_industry("600938.SH") == "石油化工"
+        assert _map_stock_to_industry("000301.SZ") == "石油化工"
+
+    def test_finance_real_estate_stocks(self):
+        """测试金融地产/银行赛道核心标的映射 (DAV-256)."""
+        # 招商银行
+        assert _map_stock_to_industry("600036.SH") == "金融地产"
+        assert _map_stock_to_industry("600036") == "金融地产"
+        assert _map_stock_to_industry("600036.sh") == "金融地产"
+        # 万科A
+        assert _map_stock_to_industry("000002.SZ") == "金融地产"
+        assert _map_stock_to_industry("000002") == "金融地产"
+        assert _map_stock_to_industry("000002.sz") == "金融地产"
+        # 其他银行地产标的
+        assert _map_stock_to_industry("601398.SH") == "金融地产"
+        assert _map_stock_to_industry("600048.SH") == "金融地产"
+
     def test_unmapped_and_invalid_inputs(self):
         """测试未映射标的及非法输入返回 None。"""
         # 未映射股票
-        assert _map_stock_to_industry("600036.SH") is None  # 招商银行
         assert _map_stock_to_industry("600519.SH") is None  # 贵州茅台
-        assert _map_stock_to_industry("000001.SZ") is None  # 平安银行
+        assert _map_stock_to_industry("601318.SH") is None  # 中国平安
+        assert _map_stock_to_industry("000858.SZ") is None  # 五粮液
         assert _map_stock_to_industry("UNKNOWN") is None
 
         # 空值与非法类型
@@ -71,7 +114,10 @@ class TestMapStockToIndustry:
         assert DataCollector._map_stock_to_industry("000725.SZ") == "消费电子"
         collector = DataCollector()
         assert collector._map_stock_to_industry("300750.SZ") == "新能源车"
-        assert collector._map_stock_to_industry("600036.SH") is None
+        assert collector._map_stock_to_industry("688981.SH") == "半导体"
+        assert collector._map_stock_to_industry("601857.SH") == "石油化工"
+        assert collector._map_stock_to_industry("600036.SH") == "金融地产"
+        assert collector._map_stock_to_industry("600519.SH") is None
 
 
 class TestDataCollectorIndustryLinkageIntegration:
@@ -135,8 +181,8 @@ class TestDataCollectorIndustryLinkageIntegration:
     @patch("tradingagents.graph.data_collector._safe", return_value="dummy_data")
     @patch("tradingagents.graph.data_collector.IndustryLinkageProvider.get_industry_linkage")
     def test_fetch_all_unmapped_stock_returns_none(self, mock_get_linkage, mock_safe):
-        """测试 _fetch_all 对未映射标的（如招商银行 600036.SH）返回 None 且不调用 Provider。"""
-        result = _fetch_all("600036.SH", "2026-08-20")
+        """测试 _fetch_all 对未映射标的（如贵州茅台 600519.SH）返回 None 且不调用 Provider。"""
+        result = _fetch_all("600519.SH", "2026-08-20")
 
         assert "industry_linkage" in result
         assert result["industry_linkage"] is None
