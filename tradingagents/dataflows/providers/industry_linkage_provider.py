@@ -153,16 +153,8 @@ class IndustryLinkageProvider:
         base_dict = config.model_dump()
 
         try:
-            # 1. LME铜价 (akshare CAD/铜 历史行情)
-            if config.name == "LME铜价" or (config.source == "akshare" and config.symbol in ("铜", "CAD")):
-                return self._fetch_lme_copper(config, as_of=as_of)
-
-            # 2. 三星电子股价 (yfinance 005930.KS 历史行情)
-            if config.name == "三星电子股价" or (config.source == "yfinance" and config.symbol == "005930.KS"):
-                return self._fetch_samsung_stock(config, as_of=as_of)
-
-            # 3. 碳酸锂价格 (待接入 API)
-            if config.name == "碳酸锂价格" or config.status == "pending_api" or config.note == "待接入API":
+            # 1. 待接入 API 指标 (显式标记 pending_api)
+            if config.status == "pending_api" or config.source == "pending_api" or config.note == "待接入API":
                 base_dict.update({
                     "current_value": None,
                     "trend": "数据缺失",
@@ -171,7 +163,7 @@ class IndustryLinkageProvider:
                 })
                 return base_dict
 
-            # 4. 手动录入/标注指标
+            # 2. 手动录入/标注指标 (显式标记 manual)
             if config.status == "manual" or config.source == "manual" or config.note == "手动":
                 base_dict.update({
                     "current_value": None,
@@ -180,6 +172,14 @@ class IndustryLinkageProvider:
                     "note": config.note or "手动",
                 })
                 return base_dict
+
+            # 3. LME铜价 / akshare 期货历史行情
+            if config.name == "LME铜价" or (config.source == "akshare" and config.symbol in ("铜", "CAD")):
+                return self._fetch_lme_copper(config, as_of=as_of)
+
+            # 4. yfinance 标的 (三星电子股价、费城半导体指数、台积电、布伦特原油、埃克森美孚、摩根大通、标普500金融指数等)
+            if config.source == "yfinance" and config.symbol:
+                return self._fetch_yfinance_indicator(config, as_of=as_of)
 
             # 5. 其余默认未实现指标
             base_dict.update({
@@ -262,14 +262,22 @@ class IndustryLinkageProvider:
             })
             return result
 
-    def _fetch_samsung_stock(
+    def _fetch_yfinance_indicator(
         self,
         config: IndustryLinkageIndicator,
         as_of: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """采集三星电子股价行情并计算最新值、月环比、季度环比与趋势。"""
+        """采集 yfinance 标的历史行情并计算最新值、月环比、季度环比与趋势。"""
         result = config.model_dump()
-        symbol = config.symbol or "005930.KS"
+        symbol = config.symbol
+        if not symbol:
+            result.update({
+                "current_value": None,
+                "trend": "数据缺失",
+                "confidence": "低（代码缺失）",
+                "note": "未配置有效的 yfinance 证券代码",
+            })
+            return result
 
         try:
             import yfinance as yf
@@ -328,7 +336,7 @@ class IndustryLinkageProvider:
             return result
 
         except Exception as e:
-            logger.warning("IndustryLinkageProvider: 获取 三星电子股价 失败: %s", e)
+            logger.warning("IndustryLinkageProvider: 获取 %s (%s) 失败: %s", config.name, symbol, e)
             result.update({
                 "current_value": None,
                 "trend": "数据缺失",
@@ -336,6 +344,14 @@ class IndustryLinkageProvider:
                 "note": f"数据获取失败: {e}",
             })
             return result
+
+    def _fetch_samsung_stock(
+        self,
+        config: IndustryLinkageIndicator,
+        as_of: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """采集三星电子股价行情（委托给 _fetch_yfinance_indicator 统一处理）。"""
+        return self._fetch_yfinance_indicator(config, as_of=as_of)
 
     def _calculate_series_metrics(
         self,
