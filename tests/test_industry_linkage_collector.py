@@ -1,4 +1,4 @@
-"""针对 DataCollector 产业链数据层集成 (DAV-201 M3) 的单元测试。
+"""针对 DataCollector 产业链数据层集成 (DAV-201 / DAV-274) 的单元测试。
 
 测试覆盖：
 1. 股票代码到核心行业硬编码映射 (_map_stock_to_industry)；
@@ -53,7 +53,7 @@ class TestMapStockToIndustry:
         assert _map_stock_to_industry("002466.SZ") == "新能源车"
 
     def test_semiconductor_stocks(self):
-        """测试半导体赛道核心标的映射 (DAV-256)."""
+        """测试半导体赛道核心标的映射。"""
         # 中芯国际
         assert _map_stock_to_industry("688981.SH") == "半导体"
         assert _map_stock_to_industry("688981") == "半导体"
@@ -68,7 +68,7 @@ class TestMapStockToIndustry:
         assert _map_stock_to_industry("002371.SZ") == "半导体"
 
     def test_petrochemical_stocks(self):
-        """测试石油化工赛道核心标的映射 (DAV-256)."""
+        """测试石油化工赛道核心标的映射。"""
         # 中国石油
         assert _map_stock_to_industry("601857.SH") == "石油化工"
         assert _map_stock_to_industry("601857") == "石油化工"
@@ -82,7 +82,7 @@ class TestMapStockToIndustry:
         assert _map_stock_to_industry("000301.SZ") == "石油化工"
 
     def test_finance_real_estate_stocks(self):
-        """测试金融地产/银行赛道核心标的映射 (DAV-256)."""
+        """测试金融地产/银行赛道核心标的映射。"""
         # 招商银行
         assert _map_stock_to_industry("600036.SH") == "金融地产"
         assert _map_stock_to_industry("600036") == "金融地产"
@@ -98,10 +98,7 @@ class TestMapStockToIndustry:
     def test_unmapped_and_invalid_inputs(self):
         """测试未映射标的及非法输入返回 None。"""
         # 未映射股票
-        assert _map_stock_to_industry("600519.SH") is None  # 贵州茅台
-        assert _map_stock_to_industry("601318.SH") is None  # 中国平安
-        assert _map_stock_to_industry("000858.SZ") is None  # 五粮液
-        assert _map_stock_to_industry("UNKNOWN") is None
+        assert _map_stock_to_industry("UNKNOWN_999999") is None
 
         # 空值与非法类型
         assert _map_stock_to_industry(None) is None
@@ -117,7 +114,7 @@ class TestMapStockToIndustry:
         assert collector._map_stock_to_industry("688981.SH") == "半导体"
         assert collector._map_stock_to_industry("601857.SH") == "石油化工"
         assert collector._map_stock_to_industry("600036.SH") == "金融地产"
-        assert collector._map_stock_to_industry("600519.SH") is None
+        assert collector._map_stock_to_industry("UNKNOWN_999999") is None
 
 
 class TestDataCollectorIndustryLinkageIntegration:
@@ -138,7 +135,7 @@ class TestDataCollectorIndustryLinkageIntegration:
     def test_fetch_all_mapped_stock_consumer_electronics(self, mock_get_linkage, mock_safe):
         """测试 _fetch_all 对消费电子标的（如京东方A 000725.SZ）调用 Provider 并填充 industry_linkage。"""
         mock_get_linkage.return_value = {
-            "industry_name": "消费电子/半导体显示",
+            "industry_name": "消费电子与智能终端",
             "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5}],
             "downstream_demand": [{"name": "全球智能手机出货量", "trend": "数据缺失"}],
             "international_benchmark": [{"name": "三星电子股价", "current_value": 52000.0}],
@@ -152,7 +149,7 @@ class TestDataCollectorIndustryLinkageIntegration:
         assert "industry_linkage" in result
         linkage = result["industry_linkage"]
         assert linkage is not None
-        assert linkage["industry_name"] == "消费电子/半导体显示"
+        assert linkage["industry_name"] == "消费电子与智能终端"
         assert linkage["upstream_cost"][0]["name"] == "LME铜价"
         mock_get_linkage.assert_called_once_with("消费电子", as_of="2026-08-20")
 
@@ -161,7 +158,7 @@ class TestDataCollectorIndustryLinkageIntegration:
     def test_fetch_all_mapped_stock_new_energy(self, mock_get_linkage, mock_safe):
         """测试 _fetch_all 对新能源车标的（如宁德时代 300750.SZ）调用 Provider 并填充 industry_linkage。"""
         mock_get_linkage.return_value = {
-            "industry_name": "新能源车/动力电池",
+            "industry_name": "新能源汽车与智能汽车",
             "upstream_cost": [{"name": "碳酸锂价格", "trend": "数据缺失"}],
             "downstream_demand": [{"name": "新能源车渗透率", "trend": "数据缺失"}],
             "international_benchmark": [{"name": "特斯拉交付量", "trend": "数据缺失"}],
@@ -175,14 +172,14 @@ class TestDataCollectorIndustryLinkageIntegration:
         assert "industry_linkage" in result
         linkage = result["industry_linkage"]
         assert linkage is not None
-        assert linkage["industry_name"] == "新能源车/动力电池"
+        assert linkage["industry_name"] == "新能源汽车与智能汽车"
         mock_get_linkage.assert_called_once_with("新能源车", as_of="2026-08-20")
 
     @patch("tradingagents.graph.data_collector._safe", return_value="dummy_data")
     @patch("tradingagents.graph.data_collector.IndustryLinkageProvider.get_industry_linkage")
     def test_fetch_all_unmapped_stock_returns_none(self, mock_get_linkage, mock_safe):
-        """测试 _fetch_all 对未映射标的（如贵州茅台 600519.SH）返回 None 且不调用 Provider。"""
-        result = _fetch_all("600519.SH", "2026-08-20")
+        """测试 _fetch_all 对未映射标的返回 None 且不调用 Provider。"""
+        result = _fetch_all("UNKNOWN_999999", "2026-08-20")
 
         assert "industry_linkage" in result
         assert result["industry_linkage"] is None
@@ -193,7 +190,7 @@ class TestDataCollectorIndustryLinkageIntegration:
         """测试 _fetch_all 能兼容 YYYYMMDD 与 YYYY-MM-DD 两种日期输入格式。"""
         mock_provider = MagicMock(spec=IndustryLinkageProvider)
         mock_provider.get_industry_linkage.return_value = {
-            "industry_name": "消费电子/半导体显示",
+            "industry_name": "消费电子与智能终端",
             "as_of": "2026-08-20",
         }
 
@@ -222,7 +219,7 @@ class TestDataCollectorIndustryLinkageIntegration:
         """测试 DataCollector.collect 返回深拷贝且支持缓存。"""
         collector = DataCollector()
         fake_linkage = {
-            "industry_name": "消费电子/半导体显示",
+            "industry_name": "消费电子与智能终端",
             "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5}],
         }
         stub_pool = {
@@ -233,7 +230,7 @@ class TestDataCollectorIndustryLinkageIntegration:
 
         with patch("tradingagents.graph.data_collector._fetch_all", return_value=stub_pool) as mock_fetch:
             res1 = collector.collect("000725.SZ", "2026-08-20")
-            assert res1["industry_linkage"]["industry_name"] == "消费电子/半导体显示"
+            assert res1["industry_linkage"]["industry_name"] == "消费电子与智能终端"
 
             # 验证深拷贝：修改返回值不污染缓存
             res1["industry_linkage"]["upstream_cost"][0]["current_value"] = 99999.0

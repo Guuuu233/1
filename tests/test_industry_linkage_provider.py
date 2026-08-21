@@ -1,4 +1,4 @@
-"""针对 IndustryLinkageProvider 的完备确定性单元测试 (DAV-201 M2)。"""
+"""针对 IndustryLinkageProvider 的完备确定性单元测试 (DAV-201 / DAV-274)。"""
 
 from unittest.mock import MagicMock, patch
 import pandas as pd
@@ -63,14 +63,13 @@ class TestIndustryLinkageProvider:
             data = provider.get_industry_linkage("消费电子", use_cache=False)
 
             assert data is not None
-            assert data["industry_name"] == "消费电子/半导体显示"
-            assert "消费品以旧换新" in data["policy_catalysts"]
+            assert data["industry_name"] == "消费电子与智能终端"
+            assert any("以旧换新" in cat for cat in data["policy_catalysts"])
 
             # 验证上游成本指标 (LME铜价)
             upstream_list = data["upstream_cost"]
-            assert len(upstream_list) == 1
-            copper = upstream_list[0]
-            assert copper["name"] == "LME铜价"
+            assert len(upstream_list) >= 1
+            copper = [u for u in upstream_list if u["name"] == "LME铜价"][0]
             assert copper["current_value"] == 9123.5
             assert copper["unit"] == "美元/吨"
             assert copper["mom_change"] is not None and copper["mom_change"] > 0
@@ -80,9 +79,8 @@ class TestIndustryLinkageProvider:
 
             # 验证下游需求指标 (全球智能手机出货量)
             downstream_list = data["downstream_demand"]
-            assert len(downstream_list) == 1
-            phone = downstream_list[0]
-            assert phone["name"] == "全球智能手机出货量"
+            assert len(downstream_list) >= 1
+            phone = [d for d in downstream_list if d["name"] == "全球智能手机出货量"][0]
             assert phone["current_value"] is None
             assert phone["trend"] == "数据缺失"
             assert phone["note"] == "手动"
@@ -90,9 +88,8 @@ class TestIndustryLinkageProvider:
 
             # 验证国际对标指标 (三星电子股价)
             benchmark_list = data["international_benchmark"]
-            assert len(benchmark_list) == 1
-            samsung = benchmark_list[0]
-            assert samsung["name"] == "三星电子股价"
+            assert len(benchmark_list) >= 1
+            samsung = [b for b in benchmark_list if "三星电子" in b["name"]][0]
             assert samsung["current_value"] == 52000.0
             assert samsung["unit"] == "韩元"
             assert samsung["mom_change"] is not None and samsung["mom_change"] < 0
@@ -103,40 +100,38 @@ class TestIndustryLinkageProvider:
     def test_new_energy_vehicle_data_fetch_success(self):
         """测试新能源车行业数据采集（包含待接入API指标与手动指标）。"""
         provider = IndustryLinkageProvider()
-        data = provider.get_industry_linkage("新能源车", use_cache=False)
+        with patch("yfinance.Ticker", side_effect=Exception("Offline test")):
+            data = provider.get_industry_linkage("新能源车", use_cache=False)
 
-        assert data is not None
-        assert data["industry_name"] == "新能源车/动力电池"
-        assert "新能源汽车购置税减免" in data["policy_catalysts"]
+            assert data is not None
+            assert data["industry_name"] == "新能源汽车与智能汽车"
+            assert any("购置税减免" in cat for cat in data["policy_catalysts"])
 
-        # 上游成本端：碳酸锂价格（待接入API）
-        upstream_list = data["upstream_cost"]
-        assert len(upstream_list) == 1
-        lithium = upstream_list[0]
-        assert lithium["name"] == "碳酸锂价格"
-        assert lithium["current_value"] is None
-        assert lithium["trend"] == "数据缺失"
-        assert lithium["confidence"] == "低（待接入API）"
-        assert lithium["note"] == "待接入API"
-        assert lithium["status"] == "pending_api"
+            # 上游成本端：碳酸锂价格（待接入API）
+            upstream_list = data["upstream_cost"]
+            assert len(upstream_list) >= 1
+            lithium = [u for u in upstream_list if "碳酸锂" in u["name"]][0]
+            assert lithium["current_value"] is None
+            assert lithium["trend"] == "数据缺失"
+            assert lithium["confidence"] == "低（待接入API）"
+            assert lithium["note"] == "待接入API"
+            assert lithium["status"] == "pending_api"
 
-        # 下游需求端：新能源车渗透率
-        downstream_list = data["downstream_demand"]
-        assert len(downstream_list) == 1
-        nev_rate = downstream_list[0]
-        assert nev_rate["name"] == "新能源车渗透率"
-        assert nev_rate["current_value"] is None
-        assert nev_rate["trend"] == "数据缺失"
-        assert nev_rate["note"] == "手动"
+            # 下游需求端：新能源车渗透率
+            downstream_list = data["downstream_demand"]
+            assert len(downstream_list) >= 1
+            nev_rate = [d for d in downstream_list if "渗透率" in d["name"]][0]
+            assert nev_rate["current_value"] is None
+            assert nev_rate["trend"] == "数据缺失"
+            assert nev_rate["note"] == "手动"
 
-        # 国际对标：特斯拉交付量
-        benchmark_list = data["international_benchmark"]
-        assert len(benchmark_list) == 1
-        tesla = benchmark_list[0]
-        assert tesla["name"] == "特斯拉交付量"
-        assert tesla["current_value"] is None
-        assert tesla["trend"] == "数据缺失"
-        assert tesla["note"] == "手动"
+            # 国际对标：特斯拉交付量
+            benchmark_list = data["international_benchmark"]
+            assert len(benchmark_list) >= 1
+            tesla = [b for b in benchmark_list if b["name"] == "特斯拉交付量"][0]
+            assert tesla["current_value"] is None
+            assert tesla["trend"] == "数据缺失"
+            assert tesla["note"] == "手动"
 
     def test_caching_and_clear_cache(self, mock_copper_dataframe):
         """测试 1 小时内存缓存命中与缓存清理逻辑。"""
@@ -192,7 +187,7 @@ class TestIndustryLinkageProvider:
             data = provider.get_industry_linkage("消费电子", use_cache=False)
 
             assert data is not None
-            assert data["industry_name"] == "消费电子/半导体显示"
+            assert data["industry_name"] == "消费电子与智能终端"
 
             # 异常时返回结构化缺失状态，不中断分析
             copper = data["upstream_cost"][0]
@@ -201,7 +196,7 @@ class TestIndustryLinkageProvider:
             assert copper["confidence"] == "低（接口异常）"
             assert "Connection timed out" in copper["note"]
 
-            samsung = data["international_benchmark"][0]
+            samsung = [b for b in data["international_benchmark"] if "三星电子" in b["name"]][0]
             assert samsung["current_value"] is None
             assert samsung["trend"] == "数据缺失"
             assert samsung["confidence"] == "低（接口异常）"
@@ -274,7 +269,7 @@ class TestIndustryLinkageProvider:
             )
             result = provider._fetch_indicator(ind, as_of="2020-01-01")
 
-            assert result["current_value"] is None
+            assert result["current_value"] == None
             assert result["trend"] == "数据缺失"
             assert result["confidence"] == "低（有效数据不足）"
 

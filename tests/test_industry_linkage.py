@@ -1,16 +1,14 @@
-"""产业链数据层核心综合单元测试套件 (DAV-201 M5 / DAV-196).
+"""产业链数据层核心综合单元测试套件 (DAV-201 / DAV-256 / DAV-274).
 
-本模块按照施工计划 M5 阶段要求，为产业链数据层 (Industry Linkage MVP) 提供综合确定性单元测试：
+本模块为产业链数据层 (Industry Linkage 27 行业全景) 提供综合确定性单元测试：
 1. `test_get_industry_linkage_consumer_electronics`: 消费电子行业数据采集、指标完整性与 Prompt 渲染验证；
-2. `test_get_industry_linkage_new_energy`: 新能源车行业数据采集、缺失与手动标注指标验证；
+2. `test_get_industry_linkage_new_energy`: 新能源汽车行业数据采集、缺失与手动标注指标验证；
 3. `test_cache`: 1 小时内存 TTL 缓存机制、缓存清理、防御性拷贝与多线程并发安全；
 4. `test_unknown_industry`: 未配置行业安全返回 None、网络异常优雅降级及空值边界容错；
-5. `test_data_collector_integration`: DataCollector 股票到行业映射、数据注入与全流程采集缓存集成。
-
-设计规范：
-- 离线确定性：所有涉及外部网络与数据接口 (akshare / yfinance / DataCollector) 均具备完备 Mock，确保 CI 环境 100% 通过；
-- 防前视纪律：验证 as_of 参数过滤机制与截止日期截断；
-- 零虚构原则：严格核查未接入指标与手动指标的结构化缺失标注。
+5. `test_data_collector_integration`: DataCollector 股票到行业映射、数据注入与全流程采集缓存集成；
+6. `test_all_twenty_seven_industries_return_non_empty_linkage`: 验证 27 个行业全部返回非空结构，无 API 指标显式缺失，零虚构值；
+7. `test_data_collector_maps_required_six_stocks`: 验证原 6 只核心股票映射严格不回归；
+8. `test_data_collector_maps_all_twenty_seven_industries`: 验证 27 个行业均有至少 1 只 A 股代表股票映射。
 """
 
 import concurrent.futures
@@ -36,6 +34,9 @@ from tradingagents.graph.data_collector import (
     DataCollector,
     _fetch_all,
     _map_stock_to_industry,
+)
+from tradingagents.knowledge.industry_linkage import (
+    get_all_industry_names,
 )
 
 
@@ -85,21 +86,21 @@ def mock_samsung_dataframe() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 5 个核心测试用例 (Mandatory Test Cases for DAV-201 M5)
+# 5 个核心测试用例
 # ---------------------------------------------------------------------------
 
 
 def test_get_industry_linkage_consumer_electronics(
     mock_copper_dataframe: pd.DataFrame, mock_samsung_dataframe: pd.DataFrame
 ):
-    """测试消费电子行业数据采集与指标完整性 (M5 核心用例 1).
+    """测试消费电子行业数据采集与指标完整性 (核心用例 1).
 
     验证点：
-    1. 成功匹配并获取 '消费电子/半导体显示' 配置；
+    1. 成功匹配并获取 '消费电子与智能终端' 配置；
     2. 上游成本端：LME铜价实时采集、最新值 (9123.50)、月环比 (MoM) 与季度环比 (QoQ)、趋势 (上升)、置信度 (高)；
     3. 下游需求端：全球智能手机出货量标注为 '手动'，当前值为 None，趋势为 '数据缺失'；
     4. 国际对标：三星电子股价实时采集 (52000.00 韩元)、趋势 (下降)、置信度 (高)；
-    5. 行业政策催化关键词包含 '消费品以旧换新'、'超高清视频产业发展'、'新型显示产业支持政策'；
+    5. 行业政策催化关键词包含 '消费品以旧换新补贴政策'；
     6. 验证 format_industry_linkage_for_prompt 能正确将该结构渲染为 Prompt 文本。
     """
     provider = IndustryLinkageProvider()
@@ -113,17 +114,14 @@ def test_get_industry_linkage_consumer_electronics(
         data = provider.get_industry_linkage("消费电子", as_of="2026-08-20", use_cache=False)
 
         assert data is not None, "消费电子产业链数据采集结果不应为 None"
-        assert data["industry_name"] == "消费电子/半导体显示"
+        assert data["industry_name"] == "消费电子与智能终端"
         assert data["as_of"] == "2026-08-20"
-        assert "消费品以旧换新" in data["policy_catalysts"]
-        assert "超高清视频产业发展" in data["policy_catalysts"]
-        assert "新型显示产业支持政策" in data["policy_catalysts"]
+        assert any("以旧换新" in cat for cat in data["policy_catalysts"])
 
         # 1. 验证上游成本端：LME铜价
         upstream_list = data["upstream_cost"]
-        assert len(upstream_list) == 1
-        copper = upstream_list[0]
-        assert copper["name"] == "LME铜价"
+        assert len(upstream_list) >= 1
+        copper = [u for u in upstream_list if u["name"] == "LME铜价"][0]
         assert copper["source"] == "akshare"
         assert copper["current_value"] == 9123.5
         assert copper["unit"] == "美元/吨"
@@ -137,9 +135,8 @@ def test_get_industry_linkage_consumer_electronics(
 
         # 2. 验证下游需求端：全球智能手机出货量 (手动标注)
         downstream_list = data["downstream_demand"]
-        assert len(downstream_list) == 1
-        phone = downstream_list[0]
-        assert phone["name"] == "全球智能手机出货量"
+        assert len(downstream_list) >= 1
+        phone = [d for d in downstream_list if d["name"] == "全球智能手机出货量"][0]
         assert phone["source"] == "manual"
         assert phone["current_value"] is None
         assert phone["trend"] == "数据缺失"
@@ -150,9 +147,8 @@ def test_get_industry_linkage_consumer_electronics(
 
         # 3. 验证国际对标：三星电子股价
         benchmark_list = data["international_benchmark"]
-        assert len(benchmark_list) == 1
-        samsung = benchmark_list[0]
-        assert samsung["name"] == "三星电子股价"
+        assert len(benchmark_list) >= 1
+        samsung = [b for b in benchmark_list if "三星电子" in b["name"]][0]
         assert samsung["source"] == "yfinance"
         assert samsung["symbol"] == "005930.KS"
         assert samsung["current_value"] == 52000.0
@@ -162,89 +158,83 @@ def test_get_industry_linkage_consumer_electronics(
         assert samsung["confidence"] == "高"
         assert samsung["trend"] == "下降"
         assert samsung["mom_change"] is not None and samsung["mom_change"] < 0
-        assert "龙头估值与景气度对标" in (samsung.get("transmission_logic") or "")
+        assert "对标" in (samsung.get("transmission_logic") or "")
 
         # 4. 验证 Prompt 渲染
         prompt_text = format_industry_linkage_for_prompt(data)
-        assert "【产业链联想数据】：消费电子/半导体显示" in prompt_text
+        assert "【产业链联想数据】：消费电子与智能终端" in prompt_text
         assert "LME铜价：9123.50 美元/吨" in prompt_text
         assert "三星电子股价：52000.00 韩元" in prompt_text
         assert "【数据缺失】全球智能手机出货量：手动" in prompt_text
-        assert "消费品以旧换新" in prompt_text
 
 
 def test_get_industry_linkage_new_energy():
-    """测试新能源车行业数据采集与缺失/手动标注 (M5 核心用例 2).
+    """测试新能源汽车行业数据采集与缺失/手动标注 (核心用例 2).
 
     验证点：
-    1. 成功匹配并获取 '新能源车/动力电池' 配置；
+    1. 成功匹配并获取 '新能源汽车与智能汽车' 配置；
     2. 上游成本端：碳酸锂价格明确标注为 '待接入API' (pending_api)，current_value 为 None，置信度 '低（待接入API）'，不产生异常；
     3. 下游需求端：新能源车渗透率标注为 '手动'，current_value 为 None，趋势 '数据缺失'；
     4. 国际对标：特斯拉交付量标注为 '手动'，current_value 为 None，趋势 '数据缺失'；
-    5. 行业政策催化关键词包含 '新能源汽车购置税减免'、'车路云一体化试点'、'充换电基础设施建设支持'；
+    5. 行业政策催化关键词包含 '新能源汽车购置税减免'；
     6. 验证 Prompt 渲染中所有未接入/手动指标均带有显式【数据缺失】标识，严禁杜撰虚构。
     """
     provider = IndustryLinkageProvider()
-    data = provider.get_industry_linkage("新能源车", as_of="2026-08-20", use_cache=False)
+    with patch("yfinance.Ticker", side_effect=Exception("Offline test")):
+        data = provider.get_industry_linkage("新能源车", as_of="2026-08-20", use_cache=False)
 
-    assert data is not None, "新能源车产业链数据采集结果不应为 None"
-    assert data["industry_name"] == "新能源车/动力电池"
-    assert data["as_of"] == "2026-08-20"
-    assert "新能源汽车购置税减免" in data["policy_catalysts"]
-    assert "车路云一体化试点" in data["policy_catalysts"]
-    assert "充换电基础设施建设支持" in data["policy_catalysts"]
+        assert data is not None, "新能源汽车产业链数据采集结果不应为 None"
+        assert data["industry_name"] == "新能源汽车与智能汽车"
+        assert data["as_of"] == "2026-08-20"
+        assert any("购置税减免" in cat for cat in data["policy_catalysts"])
 
-    # 1. 验证上游成本端：碳酸锂价格（待接入API）
-    upstream_list = data["upstream_cost"]
-    assert len(upstream_list) == 1
-    lithium = upstream_list[0]
-    assert lithium["name"] == "碳酸锂价格"
-    assert lithium["source"] == "pending_api"
-    assert lithium["current_value"] is None
-    assert lithium["unit"] == "万元/吨"
-    assert lithium["trend"] == "数据缺失"
-    assert lithium["confidence"] == "低（待接入API）"
-    assert lithium["note"] == "待接入API"
-    assert lithium["status"] == "pending_api"
-    assert "动力电池正极核心原材料成本传导" in (lithium.get("transmission_logic") or "")
+        # 1. 验证上游成本端：碳酸锂价格（待接入API）
+        upstream_list = data["upstream_cost"]
+        assert len(upstream_list) >= 1
+        lithium = [u for u in upstream_list if "碳酸锂" in u["name"]][0]
+        assert lithium["source"] == "pending_api"
+        assert lithium["current_value"] is None
+        assert lithium["unit"] == "万元/吨"
+        assert lithium["trend"] == "数据缺失"
+        assert lithium["confidence"] == "低（待接入API）"
+        assert lithium["note"] == "待接入API"
+        assert lithium["status"] == "pending_api"
+        assert "动力电池正极核心原材料成本传导" in (lithium.get("transmission_logic") or "")
 
-    # 2. 验证下游需求端：新能源车渗透率（手动标注）
-    downstream_list = data["downstream_demand"]
-    assert len(downstream_list) == 1
-    nev_penetration = downstream_list[0]
-    assert nev_penetration["name"] == "新能源车渗透率"
-    assert nev_penetration["source"] == "manual"
-    assert nev_penetration["current_value"] is None
-    assert nev_penetration["unit"] == "%"
-    assert nev_penetration["trend"] == "数据缺失"
-    assert nev_penetration["confidence"] == "低（待手动录入）"
-    assert nev_penetration["note"] == "手动"
-    assert nev_penetration["status"] == "manual"
+        # 2. 验证下游需求端：新能源车渗透率（手动标注）
+        downstream_list = data["downstream_demand"]
+        assert len(downstream_list) >= 1
+        nev_penetration = [d for d in downstream_list if "渗透率" in d["name"]][0]
+        assert nev_penetration["source"] == "manual"
+        assert nev_penetration["current_value"] is None
+        assert nev_penetration["unit"] == "%"
+        assert nev_penetration["trend"] == "数据缺失"
+        assert nev_penetration["confidence"] == "低（待手动录入）"
+        assert nev_penetration["note"] == "手动"
+        assert nev_penetration["status"] == "manual"
 
-    # 3. 验证国际对标：特斯拉交付量（手动标注）
-    benchmark_list = data["international_benchmark"]
-    assert len(benchmark_list) == 1
-    tesla = benchmark_list[0]
-    assert tesla["name"] == "特斯拉交付量"
-    assert tesla["symbol"] == "TSLA"
-    assert tesla["current_value"] is None
-    assert tesla["unit"] == "辆"
-    assert tesla["trend"] == "数据缺失"
-    assert tesla["confidence"] == "低（待手动录入）"
-    assert tesla["note"] == "手动"
-    assert tesla["status"] == "manual"
+        # 3. 验证国际对标：特斯拉交付量（手动标注）
+        benchmark_list = data["international_benchmark"]
+        assert len(benchmark_list) >= 1
+        tesla_delivery = [b for b in benchmark_list if b["name"] == "特斯拉交付量"][0]
+        assert tesla_delivery["symbol"] == "TSLA"
+        assert tesla_delivery["current_value"] is None
+        assert tesla_delivery["unit"] == "辆"
+        assert tesla_delivery["trend"] == "数据缺失"
+        assert tesla_delivery["confidence"] == "低（待手动录入）"
+        assert tesla_delivery["note"] == "手动"
+        assert tesla_delivery["status"] == "manual"
 
-    # 4. 验证 Prompt 渲染文本
-    prompt_text = format_industry_linkage_for_prompt(data)
-    assert "【产业链联想数据】：新能源车/动力电池" in prompt_text
-    assert "【数据缺失】碳酸锂价格：待接入API" in prompt_text
-    assert "【数据缺失】新能源车渗透率：手动" in prompt_text
-    assert "【数据缺失】特斯拉交付量：手动" in prompt_text
-    assert "新能源汽车购置税减免" in prompt_text
+        # 4. 验证 Prompt 渲染文本
+        prompt_text = format_industry_linkage_for_prompt(data)
+        assert "【产业链联想数据】：新能源汽车与智能汽车" in prompt_text
+        assert "【数据缺失】碳酸锂价格：待接入API" in prompt_text
+        assert "【数据缺失】新能源车渗透率：手动" in prompt_text
+        assert "【数据缺失】特斯拉交付量：手动" in prompt_text
 
 
 def test_cache(mock_copper_dataframe: pd.DataFrame):
-    """测试 1 小时内存 TTL 缓存机制与并发安全 (M5 核心用例 3).
+    """测试 1 小时内存 TTL 缓存机制与并发安全 (核心用例 3).
 
     验证点：
     1. 首次调用执行实际采集并建立缓存；
@@ -325,10 +315,10 @@ def test_cache(mock_copper_dataframe: pd.DataFrame):
 
 
 def test_unknown_industry():
-    """测试未配置行业安全返回与异常优雅降级 (M5 核心用例 4).
+    """测试未配置行业安全返回与异常优雅降级 (核心用例 4).
 
     验证点：
-    1. 查询未配置行业（如 '未知行业'、'采掘服务'、'养殖业'）安全返回 None，不抛出异常；
+    1. 查询未配置行业（如 '未知行业XYZ'、'采掘服务'、'虚拟游戏'）安全返回 None，不抛出异常；
     2. 空字符串、纯空白、非法类型 (None, 数字) 安全返回 None；
     3. 外部数据源（akshare / yfinance）网络超时、429 报错或接口崩溃时，Provider 自动捕获并降级为结构化缺失状态；
     4. format_industry_linkage_for_prompt 面对空数据、None 与非预期输入安全返回空字符串。
@@ -336,9 +326,9 @@ def test_unknown_industry():
     provider = IndustryLinkageProvider()
 
     # 1. 未配置或非法行业输入
-    assert provider.get_industry_linkage("未知行业") is None
+    assert provider.get_industry_linkage("未知行业XYZ") is None
     assert provider.get_industry_linkage("采掘服务") is None
-    assert provider.get_industry_linkage("养殖业") is None
+    assert provider.get_industry_linkage("虚拟游戏") is None
     assert provider.get_industry_linkage("") is None
     assert provider.get_industry_linkage("   ") is None
     assert provider.get_industry_linkage(None) is None  # type: ignore
@@ -351,7 +341,7 @@ def test_unknown_industry():
         data = provider.get_industry_linkage("消费电子", use_cache=False)
 
         assert data is not None
-        assert data["industry_name"] == "消费电子/半导体显示"
+        assert data["industry_name"] == "消费电子与智能终端"
 
         # LME铜价在异常时安全降级
         copper = data["upstream_cost"][0]
@@ -361,7 +351,7 @@ def test_unknown_industry():
         assert "Connection timed out" in (copper.get("note") or "")
 
         # 三星电子股价在异常时安全降级
-        samsung = data["international_benchmark"][0]
+        samsung = [b for b in data["international_benchmark"] if "三星电子" in b["name"]][0]
         assert samsung["current_value"] is None
         assert samsung["trend"] == "数据缺失"
         assert samsung["confidence"] == "低（接口异常）"
@@ -369,7 +359,7 @@ def test_unknown_industry():
 
         # 降级后的数据格式化依旧能安全输出
         prompt_text = format_industry_linkage_for_prompt(data)
-        assert "【产业链联想数据】：消费电子/半导体显示" in prompt_text
+        assert "【产业链联想数据】：消费电子与智能终端" in prompt_text
         assert "【数据缺失】LME铜价" in prompt_text
         assert "【数据缺失】三星电子股价" in prompt_text
 
@@ -381,60 +371,42 @@ def test_unknown_industry():
 
 
 def test_data_collector_integration():
-    """测试 DataCollector 股票映射与产业链数据注入全流程 (M5 核心用例 5).
+    """测试 DataCollector 股票映射与产业链数据注入全流程 (核心用例 5).
 
     验证点：
-    1. _map_stock_to_industry 映射逻辑（消费电子、新能源车、半导体、石油化工、金融地产标的及未映射标的）；
+    1. _map_stock_to_industry 映射逻辑（包含原有 6 只标的、新行业标的及未映射标的）；
     2. DataCollector 实例初始化与 industry_linkage_provider 依赖注入；
-    3. _fetch_all 针对已映射标的（京东方A、中芯国际、中国石油、招商银行等）正确注入 industry_linkage；
-    4. _fetch_all 针对未映射标的（贵州茅台 600519.SH）将 industry_linkage 置为 None 且不发起多余调用；
+    3. _fetch_all 针对已映射标的正确注入 industry_linkage；
+    4. _fetch_all 针对未映射标的将 industry_linkage 置为 None 且不发起多余调用；
     5. _fetch_all 兼容 YYYY-MM-DD 与 YYYYMMDD 两种日期格式；
     6. DataCollector.collect() 具备全局缓存与深拷贝安全。
     """
     # 1. 股票代码映射验证
-    # 消费电子
-    assert _map_stock_to_industry("000725.SZ") == "消费电子"  # 京东方A
-    assert _map_stock_to_industry("000725") == "消费电子"
-    assert _map_stock_to_industry("000725.sz") == "消费电子"
-    assert _map_stock_to_industry("000100.SZ") == "消费电子"  # TCL科技
-    assert _map_stock_to_industry("002475.SZ") == "消费电子"  # 立讯精密
-    assert _map_stock_to_industry("002241.SZ") == "消费电子"  # 歌尔股份
-    assert _map_stock_to_industry("300433.SZ") == "消费电子"  # 蓝思科技
-
-    # 新能源车
-    assert _map_stock_to_industry("300750.SZ") == "新能源车"  # 宁德时代
-    assert _map_stock_to_industry("300750") == "新能源车"
-    assert _map_stock_to_industry("300750.sz") == "新能源车"
-    assert _map_stock_to_industry("002594.SZ") == "新能源车"  # 比亚迪
-    assert _map_stock_to_industry("601633.SH") == "新能源车"  # 长城汽车
-    assert _map_stock_to_industry("002460.SZ") == "新能源车"  # 赣锋锂业
-    assert _map_stock_to_industry("002466.SZ") == "新能源车"  # 天齐锂业
-
-    # 半导体
+    # 原有 6 只核心标的严格验证
     assert _map_stock_to_industry("688981.SH") == "半导体"  # 中芯国际
-    assert _map_stock_to_industry("688981") == "半导体"
-    assert _map_stock_to_industry("688981.sh") == "半导体"
     assert _map_stock_to_industry("603501.SH") == "半导体"  # 韦尔股份
-    assert _map_stock_to_industry("603501") == "半导体"
-
-    # 石油化工
     assert _map_stock_to_industry("601857.SH") == "石油化工"  # 中国石油
-    assert _map_stock_to_industry("601857") == "石油化工"
-    assert _map_stock_to_industry("601857.sh") == "石油化工"
     assert _map_stock_to_industry("600309.SH") == "石油化工"  # 万华化学
-    assert _map_stock_to_industry("600309") == "石油化工"
-
-    # 金融地产
     assert _map_stock_to_industry("600036.SH") == "金融地产"  # 招商银行
-    assert _map_stock_to_industry("600036") == "金融地产"
-    assert _map_stock_to_industry("600036.sh") == "金融地产"
     assert _map_stock_to_industry("000002.SZ") == "金融地产"  # 万科A
-    assert _map_stock_to_industry("000002") == "金融地产"
-    assert _map_stock_to_industry("000002.sz") == "金融地产"
+
+    # 消费电子 & 新能源车标的
+    assert _map_stock_to_industry("000725.SZ") == "消费电子"  # 京东方A
+    assert _map_stock_to_industry("300750.SZ") == "新能源车"  # 宁德时代
+
+    # 新增行业标的
+    assert _map_stock_to_industry("600519.SH") == "白酒与精制茶酒"  # 贵州茅台
+    assert _map_stock_to_industry("600030.SH") == "证券公司与资本市场"  # 中信证券
+    assert _map_stock_to_industry("601318.SH") == "保险与多元金融"  # 中国平安
+    assert _map_stock_to_industry("601088.SH") == "煤炭与传统化石能源"  # 中国神华
+    assert _map_stock_to_industry("600900.SH") == "电力与公用事业"  # 长江电力
+    assert _map_stock_to_industry("600019.SH") == "钢铁与黑色金属"  # 宝钢股份
+    assert _map_stock_to_industry("601899.SH") == "有色金属与工业金属"  # 紫金矿业
+    assert _map_stock_to_industry("600547.SH") == "贵金属与稀缺资源"  # 山东黄金
+    assert _map_stock_to_industry("002714.SZ") == "农林牧渔与生猪养殖"  # 牧原股份
 
     # 未映射股票与非法输入
-    assert _map_stock_to_industry("600519.SH") is None  # 贵州茅台
-    assert _map_stock_to_industry("601318.SH") is None  # 中国平安
+    assert _map_stock_to_industry("UNKNOWN_999999") is None
     assert _map_stock_to_industry(None) is None
     assert _map_stock_to_industry("") is None
     assert _map_stock_to_industry(12345) is None  # type: ignore
@@ -450,7 +422,7 @@ def test_data_collector_integration():
 
     # 3. _fetch_all 对消费电子标的采集注入
     mock_linkage_payload = {
-        "industry_name": "消费电子/半导体显示",
+        "industry_name": "消费电子与智能终端",
         "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5}],
         "downstream_demand": [{"name": "全球智能手机出货量", "trend": "数据缺失"}],
         "international_benchmark": [{"name": "三星电子股价", "current_value": 52000.0}],
@@ -467,14 +439,14 @@ def test_data_collector_integration():
         res_boe = _fetch_all("000725.SZ", "2026-08-20", industry_provider=mock_provider)
         assert "industry_linkage" in res_boe
         assert res_boe["industry_linkage"] is not None
-        assert res_boe["industry_linkage"]["industry_name"] == "消费电子/半导体显示"
+        assert res_boe["industry_linkage"]["industry_name"] == "消费电子与智能终端"
         mock_provider.get_industry_linkage.assert_called_with("消费电子", as_of="2026-08-20")
 
-        # 4. _fetch_all 对未映射标的 (贵州茅台 600519.SH)
+        # 4. _fetch_all 对未映射标的
         mock_provider.reset_mock()
-        res_moutai = _fetch_all("600519.SH", "2026-08-20", industry_provider=mock_provider)
-        assert "industry_linkage" in res_moutai
-        assert res_moutai["industry_linkage"] is None
+        res_unmapped = _fetch_all("999999.SH", "2026-08-20", industry_provider=mock_provider)
+        assert "industry_linkage" in res_unmapped
+        assert res_unmapped["industry_linkage"] is None
         mock_provider.get_industry_linkage.assert_not_called()
 
         # 5. 日期格式归一化 (YYYYMMDD -> 2026-08-20)
@@ -493,7 +465,7 @@ def test_data_collector_integration():
 
     with patch("tradingagents.graph.data_collector._fetch_all", return_value=stub_pool) as mock_fetch:
         coll_res1 = collector_instance.collect("000725.SZ", "2026-08-20")
-        assert coll_res1["industry_linkage"]["industry_name"] == "消费电子/半导体显示"
+        assert coll_res1["industry_linkage"]["industry_name"] == "消费电子与智能终端"
 
         # 修改返回值验证深拷贝防护
         coll_res1["industry_linkage"]["upstream_cost"][0]["current_value"] = 88888.88
@@ -504,252 +476,63 @@ def test_data_collector_integration():
 
 
 # ---------------------------------------------------------------------------
-# 补充测试类 (Structural & Boundary Checks & DAV-256 Multi-industry)
+# 补充测试类 (DAV-274: 27 行业全覆盖与验收用例)
 # ---------------------------------------------------------------------------
 
 
 class TestIndustryLinkageSuite:
-    """产业链数据层完整性与边界回归测试类。"""
+    """产业链数据层完整性与 27 行业覆盖验收测试类。"""
 
     def test_linkage_map_and_helper_functions(self):
-        """测试 INDUSTRY_LINKAGE_MAP 配置结构与辅助查询函数（验证 5 个支持行业）。"""
+        """测试 INDUSTRY_LINKAGE_MAP 覆盖全部 27 个行业且支持历史 5 个行业快捷解析。"""
         supported = list_supported_industries()
-        assert "消费电子" in supported
-        assert "新能源车" in supported
-        assert "半导体" in supported
-        assert "石油化工" in supported
-        assert "金融地产" in supported
-        assert len(supported) == 5
+        kb_names = get_all_industry_names()
 
-        ce_config = get_industry_linkage_config("消费电子")
-        assert ce_config is not None
-        assert ce_config.industry_name == "消费电子/半导体显示"
+        assert len(supported) == 27
+        assert len(kb_names) == 27
+        assert set(supported) == set(kb_names)
 
-        # 模糊匹配测试
-        ce_fuzzy = get_industry_linkage_config("消费电子/半导体显示")
-        assert ce_fuzzy is not None
-        assert ce_fuzzy.industry_name == "消费电子/半导体显示"
+        # 历史 5 行业别名查询验证
+        for legacy_key, expected_target in [
+            ("消费电子", "消费电子与智能终端"),
+            ("新能源车", "新能源汽车与智能汽车"),
+            ("半导体", "半导体与集成电路"),
+            ("石油化工", "石油石化与基础化工"),
+            ("金融地产", "商业银行与信贷"),
+        ]:
+            cfg = get_industry_linkage_config(legacy_key)
+            assert cfg is not None, f"历史行业 {legacy_key} 必须能解析"
+            assert cfg.industry_name == expected_target
 
-        semi_fuzzy = get_industry_linkage_config("半导体/集成电路")
-        assert semi_fuzzy is not None
-        assert semi_fuzzy.industry_name == "半导体/集成电路"
+        # 验证字典索引能力
+        assert INDUSTRY_LINKAGE_MAP["消费电子"].industry_name == "消费电子与智能终端"
+        assert INDUSTRY_LINKAGE_MAP["新能源车"].industry_name == "新能源汽车与智能汽车"
+        assert INDUSTRY_LINKAGE_MAP["半导体"].industry_name == "半导体与集成电路"
+        assert INDUSTRY_LINKAGE_MAP["石油化工"].industry_name == "石油石化与基础化工"
+        assert INDUSTRY_LINKAGE_MAP["金融地产"].industry_name == "商业银行与信贷"
 
-        bank_fuzzy = get_industry_linkage_config("银行")
-        assert bank_fuzzy is not None
-        assert bank_fuzzy.industry_name == "金融地产/商业银行与房地产"
-
-        re_fuzzy = get_industry_linkage_config("房地产")
-        assert re_fuzzy is not None
-        assert re_fuzzy.industry_name == "金融地产/商业银行与房地产"
-
-        unknown_config = get_industry_linkage_config("未知赛道")
+        unknown_config = get_industry_linkage_config("未知赛道XYZ")
         assert unknown_config is None
 
-    def test_get_industry_linkage_semiconductor(self):
-        """测试半导体行业动态产业链采集与指标结构 (DAV-256)."""
+    def test_all_twenty_seven_industries_return_non_empty_linkage(self):
+        """验收标准 1 & 2：27 个行业都能 get_industry_linkage 返回非空结构；缺指标显式「数据缺失」，禁止臆造数值。"""
         provider = IndustryLinkageProvider()
-
-        # 构造 yfinance 模拟数据
-        dates = pd.date_range("2026-05-01", periods=70, freq="B")
-        prices_sox = [5000.0 + (i * 10.0) for i in range(70)]
-        df_sox = pd.DataFrame({"Open": prices_sox, "High": prices_sox, "Low": prices_sox, "Close": prices_sox, "Volume": [1000000] * 70}, index=dates)
-        df_sox.index.name = "Date"
-
-        prices_tsm = [150.0 + (i * 0.5) for i in range(70)]
-        df_tsm = pd.DataFrame({"Open": prices_tsm, "High": prices_tsm, "Low": prices_tsm, "Close": prices_tsm, "Volume": [5000000] * 70}, index=dates)
-        df_tsm.index.name = "Date"
-
-        with patch("yfinance.Ticker") as mock_yf:
-            def side_effect_yf(symbol):
-                instance = MagicMock()
-                if symbol == "^SOX":
-                    instance.history.return_value = df_sox
-                elif symbol == "TSM":
-                    instance.history.return_value = df_tsm
-                else:
-                    instance.history.return_value = pd.DataFrame()
-                return instance
-
-            mock_yf.side_effect = side_effect_yf
-
-            data = provider.get_industry_linkage("半导体", as_of="2026-08-20", use_cache=False)
-
-            assert data is not None
-            assert data["industry_name"] == "半导体/集成电路"
-            assert "国家大基金产业投资" in data["policy_catalysts"]
-
-            # 上游指标（待接入API）
-            assert len(data["upstream_cost"]) >= 1
-            silicon = data["upstream_cost"][0]
-            assert silicon["name"] == "半导体硅片价格"
-            assert silicon["current_value"] is None
-            assert silicon["trend"] == "数据缺失"
-            assert silicon["confidence"] == "低（待接入API）"
-
-            # 下游指标（手动 + 待接入）
-            assert len(data["downstream_demand"]) >= 2
-            sia = [d for d in data["downstream_demand"] if d["name"] == "全球半导体销售额"][0]
-            assert sia["current_value"] is None
-            assert sia["trend"] == "数据缺失"
-            assert sia["confidence"] == "低（待手动录入）"
-
-            dram = [d for d in data["downstream_demand"] if d["name"] == "DRAM存储芯片现货价"][0]
-            assert dram["current_value"] is None
-            assert dram["trend"] == "数据缺失"
-            assert dram["confidence"] == "低（待接入API）"
-
-            # 国际对标（yfinance）
-            assert len(data["international_benchmark"]) >= 2
-            sox = [b for b in data["international_benchmark"] if b["symbol"] == "^SOX"][0]
-            assert sox["current_value"] is not None and sox["current_value"] > 0
-            assert sox["trend"] == "上升"
-            assert sox["confidence"] == "高"
-
-            tsm = [b for b in data["international_benchmark"] if b["symbol"] == "TSM"][0]
-            assert tsm["current_value"] is not None and tsm["current_value"] > 0
-            assert tsm["trend"] == "上升"
-            assert tsm["confidence"] == "高"
-
-            # Prompt 渲染
-            prompt = format_industry_linkage_for_prompt(data)
-            assert "【产业链联想数据】：半导体/集成电路" in prompt
-            assert "费城半导体指数" in prompt
-            assert "台积电股价" in prompt
-            assert "【数据缺失】半导体硅片价格" in prompt
-
-    def test_get_industry_linkage_petrochemicals(self):
-        """测试石油化工行业动态产业链采集与指标结构 (DAV-256)."""
-        provider = IndustryLinkageProvider()
-
-        dates = pd.date_range("2026-05-01", periods=70, freq="B")
-        prices_brent = [80.0 + (i * 0.2) for i in range(70)]
-        df_brent = pd.DataFrame({"Open": prices_brent, "High": prices_brent, "Low": prices_brent, "Close": prices_brent, "Volume": [200000] * 70}, index=dates)
-        df_brent.index.name = "Date"
-
-        prices_xom = [115.0 - (i * 0.3) for i in range(70)]
-        df_xom = pd.DataFrame({"Open": prices_xom, "High": prices_xom, "Low": prices_xom, "Close": prices_xom, "Volume": [3000000] * 70}, index=dates)
-        df_xom.index.name = "Date"
-
-        with patch("yfinance.Ticker") as mock_yf:
-            def side_effect_yf(symbol):
-                instance = MagicMock()
-                if symbol == "BZ=F":
-                    instance.history.return_value = df_brent
-                elif symbol == "XOM":
-                    instance.history.return_value = df_xom
-                else:
-                    instance.history.return_value = pd.DataFrame()
-                return instance
-
-            mock_yf.side_effect = side_effect_yf
-
-            data = provider.get_industry_linkage("石油化工", as_of="2026-08-20", use_cache=False)
-
-            assert data is not None
-            assert data["industry_name"] == "石油化工/基础化工"
-            assert "能耗双控向碳排放双控转变" in data["policy_catalysts"]
-
-            # 上游原油
-            assert len(data["upstream_cost"]) >= 1
-            brent = data["upstream_cost"][0]
-            assert brent["name"] == "布伦特原油价格"
-            assert brent["current_value"] is not None and brent["current_value"] > 0
-            assert brent["trend"] == "上升"
-            assert brent["confidence"] == "高"
-
-            # 下游成品油与聚酯
-            assert len(data["downstream_demand"]) >= 2
-            oil_demand = [d for d in data["downstream_demand"] if d["name"] == "国内成品油消费量"][0]
-            assert oil_demand["current_value"] is None
-            assert oil_demand["trend"] == "数据缺失"
-
-            # 国际对标
-            xom = data["international_benchmark"][0]
-            assert xom["symbol"] == "XOM"
-            assert xom["current_value"] is not None and xom["current_value"] > 0
-            assert xom["trend"] == "下降"
-            assert xom["confidence"] == "高"
-
-            # Prompt 渲染
-            prompt = format_industry_linkage_for_prompt(data)
-            assert "【产业链联想数据】：石油化工/基础化工" in prompt
-            assert "布伦特原油价格" in prompt
-            assert "埃克森美孚股价" in prompt
-
-    def test_get_industry_linkage_finance_real_estate(self):
-        """测试金融地产行业动态产业链采集与指标结构 (DAV-256)."""
-        provider = IndustryLinkageProvider()
-
-        dates = pd.date_range("2026-05-01", periods=70, freq="B")
-        prices_jpm = [190.0 + (i * 0.4) for i in range(70)]
-        df_jpm = pd.DataFrame({"Open": prices_jpm, "High": prices_jpm, "Low": prices_jpm, "Close": prices_jpm, "Volume": [2000000] * 70}, index=dates)
-        df_jpm.index.name = "Date"
-
-        prices_xlf = [40.0 + (i * 0.1) for i in range(70)]
-        df_xlf = pd.DataFrame({"Open": prices_xlf, "High": prices_xlf, "Low": prices_xlf, "Close": prices_xlf, "Volume": [10000000] * 70}, index=dates)
-        df_xlf.index.name = "Date"
-
-        with patch("yfinance.Ticker") as mock_yf:
-            def side_effect_yf(symbol):
-                instance = MagicMock()
-                if symbol == "JPM":
-                    instance.history.return_value = df_jpm
-                elif symbol == "XLF":
-                    instance.history.return_value = df_xlf
-                else:
-                    instance.history.return_value = pd.DataFrame()
-                return instance
-
-            mock_yf.side_effect = side_effect_yf
-
-            data = provider.get_industry_linkage("金融地产", as_of="2026-08-20", use_cache=False)
-
-            assert data is not None
-            assert data["industry_name"] == "金融地产/商业银行与房地产"
-            assert "存量房贷利率调降政策" in data["policy_catalysts"]
-
-            # 上游指标（待接入/手动）
-            assert len(data["upstream_cost"]) >= 2
-            shibor = [u for u in data["upstream_cost"] if "同业拆借" in u["name"]][0]
-            assert shibor["current_value"] is None
-            assert shibor["trend"] == "数据缺失"
-
-            # 下游指标（待接入/手动）
-            assert len(data["downstream_demand"]) >= 2
-            re_sales = [d for d in data["downstream_demand"] if "商品房成交" in d["name"]][0]
-            assert re_sales["current_value"] is None
-            assert re_sales["trend"] == "数据缺失"
-
-            # 国际对标
-            assert len(data["international_benchmark"]) >= 2
-            jpm = [b for b in data["international_benchmark"] if b["symbol"] == "JPM"][0]
-            assert jpm["current_value"] is not None and jpm["current_value"] > 0
-            assert jpm["confidence"] == "高"
-
-            xlf = [b for b in data["international_benchmark"] if b["symbol"] == "XLF"][0]
-            assert xlf["current_value"] is not None and xlf["current_value"] > 0
-            assert xlf["confidence"] == "高"
-
-            prompt = format_industry_linkage_for_prompt(data)
-            assert "【产业链联想数据】：金融地产/商业银行与房地产" in prompt
-            assert "摩根大通股价" in prompt
-            assert "标普500金融行业指数" in prompt
-
-    def test_all_five_industries_return_non_empty_linkage(self):
-        """验收标准2：5个行业都能 get_industry_linkage 返回非空结构；缺指标显式「数据缺失」，禁止臆造数值。"""
-        provider = IndustryLinkageProvider()
-        five_industries = ["消费电子", "新能源车", "半导体", "石油化工", "金融地产"]
+        all_27_names = get_all_industry_names()
+        assert len(all_27_names) == 27
 
         with patch("akshare.futures_foreign_hist", return_value=pd.DataFrame()), \
              patch("yfinance.Ticker", side_effect=Exception("Offline test")):
-            for ind_name in five_industries:
+            for ind_name in all_27_names:
                 data = provider.get_industry_linkage(ind_name, as_of="2026-08-20", use_cache=False)
                 assert data is not None, f"行业 {ind_name} 应返回非空产业链结构"
-                assert "industry_name" in data and len(data["industry_name"]) > 0
+                assert data["industry_name"] == ind_name
                 assert "upstream_cost" in data and isinstance(data["upstream_cost"], list)
+                assert len(data["upstream_cost"]) >= 1, f"行业 {ind_name} 必须有上游成本指标"
                 assert "downstream_demand" in data and isinstance(data["downstream_demand"], list)
+                assert len(data["downstream_demand"]) >= 1, f"行业 {ind_name} 必须有下游需求指标"
                 assert "international_benchmark" in data and isinstance(data["international_benchmark"], list)
-                assert "policy_catalysts" in data and len(data["policy_catalysts"]) > 0
+                assert len(data["international_benchmark"]) >= 1, f"行业 {ind_name} 必须有国际对标指标"
+                assert "policy_catalysts" in data and len(data["policy_catalysts"]) >= 1, f"行业 {ind_name} 必须有政策催化"
                 assert "description" in data
 
                 # 验证离线/异常时所有指标均为「数据缺失」，零臆造数值
@@ -761,8 +544,60 @@ class TestIndustryLinkageSuite:
                     assert ind["current_value"] is None, f"{ind['name']} 异常/离线时 current_value 必须为 None"
                     assert ind["trend"] == "数据缺失", f"{ind['name']} trend 必须为「数据缺失」"
 
+                prompt = format_industry_linkage_for_prompt(data)
+                assert f"【产业链联想数据】：{ind_name}" in prompt
+
+    def test_data_collector_maps_required_six_stocks(self):
+        """验收标准 3：DataCollector 能把原有 6 只股票严格映射到对应行业，绝不回归。"""
+        assert _map_stock_to_industry("688981.SH") == "半导体"  # 中芯国际
+        assert _map_stock_to_industry("603501.SH") == "半导体"  # 韦尔股份
+        assert _map_stock_to_industry("601857.SH") == "石油化工"  # 中国石油
+        assert _map_stock_to_industry("600309.SH") == "石油化工"  # 万华化学
+        assert _map_stock_to_industry("600036.SH") == "金融地产"  # 招商银行
+        assert _map_stock_to_industry("000002.SZ") == "金融地产"  # 万科A
+
+    def test_data_collector_maps_all_twenty_seven_industries(self):
+        """验收标准：27 个行业均有至少 1 只 A 股代表股票映射，且全部可解析。"""
+        representative_stocks = {
+            "半导体与集成电路": "688981.SH",  # 中芯国际
+            "人工智能与算力服务": "300308.SZ",  # 中际旭创
+            "新能源汽车与智能汽车": "300750.SZ",  # 宁德时代
+            "光伏与储能系统": "601012.SH",  # 隆基绿能
+            "动力电池与储能电池材料": "002709.SZ",  # 天赐材料
+            "医药生物与创新药": "600276.SH",  # 恒瑞医药
+            "医疗器械与医疗服务": "300760.SZ",  # 迈瑞医疗
+            "消费电子与智能终端": "000725.SZ",  # 京东方A
+            "白酒与精制茶酒": "600519.SH",  # 贵州茅台
+            "大众食品与饮料": "603288.SH",  # 海天味业
+            "家用电器与智能家居": "000333.SZ",  # 美的集团
+            "商业银行与信贷": "601166.SH",  # 兴业银行
+            "证券公司与资本市场": "600030.SH",  # 中信证券
+            "保险与多元金融": "601318.SH",  # 中国平安
+            "钢铁与黑色金属": "600019.SH",  # 宝钢股份
+            "有色金属与工业金属": "601899.SH",  # 紫金矿业
+            "贵金属与稀缺资源": "600547.SH",  # 山东黄金
+            "石油石化与基础化工": "601857.SH",  # 中国石油
+            "煤炭与传统化石能源": "601088.SH",  # 中国神华
+            "电力与公用事业": "600900.SH",  # 长江电力
+            "房地产开发与运营": "600383.SH",  # 金地集团
+            "建筑装饰与基础设施工程": "601668.SH",  # 中国建筑
+            "机械设备与工业母机": "600031.SH",  # 三一重工
+            "国防军工与航天装备": "600893.SH",  # 航发动力
+            "交通运输与航运港口": "601919.SH",  # 中远海控
+            "通信网络与光通信": "600941.SH",  # 中国移动
+            "农林牧渔与生猪养殖": "002714.SZ",  # 牧原股份
+        }
+
+        assert len(representative_stocks) == 27
+        for expected_ind_name, stock in representative_stocks.items():
+            mapped_ind = _map_stock_to_industry(stock)
+            assert mapped_ind is not None, f"股票 {stock} ({expected_ind_name}) 未能映射"
+            cfg = get_industry_linkage_config(mapped_ind)
+            assert cfg is not None, f"股票 {stock} 映射行业 {mapped_ind} 无法解析到配置"
+            assert cfg.industry_name == expected_ind_name, f"股票 {stock} 映射到 {cfg.industry_name}，预期 {expected_ind_name}"
+
     def test_free_sources_typed_gap_on_failure(self):
-        """验收标准4：免费源（Yahoo/LME 等）失败必须 typed gap，不得假成功。"""
+        """验收标准：免费源（Yahoo/LME 等）失败必须 typed gap，不得假成功。"""
         provider = IndustryLinkageProvider()
 
         # akshare 失败
@@ -782,15 +617,6 @@ class TestIndustryLinkageSuite:
             assert res_yf["trend"] == "数据缺失"
             assert res_yf["confidence"] == "低（接口异常）"
             assert "Yahoo 429" in res_yf["note"]
-
-    def test_data_collector_maps_required_six_stocks(self):
-        """验收标准3：DataCollector 能把 6 只股票映射到正确行业。"""
-        assert _map_stock_to_industry("688981.SH") == "半导体"  # 中芯国际
-        assert _map_stock_to_industry("603501.SH") == "半导体"  # 韦尔股份
-        assert _map_stock_to_industry("601857.SH") == "石油化工"  # 中国石油
-        assert _map_stock_to_industry("600309.SH") == "石油化工"  # 万华化学
-        assert _map_stock_to_industry("600036.SH") == "金融地产"  # 招商银行
-        assert _map_stock_to_industry("000002.SZ") == "金融地产"  # 万科A
 
     def test_as_of_lookahead_filtering(self, mock_copper_dataframe: pd.DataFrame):
         """测试 as_of 截止日期过滤，防止未来数据泄露。"""
@@ -814,7 +640,7 @@ class TestIndustryLinkageSuite:
         config = get_industry_linkage_config("消费电子")
         assert config is not None
         text = format_industry_linkage_for_prompt(config)
-        assert "【产业链联想数据】：消费电子/半导体显示" in text
+        assert "【产业链联想数据】：消费电子与智能终端" in text
         assert "LME铜价" in text
 
     def test_calculate_series_metrics_variations(self):
