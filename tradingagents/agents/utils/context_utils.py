@@ -277,6 +277,25 @@ def build_agent_context_view(state: Mapping[str, Any], role: str) -> dict[str, s
     }
 
 
+def format_phase1_reports(state: Mapping[str, Any] | None) -> str:
+    """Format Phase 1 analyst outputs (macro, market, sentiment) for Phase 2 analysts."""
+    st = state or {}
+    macro_rep = (st.get("macro_report") or "").strip()
+    market_rep = (st.get("market_report") or "").strip()
+    sentiment_rep = (st.get("sentiment_report") or "").strip()
+
+    macro_content = macro_rep if macro_rep and macro_rep != "无数据" else "【数据缺失】宏观板块分析报告缺失"
+    market_content = market_rep if market_rep and market_rep != "无数据" else "【数据缺失】大盘市场技术分析报告缺失"
+    sentiment_content = sentiment_rep if sentiment_rep and sentiment_rep != "无数据" else "【数据缺失】市场情绪舆情分析报告缺失"
+
+    return (
+        "【阶段一分析师产物（宏观/大盘/情绪）】\n"
+        f"【宏观与行业板块结论（阶段一）】\n{macro_content}\n\n"
+        f"【大盘与市场技术面结论（阶段一）】\n{market_content}\n\n"
+        f"【市场情绪与舆情结论（阶段一）】\n{sentiment_content}"
+    )
+
+
 def _build_cn_market_context(trade_date: str, now: datetime | None = None) -> dict[str, Any]:
     now_dt = (now or datetime.now(CN_TZ)).astimezone(CN_TZ)
     today = now_dt.date().strftime("%Y-%m-%d")

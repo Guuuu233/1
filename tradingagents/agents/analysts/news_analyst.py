@@ -1,5 +1,5 @@
 import logging
-from tradingagents.agents.utils.context_utils import get_cn_stock_name
+from tradingagents.agents.utils.context_utils import get_cn_stock_name, format_phase1_reports
 import asyncio
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -71,13 +71,20 @@ def create_news_analyst(llm, data_collector=None):
             data_window = f"{days}天"
 
         # ── 宏观事件情景图谱挂载 ──────────────────
+        extra_event_text = f"{stock_news}\n{global_news}"
+        macro_report = state.get("macro_report", "")
+        if macro_report and macro_report != "无数据":
+            extra_event_text += f"\n{macro_report}"
         _, macro_event_ctx = resolve_macro_event_context(
-            text=f"{stock_news}\n{global_news}",
+            text=extra_event_text,
             max_events=2,
         )
 
+        phase1_reports_text = format_phase1_reports(state)
+
         human_content_blocks = [
             horizon_ctx + "\n" + f"以下是 {ticker_display} 在 {current_date} 的新闻资料（{data_window}）。",
+            phase1_reports_text,
             f"【get_news】\n{stock_news}",
             f"【get_global_news】\n{global_news}",
         ]

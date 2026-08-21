@@ -225,11 +225,33 @@ class GraphSetup:
         workflow.add_node("Risk Judge", risk_manager_node)
 
         # Define edges
-        # Fan out all selected analysts in parallel from START
-        for analyst_type in selected_analysts:
-            workflow.add_edge(START, f"{analyst_display_name(analyst_type)} Analyst")
+        # Two-stage analyst topology:
+        # Phase 1: Macro, Market, Social parallel from START
+        # Barrier: All Phase 1 analysts complete -> fan out to Phase 2 (Fundamentals, News, Smart Money, Volume Price)
+        # All Phase 2 analysts complete -> Bull Researcher (start debate)
 
-        # Each analyst runs independently, then fans in to Bull Researcher
+        phase1_types = [a for a in selected_analysts if a in ("macro", "market", "social")]
+        phase2_types = [a for a in selected_analysts if a not in ("macro", "market", "social")]
+
+        phase1_dones = [f"{analyst_display_name(a)} Analyst Done" for a in phase1_types]
+        phase2_dones = [f"{analyst_display_name(a)} Analyst Done" for a in phase2_types]
+
+        if phase1_types and phase2_types:
+            for analyst_type in phase1_types:
+                workflow.add_edge(START, f"{analyst_display_name(analyst_type)} Analyst")
+            for analyst_type in phase2_types:
+                workflow.add_edge(phase1_dones, f"{analyst_display_name(analyst_type)} Analyst")
+            workflow.add_edge(phase2_dones, "Bull Researcher")
+        elif phase1_types:
+            for analyst_type in phase1_types:
+                workflow.add_edge(START, f"{analyst_display_name(analyst_type)} Analyst")
+            workflow.add_edge(phase1_dones, "Bull Researcher")
+        elif phase2_types:
+            for analyst_type in phase2_types:
+                workflow.add_edge(START, f"{analyst_display_name(analyst_type)} Analyst")
+            workflow.add_edge(phase2_dones, "Bull Researcher")
+
+        # Each analyst loops independently with its tool node until done
         for analyst_type in selected_analysts:
             current_analyst = f"{analyst_display_name(analyst_type)} Analyst"
             current_tools = f"tools_{analyst_type}"
@@ -244,12 +266,6 @@ class GraphSetup:
                 },
             )
             workflow.add_edge(current_tools, current_analyst)
-
-        # All analysts complete → Bull Researcher (start debate)
-        workflow.add_edge(
-            [f"{analyst_display_name(analyst_type)} Analyst Done" for analyst_type in selected_analysts],
-            "Bull Researcher",
-        )
 
         # Add remaining edges
         workflow.add_conditional_edges(

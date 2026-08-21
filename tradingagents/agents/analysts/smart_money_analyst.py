@@ -1,5 +1,5 @@
 import logging
-from tradingagents.agents.utils.context_utils import get_cn_stock_name
+from tradingagents.agents.utils.context_utils import get_cn_stock_name, format_phase1_reports
 import asyncio
 import json
 
@@ -123,6 +123,7 @@ def create_smart_money_analyst(llm, data_collector=None):
             "reason": (validation or {}).get("hard_guard", {}).get("reason")
             or (selection or {}).get("reason", "fund-flow source selection unavailable"),
         }
+        phase1_reports_text = format_phase1_reports(state)
         messages = [
             SystemMessage(content=(
                 system_message
@@ -132,6 +133,7 @@ def create_smart_money_analyst(llm, data_collector=None):
                 horizon_ctx + "\n"
                 f"请分析 {ticker_display} 在 {current_date} 的资金流数据。若来源为同花顺即时资金流净额快照，"
                 "不得将其视为新浪历史 netamount/r0_net 同口径的主力序列。\n\n"
+                f"{phase1_reports_text}\n\n"
                 f"【资金流数据（来源、日期与口径见数据）】\n{fund_flow}\n\n"
                 f"【资金流结构化 evidence（仅用于精确累计，不得从展示文本反推）】\n{evidence_text}\n\n"
                 f"【资金流来源选择与方向规则】\n{consensus_instruction}\n\n"

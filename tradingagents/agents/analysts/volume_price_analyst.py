@@ -1,7 +1,7 @@
 import logging
 import asyncio
 
-from tradingagents.agents.utils.context_utils import get_cn_stock_name
+from tradingagents.agents.utils.context_utils import get_cn_stock_name, format_phase1_reports
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from tradingagents.dataflows.config import get_config
@@ -42,10 +42,12 @@ def create_volume_price_analyst(llm, data_collector=None):
         else:
             vpa_data, stock_data, data_window = "无数据", "无数据", "14天"
 
+        phase1_reports_text = format_phase1_reports(state)
         messages = [
             SystemMessage(content=horizon_ctx + system_message + "\n\n请全程使用中文。"),
             HumanMessage(content=(
                 f"以下是 {ticker_display} 在 {current_date} 的量价分析预计算数据（数据窗口：{data_window}）。\n\n"
+                f"{phase1_reports_text}\n\n"
                 f"{vpa_data}\n\n"
                 f"【原始 K 线数据参考】\n{stock_data}"
             )),

@@ -12,7 +12,7 @@ from tradingagents.agents.utils.agent_states import (
     check_llm_output_degraded,
     check_stream_chunk_degraded,
 )
-from tradingagents.agents.utils.context_utils import get_cn_stock_name
+from tradingagents.agents.utils.context_utils import get_cn_stock_name, format_phase1_reports
 from tradingagents.agents.utils.knowledge_context import (
     resolve_industry_context,
     resolve_macro_event_context,
@@ -135,8 +135,11 @@ def create_fundamentals_analyst(llm, data_collector=None):
         # ── 产业链联想数据段落 ──────────────────────
         industry_linkage_text = format_industry_linkage_for_prompt(industry_linkage_data)
 
+        phase1_reports_text = format_phase1_reports(state)
+
         human_content_blocks = [
             horizon_ctx + "\n" + f"以下是 {ticker_display} 在 {current_date} 的基本面资料与产业链/宏观背景。",
+            phase1_reports_text,
         ]
 
         if industry_linkage_text:
