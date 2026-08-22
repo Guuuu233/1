@@ -52,6 +52,7 @@ import requests
 from api.database import UserDB, VersionStatsDB, FeedbackDB, SponsorDB, ProviderDB, init_db, get_db, get_db_ctx
 from api.job_store import get_job_store as _new_job_store
 from api.services import auth_service, portfolio_import_service, report_service, token_service, watchlist_service, scheduled_service, tracking_board_service, feedback_service, sponsor_service, role_routing_service, custom_prompt_service
+import jwt
 
 def _get_real_ip(request: Request) -> Optional[str]:
     """Extract real client IP, preferring Cloudflare/proxy headers."""
@@ -1770,30 +1771,54 @@ class RequireUser:
 
     def __call__(
         self,
+        request: Request,
         credentials: Optional[HTTPAuthorizationCredentials] = Depends(_auth_scheme),
     ) -> UserDB:
-        with get_db_ctx() as db:
-            if credentials:
-                token = credentials.credentials
-                # 1. 优先尝试 JWT (网页登录)
-                try:
-                    payload = auth_service.decode_access_token(token)
-                    user_id = str(payload.get("sub") or "")
-                    user = auth_service.get_user_by_id(db, user_id)
-                    if user and user.is_active:
-                        db.expunge(user)
-                        return user
-                except Exception:
-                    pass
+        raw_auth = request.headers.get("authorization")
+        if raw_auth is not None:
+            raw_auth = raw_auth.strip()
+            if not raw_auth:
+                raise HTTPException(status_code=401, detail="Invalid authorization header")
 
-                # 2. 尝试 API Token (仅在允许时)
-                if self.allow_api_token and token.startswith(token_service.TOKEN_PREFIX):
+            parts = raw_auth.split(" ", 1)
+            if len(parts) != 2 or parts[0].lower() != "bearer":
+                raise HTTPException(status_code=401, detail="Invalid authorization header format")
+
+            token = parts[1].strip()
+            if not token:
+                raise HTTPException(status_code=401, detail="Missing bearer token")
+
+            with get_db_ctx() as db:
+                # 1. API Token (仅在允许时)
+                if token.startswith(token_service.TOKEN_PREFIX):
+                    if not self.allow_api_token:
+                        raise HTTPException(status_code=401, detail="API tokens are not allowed for this endpoint")
                     user = token_service.verify_token(db, token)
                     if user and user.is_active:
                         db.expunge(user)
                         return user
+                    raise HTTPException(status_code=401, detail="Invalid or inactive API token")
 
-            # 本地单用户/未登录回退至默认本地账户
+                # 2. JWT (网页登录)
+                try:
+                    payload = auth_service.decode_access_token(token)
+                except jwt.ExpiredSignatureError:
+                    raise HTTPException(status_code=401, detail="Token has expired")
+                except (jwt.InvalidTokenError, Exception):
+                    raise HTTPException(status_code=401, detail="Invalid token")
+
+                user_id = str(payload.get("sub") or "")
+                if not user_id:
+                    raise HTTPException(status_code=401, detail="Invalid token payload")
+
+                user = auth_service.get_user_by_id(db, user_id)
+                if user and user.is_active:
+                    db.expunge(user)
+                    return user
+                raise HTTPException(status_code=401, detail="User not found or inactive")
+
+        # 本地单用户/未登录回退至默认本地账户
+        with get_db_ctx() as db:
             user = auth_service.get_or_create_default_user(db)
             db.expunge(user)
             return user
@@ -5365,24 +5390,72 @@ def _config_response_for_user(user: Optional[UserDB], db: Session) -> UserRuntim
     )
 
 
+_REQUEST_CODE_RATE_WINDOW_SECONDS = int(os.getenv("AUTH_REQUEST_CODE_RATE_WINDOW", "60"))
+_REQUEST_CODE_RATE_MAX = int(os.getenv("AUTH_REQUEST_CODE_RATE_MAX", "10"))
+_request_code_rate_hits: Dict[str, List[float]] = {}
+_request_code_rate_lock = Lock()
+
+
+def _enforce_request_code_rate_limit(remote_ip: Optional[str], email: str) -> None:
+    now = time.time()
+    key = f"{remote_ip or 'unknown'}:{email}"
+    with _request_code_rate_lock:
+        hits = _request_code_rate_hits.setdefault(key, [])
+        hits[:] = [t for t in hits if now - t < _REQUEST_CODE_RATE_WINDOW_SECONDS]
+        if len(hits) >= _REQUEST_CODE_RATE_MAX:
+            raise HTTPException(status_code=429, detail="请求过于频繁，请稍后重试")
+        hits.append(now)
+        if len(_request_code_rate_hits) > 1024:
+            empty_keys = [k for k, v in _request_code_rate_hits.items() if not v]
+            for k in empty_keys:
+                _request_code_rate_hits.pop(k, None)
+
+
+_VERIFY_CODE_RATE_WINDOW_SECONDS = int(os.getenv("AUTH_VERIFY_CODE_RATE_WINDOW", "60"))
+_VERIFY_CODE_RATE_MAX = int(os.getenv("AUTH_VERIFY_CODE_RATE_MAX", "10"))
+_verify_code_rate_hits: Dict[str, List[float]] = {}
+_verify_code_rate_lock = Lock()
+
+
+def _enforce_verify_code_rate_limit(remote_ip: Optional[str], email: str) -> None:
+    now = time.time()
+    key = f"{remote_ip or 'unknown'}:{email}"
+    with _verify_code_rate_lock:
+        hits = _verify_code_rate_hits.setdefault(key, [])
+        hits[:] = [t for t in hits if now - t < _VERIFY_CODE_RATE_WINDOW_SECONDS]
+        if len(hits) >= _VERIFY_CODE_RATE_MAX:
+            raise HTTPException(status_code=429, detail="验证请求过于频繁，请稍后重试")
+        hits.append(now)
+        if len(_verify_code_rate_hits) > 1024:
+            empty_keys = [k for k, v in _verify_code_rate_hits.items() if not v]
+            for k in empty_keys:
+                _verify_code_rate_hits.pop(k, None)
+
+
 @app.post("/v1/auth/request-code")
-def request_login_code(request: AuthRequestCodeRequest):
-    email = auth_service.normalize_email(request.email)
+def request_login_code(body: AuthRequestCodeRequest, request: Request):
+    email = auth_service.normalize_email(body.email)
     if not re.match(r"^[^@\s]+@[^@\s.]+\.[^@\s.]+$", email):
         raise HTTPException(status_code=400, detail="邮箱格式不正确")
+    remote_ip = _get_real_ip(request)
+    _enforce_request_code_rate_limit(remote_ip, email)
     with get_db_ctx() as db:
         code = auth_service.upsert_login_code(db, email)
     # DB session 已释放，SMTP 不会阻塞连接池
     dev_code = auth_service.send_login_code(email, code)
     response = {"message": "验证码已发送"}
-    if dev_code:
+    is_prod = os.getenv("APP_ENV", "development").strip().lower() == "production"
+    if dev_code and not is_prod:
         response["dev_code"] = dev_code
     return response
 
 
 @app.post("/v1/auth/verify-code", response_model=AuthVerifyCodeResponse)
 def verify_login_code(body: AuthVerifyCodeRequest, request: Request, db: Session = Depends(get_db)):
-    user = auth_service.verify_login_code(db, body.email, body.code, client_ip=_get_real_ip(request))
+    email = auth_service.normalize_email(body.email)
+    remote_ip = _get_real_ip(request)
+    _enforce_verify_code_rate_limit(remote_ip, email)
+    user = auth_service.verify_login_code(db, email, body.code, client_ip=remote_ip)
     if not user:
         raise HTTPException(status_code=400, detail="验证码错误或已过期")
     access_token = auth_service.create_access_token(user)

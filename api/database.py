@@ -86,9 +86,21 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_report_schema()
     _ensure_user_schema()
+    _ensure_auth_schema()
     _ensure_scheduled_schema()
     _ensure_llm_call_log_schema()
     _ensure_historical_cases_schema()
+
+
+def _ensure_auth_schema() -> None:
+    """Add lightweight columns for email verification codes for existing SQLite deployments."""
+    try:
+        with engine.begin() as conn:
+            columns = {row[1] for row in conn.execute(text("PRAGMA table_info(email_verification_codes)"))}
+            if "attempts" not in columns:
+                conn.execute(text("ALTER TABLE email_verification_codes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"))
+    except Exception as e:
+        logger.error("Failed to ensure auth schema: %s", e)
 
 
 def _ensure_report_schema() -> None:
@@ -429,6 +441,7 @@ class EmailVerificationCodeDB(Base):
     email = Column(String(255), index=True, nullable=False)
     code_hash = Column(String(255), nullable=False)
     purpose = Column(String(50), default="login", nullable=False)
+    attempts = Column(Integer, default=0, nullable=False, server_default="0")
     expires_at = Column(DateTime, nullable=False)
     consumed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
