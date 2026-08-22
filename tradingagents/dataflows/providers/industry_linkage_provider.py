@@ -18,11 +18,13 @@
 
 import copy
 import logging
+import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import requests
 
 from tradingagents.dataflows.industry_linkage import (
     IndustryLinkage,
@@ -48,6 +50,139 @@ APPROX_TRADING_DAYS_PER_QUARTER = 63
 # 趋势判定阈值 (%)
 TREND_UPWARD_THRESHOLD_PCT = 1.0
 TREND_DOWNWARD_THRESHOLD_PCT = -1.0
+
+# ── Tushare API 常量与错误码分类 ──
+_TUSHARE_DEFAULT_URL = "https://api.tushare.pro"
+_TUSHARE_TIMEOUT = 10
+_TUSHARE_AUTH_CODES = {2001, 2002, 40101, 40102, 40103}
+_TUSHARE_RATE_LIMIT_CODES = {2003, 40203, 40204, 40205, 40206}
+_FUTURES_EXCHANGE_SUFFIXES = (".GFE", ".SHF", ".DCE", ".CZC", ".INE", ".CFX", ".ZCE")
+
+
+def _get_tushare_url() -> str:
+    """解析 Tushare API 请求 URL（优先环境变量 TUSHARE_API_URL / TUSHARE_BASE_URL）。"""
+    return (
+        os.getenv("TUSHARE_API_URL", "").strip()
+        or os.getenv("TUSHARE_BASE_URL", "").strip()
+        or _TUSHARE_DEFAULT_URL
+    )
+
+
+def _get_tushare_token() -> str:
+    """安全读取 Tushare Token，严禁硬编码或打印到日志/错误信息中。"""
+    return os.getenv("TUSHARE_TOKEN", "").strip()
+
+
+def _resolve_tushare_api_name(
+    symbol: str, metadata: Optional[Dict[str, Any]] = None
+) -> str:
+    """根据标的代码或元数据判定 Tushare API 接口类型。
+
+    - 期货标的 (以交易所后缀结尾，如 .GFE, .SHF 等): 调用 fut_daily
+    - 全球指数标的 (如 SPX, IXIC 等): 调用 index_global
+    """
+    if metadata and metadata.get("api_name"):
+        return str(metadata["api_name"]).strip()
+    sym_upper = symbol.strip().upper()
+    if sym_upper.endswith(_FUTURES_EXCHANGE_SUFFIXES):
+        return "fut_daily"
+    return "index_global"
+
+
+def _query_tushare_api(
+    api_name: str,
+    ts_code: str,
+    as_of: Optional[str] = None,
+    fields: Optional[str] = None,
+) -> Tuple[Optional[pd.DataFrame], Optional[str], Optional[str]]:
+    """向 Tushare 发起行情请求并进行响应校验与错误分类。
+
+    Args:
+        api_name: 接口名称 (fut_daily / index_global 等)
+        ts_code: 证券代码 (如 LC.GFE / SPX)
+        as_of: 截止基准日期 (YYYY-MM-DD 或 YYYYMMDD)
+        fields: 请求字段列表
+
+    Returns:
+        (DataFrame, error_category, error_note): 成功时 DataFrame 非空，失败时返回错误分类与说明
+    """
+    token = _get_tushare_token()
+    if not token:
+        return None, "token", "Tushare Token 未配置 (TUSHARE_TOKEN missing)"
+
+    url = _get_tushare_url()
+    req_fields = fields or "ts_code,trade_date,open,high,low,close,vol"
+    params: Dict[str, Any] = {"ts_code": ts_code}
+    if as_of:
+        clean_as_of = str(as_of).replace("-", "").strip()
+        if len(clean_as_of) == 8 and clean_as_of.isdigit():
+            params["end_date"] = clean_as_of
+
+    payload = {
+        "api_name": api_name,
+        "token": token,
+        "params": params,
+        "fields": req_fields,
+    }
+
+    try:
+        resp = requests.post(url, json=payload, timeout=_TUSHARE_TIMEOUT)
+    except requests.Timeout as e:
+        return None, "timeout", f"Tushare 请求超时: {e}"
+    except requests.RequestException as e:
+        return None, "network_error", f"Tushare 请求异常: {e}"
+    except Exception as e:
+        return None, "network_error", f"Tushare 调用未知异常: {e}"
+
+    if resp.status_code == 403:
+        return None, "403", "Tushare HTTP 403 权限不足"
+    if resp.status_code == 429:
+        return None, "rate_limited", "Tushare HTTP 429 请求超限"
+    if resp.status_code != 200:
+        return None, "http_error", f"Tushare HTTP 错误 (status={resp.status_code})"
+
+    try:
+        res_json = resp.json()
+    except Exception as e:
+        return None, "parse_error", f"Tushare 响应 JSON 解析失败: {e}"
+
+    if not isinstance(res_json, dict):
+        return None, "parse_error", "Tushare 响应格式非法 (非 dict)"
+
+    code = res_json.get("code")
+    msg = str(res_json.get("msg") or "")
+
+    try:
+        code_val = int(code) if code is not None else -1
+    except (TypeError, ValueError):
+        code_val = -1
+
+    if code_val != 0:
+        msg_lower = msg.lower()
+        if code_val in _TUSHARE_AUTH_CODES or any(
+            k in msg_lower for k in ("权限", "permission", "403", "unauthor")
+        ):
+            return None, "403", f"Tushare API 权限不足 (code={code}): {msg}"
+        if code_val in _TUSHARE_RATE_LIMIT_CODES or any(
+            k in msg_lower for k in ("频率", "rate", "limit")
+        ):
+            return None, "rate_limited", f"Tushare API 触发限频 (code={code}): {msg}"
+        return None, "api_error", f"Tushare API 错误 (code={code}): {msg}"
+
+    data = res_json.get("data")
+    if not data or not isinstance(data, dict):
+        return None, "empty_rows", "Tushare 未返回有效数据（data 字段为空）"
+
+    resp_fields = data.get("fields")
+    items = data.get("items")
+    if not items or not isinstance(items, list) or len(items) == 0:
+        return None, "empty_rows", "Tushare 未返回有效行情记录（空行）"
+
+    try:
+        df = pd.DataFrame(items, columns=resp_fields)
+        return df, None, None
+    except Exception as e:
+        return None, "parse_error", f"Tushare 数据构造 DataFrame 失败: {e}"
 
 
 class IndustryLinkageProvider:
@@ -173,15 +308,19 @@ class IndustryLinkageProvider:
                 })
                 return base_dict
 
-            # 3. LME铜价 / akshare 期货历史行情
+            # 3. LME铜价 / akshare 期货历史行情 (支持 Tushare 沪铜 CU.SHF 备源)
             if config.name == "LME铜价" or (config.source == "akshare" and config.symbol in ("铜", "CAD")):
                 return self._fetch_lme_copper(config, as_of=as_of)
 
-            # 4. yfinance 标的 (三星电子股价、费城半导体指数、台积电、布伦特原油、埃克森美孚、摩根大通、标普500金融指数等)
+            # 4. Tushare 付费数据源标的 (碳酸锂 LC.GFE、多晶硅 PS.GFE、全球指数 SPX 等)
+            if config.source == "tushare" and config.symbol:
+                return self._fetch_tushare_indicator(config, as_of=as_of)
+
+            # 5. yfinance 标的 (三星电子股价、费城半导体指数、台积电、布伦特原油、埃克森美孚、摩根大通、标普500金融指数等)
             if config.source == "yfinance" and config.symbol:
                 return self._fetch_yfinance_indicator(config, as_of=as_of)
 
-            # 5. 其余默认未实现指标
+            # 6. 其余默认未实现指标
             base_dict.update({
                 "current_value": None,
                 "trend": "数据缺失",
@@ -200,18 +339,90 @@ class IndustryLinkageProvider:
             })
             return base_dict
 
+    def _fetch_tushare_indicator(
+        self,
+        config: IndustryLinkageIndicator,
+        as_of: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """采集 Tushare 标的历史行情并计算最新值、月环比、季度环比与趋势。"""
+        result = config.model_dump()
+        symbol = config.symbol
+        if not symbol:
+            result.update({
+                "current_value": None,
+                "trend": "数据缺失",
+                "confidence": "低（代码缺失）",
+                "note": "未配置有效的 Tushare 证券代码",
+            })
+            return result
+
+        api_name = _resolve_tushare_api_name(symbol, config.metadata)
+
+        df, err_cat, err_note = _query_tushare_api(
+            api_name=api_name,
+            ts_code=symbol,
+            as_of=as_of,
+        )
+
+        if df is None:
+            conf_map = {
+                "token": "低（Token缺失）",
+                "403": "低（无权限403）",
+                "rate_limited": "低（频率限制）",
+                "empty_rows": "低（数据源为空）",
+                "timeout": "低（网络超时）",
+                "network_error": "低（接口异常）",
+                "http_error": "低（接口异常）",
+                "api_error": "低（接口异常）",
+                "parse_error": "低（接口异常）",
+            }
+            confidence = conf_map.get(err_cat or "", "低（接口异常）")
+            result.update({
+                "current_value": None,
+                "trend": "数据缺失",
+                "confidence": confidence,
+                "note": err_note or "Tushare 数据获取失败",
+            })
+            return result
+
+        metrics = self._calculate_series_metrics(
+            df, as_of=as_of, price_col="close", date_col="trade_date"
+        )
+
+        if not metrics:
+            result.update({
+                "current_value": None,
+                "trend": "数据缺失",
+                "confidence": "低（有效数据不足）",
+                "note": "无符合截止日期的有效价格序列",
+            })
+            return result
+
+        result.update({
+            "current_value": metrics["current_value"],
+            "mom_change": metrics["mom_change"],
+            "qoq_change": metrics["qoq_change"],
+            "trend": metrics["trend"],
+            "confidence": "高",
+            "status": "active",
+            "note": f"数据源: tushare (接口: {api_name}, 代码: {symbol})",
+        })
+        return result
+
     def _fetch_lme_copper(
         self,
         config: IndustryLinkageIndicator,
         as_of: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """采集 LME 铜价历史行情并计算最新值、月环比、季度环比与趋势。"""
+        """采集 LME 铜价历史行情（优先 akshare 伦敦铜，失败时回退 Tushare 沪铜 CU.SHF 备源）。"""
         result = config.model_dump()
         symbol = config.symbol or "CAD"
         # akshare foreign hist symbol 映射: 铜 -> CAD
         if symbol == "铜":
             symbol = "CAD"
 
+        akshare_err_note = None
+        akshare_conf = "低（接口异常）"
         try:
             import akshare as ak
 
@@ -219,48 +430,66 @@ class IndustryLinkageProvider:
                 # 调用外盘期货历史行情
                 df = ak.futures_foreign_hist(symbol=symbol)
 
-            if df is None or df.empty:
-                result.update({
-                    "current_value": None,
-                    "trend": "数据缺失",
-                    "confidence": "低（数据源为空）",
-                    "note": "akshare 未返回有效行情记录",
-                })
-                return result
-
-            metrics = self._calculate_series_metrics(
-                df, as_of=as_of, price_col="close", date_col="date"
-            )
-
-            if not metrics:
-                result.update({
-                    "current_value": None,
-                    "trend": "数据缺失",
-                    "confidence": "低（有效数据不足）",
-                    "note": "无符合截止日期的有效价格序列",
-                })
-                return result
-
-            result.update({
-                "current_value": metrics["current_value"],
-                "mom_change": metrics["mom_change"],
-                "qoq_change": metrics["qoq_change"],
-                "trend": metrics["trend"],
-                "confidence": "高",
-                "status": "active",
-                "note": f"数据源: akshare (代码: {symbol})",
-            })
-            return result
+            if df is not None and not df.empty:
+                metrics = self._calculate_series_metrics(
+                    df, as_of=as_of, price_col="close", date_col="date"
+                )
+                if metrics:
+                    result.update({
+                        "current_value": metrics["current_value"],
+                        "mom_change": metrics["mom_change"],
+                        "qoq_change": metrics["qoq_change"],
+                        "trend": metrics["trend"],
+                        "confidence": "高",
+                        "status": "active",
+                        "note": f"数据源: akshare (代码: {symbol})",
+                    })
+                    return result
+                else:
+                    akshare_err_note = "无符合截止日期的有效价格序列"
+                    akshare_conf = "低（有效数据不足）"
+            else:
+                akshare_err_note = "akshare 未返回有效行情记录"
+                akshare_conf = "低（数据源为空）"
 
         except Exception as e:
-            logger.warning("IndustryLinkageProvider: 获取 LME铜价 失败: %s", e)
-            result.update({
-                "current_value": None,
-                "trend": "数据缺失",
-                "confidence": "低（接口异常）",
-                "note": f"数据获取失败: {e}",
-            })
-            return result
+            logger.warning("IndustryLinkageProvider: 获取 LME铜价 (akshare) 失败: %s", e)
+            akshare_err_note = str(e)
+            akshare_conf = "低（接口异常）"
+
+        # akshare 不可用时，尝试 Tushare fut_daily CU.SHF 作为备用数据源
+        df_ts, ts_err_cat, ts_err_note = _query_tushare_api(
+            api_name="fut_daily",
+            ts_code="CU.SHF",
+            as_of=as_of,
+        )
+        if df_ts is not None and not df_ts.empty:
+            metrics_ts = self._calculate_series_metrics(
+                df_ts, as_of=as_of, price_col="close", date_col="trade_date"
+            )
+            if metrics_ts:
+                result.update({
+                    "current_value": metrics_ts["current_value"],
+                    "mom_change": metrics_ts["mom_change"],
+                    "qoq_change": metrics_ts["qoq_change"],
+                    "trend": metrics_ts["trend"],
+                    "confidence": "高",
+                    "status": "active",
+                    "note": "数据源: tushare (备源接口: fut_daily, 代码: CU.SHF)",
+                })
+                return result
+
+        result.update({
+            "current_value": None,
+            "trend": "数据缺失",
+            "confidence": akshare_conf,
+            "note": (
+                f"akshare 失败 ({akshare_err_note})；Tushare 备源失败 ({ts_err_note or '未知'})"
+                if akshare_conf == "低（接口异常）"
+                else (akshare_err_note or "未获取到有效数据")
+            ),
+        })
+        return result
 
     def _fetch_yfinance_indicator(
         self,
