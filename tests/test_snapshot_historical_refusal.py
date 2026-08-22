@@ -18,8 +18,8 @@ from tradingagents.dataflows.vendor_result import result_to_prompt
 from tradingagents.dataflows.providers.cn_akshare_provider import CnAkshareProvider
 
 
-def test_is_historical_true_for_past_false_for_today_and_missing():
-    today = cn_today_str()
+def test_is_historical_true_for_past_false_for_today_and_missing(frozen_trade_date):
+    today = frozen_trade_date
     past = (now_cn().date() - timedelta(days=90)).isoformat()
     assert is_historical_analysis_date(past) is True
     assert is_historical_analysis_date(today) is False
@@ -27,14 +27,14 @@ def test_is_historical_true_for_past_false_for_today_and_missing():
     assert is_historical_analysis_date("") is False
 
 
-def test_snapshot_refusal_message_stable():
+def test_snapshot_refusal_message_stable(frozen_trade_date):
     past = (now_cn().date() - timedelta(days=10)).isoformat()
     msg = snapshot_historical_refusal(past, source_label="股权质押（全市场快照）")
     assert msg is not None
     assert msg.startswith("【数据获取失败】")
     assert SNAPSHOT_ONLY_REFUSAL in msg
     assert "股权质押" in msg
-    assert snapshot_historical_refusal(cn_today_str()) is None
+    assert snapshot_historical_refusal(frozen_trade_date) is None
 
 
 @pytest.fixture
@@ -109,9 +109,9 @@ def test_fundamentals_profile_refused_abstract_may_remain(provider):
     assert "股票简称" not in out.split("### Company Profile", 1)[1].split("###", 1)[0]
 
 
-def test_same_day_board_does_not_auto_refuse(provider):
+def test_same_day_board_does_not_auto_refuse(provider, frozen_trade_date):
     """Today is not historical; refusal helper returns None (network still may fail)."""
-    today = cn_today_str()
+    today = frozen_trade_date
     assert snapshot_historical_refusal(today, source_label="板块") is None
 
 
@@ -125,7 +125,7 @@ def test_zt_pool_refuses_historical(provider):
     assert prompt.startswith("【数据获取失败】")
 
 
-def test_zt_pool_same_day_does_not_auto_refuse(provider):
-    today = cn_today_str()
+def test_zt_pool_same_day_does_not_auto_refuse(provider, frozen_trade_date):
+    today = frozen_trade_date
     assert snapshot_historical_refusal(today, source_label="涨停") is None
 

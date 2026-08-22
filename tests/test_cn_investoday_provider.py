@@ -467,9 +467,8 @@ def test_investoday_get_fundamentals_profiles():
     assert "Fundamentals" in out
 
 
-def test_investoday_get_insider_exec_shrhld_markdown():
+def test_investoday_get_insider_exec_shrhld_markdown(frozen_trade_date):
     from tradingagents.dataflows.providers.cn_investoday_provider import CnInvestodayProvider
-    from tradingagents.dataflows.trade_calendar import cn_today_str
 
     rows = [
         {
@@ -482,7 +481,7 @@ def test_investoday_get_insider_exec_shrhld_markdown():
     provider = CnInvestodayProvider()
     with patch.object(provider, "_resolve_api_key", return_value="k"), \
          patch.object(provider, "_fetch_paged_list", return_value=rows):
-        out = provider.get_insider_transactions("600519.SH", curr_date=cn_today_str())
+        out = provider.get_insider_transactions("600519.SH", curr_date=frozen_trade_date)
 
     assert "高管持股变动" in out or "exec-shrhld-chg" in out
     assert "ZhangSan" in out

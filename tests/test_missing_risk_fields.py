@@ -51,7 +51,7 @@ class _MarginProvider(CnAkshareProvider):
         return str(symbol).zfill(6)
 
 
-def test_share_pledge_missing_ratio_is_unassessed_not_safe():
+def test_share_pledge_missing_ratio_is_unassessed_not_safe(frozen_trade_date):
     df = pd.DataFrame(
         {
             "股票代码": ["600519"],
@@ -60,13 +60,13 @@ def test_share_pledge_missing_ratio_is_unassessed_not_safe():
             "所属行业": ["白酒"],
         }
     )
-    out = _PledgeProvider(df).get_share_pledge("600519", curr_date=cn_today_str())
+    out = _PledgeProvider(df).get_share_pledge("600519", curr_date=frozen_trade_date)
     assert "未排查" in out
     assert "安全" not in out
     assert "质押比例" in out
 
 
-def test_share_pledge_blank_ratio_is_unassessed():
+def test_share_pledge_blank_ratio_is_unassessed(frozen_trade_date):
     df = pd.DataFrame(
         {
             "股票代码": ["600519"],
@@ -75,12 +75,12 @@ def test_share_pledge_blank_ratio_is_unassessed():
             "所属行业": ["白酒"],
         }
     )
-    out = _PledgeProvider(df).get_share_pledge("600519", curr_date=cn_today_str())
+    out = _PledgeProvider(df).get_share_pledge("600519", curr_date=frozen_trade_date)
     assert "未排查" in out
     assert "安全" not in out
 
 
-def test_share_pledge_present_ratio_still_thresholds():
+def test_share_pledge_present_ratio_still_thresholds(frozen_trade_date):
     df = pd.DataFrame(
         {
             "股票代码": ["600519"],
@@ -89,7 +89,7 @@ def test_share_pledge_present_ratio_still_thresholds():
             "所属行业": ["白酒"],
         }
     )
-    out = _PledgeProvider(df).get_share_pledge("600519", curr_date=cn_today_str())
+    out = _PledgeProvider(df).get_share_pledge("600519", curr_date=frozen_trade_date)
     assert "整体质押比例：12.5%" in out
     assert "未排查" not in out
 

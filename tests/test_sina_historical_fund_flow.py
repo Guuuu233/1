@@ -183,9 +183,9 @@ def test_sina_history_empty_rows_reports_explicitly():
     assert "不可用" in text
 
 
-def test_current_day_snapshot_precedes_legacy_close_after_eastmoney_failure():
+def test_current_day_snapshot_precedes_legacy_close_after_eastmoney_failure(frozen_trade_date):
     """A validated new THS snapshot is preferred over a legacy close row."""
-    today = cn_today_str()
+    today = frozen_trade_date
     rows = [
         *_SINA_HIST_ROWS,
         {
@@ -205,9 +205,9 @@ def test_current_day_snapshot_precedes_legacy_close_after_eastmoney_failure():
     assert "新浪历史/收盘数据" not in text
 
 
-def test_current_day_without_close_row_still_tries_snapshot():
+def test_current_day_without_close_row_still_tries_snapshot(frozen_trade_date):
     """Before the Sina close arrives, a unit-bearing THS net amount is preserved."""
-    today = cn_today_str()
+    today = frozen_trade_date
     provider = _CurrentDaySnapshotProvider()
     with patch("requests.get", return_value=_FakeResp(_SINA_HIST_ROWS)) as mock_get:
         text = provider.get_individual_fund_flow("600519", curr_date=today)
@@ -231,9 +231,9 @@ def test_current_day_without_close_row_still_tries_snapshot():
     ],
     ids=["missing-column", "none", "nan", "empty", "invalid"],
 )
-def test_ths_matched_row_without_usable_net_amount_reports_gap(row):
+def test_ths_matched_row_without_usable_net_amount_reports_gap(frozen_trade_date, row):
     """A matched THS row without 净额 must not become a success response."""
-    today = cn_today_str()
+    today = frozen_trade_date
     provider = _CurrentDaySnapshotProvider(row=row)
     with patch("requests.get", return_value=_FakeResp(_SINA_HIST_ROWS)):
         text = provider.get_individual_fund_flow("600519", curr_date=today)
@@ -243,9 +243,9 @@ def test_ths_matched_row_without_usable_net_amount_reports_gap(row):
     assert "【备用数据源：同花顺即时资金流净额快照】" not in text
 
 
-def test_current_day_without_close_or_snapshot_reports_data_gap():
+def test_current_day_without_close_or_snapshot_reports_data_gap(frozen_trade_date):
     """A missing close plus failed snapshot is an explicit data gap."""
-    today = cn_today_str()
+    today = frozen_trade_date
     provider = _CurrentDaySnapshotProvider(
         snapshot_error=AttributeError("stock_fund_flow_individual unavailable")
     )
@@ -257,9 +257,9 @@ def test_current_day_without_close_or_snapshot_reports_data_gap():
     assert "【备用数据源：同花顺即时资金流净额快照】" not in text
 
 
-def test_current_day_invalid_close_amount_uses_ths_snapshot():
+def test_current_day_invalid_close_amount_uses_ths_snapshot(frozen_trade_date):
     """A date-matched but unusable close row must not mask the THS fallback."""
-    today = cn_today_str()
+    today = frozen_trade_date
     rows = [
         *_SINA_HIST_ROWS,
         {"opendate": today, "netamount": "", "r0_net": "not-a-number"},
@@ -273,9 +273,9 @@ def test_current_day_invalid_close_amount_uses_ths_snapshot():
     assert "资金净额: 5.60亿" in text
 
 
-def test_current_day_invalid_close_amount_and_ths_failure_reports_gap():
+def test_current_day_invalid_close_amount_and_ths_failure_reports_gap(frozen_trade_date):
     """An unusable close and failed THS snapshot must remain an explicit gap."""
-    today = cn_today_str()
+    today = frozen_trade_date
     rows = [
         *_SINA_HIST_ROWS,
         {"opendate": today, "netamount": "NaN", "r0_net": None},
@@ -291,9 +291,9 @@ def test_current_day_invalid_close_amount_and_ths_failure_reports_gap():
     assert "新浪历史/收盘数据" not in text
 
 
-def test_current_day_zero_core_amount_is_valid_close_data():
+def test_current_day_zero_core_amount_is_valid_close_data(frozen_trade_date):
     """Numeric zero is valid and must not be treated as a missing close."""
-    today = cn_today_str()
+    today = frozen_trade_date
     rows = [{"opendate": today, "netamount": "0", "r0_net": ""}]
     provider = _CurrentDaySnapshotProvider(
         snapshot_error=AssertionError("THS snapshot should not run for a valid close")
@@ -307,9 +307,9 @@ def test_current_day_zero_core_amount_is_valid_close_data():
 
 
 @pytest.mark.parametrize("bad_value", ["inf", "-inf", "1e309"])
-def test_current_day_nonfinite_close_amount_uses_ths_snapshot(bad_value):
+def test_current_day_nonfinite_close_amount_uses_ths_snapshot(frozen_trade_date, bad_value):
     """Non-finite core amounts must not masquerade as a historical close."""
-    today = cn_today_str()
+    today = frozen_trade_date
     rows = [
         *_SINA_HIST_ROWS,
         {"opendate": today, "netamount": bad_value, "r0_net": ""},

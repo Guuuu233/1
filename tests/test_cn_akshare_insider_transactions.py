@@ -23,10 +23,10 @@ class _NewsFallbackProvider(CnAkshareProvider):
         return "fallback news"
 
 
-def test_insider_transactions_fallback_uses_analysis_date_window():
+def test_insider_transactions_fallback_uses_analysis_date_window(frozen_trade_date):
     provider = _NewsFallbackProvider()
 
-    end_date = cn_today_str()
+    end_date = frozen_trade_date
     start_date = (now_cn().date() - timedelta(days=14)).isoformat()
     result = provider.get_insider_transactions("600519.SH", curr_date=end_date)
 
