@@ -134,6 +134,11 @@ class TestIndustryLinkageProvider:
             assert copper["trend"] == "上升"
             assert copper["confidence"] == "高"
             assert copper["status"] == "active"
+            assert copper["requested_as_of"] is None
+            assert copper["actual_as_of"] == "2026-08-06"
+            assert copper["retrieved_at"] is not None
+            assert copper["transport_provider"] == "akshare"
+            assert copper["api_name"] == "futures_foreign_hist"
 
             # 验证下游需求指标 (全球智能手机出货量)
             downstream_list = data["downstream_demand"]
@@ -143,6 +148,7 @@ class TestIndustryLinkageProvider:
             assert phone["trend"] == "数据缺失"
             assert phone["note"] == "手动"
             assert phone["status"] == "manual"
+            assert phone["actual_as_of"] is None
 
             # 验证国际对标指标 (三星电子股价)
             benchmark_list = data["international_benchmark"]
@@ -154,6 +160,11 @@ class TestIndustryLinkageProvider:
             assert samsung["trend"] == "下降"
             assert samsung["confidence"] == "高"
             assert samsung["status"] == "active"
+            assert samsung["requested_as_of"] is None
+            assert samsung["actual_as_of"] == "2026-08-06"
+            assert samsung["retrieved_at"] is not None
+            assert samsung["transport_provider"] == "yfinance"
+            assert samsung["api_name"] == "history"
 
     def test_new_energy_vehicle_data_fetch_success(
         self, monkeypatch, mock_tushare_lc_response
@@ -253,9 +264,16 @@ class TestIndustryLinkageProvider:
 
             assert result["current_value"] == expected_price
             assert result["confidence"] == "高"
+            assert result["status"] == "active"
+            assert result["requested_as_of"] == cutoff_date
+            assert result["actual_as_of"] == cutoff_date
+            assert result["actual_as_of"] <= result["requested_as_of"]
+            assert result["transport_provider"] == "akshare"
+            assert result["api_name"] == "futures_foreign_hist"
 
-    def test_graceful_degradation_on_exceptions(self):
-        """测试当外部数据源发生超时、网络故障或异常时优雅降级，不抛出异常。"""
+    def test_graceful_degradation_on_exceptions(self, monkeypatch):
+        """测试当外部数据源发生超时、网络故障或异常时优雅降级，不抛出异常，状态为 unavailable。"""
+        monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
         provider = IndustryLinkageProvider()
 
         with patch("akshare.futures_foreign_hist", side_effect=TimeoutError("Connection timed out")), \
@@ -268,19 +286,23 @@ class TestIndustryLinkageProvider:
 
             # 异常时返回结构化缺失状态，不中断分析
             copper = data["upstream_cost"][0]
+            assert copper["status"] == "unavailable"
             assert copper["current_value"] is None
+            assert copper["actual_as_of"] is None
             assert copper["trend"] == "数据缺失"
             assert copper["confidence"] == "低（接口异常）"
             assert "Connection timed out" in copper["note"]
 
             samsung = [b for b in data["international_benchmark"] if "三星电子" in b["name"]][0]
+            assert samsung["status"] == "unavailable"
             assert samsung["current_value"] is None
+            assert samsung["actual_as_of"] is None
             assert samsung["trend"] == "数据缺失"
             assert samsung["confidence"] == "低（接口异常）"
             assert "Rate limited" in samsung["note"]
 
     def test_as_of_historical_beyond_3_months(self):
-        """测试超过3个月的超长历史 as_of 请求能正确构建历史查询窗口并计算指标。"""
+        """测试超过3个月的超长历史 as_of 请求能正确构建历史查询窗口并计算指标与 Provenance。"""
         provider = IndustryLinkageProvider()
 
         # 构造 2024 年 6 月至 10 月的历史数据（上涨趋势）
@@ -310,7 +332,13 @@ class TestIndustryLinkageProvider:
 
             assert result["current_value"] == hist_prices[-1]
             assert result["confidence"] == "高"
+            assert result["status"] == "active"
             assert result["trend"] == "上升"
+            assert result["requested_as_of"] == "2024-10-15"
+            assert result["actual_as_of"] == "2024-10-15"
+            assert result["actual_as_of"] <= result["requested_as_of"]
+            assert result["transport_provider"] == "yfinance"
+            assert result["api_name"] == "history"
 
     def test_as_of_future_rows_strictly_discarded(self, mock_copper_dataframe):
         """测试未来日期数据被严格截断丢弃，杜绝前视偏差。"""
@@ -332,9 +360,14 @@ class TestIndustryLinkageProvider:
 
             assert result["current_value"] == cutoff_price
             assert result["current_value"] != future_price
+            assert result["status"] == "active"
+            assert result["requested_as_of"] == cutoff_date
+            assert result["actual_as_of"] == cutoff_date
+            assert result["actual_as_of"] <= result["requested_as_of"]
 
-    def test_empty_dataframe_or_no_data_before_as_of(self, mock_copper_dataframe):
-        """测试当 as_of 处于数据源起始日期之前时，安全返回数据缺失而不崩溃。"""
+    def test_empty_dataframe_or_no_data_before_as_of(self, monkeypatch, mock_copper_dataframe):
+        """测试当 as_of 处于数据源起始日期之前时，安全返回数据缺失与 unavailable 状态。"""
+        monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
         provider = IndustryLinkageProvider()
 
         with patch("akshare.futures_foreign_hist", return_value=mock_copper_dataframe):
@@ -346,9 +379,12 @@ class TestIndustryLinkageProvider:
             )
             result = provider._fetch_indicator(ind, as_of="2020-01-01")
 
-            assert result["current_value"] == None
+            assert result["status"] == "unavailable"
+            assert result["current_value"] is None
+            assert result["actual_as_of"] is None
             assert result["trend"] == "数据缺失"
             assert result["confidence"] == "低（有效数据不足）"
+            assert result["category"] == "empty_rows"
 
     def test_unknown_industry_returns_none(self):
         """测试查询未配置的未知行业时返回 None。"""
@@ -636,7 +672,7 @@ class TestIndustryLinkageProvider:
             assert result["api_name"] == "fut_daily"
 
     def test_lme_copper_both_sources_fail_gracefully(self, monkeypatch):
-        """测试 LME铜价 在 akshare 与 Tushare 均异常时优雅降级为数据缺失，不抛出异常。"""
+        """测试 LME铜价 在 akshare 与 Tushare 均异常时优雅降级为数据缺失与 unavailable 状态。"""
         monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
         provider = IndustryLinkageProvider()
 
@@ -650,11 +686,16 @@ class TestIndustryLinkageProvider:
         with patch("akshare.futures_foreign_hist", side_effect=TimeoutError("LME akshare timeout")):
             result = provider._fetch_indicator(ind)
 
+            assert result["status"] == "unavailable"
             assert result["current_value"] is None
+            assert result["actual_as_of"] is None
             assert result["trend"] == "数据缺失"
             assert result["confidence"] == "低（接口异常）"
             assert "akshare 失败" in result["note"]
             assert "Tushare 备源失败" in result["note"]
+            assert result["transport_provider"] == "akshare"
+            assert result["api_name"] == "futures_foreign_hist"
+            assert result["category"] == "api_error"
 
     def test_tushare_fail_closed_on_lookahead_violation(self, monkeypatch):
         """测试当 Tushare 返回数据存在未来日期违背防前视纪律时，必须 fail-closed。"""
@@ -689,6 +730,7 @@ class TestIndustryLinkageProvider:
             result = provider._fetch_indicator(ind, as_of="2026-08-10")
 
             # 验证 fail-closed: 不返回虚假行情，保留 requested_as_of 与类型化 category
+            assert result["status"] == "unavailable"
             assert result["current_value"] is None
             assert result["mom_change"] is None
             assert result["qoq_change"] is None
@@ -715,6 +757,7 @@ class TestIndustryLinkageProvider:
         with patch("requests.post", side_effect=Exception(f"Connection error to API with token")):
             result_err = provider._fetch_indicator(ind, as_of="2026-08-15")
 
+            assert result_err["status"] == "unavailable"
             assert result_err["current_value"] is None
             assert result_err["requested_as_of"] == "2026-08-15"
             assert result_err["actual_as_of"] is None
@@ -735,6 +778,7 @@ class TestIndustryLinkageProvider:
         )
         result = provider._fetch_indicator(ind, as_of="2026-08-15")
 
+        assert result["status"] == "unavailable"
         assert result["current_value"] is None
         assert result["trend"] == "数据缺失"
         assert result["confidence"] == "低（代码缺失）"
@@ -742,3 +786,214 @@ class TestIndustryLinkageProvider:
         assert result["actual_as_of"] is None
         assert result["transport_provider"] == "tushare"
         assert result["category"] == "symbol_missing"
+
+    def test_akshare_lme_copper_date_penetration_and_provenance(self, mock_copper_dataframe):
+        """测试 AkShare LME 铜价成功路径穿透 actual_as_of 并包含完整 Provenance。"""
+        provider = IndustryLinkageProvider()
+
+        with patch("akshare.futures_foreign_hist", return_value=mock_copper_dataframe):
+            ind = IndustryLinkageIndicator(
+                name="LME铜价",
+                source="akshare",
+                symbol="铜",
+                unit="美元/吨",
+            )
+            result = provider._fetch_indicator(ind, as_of="2026-08-05")
+
+            assert result["status"] == "active"
+            assert result["current_value"] is not None
+            assert result["requested_as_of"] == "2026-08-05"
+            assert result["actual_as_of"] == "2026-08-05"
+            assert result["actual_as_of"] <= result["requested_as_of"]
+            assert result["retrieved_at"] is not None
+            assert result["transport_provider"] == "akshare"
+            assert result["api_name"] == "futures_foreign_hist"
+            assert result["confidence"] == "高"
+
+    def test_yfinance_indicator_date_penetration_and_provenance(self, mock_samsung_dataframe):
+        """测试 yfinance 成功路径穿透 actual_as_of 并包含完整 Provenance。"""
+        provider = IndustryLinkageProvider()
+
+        with patch("yfinance.Ticker") as mock_yf:
+            mock_ticker_instance = MagicMock()
+            mock_ticker_instance.history.return_value = mock_samsung_dataframe
+            mock_yf.return_value = mock_ticker_instance
+
+            ind = IndustryLinkageIndicator(
+                name="三星电子股价",
+                source="yfinance",
+                symbol="005930.KS",
+                unit="韩元",
+            )
+            result = provider._fetch_indicator(ind, as_of="2026-08-05")
+
+            assert result["status"] == "active"
+            assert result["current_value"] is not None
+            assert result["requested_as_of"] == "2026-08-05"
+            assert result["actual_as_of"] == "2026-08-05"
+            assert result["actual_as_of"] <= result["requested_as_of"]
+            assert result["retrieved_at"] is not None
+            assert result["transport_provider"] == "yfinance"
+            assert result["api_name"] == "history"
+            assert result["confidence"] == "高"
+
+    def test_yfinance_failures_status_unavailable(self):
+        """测试 yfinance 在空数据、异常、缺少 symbol 与前视违规时均返回 status=unavailable。"""
+        provider = IndustryLinkageProvider()
+
+        # 1. yfinance 返回空 DataFrame
+        with patch("yfinance.Ticker") as mock_yf:
+            mock_ticker = MagicMock()
+            mock_ticker.history.return_value = pd.DataFrame()
+            mock_yf.return_value = mock_ticker
+
+            ind = IndustryLinkageIndicator(name="苹果公司股价", source="yfinance", symbol="AAPL")
+            res_empty = provider._fetch_indicator(ind, as_of="2026-08-20")
+
+            assert res_empty["status"] == "unavailable"
+            assert res_empty["current_value"] is None
+            assert res_empty["actual_as_of"] is None
+            assert res_empty["requested_as_of"] == "2026-08-20"
+            assert res_empty["transport_provider"] == "yfinance"
+            assert res_empty["api_name"] == "history"
+            assert res_empty["category"] == "empty_rows"
+
+        # 2. yfinance 抛出异常
+        with patch("yfinance.Ticker", side_effect=Exception("Connection timeout")):
+            ind = IndustryLinkageIndicator(name="苹果公司股价", source="yfinance", symbol="AAPL")
+            res_err = provider._fetch_indicator(ind, as_of="2026-08-20")
+
+            assert res_err["status"] == "unavailable"
+            assert res_err["current_value"] is None
+            assert res_err["actual_as_of"] is None
+            assert res_err["requested_as_of"] == "2026-08-20"
+            assert res_err["transport_provider"] == "yfinance"
+            assert res_err["api_name"] == "history"
+            assert res_err["category"] == "api_error"
+
+        # 3. yfinance 缺少 symbol
+        ind_no_sym = IndustryLinkageIndicator(name="未知标的", source="yfinance", symbol="")
+        res_no_sym = provider._fetch_indicator(ind_no_sym, as_of="2026-08-20")
+        assert res_no_sym["status"] == "unavailable"
+        assert res_no_sym["current_value"] is None
+        assert res_no_sym["actual_as_of"] is None
+        assert res_no_sym["transport_provider"] == "yfinance"
+        assert res_no_sym["category"] == "symbol_missing"
+
+        # 4. yfinance 前视违规 fail-closed
+        future_df = pd.DataFrame(
+            {"Close": [100.0, 105.0]},
+            index=pd.to_datetime(["2026-08-25", "2026-08-26"]),
+        )
+        future_df.index.name = "Date"
+        with patch("yfinance.Ticker") as mock_yf:
+            mock_ticker = MagicMock()
+            mock_ticker.history.return_value = future_df
+            mock_yf.return_value = mock_ticker
+
+            ind = IndustryLinkageIndicator(name="苹果公司股价", source="yfinance", symbol="AAPL")
+            # 请求 2026-08-20 但数据全部在 2026-08-25 之后
+            res_future = provider._fetch_indicator(ind, as_of="2026-08-20")
+            assert res_future["status"] == "unavailable"
+            assert res_future["current_value"] is None
+            assert res_future["actual_as_of"] is None
+            assert res_future["category"] in ("empty_rows", "lookahead_violation")
+
+    def test_weekend_requested_as_of_anti_lookahead(self):
+        """测试周末请求（如周六/周日）返回上周五实际日期，绝不允许返回未来实际日期。"""
+        provider = IndustryLinkageProvider()
+
+        # 构造截至 2026-08-21 (周五) 的数据
+        dates = pd.date_range("2026-05-01", "2026-08-21", freq="B")
+        prices = [100.0 + i for i in range(len(dates))]
+
+        df_copper = pd.DataFrame({
+            "date": dates,
+            "open": prices,
+            "high": prices,
+            "low": prices,
+            "close": prices,
+            "volume": [1000] * len(dates),
+        })
+
+        df_samsung = pd.DataFrame(
+            {"Close": prices, "Open": prices, "High": prices, "Low": prices, "Volume": [1000] * len(dates)},
+            index=dates,
+        )
+        df_samsung.index.name = "Date"
+
+        # 请求日期为 2026-08-22（周六）
+        weekend_as_of = "2026-08-22"
+
+        # 1. AkShare LME 铜价
+        with patch("akshare.futures_foreign_hist", return_value=df_copper):
+            ind_copper = IndustryLinkageIndicator(name="LME铜价", source="akshare", symbol="铜")
+            res_copper = provider._fetch_indicator(ind_copper, as_of=weekend_as_of)
+
+            assert res_copper["status"] == "active"
+            assert res_copper["requested_as_of"] == "2026-08-22"
+            assert res_copper["actual_as_of"] == "2026-08-21"
+            assert res_copper["actual_as_of"] <= res_copper["requested_as_of"]
+
+        # 2. yfinance 三星电子
+        with patch("yfinance.Ticker") as mock_yf:
+            mock_ticker = MagicMock()
+            mock_ticker.history.return_value = df_samsung
+            mock_yf.return_value = mock_ticker
+
+            ind_samsung = IndustryLinkageIndicator(name="三星电子股价", source="yfinance", symbol="005930.KS")
+            res_samsung = provider._fetch_indicator(ind_samsung, as_of=weekend_as_of)
+
+            assert res_samsung["status"] == "active"
+            assert res_samsung["requested_as_of"] == "2026-08-22"
+            assert res_samsung["actual_as_of"] == "2026-08-21"
+            assert res_samsung["actual_as_of"] <= res_samsung["requested_as_of"]
+
+    def test_pending_api_and_manual_status_preserved(self):
+        """测试 pending_api 与 manual 原有状态严格保持，不把它们伪装成 unavailable 或 active。"""
+        provider = IndustryLinkageProvider()
+
+        # 1. pending_api
+        ind_pending = IndustryLinkageIndicator(
+            name="半导体硅片价格",
+            source="pending_api",
+            status="pending_api",
+            note="待接入API",
+        )
+        res_pending = provider._fetch_indicator(ind_pending, as_of="2026-08-20")
+        assert res_pending["status"] == "pending_api"
+        assert res_pending["current_value"] is None
+        assert res_pending["actual_as_of"] is None
+        assert res_pending["trend"] == "数据缺失"
+        assert res_pending["confidence"] == "低（待接入API）"
+
+        # 2. manual
+        ind_manual = IndustryLinkageIndicator(
+            name="全球智能手机出货量",
+            source="manual",
+            status="manual",
+            note="手动",
+        )
+        res_manual = provider._fetch_indicator(ind_manual, as_of="2026-08-20")
+        assert res_manual["status"] == "manual"
+        assert res_manual["current_value"] is None
+        assert res_manual["actual_as_of"] is None
+        assert res_manual["trend"] == "数据缺失"
+        assert res_manual["confidence"] == "低（待手动录入）"
+
+    def test_unimplemented_indicator_status_unavailable(self):
+        """测试未实现指标返回 status=unavailable 与 category=not_implemented。"""
+        provider = IndustryLinkageProvider()
+
+        ind_unimpl = IndustryLinkageIndicator(
+            name="自定义未实现指标",
+            source="custom_unknown",
+            status="active",
+        )
+        res = provider._fetch_indicator(ind_unimpl, as_of="2026-08-20")
+        assert res["status"] == "unavailable"
+        assert res["current_value"] is None
+        assert res["actual_as_of"] is None
+        assert res["trend"] == "数据缺失"
+        assert res["confidence"] == "低（待实现）"
+        assert res["category"] == "not_implemented"

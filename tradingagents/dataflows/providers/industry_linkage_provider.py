@@ -306,7 +306,9 @@ class IndustryLinkageProvider:
             # 1. 待接入 API 指标 (显式标记 pending_api)
             if config.status == "pending_api" or config.source == "pending_api" or config.note == "待接入API":
                 base_dict.update({
+                    "status": "pending_api",
                     "current_value": None,
+                    "actual_as_of": None,
                     "trend": "数据缺失",
                     "confidence": "低（待接入API）",
                     "note": config.note or "待接入API",
@@ -316,7 +318,9 @@ class IndustryLinkageProvider:
             # 2. 手动录入/标注指标 (显式标记 manual)
             if config.status == "manual" or config.source == "manual" or config.note == "手动":
                 base_dict.update({
+                    "status": "manual",
                     "current_value": None,
+                    "actual_as_of": None,
                     "trend": "数据缺失",
                     "confidence": "低（待手动录入）",
                     "note": config.note or "手动",
@@ -332,34 +336,49 @@ class IndustryLinkageProvider:
                 return self._fetch_tushare_indicator(config, as_of=as_of)
 
             # 5. yfinance 标的 (三星电子股价、费城半导体指数、台积电、布伦特原油、埃克森美孚、摩根大通、标普500金融指数等)
-            if config.source == "yfinance" and config.symbol:
+            if config.source == "yfinance":
                 return self._fetch_yfinance_indicator(config, as_of=as_of)
 
             # 6. 其余默认未实现指标
             base_dict.update({
+                "status": "unavailable",
                 "current_value": None,
+                "actual_as_of": None,
                 "trend": "数据缺失",
                 "confidence": "低（待实现）",
                 "note": config.note or "未接入",
+                "category": "not_implemented",
             })
             return base_dict
 
         except Exception as e:
             logger.warning("IndustryLinkageProvider: 采集指标 '%s' 发生异常: %s", config.name, e)
+            retrieved_at = datetime.now(timezone.utc).isoformat()
             base_dict.update({
+                "status": "unavailable",
                 "current_value": None,
+                "actual_as_of": None,
+                "requested_as_of": as_of,
+                "retrieved_at": retrieved_at,
                 "trend": "数据缺失",
                 "confidence": "低（接口异常）",
                 "note": f"数据获取失败: {e}",
+                "category": "api_error",
             })
             if config.source == "tushare":
                 base_dict.update({
-                    "requested_as_of": as_of,
-                    "actual_as_of": None,
-                    "retrieved_at": datetime.now(timezone.utc).isoformat(),
                     "transport_provider": "tushare",
                     "api_name": _resolve_tushare_api_name(config.symbol or "", config.metadata),
-                    "category": "api_error",
+                })
+            elif config.source == "akshare":
+                base_dict.update({
+                    "transport_provider": "akshare",
+                    "api_name": "futures_foreign_hist",
+                })
+            elif config.source == "yfinance":
+                base_dict.update({
+                    "transport_provider": "yfinance",
+                    "api_name": "history",
                 })
             return base_dict
 
@@ -376,7 +395,10 @@ class IndustryLinkageProvider:
 
         if not symbol:
             result.update({
+                "status": "unavailable",
                 "current_value": None,
+                "mom_change": None,
+                "qoq_change": None,
                 "trend": "数据缺失",
                 "confidence": "低（代码缺失）",
                 "note": "未配置有效的 Tushare 证券代码",
@@ -409,7 +431,10 @@ class IndustryLinkageProvider:
             }
             confidence = conf_map.get(err_cat or "", "低（接口异常）")
             result.update({
+                "status": "unavailable",
                 "current_value": None,
+                "mom_change": None,
+                "qoq_change": None,
                 "trend": "数据缺失",
                 "confidence": confidence,
                 "note": err_note or "Tushare 数据获取失败",
@@ -428,7 +453,10 @@ class IndustryLinkageProvider:
 
         if not metrics:
             result.update({
+                "status": "unavailable",
                 "current_value": None,
+                "mom_change": None,
+                "qoq_change": None,
                 "trend": "数据缺失",
                 "confidence": "低（有效数据不足）",
                 "note": "无符合截止日期的有效价格序列",
@@ -452,6 +480,7 @@ class IndustryLinkageProvider:
                 as_of,
             )
             result.update({
+                "status": "unavailable",
                 "current_value": None,
                 "mom_change": None,
                 "qoq_change": None,
@@ -490,6 +519,7 @@ class IndustryLinkageProvider:
     ) -> Dict[str, Any]:
         """采集 LME 铜价历史行情（优先 akshare 伦敦铜，失败时回退 Tushare 沪铜 CU.SHF 备源）。"""
         result = config.model_dump()
+        retrieved_at = datetime.now(timezone.utc).isoformat()
         symbol = config.symbol or "CAD"
         # akshare foreign hist symbol 映射: 铜 -> CAD
         if symbol == "铜":
@@ -497,6 +527,7 @@ class IndustryLinkageProvider:
 
         akshare_err_note = None
         akshare_conf = "低（接口异常）"
+        akshare_cat = "api_error"
         try:
             import akshare as ak
 
@@ -509,27 +540,49 @@ class IndustryLinkageProvider:
                     df, as_of=as_of, price_col="close", date_col="date"
                 )
                 if metrics:
-                    result.update({
-                        "current_value": metrics["current_value"],
-                        "mom_change": metrics["mom_change"],
-                        "qoq_change": metrics["qoq_change"],
-                        "trend": metrics["trend"],
-                        "confidence": "高",
-                        "status": "active",
-                        "note": f"数据源: akshare (代码: {symbol})",
-                    })
-                    return result
+                    actual_as_of = metrics.get("actual_as_of")
+                    normalized_req = _normalize_as_of_date(as_of)
+
+                    # 严格防前视纪律校验：actual_as_of <= requested_as_of，不满足时 fail-closed
+                    if normalized_req is not None and actual_as_of is not None and actual_as_of > normalized_req:
+                        logger.warning(
+                            "IndustryLinkageProvider: 防前视校验失败，actual_as_of (%s) > requested_as_of (%s)",
+                            actual_as_of,
+                            as_of,
+                        )
+                        akshare_err_note = f"防前视校验失败: 实际数据日期 ({actual_as_of}) 晚于请求基准日期 ({as_of})"
+                        akshare_conf = "低（前视偏差异常）"
+                        akshare_cat = "lookahead_violation"
+                    else:
+                        result.update({
+                            "current_value": metrics["current_value"],
+                            "mom_change": metrics["mom_change"],
+                            "qoq_change": metrics["qoq_change"],
+                            "trend": metrics["trend"],
+                            "confidence": "高",
+                            "status": "active",
+                            "note": f"数据源: akshare (代码: {symbol})",
+                            "requested_as_of": as_of,
+                            "actual_as_of": actual_as_of,
+                            "retrieved_at": retrieved_at,
+                            "transport_provider": "akshare",
+                            "api_name": "futures_foreign_hist",
+                        })
+                        return result
                 else:
                     akshare_err_note = "无符合截止日期的有效价格序列"
                     akshare_conf = "低（有效数据不足）"
+                    akshare_cat = "empty_rows"
             else:
                 akshare_err_note = "akshare 未返回有效行情记录"
                 akshare_conf = "低（数据源为空）"
+                akshare_cat = "empty_rows"
 
         except Exception as e:
             logger.warning("IndustryLinkageProvider: 获取 LME铜价 (akshare) 失败: %s", e)
             akshare_err_note = str(e)
             akshare_conf = "低（接口异常）"
+            akshare_cat = "api_error"
 
         # akshare 不可用时，尝试 Tushare fut_daily CU.SHF 作为备用数据源
         retrieved_at_ts = datetime.now(timezone.utc).isoformat()
@@ -561,11 +614,26 @@ class IndustryLinkageProvider:
                         "api_name": "fut_daily",
                     })
                     return result
+                else:
+                    ts_err_cat = "lookahead_violation"
+                    ts_err_note = f"防前视校验失败: 实际数据日期 ({actual_as_of_ts}) 晚于请求基准日期 ({as_of})"
+            else:
+                ts_err_cat = ts_err_cat or "empty_rows"
+                ts_err_note = ts_err_note or "无符合截止日期的有效价格序列"
 
         result.update({
+            "status": "unavailable",
             "current_value": None,
+            "mom_change": None,
+            "qoq_change": None,
+            "actual_as_of": None,
+            "requested_as_of": as_of,
+            "retrieved_at": retrieved_at,
+            "transport_provider": "akshare",
+            "api_name": "futures_foreign_hist",
             "trend": "数据缺失",
             "confidence": akshare_conf,
+            "category": akshare_cat,
             "note": (
                 f"akshare 失败 ({akshare_err_note})；Tushare 备源失败 ({ts_err_note or '未知'})"
                 if akshare_conf == "低（接口异常）"
@@ -581,13 +649,23 @@ class IndustryLinkageProvider:
     ) -> Dict[str, Any]:
         """采集 yfinance 标的历史行情并计算最新值、月环比、季度环比与趋势。"""
         result = config.model_dump()
+        retrieved_at = datetime.now(timezone.utc).isoformat()
         symbol = config.symbol
         if not symbol:
             result.update({
+                "status": "unavailable",
                 "current_value": None,
+                "mom_change": None,
+                "qoq_change": None,
                 "trend": "数据缺失",
                 "confidence": "低（代码缺失）",
                 "note": "未配置有效的 yfinance 证券代码",
+                "requested_as_of": as_of,
+                "actual_as_of": None,
+                "retrieved_at": retrieved_at,
+                "transport_provider": "yfinance",
+                "api_name": "history",
+                "category": "symbol_missing",
             })
             return result
 
@@ -611,10 +689,19 @@ class IndustryLinkageProvider:
 
             if data is None or data.empty:
                 result.update({
+                    "status": "unavailable",
                     "current_value": None,
+                    "mom_change": None,
+                    "qoq_change": None,
                     "trend": "数据缺失",
                     "confidence": "低（数据源为空）",
                     "note": "yfinance 未返回有效行情记录",
+                    "requested_as_of": as_of,
+                    "actual_as_of": None,
+                    "retrieved_at": retrieved_at,
+                    "transport_provider": "yfinance",
+                    "api_name": "history",
+                    "category": "empty_rows",
                 })
                 return result
 
@@ -629,10 +716,46 @@ class IndustryLinkageProvider:
 
             if not metrics:
                 result.update({
+                    "status": "unavailable",
                     "current_value": None,
+                    "mom_change": None,
+                    "qoq_change": None,
                     "trend": "数据缺失",
                     "confidence": "低（有效数据不足）",
                     "note": "无符合截止日期的有效价格序列",
+                    "requested_as_of": as_of,
+                    "actual_as_of": None,
+                    "retrieved_at": retrieved_at,
+                    "transport_provider": "yfinance",
+                    "api_name": "history",
+                    "category": "empty_rows",
+                })
+                return result
+
+            actual_as_of = metrics.get("actual_as_of")
+            normalized_req = _normalize_as_of_date(as_of)
+
+            # 严格防前视纪律校验：actual_as_of <= requested_as_of，不满足时 fail-closed
+            if normalized_req is not None and actual_as_of is not None and actual_as_of > normalized_req:
+                logger.warning(
+                    "IndustryLinkageProvider: 防前视校验失败，actual_as_of (%s) > requested_as_of (%s)",
+                    actual_as_of,
+                    as_of,
+                )
+                result.update({
+                    "status": "unavailable",
+                    "current_value": None,
+                    "mom_change": None,
+                    "qoq_change": None,
+                    "trend": "数据缺失",
+                    "confidence": "低（前视偏差异常）",
+                    "note": f"防前视校验失败: 实际数据日期 ({actual_as_of}) 晚于请求基准日期 ({as_of})",
+                    "requested_as_of": as_of,
+                    "actual_as_of": None,
+                    "retrieved_at": retrieved_at,
+                    "transport_provider": "yfinance",
+                    "api_name": "history",
+                    "category": "lookahead_violation",
                 })
                 return result
 
@@ -644,16 +767,30 @@ class IndustryLinkageProvider:
                 "confidence": "高",
                 "status": "active",
                 "note": f"数据源: yfinance (代码: {symbol})",
+                "requested_as_of": as_of,
+                "actual_as_of": actual_as_of,
+                "retrieved_at": retrieved_at,
+                "transport_provider": "yfinance",
+                "api_name": "history",
             })
             return result
 
         except Exception as e:
             logger.warning("IndustryLinkageProvider: 获取 %s (%s) 失败: %s", config.name, symbol, e)
             result.update({
+                "status": "unavailable",
                 "current_value": None,
+                "mom_change": None,
+                "qoq_change": None,
                 "trend": "数据缺失",
                 "confidence": "低（接口异常）",
                 "note": f"数据获取失败: {e}",
+                "requested_as_of": as_of,
+                "actual_as_of": None,
+                "retrieved_at": retrieved_at,
+                "transport_provider": "yfinance",
+                "api_name": "history",
+                "category": "api_error",
             })
             return result
 
