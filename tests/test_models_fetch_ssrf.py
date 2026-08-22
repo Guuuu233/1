@@ -634,8 +634,8 @@ def test_saved_backend_url_precedes_provider_url_and_uses_real_key_fields(monkey
     }
 
 
-def test_user_key_then_environment_key_fallback(monkeypatch):
-    """无 provider Key 时读 api_key_encrypted，再回退 TA_API_KEY。"""
+def test_user_key_used_and_environment_key_never_fallback(monkeypatch):
+    """无 provider Key 时读 api_key_encrypted，无凭据时绝不回退 TA_API_KEY。"""
     user_cfg = SimpleNamespace(
         backend_url="http://saved.example.com/v1",
         api_key_encrypted="user-key",
@@ -653,7 +653,63 @@ def test_user_key_then_environment_key_fallback(monkeypatch):
         payload={"base_url": "http://input.example.com/v1"},
         user_cfg=None,
     )
-    assert captured["api_key"] == "environment-key"
+    assert captured["api_key"] == ""
+
+
+def test_anonymous_fetch_loopback_with_env_key_regression(monkeypatch):
+    """回归测试：即便环境中存在 TA_API_KEY，回环匿名调用出站 api_key 必须为空。"""
+    monkeypatch.setenv("TA_API_KEY", "sk-test-leak")
+    captured = {}
+
+    def fake_fetch(base_url, api_key, *, allow_user_url=False):
+        captured.update(
+            base_url=base_url,
+            api_key=api_key,
+            allow_user_url=allow_user_url,
+        )
+        return ["model-a"], "http://public.example.com/v1/models"
+
+    monkeypatch.setattr(api_main, "_fetch_available_models", fake_fetch)
+    with _endpoint_client_with_user(
+        _default_local_user(), client_addr=("127.0.0.1", 50000)
+    ) as client:
+        resp = client.post("/v1/models/fetch", json={"base_url": "http://public.example.com/v1"})
+
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert captured == {
+        "base_url": "http://public.example.com/v1",
+        "api_key": "",
+        "allow_user_url": False,
+    }
+
+
+def test_authenticated_fetch_non_loopback_with_env_key_regression(monkeypatch):
+    """回归测试：即便环境中存在 TA_API_KEY，已登录用户未填 Key 时出站 api_key 必须为空。"""
+    monkeypatch.setenv("TA_API_KEY", "sk-test-leak")
+    captured = {}
+
+    def fake_fetch(base_url, api_key, *, allow_user_url=False):
+        captured.update(
+            base_url=base_url,
+            api_key=api_key,
+            allow_user_url=allow_user_url,
+        )
+        return ["model-a"], "http://public.example.com/v1/models"
+
+    monkeypatch.setattr(api_main, "_fetch_available_models", fake_fetch)
+    user = MagicMock()
+    user.id = "real-user-1"
+    with _endpoint_client_with_user(user, client_addr=("192.168.1.5", 50000)) as client:
+        resp = client.post("/v1/models/fetch", json={"base_url": "http://public.example.com/v1"})
+
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert captured == {
+        "base_url": "http://public.example.com/v1",
+        "api_key": "",
+        "allow_user_url": True,
+    }
 
 
 def test_authenticated_fetch_without_user_url_uses_localhost_default(monkeypatch):

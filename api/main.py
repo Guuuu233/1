@@ -6098,8 +6098,6 @@ def fetch_available_models(
         api_key = auth_service.decrypt_secret(provider.api_key_encrypted) or ""
     if not api_key and user_cfg and user_cfg.api_key_encrypted:
         api_key = auth_service.decrypt_secret(user_cfg.api_key_encrypted) or ""
-    if not api_key:
-        api_key = os.getenv("TA_API_KEY", "").strip()
     try:
         models_sorted, target_url = _fetch_available_models(
             base_url,
