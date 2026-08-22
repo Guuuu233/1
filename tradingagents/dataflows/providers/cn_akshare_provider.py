@@ -419,6 +419,36 @@ def _fund_flow_failure_category(error: object) -> str:
     return "provider"
 
 
+def _get_latest_us_session_date(dt_or_ts=None) -> str:
+    """Return the US market trading date (YYYY-MM-DD) in America/New_York.
+
+    If the datetime falls on a weekend (Saturday or Sunday), rolls back to the
+    most recent Friday close.
+    """
+    from zoneinfo import ZoneInfo
+    ny_tz = ZoneInfo("America/New_York")
+    if dt_or_ts is None:
+        dt = datetime.now(ny_tz)
+    elif isinstance(dt_or_ts, (int, float)):
+        dt = datetime.fromtimestamp(dt_or_ts, ny_tz)
+    elif isinstance(dt_or_ts, datetime):
+        if dt_or_ts.tzinfo is None:
+            dt = dt_or_ts.replace(tzinfo=ny_tz)
+        else:
+            dt = dt_or_ts.astimezone(ny_tz)
+    else:
+        dt = datetime.now(ny_tz)
+
+    weekday = dt.weekday()  # Monday is 0, Sunday is 6
+    if weekday == 5:  # Saturday
+        session_dt = dt - timedelta(days=1)
+    elif weekday == 6:  # Sunday
+        session_dt = dt - timedelta(days=2)
+    else:
+        session_dt = dt
+    return session_dt.strftime("%Y-%m-%d")
+
+
 class CnAkshareProvider(BaseMarketDataProvider):
     """A-share provider backed by AkShare."""
 
@@ -4246,6 +4276,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
         """Fetch real-time snapshot of global indices from Eastmoney ulist API."""
         import requests
         import json
+        from zoneinfo import ZoneInfo
 
         url = (
             "https://push2.eastmoney.com/api/qt/ulist.np/get?"
@@ -4306,7 +4337,18 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 try:
                     ts_int = int(ts_raw)
                     if ts_int > 1000000000:
-                        as_of = datetime.fromtimestamp(ts_int, timezone.utc).strftime("%Y-%m-%d")
+                        if code_raw in ("SPX", "NDX", "DJIA"):
+                            as_of = _get_latest_us_session_date(ts_int)
+                        elif code_raw in ("HSI", "HSTECH"):
+                            as_of = datetime.fromtimestamp(ts_int, ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+                        elif code_raw == "N225":
+                            as_of = datetime.fromtimestamp(ts_int, ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d")
+                        elif code_raw == "KS11":
+                            as_of = datetime.fromtimestamp(ts_int, ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+                        elif code_raw in ("GDAXI", "FTSE", "FCHI"):
+                            as_of = datetime.fromtimestamp(ts_int, ZoneInfo("Europe/London")).strftime("%Y-%m-%d")
+                        else:
+                            as_of = datetime.fromtimestamp(ts_int, timezone.utc).strftime("%Y-%m-%d")
                 except (ValueError, TypeError, OverflowError):
                     pass
 
@@ -4332,11 +4374,12 @@ class CnAkshareProvider(BaseMarketDataProvider):
         """Fetch real-time snapshot of global indices from Sina Finance HQ API."""
         import requests
         import re
+        from zoneinfo import ZoneInfo
 
         symbols = [
-            ("标普500", "^GSPC", "gb_inx"),
-            ("纳斯达克综合", "^IXIC", "gb_ixic"),
-            ("道琼斯", "^DJI", "gb_dji"),
+            ("标普500", ".INX", "int_sp500"),
+            ("纳斯达克综合", ".IXIC", "int_nasdaq"),
+            ("道琼斯", ".DJI", "int_dji"),
             ("恒生指数", "HSI", "rt_hkHSI"),
             ("恒生科技指数", "HSTECH", "rt_hkHSTECH"),
             ("日经225", "N225", "int_nikkei"),
@@ -4361,22 +4404,43 @@ class CnAkshareProvider(BaseMarketDataProvider):
             if not line or '="' not in line:
                 continue
             k, v = line.split('="', 1)
+            raw_fields = v.rstrip('";').split(",")
+            m = re.search(r"hq_str_([a-zA-Z0-9_]+)", k)
+            if m:
+                res_map[m.group(1)] = raw_fields
             raw_code = k.split("_")[-1]
-            res_map[raw_code] = v.rstrip('";').split(",")
+            res_map[raw_code] = raw_fields
 
         retrieved_at = datetime.now(timezone.utc).isoformat()
         out = {}
         for name, code, sina_symbol in symbols:
-            raw_key = sina_symbol.split("_")[-1]
-            raw = res_map.get(raw_key)
+            raw = res_map.get(sina_symbol) or res_map.get(sina_symbol.split("_")[-1])
             if not raw or len(raw) < 2 or not raw[1]:
                 continue
             try:
-                if sina_symbol.startswith("gb_"):
+                if sina_symbol.startswith("int_"):
+                    # fields: [name, latest, change_amt, change_pct]
+                    price = safe_float(raw[1])
+                    change_1d_pct = safe_float(raw[3])
+                    if sina_symbol in ("int_sp500", "int_nasdaq", "int_dji"):
+                        as_of = _get_latest_us_session_date()
+                    elif sina_symbol == "int_nikkei":
+                        as_of = curr_date
+                    else:
+                        as_of = curr_date
+                elif sina_symbol.startswith("gb_"):
                     # fields: [name, price, change_pct, datetime, change_amt, ...]
                     price = safe_float(raw[1])
                     change_1d_pct = safe_float(raw[2])
-                    as_of = raw[3][:10] if len(raw) > 3 and len(raw[3]) >= 10 else curr_date
+                    raw_dt = raw[3] if len(raw) > 3 and len(raw[3]) >= 10 else ""
+                    if raw_dt:
+                        try:
+                            dt_cst = datetime.strptime(raw_dt[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+                            as_of = _get_latest_us_session_date(dt_cst)
+                        except Exception:
+                            as_of = raw_dt[:10]
+                    else:
+                        as_of = curr_date
                 elif sina_symbol.startswith("rt_hk"):
                     # fields: [symbol, name, prev_close, open, high, low, latest, change_amt, change_pct, ..., date, time]
                     price = safe_float(raw[6])
@@ -4386,13 +4450,23 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     # fields: [name, latest, change_amt, change_pct, ...]
                     price = safe_float(raw[1])
                     change_1d_pct = safe_float(raw[3])
-                    candidates = [f for f in raw if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", f) and f <= curr_date]
-                    as_of = max(candidates) if candidates else curr_date
-                elif sina_symbol.startswith("int_"):
-                    # fields: [name, latest, change_amt, change_pct]
-                    price = safe_float(raw[1])
-                    change_1d_pct = safe_float(raw[3])
-                    as_of = curr_date
+                    date_val, time_val = None, None
+                    for i, f in enumerate(raw):
+                        if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", f):
+                            date_val = f
+                            if i + 1 < len(raw) and re.fullmatch(r"\d{2}:\d{2}:\d{2}", raw[i+1]):
+                                time_val = raw[i+1]
+                    tz_target = "Europe/Berlin" if "DAX" in sina_symbol else ("Europe/London" if "FTSE" in sina_symbol else ("Europe/Paris" if "CAC" in sina_symbol else "Asia/Seoul"))
+                    if date_val and time_val:
+                        try:
+                            dt_cst = datetime.strptime(f"{date_val} {time_val}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+                            as_of = dt_cst.astimezone(ZoneInfo(tz_target)).strftime("%Y-%m-%d")
+                        except Exception:
+                            candidates = [f for f in raw if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", f) and f <= curr_date]
+                            as_of = max(candidates) if candidates else curr_date
+                    else:
+                        candidates = [f for f in raw if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", f) and f <= curr_date]
+                        as_of = max(candidates) if candidates else curr_date
                 else:
                     continue
 
@@ -4487,16 +4561,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
                         results[name] = metrics
 
         def _fetch_from_snapshots():
-            # Step 1: Eastmoney ulist
-            try:
-                em_snapshots = self._fetch_global_indices_em_ulist(curr_date)
-                for k, v in em_snapshots.items():
-                    if k not in results and v.get("as_of", "") <= curr_date:
-                        results[k] = v
-            except Exception as exc:
-                _provider_logger.debug("EM ulist global indices failed: %s", exc)
-
-            # Step 2: Sina hq fallback for missing items
+            # Step 1: Sina HQ (prioritized for US int_* and global indices)
             try:
                 sina_snapshots = self._fetch_global_indices_sina_hq(curr_date)
                 for k, v in sina_snapshots.items():
@@ -4505,12 +4570,23 @@ class CnAkshareProvider(BaseMarketDataProvider):
             except Exception as exc:
                 _provider_logger.debug("Sina HQ global indices failed: %s", exc)
 
+            # Step 2: Eastmoney ulist for missing items
+            try:
+                em_snapshots = self._fetch_global_indices_em_ulist(curr_date)
+                for k, v in em_snapshots.items():
+                    if k not in results and v.get("as_of", "") <= curr_date:
+                        if k == "纳斯达克100" and "纳斯达克综合" in results:
+                            continue
+                        results[k] = v
+            except Exception as exc:
+                _provider_logger.debug("EM ulist global indices failed: %s", exc)
+
         if is_historical:
             # 历史日期：优先 hist 接口，若 hist 失败且快照日期 <= curr_date 才可用
             _fetch_from_hist()
             _fetch_from_snapshots()
         else:
-            # 非历史日期（当日/实时）：优先 ulist -> sina hq 实时快照，再回退 hist 接口
+            # 非历史日期（当日/实时）：优先 sina hq -> ulist 实时快照，再回退 hist 接口
             _fetch_from_snapshots()
             _fetch_from_hist()
 
