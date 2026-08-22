@@ -149,14 +149,13 @@ class TestIndustryLinkageMap:
         assert len(config.international_benchmark) >= 1
         assert len(config.policy_catalysts) >= 1
 
-        # 上游成本端：碳酸锂价格（标注待接入API）
+        # 上游成本端：碳酸锂价格（已付费 Tushare fut_daily LC.GFE）
         upstream = config.upstream_cost[0]
         assert "碳酸锂" in upstream.name
-        assert upstream.source == "pending_api"
-        assert upstream.note == "待接入API"
-        assert upstream.status == "pending_api"
+        assert upstream.source == "tushare"
+        assert upstream.symbol == "LC.GFE"
+        assert upstream.status == "active"
         assert upstream.role == "upstream"
-        assert upstream.current_value is None
 
         # 下游需求端：新能源车渗透率（标注手动）
         downstream = config.downstream_demand[0]
