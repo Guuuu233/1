@@ -1038,14 +1038,18 @@ _BASE_INDUSTRY_LINKAGE_MAP: Dict[str, IndustryLinkage] = {
         upstream_cost=[
             IndustryLinkageIndicator(
                 name="银行间同业拆借利率Shibor",
-                source="pending_api",
+                source="tushare",
                 symbol="Shibor_3M",
                 frequency="daily",
                 unit="%",
                 role="upstream",
-                status="pending_api",
-                note="待接入API",
+                status="active",
                 transmission_logic="商业银行同业负债与批发性资金综合获取成本传导",
+                metadata={
+                    "api_name": "shibor",
+                    "value_field": "3m",
+                    "is_price": False,
+                },
             ),
             IndustryLinkageIndicator(
                 name="国有大行1年期定期存款挂牌利率",
@@ -1073,14 +1077,18 @@ _BASE_INDUSTRY_LINKAGE_MAP: Dict[str, IndustryLinkage] = {
             ),
             IndustryLinkageIndicator(
                 name="贷款市场报价利率LPR_1Y",
-                source="pending_api",
-                symbol=None,
+                source="tushare",
+                symbol="LPR_1Y",
                 frequency="monthly",
                 unit="%",
                 role="downstream",
-                status="pending_api",
-                note="待接入API",
+                status="active",
                 transmission_logic="资产端企业贷款与零售贷款基准定价中枢",
+                metadata={
+                    "api_name": "shibor_lpr",
+                    "value_field": "1y",
+                    "is_price": False,
+                },
             ),
         ],
         international_benchmark=[

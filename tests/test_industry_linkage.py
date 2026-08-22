@@ -255,6 +255,93 @@ def test_get_industry_linkage_new_energy(monkeypatch):
         assert "【数据缺失】特斯拉交付量：手动" in prompt_text
 
 
+def test_get_industry_linkage_commercial_bank(monkeypatch):
+    """测试商业银行与信贷行业数据采集、Tushare宏观利率与 Prompt 渲染。"""
+    monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+    provider = IndustryLinkageProvider()
+
+    # 构造 shibor 数据
+    dates_shibor = pd.date_range("2026-05-01", periods=70, freq="B")
+    items_shibor = []
+    for i, dt in enumerate(dates_shibor):
+        d_str = dt.strftime("%Y%m%d")
+        rate_3m = 1.60 + (i * 0.005) if i < 69 else 1.95
+        items_shibor.append([d_str, 1.20, 1.35, 1.45, 1.50, rate_3m, 1.75, 1.85, 1.95])
+    mock_shibor_resp = {
+        "code": 0,
+        "msg": None,
+        "data": {
+            "fields": ["date", "on", "1w", "2w", "1m", "3m", "6m", "9m", "1y"],
+            "items": list(reversed(items_shibor)),
+        },
+    }
+
+    # 构造 lpr 数据 (每月 20 日)
+    dates_lpr = [pd.Timestamp("2024-09-20") + pd.DateOffset(months=i) for i in range(24)]
+    items_lpr = []
+    for i, dt in enumerate(dates_lpr):
+        d_str = dt.strftime("%Y%m%d")
+        rate_1y = 3.45 - (i * 0.005) if i < 23 else 3.35
+        items_lpr.append([d_str, rate_1y, 3.85])
+    mock_lpr_resp = {
+        "code": 0,
+        "msg": None,
+        "data": {
+            "fields": ["date", "1y", "5y"],
+            "items": list(reversed(items_lpr)),
+        },
+    }
+
+    def mock_post(url, json=None, **kwargs):
+        mock_r = MagicMock()
+        mock_r.status_code = 200
+        if json and json.get("api_name") == "shibor":
+            mock_r.json.return_value = mock_shibor_resp
+        elif json and json.get("api_name") == "shibor_lpr":
+            mock_r.json.return_value = mock_lpr_resp
+        else:
+            mock_r.json.return_value = {"code": 0, "msg": None, "data": {"fields": [], "items": []}}
+        return mock_r
+
+    with patch("requests.post", side_effect=mock_post), \
+         patch("yfinance.Ticker", side_effect=Exception("Offline test")):
+
+        data = provider.get_industry_linkage("商业银行与信贷", as_of="2026-08-20", use_cache=False)
+
+        assert data is not None
+        assert data["industry_name"] == "商业银行与信贷"
+
+        # 1. 验证 Shibor 3M
+        shibor = [u for u in data["upstream_cost"] if "Shibor" in u["name"]][0]
+        assert shibor["source"] == "tushare"
+        assert shibor["status"] == "active"
+        assert shibor["current_value"] == 1.95
+        assert shibor["unit"] == "%"
+        assert shibor["trend"] == "上升"
+        assert shibor["confidence"] == "高"
+        assert shibor["transport_provider"] == "tushare"
+        assert shibor["api_name"] == "shibor"
+        assert shibor["value_field"] == "3m"
+
+        # 2. 验证 LPR 1Y
+        lpr = [d for d in data["downstream_demand"] if "LPR" in d["name"]][0]
+        assert lpr["source"] == "tushare"
+        assert lpr["status"] == "active"
+        assert lpr["current_value"] == 3.35
+        assert lpr["unit"] == "%"
+        assert lpr["trend"] == "下降"
+        assert lpr["confidence"] == "高"
+        assert lpr["transport_provider"] == "tushare"
+        assert lpr["api_name"] == "shibor_lpr"
+        assert lpr["value_field"] == "1y"
+
+        # 3. 验证 Prompt 渲染
+        prompt_text = format_industry_linkage_for_prompt(data)
+        assert "【产业链联想数据】：商业银行与信贷" in prompt_text
+        assert "银行间同业拆借利率Shibor：1.95 %" in prompt_text
+        assert "贷款市场报价利率LPR_1Y：3.35 %" in prompt_text
+
+
 def test_cache(mock_copper_dataframe: pd.DataFrame):
     """测试 1 小时内存 TTL 缓存机制与并发安全 (核心用例 3).
 
@@ -536,14 +623,39 @@ class TestIndustryLinkageSuite:
         unknown_config = get_industry_linkage_config("未知赛道XYZ")
         assert unknown_config is None
 
-    def test_all_twenty_seven_industries_return_non_empty_linkage(self):
+    def test_commercial_bank_linkage_shibor_and_lpr_config(self):
+        """测试商业银行与信贷行业图谱配置中 Shibor 与 LPR 为 Tushare A类真值源。"""
+        bank_cfg = get_industry_linkage_config("商业银行与信贷")
+        assert bank_cfg is not None
+
+        # 1. 验证 Shibor 3M 配置
+        shibor_ind = [u for u in bank_cfg.upstream_cost if "Shibor" in u.name][0]
+        assert shibor_ind.source == "tushare"
+        assert shibor_ind.status == "active"
+        assert shibor_ind.unit == "%"
+        assert shibor_ind.metadata.get("api_name") == "shibor"
+        assert shibor_ind.metadata.get("value_field") == "3m"
+        assert shibor_ind.metadata.get("is_price") is False
+
+        # 2. 验证 LPR 1Y 配置
+        lpr_ind = [d for d in bank_cfg.downstream_demand if "LPR" in d.name][0]
+        assert lpr_ind.source == "tushare"
+        assert lpr_ind.status == "active"
+        assert lpr_ind.unit == "%"
+        assert lpr_ind.metadata.get("api_name") == "shibor_lpr"
+        assert lpr_ind.metadata.get("value_field") == "1y"
+        assert lpr_ind.metadata.get("is_price") is False
+
+    def test_all_twenty_seven_industries_return_non_empty_linkage(self, monkeypatch):
         """验收标准 1 & 2：27 个行业都能 get_industry_linkage 返回非空结构；缺指标显式「数据缺失」，禁止臆造数值。"""
+        monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
         provider = IndustryLinkageProvider()
         all_27_names = get_all_industry_names()
         assert len(all_27_names) == 27
 
         with patch("akshare.futures_foreign_hist", return_value=pd.DataFrame()), \
-             patch("yfinance.Ticker", side_effect=Exception("Offline test")):
+             patch("yfinance.Ticker", side_effect=Exception("Offline test")), \
+             patch("requests.post", side_effect=Exception("Offline test")):
             for ind_name in all_27_names:
                 data = provider.get_industry_linkage(ind_name, as_of="2026-08-20", use_cache=False)
                 assert data is not None, f"行业 {ind_name} 应返回非空产业链结构"

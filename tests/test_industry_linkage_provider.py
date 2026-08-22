@@ -103,6 +103,55 @@ def mock_tushare_cu_shf_response():
     }
 
 
+@pytest.fixture
+def mock_tushare_shibor_response():
+    """构造 Tushare shibor 70 个交易日合成数据 (date, on, 1w, 2w, 1m, 3m, 6m, 9m, 1y)。"""
+    dates = pd.date_range("2026-05-01", periods=70, freq="B")
+    items = []
+    for i, dt in enumerate(dates):
+        d_str = dt.strftime("%Y%m%d")
+        rate_3m = 1.60 + (i * 0.005) if i < 69 else 1.95
+        items.append([
+            d_str,
+            1.20 + (i * 0.002),  # on
+            1.35 + (i * 0.003),  # 1w
+            1.45 + (i * 0.003),  # 2w
+            1.50 + (i * 0.004),  # 1m
+            rate_3m,             # 3m (目标字段)
+            1.75 + (i * 0.005),  # 6m
+            1.85 + (i * 0.005),  # 9m
+            1.95 + (i * 0.005),  # 1y
+        ])
+    return {
+        "code": 0,
+        "msg": None,
+        "data": {
+            "fields": ["date", "on", "1w", "2w", "1m", "3m", "6m", "9m", "1y"],
+            "items": list(reversed(items)),  # Tushare 倒序返回
+        },
+    }
+
+
+@pytest.fixture
+def mock_tushare_shibor_lpr_response():
+    """构造 Tushare shibor_lpr 24 个月度报价日合成数据 (date, 1y, 5y)。"""
+    dates = [pd.Timestamp("2024-09-20") + pd.DateOffset(months=i) for i in range(24)]
+    items = []
+    for i, dt in enumerate(dates):
+        d_str = dt.strftime("%Y%m%d")
+        rate_1y = 3.45 - (i * 0.005) if i < 23 else 3.35
+        rate_5y = 3.95 - (i * 0.005) if i < 23 else 3.85
+        items.append([d_str, rate_1y, rate_5y])
+    return {
+        "code": 0,
+        "msg": None,
+        "data": {
+            "fields": ["date", "1y", "5y"],
+            "items": list(reversed(items)),  # Tushare 倒序返回
+        },
+    }
+
+
 class TestIndustryLinkageProvider:
     """测试 IndustryLinkageProvider 核心功能与指标采集。"""
 
@@ -997,3 +1046,266 @@ class TestIndustryLinkageProvider:
         assert res["trend"] == "数据缺失"
         assert res["confidence"] == "低（待实现）"
         assert res["category"] == "not_implemented"
+
+    def test_tushare_shibor_3m_success(
+        self, monkeypatch, mock_tushare_shibor_response
+    ):
+        """测试 Tushare shibor 接口拉取 Shibor 3M 并完成字段解析、趋势计算与 Provenance 验证。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        provider = IndustryLinkageProvider()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_tushare_shibor_response
+
+        ind = IndustryLinkageIndicator(
+            name="银行间同业拆借利率Shibor",
+            source="tushare",
+            symbol="Shibor_3M",
+            unit="%",
+            metadata={"api_name": "shibor", "value_field": "3m", "is_price": False},
+        )
+
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            result = provider._fetch_indicator(ind, as_of="2026-08-20")
+
+            assert mock_post.call_count == 1
+            call_json = mock_post.call_args.kwargs.get("json", {})
+            assert call_json.get("api_name") == "shibor"
+            assert call_json.get("fields") == "date,on,1w,2w,1m,3m,6m,9m,1y"
+            assert "ts_code" not in call_json.get("params", {})
+            assert call_json.get("params", {}).get("end_date") == "20260820"
+
+            assert result["current_value"] == 1.95
+            assert result["unit"] == "%"
+            assert result["trend"] == "上升"
+            assert result["confidence"] == "高"
+            assert result["status"] == "active"
+            assert result["mom_change"] is not None and result["mom_change"] > 0
+            assert result["requested_as_of"] == "2026-08-20"
+            assert result["actual_as_of"] == "2026-08-06"
+            assert result["actual_as_of"] <= result["requested_as_of"]
+            assert result["retrieved_at"] is not None
+            assert result["transport_provider"] == "tushare"
+            assert result["api_name"] == "shibor"
+            assert result["value_field"] == "3m"
+            assert "tushare" in result["note"]
+
+    def test_tushare_shibor_lpr_1y_success(
+        self, monkeypatch, mock_tushare_shibor_lpr_response
+    ):
+        """测试 Tushare shibor_lpr 接口拉取 LPR 1Y 并完成字段解析、趋势计算与 Provenance 验证。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        provider = IndustryLinkageProvider()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_tushare_shibor_lpr_response
+
+        ind = IndustryLinkageIndicator(
+            name="贷款市场报价利率LPR_1Y",
+            source="tushare",
+            symbol="LPR_1Y",
+            unit="%",
+            metadata={"api_name": "shibor_lpr", "value_field": "1y", "is_price": False},
+        )
+
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            result = provider._fetch_indicator(ind, as_of="2026-08-20")
+
+            assert mock_post.call_count == 1
+            call_json = mock_post.call_args.kwargs.get("json", {})
+            assert call_json.get("api_name") == "shibor_lpr"
+            assert call_json.get("fields") == "date,1y,5y"
+            assert "ts_code" not in call_json.get("params", {})
+
+            assert result["current_value"] == 3.35
+            assert result["unit"] == "%"
+            assert result["trend"] == "下降"
+            assert result["confidence"] == "高"
+            assert result["status"] == "active"
+            assert result["mom_change"] is not None and result["mom_change"] < 0
+            assert result["requested_as_of"] == "2026-08-20"
+            assert result["actual_as_of"] == "2026-08-20"
+            assert result["actual_as_of"] <= result["requested_as_of"]
+            assert result["retrieved_at"] is not None
+            assert result["transport_provider"] == "tushare"
+            assert result["api_name"] == "shibor_lpr"
+            assert result["value_field"] == "1y"
+            assert "tushare" in result["note"]
+
+    def test_commercial_bank_industry_linkage_fetch_success(
+        self, monkeypatch, mock_tushare_shibor_response, mock_tushare_shibor_lpr_response
+    ):
+        """测试商业银行与信贷行业全景数据拉取与 Prompt 渲染。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        provider = IndustryLinkageProvider()
+
+        def mock_post_dispatch(url, json=None, **kwargs):
+            mock_r = MagicMock()
+            mock_r.status_code = 200
+            if json and json.get("api_name") == "shibor":
+                mock_r.json.return_value = mock_tushare_shibor_response
+            elif json and json.get("api_name") == "shibor_lpr":
+                mock_r.json.return_value = mock_tushare_shibor_lpr_response
+            else:
+                mock_r.json.return_value = {"code": 0, "msg": None, "data": {"fields": [], "items": []}}
+            return mock_r
+
+        with patch("requests.post", side_effect=mock_post_dispatch), \
+             patch("yfinance.Ticker", side_effect=Exception("Offline yfinance test")):
+
+            data = provider.get_industry_linkage("商业银行与信贷", as_of="2026-08-20", use_cache=False)
+
+            assert data is not None
+            assert data["industry_name"] == "商业银行与信贷"
+
+            # 1. 验证上游 Shibor 3M
+            shibor = [u for u in data["upstream_cost"] if "Shibor" in u["name"]][0]
+            assert shibor["source"] == "tushare"
+            assert shibor["status"] == "active"
+            assert shibor["current_value"] == 1.95
+            assert shibor["unit"] == "%"
+            assert shibor["trend"] == "上升"
+            assert shibor["confidence"] == "高"
+            assert shibor["transport_provider"] == "tushare"
+            assert shibor["api_name"] == "shibor"
+            assert shibor["value_field"] == "3m"
+
+            # 2. 验证上游定期存款挂牌利率 (手动)
+            deposit = [u for u in data["upstream_cost"] if "存款" in u["name"]][0]
+            assert deposit["source"] == "manual"
+            assert deposit["status"] == "manual"
+            assert deposit["current_value"] is None
+            assert deposit["trend"] == "数据缺失"
+
+            # 3. 验证下游 LPR 1Y
+            lpr = [d for d in data["downstream_demand"] if "LPR" in d["name"]][0]
+            assert lpr["source"] == "tushare"
+            assert lpr["status"] == "active"
+            assert lpr["current_value"] == 3.35
+            assert lpr["unit"] == "%"
+            assert lpr["trend"] == "下降"
+            assert lpr["confidence"] == "高"
+            assert lpr["transport_provider"] == "tushare"
+            assert lpr["api_name"] == "shibor_lpr"
+            assert lpr["value_field"] == "1y"
+
+            # 4. 验证下游新增人民币贷款 (手动)
+            loan = [d for d in data["downstream_demand"] if "贷款" in d["name"] and "LPR" not in d["name"]][0]
+            assert loan["source"] == "manual"
+            assert loan["status"] == "manual"
+            assert loan["current_value"] is None
+            assert loan["trend"] == "数据缺失"
+
+    def test_macro_rate_weekend_requested_as_of_anti_lookahead(
+        self, monkeypatch, mock_tushare_shibor_response
+    ):
+        """测试宏观利率接口在周末/非交易日请求时回退到上一个有效工作日，绝不泄露未来数据。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        provider = IndustryLinkageProvider()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_tushare_shibor_response
+
+        ind = IndustryLinkageIndicator(
+            name="银行间同业拆借利率Shibor",
+            source="tushare",
+            symbol="Shibor_3M",
+            unit="%",
+            metadata={"api_name": "shibor", "value_field": "3m"},
+        )
+
+        with patch("requests.post", return_value=mock_resp):
+            # 2026-08-22 为周六，mock 中最新数据为 2026-08-06
+            res = provider._fetch_indicator(ind, as_of="2026-08-22")
+
+            assert res["status"] == "active"
+            assert res["requested_as_of"] == "2026-08-22"
+            assert res["actual_as_of"] == "2026-08-06"
+            assert res["actual_as_of"] <= res["requested_as_of"]
+            assert res["current_value"] == 1.95
+            assert res["transport_provider"] == "tushare"
+            assert res["api_name"] == "shibor"
+            assert res["value_field"] == "3m"
+
+    def test_macro_rate_fail_closed_on_lookahead_violation(self, monkeypatch):
+        """测试宏观利率接口在数据日期全晚于请求基准日时，严格 fail-closed 返回 unavailable。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        provider = IndustryLinkageProvider()
+
+        future_shibor_data = {
+            "code": 0,
+            "msg": None,
+            "data": {
+                "fields": ["date", "on", "1w", "2w", "1m", "3m", "6m", "9m", "1y"],
+                "items": [
+                    ["20260825", 1.20, 1.30, 1.40, 1.50, 1.88, 1.90, 2.00, 2.10],
+                    ["20260824", 1.20, 1.30, 1.40, 1.50, 1.86, 1.90, 2.00, 2.10],
+                ],
+            },
+        }
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = future_shibor_data
+
+        ind = IndustryLinkageIndicator(
+            name="银行间同业拆借利率Shibor",
+            source="tushare",
+            symbol="Shibor_3M",
+            unit="%",
+            metadata={"api_name": "shibor", "value_field": "3m"},
+        )
+
+        with patch("requests.post", return_value=mock_resp):
+            # 请求 2026-08-20，所有返回数据均晚于该日期
+            result = provider._fetch_indicator(ind, as_of="2026-08-20")
+
+            assert result["status"] == "unavailable"
+            assert result["current_value"] is None
+            assert result["actual_as_of"] is None
+            assert result["requested_as_of"] == "2026-08-20"
+            assert result["transport_provider"] == "tushare"
+            assert result["api_name"] == "shibor"
+            assert result["value_field"] == "3m"
+            assert result["category"] in ("empty_rows", "lookahead_violation")
+
+    def test_macro_rate_token_missing_and_permission_denied(self, monkeypatch):
+        """测试宏观利率接口在 Token 缺失或 403 权限不足时安全分类与 fail-closed 表现。"""
+        provider = IndustryLinkageProvider()
+
+        ind = IndustryLinkageIndicator(
+            name="贷款市场报价利率LPR_1Y",
+            source="tushare",
+            symbol="LPR_1Y",
+            unit="%",
+            metadata={"api_name": "shibor_lpr", "value_field": "1y"},
+        )
+
+        # 1. Token 缺失
+        monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+        res_no_token = provider._fetch_indicator(ind, as_of="2026-08-20")
+        assert res_no_token["status"] == "unavailable"
+        assert res_no_token["current_value"] is None
+        assert res_no_token["confidence"] == "低（Token缺失）"
+        assert res_no_token["category"] == "token"
+        assert res_no_token["transport_provider"] == "tushare"
+        assert res_no_token["api_name"] == "shibor_lpr"
+        assert res_no_token["value_field"] == "1y"
+
+        # 2. 403 权限不足
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        mock_resp_403 = MagicMock()
+        mock_resp_403.status_code = 200
+        mock_resp_403.json.return_value = {"code": 40101, "msg": "抱歉，您没有访问 shibor_lpr 接口的权限"}
+
+        with patch("requests.post", return_value=mock_resp_403):
+            res_403 = provider._fetch_indicator(ind, as_of="2026-08-20")
+            assert res_403["status"] == "unavailable"
+            assert res_403["current_value"] is None
+            assert res_403["confidence"] == "低（无权限403）"
+            assert res_403["category"] == "403"
+            assert res_403["transport_provider"] == "tushare"
+            assert res_403["api_name"] == "shibor_lpr"
+            assert res_403["value_field"] == "1y"

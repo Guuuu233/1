@@ -75,19 +75,43 @@ def _get_tushare_token() -> str:
 
 
 def _resolve_tushare_api_name(
-    symbol: str, metadata: Optional[Dict[str, Any]] = None
+    symbol: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None
 ) -> str:
     """根据标的代码或元数据判定 Tushare API 接口类型。
 
+    - 宏观利率标的 (shibor / shibor_lpr 等): 调用 shibor / shibor_lpr
     - 期货标的 (以交易所后缀结尾，如 .GFE, .SHF 等): 调用 fut_daily
     - 全球指数标的 (如 SPX, IXIC 等): 调用 index_global
     """
     if metadata and metadata.get("api_name"):
         return str(metadata["api_name"]).strip()
-    sym_upper = symbol.strip().upper()
+    sym_upper = symbol.strip().upper() if symbol else ""
+    if sym_upper in ("SHIBOR", "SHIBOR_3M", "SHIBOR_ON"):
+        return "shibor"
+    if sym_upper in ("LPR", "LPR_1Y", "SHIBOR_LPR", "LPR_5Y"):
+        return "shibor_lpr"
     if sym_upper.endswith(_FUTURES_EXCHANGE_SUFFIXES):
         return "fut_daily"
     return "index_global"
+
+
+def _resolve_tushare_value_field(
+    api_name: str,
+    symbol: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
+    """解析 Tushare 返回结果中用于提取数值的目标字段。"""
+    if metadata and metadata.get("value_field"):
+        return str(metadata["value_field"]).strip()
+    if api_name == "shibor":
+        if symbol and "1Y" in symbol.upper():
+            return "1y"
+        return "3m"
+    if api_name == "shibor_lpr":
+        if symbol and "5Y" in symbol.upper():
+            return "5y"
+        return "1y"
+    return "close"
 
 
 def _normalize_as_of_date(as_of: Optional[str]) -> Optional[str]:
@@ -106,17 +130,19 @@ def _normalize_as_of_date(as_of: Optional[str]) -> Optional[str]:
 
 def _query_tushare_api(
     api_name: str,
-    ts_code: str,
+    ts_code: Optional[str] = None,
     as_of: Optional[str] = None,
     fields: Optional[str] = None,
+    params: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[pd.DataFrame], Optional[str], Optional[str]]:
-    """向 Tushare 发起行情请求并进行响应校验与错误分类。
+    """向 Tushare 发起行情/宏观数据请求并进行响应校验与错误分类。
 
     Args:
-        api_name: 接口名称 (fut_daily / index_global 等)
-        ts_code: 证券代码 (如 LC.GFE / SPX)
+        api_name: 接口名称 (fut_daily / index_global / shibor / shibor_lpr 等)
+        ts_code: 证券代码 (如 LC.GFE / SPX，宏观利率接口可为空)
         as_of: 截止基准日期 (YYYY-MM-DD 或 YYYYMMDD)
         fields: 请求字段列表
+        params: 额外自定义参数字典
 
     Returns:
         (DataFrame, error_category, error_note): 成功时 DataFrame 非空，失败时返回错误分类与说明
@@ -126,17 +152,31 @@ def _query_tushare_api(
         return None, "token", "Tushare Token 未配置 (TUSHARE_TOKEN missing)"
 
     url = _get_tushare_url()
-    req_fields = fields or "ts_code,trade_date,open,high,low,close,vol"
-    params: Dict[str, Any] = {"ts_code": ts_code}
+
+    # 确定请求字段
+    if fields:
+        req_fields = fields
+    elif api_name == "shibor":
+        req_fields = "date,on,1w,2w,1m,3m,6m,9m,1y"
+    elif api_name == "shibor_lpr":
+        req_fields = "date,1y,5y"
+    else:
+        req_fields = "ts_code,trade_date,open,high,low,close,vol"
+
+    # 构造请求参数
+    req_params: Dict[str, Any] = dict(params or {})
+    if ts_code and api_name not in ("shibor", "shibor_lpr"):
+        req_params["ts_code"] = ts_code
+
     if as_of:
         clean_as_of = str(as_of).replace("-", "").strip()
         if len(clean_as_of) == 8 and clean_as_of.isdigit():
-            params["end_date"] = clean_as_of
+            req_params["end_date"] = clean_as_of
 
     payload = {
         "api_name": api_name,
         "token": token,
-        "params": params,
+        "params": req_params,
         "fields": req_fields,
     }
 
@@ -366,9 +406,12 @@ class IndustryLinkageProvider:
                 "category": "api_error",
             })
             if config.source == "tushare":
+                api_name = _resolve_tushare_api_name(config.symbol or "", config.metadata)
+                value_field = _resolve_tushare_value_field(api_name, config.symbol, config.metadata)
                 base_dict.update({
                     "transport_provider": "tushare",
-                    "api_name": _resolve_tushare_api_name(config.symbol or "", config.metadata),
+                    "api_name": api_name,
+                    "value_field": value_field,
                 })
             elif config.source == "akshare":
                 base_dict.update({
@@ -387,13 +430,16 @@ class IndustryLinkageProvider:
         config: IndustryLinkageIndicator,
         as_of: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """采集 Tushare 标的历史行情并计算最新值、月环比、季度环比与趋势，附带完整 Provenance 证据链。"""
+        """采集 Tushare 标的历史行情/宏观利率并计算最新值、月环比、季度环比与趋势，附带完整 Provenance 证据链。"""
         result = config.model_dump()
         retrieved_at = datetime.now(timezone.utc).isoformat()
         symbol = config.symbol
         api_name = _resolve_tushare_api_name(symbol or "", config.metadata)
+        value_field = _resolve_tushare_value_field(api_name, symbol, config.metadata)
 
-        if not symbol:
+        is_macro_rate = api_name in ("shibor", "shibor_lpr")
+
+        if not symbol and not is_macro_rate:
             result.update({
                 "status": "unavailable",
                 "current_value": None,
@@ -407,13 +453,14 @@ class IndustryLinkageProvider:
                 "retrieved_at": retrieved_at,
                 "transport_provider": "tushare",
                 "api_name": api_name,
+                "value_field": value_field,
                 "category": "symbol_missing",
             })
             return result
 
         df, err_cat, err_note = _query_tushare_api(
             api_name=api_name,
-            ts_code=symbol,
+            ts_code=symbol or "",
             as_of=as_of,
         )
 
@@ -443,12 +490,14 @@ class IndustryLinkageProvider:
                 "retrieved_at": retrieved_at,
                 "transport_provider": "tushare",
                 "api_name": api_name,
+                "value_field": value_field,
                 "category": err_cat or "api_error",
             })
             return result
 
+        date_col = "date" if is_macro_rate else "trade_date"
         metrics = self._calculate_series_metrics(
-            df, as_of=as_of, price_col="close", date_col="trade_date"
+            df, as_of=as_of, price_col=value_field, date_col=date_col
         )
 
         if not metrics:
@@ -459,12 +508,13 @@ class IndustryLinkageProvider:
                 "qoq_change": None,
                 "trend": "数据缺失",
                 "confidence": "低（有效数据不足）",
-                "note": "无符合截止日期的有效价格序列",
+                "note": "无符合截止日期的有效利率序列" if is_macro_rate else "无符合截止日期的有效价格序列",
                 "requested_as_of": as_of,
                 "actual_as_of": None,
                 "retrieved_at": retrieved_at,
                 "transport_provider": "tushare",
                 "api_name": api_name,
+                "value_field": value_field,
                 "category": "empty_rows",
             })
             return result
@@ -492,9 +542,16 @@ class IndustryLinkageProvider:
                 "retrieved_at": retrieved_at,
                 "transport_provider": "tushare",
                 "api_name": api_name,
+                "value_field": value_field,
                 "category": "lookahead_violation",
             })
             return result
+
+        note_str = (
+            f"数据源: tushare (宏观利率接口: {api_name}, 目标字段: {value_field})"
+            if is_macro_rate
+            else f"数据源: tushare (接口: {api_name}, 代码: {symbol})"
+        )
 
         result.update({
             "current_value": metrics["current_value"],
@@ -503,12 +560,13 @@ class IndustryLinkageProvider:
             "trend": metrics["trend"],
             "confidence": "高",
             "status": "active",
-            "note": f"数据源: tushare (接口: {api_name}, 代码: {symbol})",
+            "note": note_str,
             "requested_as_of": as_of,
             "actual_as_of": actual_as_of,
             "retrieved_at": retrieved_at,
             "transport_provider": "tushare",
             "api_name": api_name,
+            "value_field": value_field,
         })
         return result
 
@@ -612,6 +670,7 @@ class IndustryLinkageProvider:
                         "retrieved_at": retrieved_at_ts,
                         "transport_provider": "tushare",
                         "api_name": "fut_daily",
+                        "value_field": "close",
                     })
                     return result
                 else:
