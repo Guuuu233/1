@@ -528,6 +528,7 @@ class TradingAgentsGraph:
                     "judge_decision"
                 ],
                 "claims": final_state["investment_debate_state"].get("claims", []),
+                "round_messages": final_state["investment_debate_state"].get("round_messages", []),
                 "focus_claim_ids": final_state["investment_debate_state"].get("focus_claim_ids", []),
                 "open_claim_ids": final_state["investment_debate_state"].get("open_claim_ids", []),
                 "resolved_claim_ids": final_state["investment_debate_state"].get("resolved_claim_ids", []),

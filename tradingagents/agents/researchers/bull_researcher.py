@@ -1,13 +1,17 @@
+import logging
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
 from tradingagents.graph.intent_parser import build_horizon_context
 from tradingagents.agents.utils.agent_states import current_tracker_var
 from tradingagents.agents.utils.debate_utils import (
+    build_debate_report_manifest,
     format_claim_subset_for_prompt,
     format_claims_for_prompt,
     update_debate_state_with_payload,
 )
 from tradingagents.agents.utils.prompt_injection import build_injection_slots, Placement, DEFAULT_PLACEMENT
+
+_logger = logging.getLogger(__name__)
 
 
 def create_bull_researcher(llm, memory, custom_prompt: str = "", placement: Placement = DEFAULT_PLACEMENT):
@@ -15,11 +19,17 @@ def create_bull_researcher(llm, memory, custom_prompt: str = "", placement: Plac
         investment_debate_state = state["investment_debate_state"]
         history = investment_debate_state.get("history", "")
         current_response = investment_debate_state.get("current_response", "")
-        market_research_report = state["market_report"]
-        sentiment_report = state["sentiment_report"]
-        news_report = state["news_report"]
-        fundamentals_report = state["fundamentals_report"]
+        macro_report = state.get("macro_report", "")
+        market_research_report = state.get("market_report", "")
+        sentiment_report = state.get("sentiment_report", "")
+        news_report = state.get("news_report", "")
+        fundamentals_report = state.get("fundamentals_report", "")
+        smart_money_report = state.get("smart_money_report", "")
         volume_price_report = state.get("volume_price_report", "")
+
+        report_manifest = build_debate_report_manifest(state)
+        _logger.info("[bull_researcher] report input manifest: %s", report_manifest)
+
         claims = investment_debate_state.get("claims", [])
         focus_claim_ids = investment_debate_state.get("focus_claim_ids", [])
         unresolved_claim_ids = investment_debate_state.get("unresolved_claim_ids", [])
@@ -32,7 +42,15 @@ def create_bull_researcher(llm, memory, custom_prompt: str = "", placement: Plac
         specific_questions = user_intent.get("specific_questions", [])
         horizon_ctx = build_horizon_context(horizon, focus_areas, specific_questions, agent_type="bull")
 
-        curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}\n\n{volume_price_report}"
+        curr_situation = (
+            f"{macro_report}\n\n"
+            f"{market_research_report}\n\n"
+            f"{sentiment_report}\n\n"
+            f"{news_report}\n\n"
+            f"{fundamentals_report}\n\n"
+            f"{smart_money_report}\n\n"
+            f"{volume_price_report}"
+        )
         past_memories = memory.get_memories(curr_situation, n_matches=2)
 
         past_memory_str = ""
@@ -41,10 +59,12 @@ def create_bull_researcher(llm, memory, custom_prompt: str = "", placement: Plac
 
         injection_slots = build_injection_slots(custom_prompt, placement, role_key="bull_researcher")
         prompt = horizon_ctx + get_prompt("bull_prompt", config=get_config()).format(
+            macro_report=macro_report,
             market_research_report=market_research_report,
             sentiment_report=sentiment_report,
             news_report=news_report,
             fundamentals_report=fundamentals_report,
+            smart_money_report=smart_money_report,
             volume_price_report=volume_price_report,
             history=history,
             current_response=current_response,
@@ -93,8 +113,11 @@ def create_bull_researcher(llm, memory, custom_prompt: str = "", placement: Plac
             claim_prefix="INV",
             domain="investment",
             speaker_field="current_speaker",
+            model_name=model_name,
         )
 
         return {"investment_debate_state": new_investment_debate_state}
+
+    return bull_node
 
     return bull_node

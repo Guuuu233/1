@@ -105,6 +105,7 @@ class InvestDebateState(TypedDict):
     judge_decision: Annotated[str, "Final judge decision"]
     count: Annotated[int, "Length of the current conversation"]
     claims: Annotated[list[dict[str, Any]], "Tracked research claims"]
+    round_messages: Annotated[list[dict[str, Any]], "Tracked round-by-round messages"]
     focus_claim_ids: Annotated[list[str], "Claim ids that must be answered in the next round"]
     open_claim_ids: Annotated[list[str], "Claim ids still open"]
     resolved_claim_ids: Annotated[list[str], "Claim ids considered resolved"]

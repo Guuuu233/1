@@ -119,10 +119,12 @@ def test_debate_prompts_strict_mirror_symmetry():
     # Required placeholder symmetry
     common_placeholders = [
         "{custom_prompt_before_data}",
+        "{macro_report}",
         "{market_research_report}",
         "{sentiment_report}",
         "{news_report}",
         "{fundamentals_report}",
+        "{smart_money_report}",
         "{volume_price_report}",
         "{history}",
         "{current_response}",

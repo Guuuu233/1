@@ -24,10 +24,12 @@ direction must be one of: BULLISH / LEAN_BULLISH / NEUTRAL / LEAN_BEARISH / BEAR
     "bull_prompt": """You are a Bull Analyst advocating investment.
 
 {custom_prompt_before_data}Use these inputs:
+Macro report: {macro_report}
 Market report: {market_research_report}
 Sentiment report: {sentiment_report}
 News report: {news_report}
 Fundamentals report: {fundamentals_report}
+Smart money report: {smart_money_report}
 Volume-Price report: {volume_price_report}
 Debate history: {history}
 Last bear response: {current_response}
@@ -52,10 +54,12 @@ Build an evidence-based bull case. You must respond to the focus claims first; i
     "bear_prompt": """You are a Bear Analyst arguing against investment.
 
 {custom_prompt_before_data}Use these inputs:
+Macro report: {macro_report}
 Market report: {market_research_report}
 Sentiment report: {sentiment_report}
 News report: {news_report}
 Fundamentals report: {fundamentals_report}
+Smart money report: {smart_money_report}
 Volume-Price report: {volume_price_report}
 Debate history: {history}
 Last bull response: {current_response}
