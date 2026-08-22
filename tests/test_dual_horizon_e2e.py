@@ -40,6 +40,7 @@ class _FakeGraphStream:
     """Yields a per-horizon final state; raises when the horizon is marked failed."""
 
     fail_horizons = set()
+    empty_horizons = set()
 
     @staticmethod
     def _state(init_state):
@@ -61,6 +62,8 @@ class _FakeGraphStream:
         horizon = init_state["horizon"]
         if horizon in _FakeGraphStream.fail_horizons:
             raise RuntimeError(f"{horizon} provider unavailable")
+        if horizon in _FakeGraphStream.empty_horizons:
+            return
         yield self._state(init_state)
 
 
@@ -68,6 +71,8 @@ class _FakeTradingGraph:
     """Fake TradingAgentsGraph used for both the outer graph and per-horizon graphs."""
 
     fail_horizons = set()
+    empty_horizons = set()
+    build_fail_horizons = set()
 
     def __init__(self, *_args, data_collector=None, **_kwargs):
         self.data_collector = data_collector
@@ -79,11 +84,13 @@ class _FakeTradingGraph:
     def process_signal(self, _decision):
         return "HOLD"
 
-    def _build_horizon_result(self, _horizon, state):
+    def _build_horizon_result(self, horizon, state):
+        if horizon in _FakeTradingGraph.build_fail_horizons:
+            raise RuntimeError(f"{horizon} build error")
         return dict(state)
 
 
-def _run_dual_horizon_job(*, fail_horizons=(), horizons=("short", "medium")):
+def _run_dual_horizon_job(*, fail_horizons=(), empty_horizons=(), build_fail_horizons=(), horizons=("short", "medium")):
     """Run the full dual-horizon job path with fakes, returning observable state."""
     job_id = f"dual-e2e-{uuid4().hex}"
     store = InMemoryJobStore()
@@ -93,6 +100,9 @@ def _run_dual_horizon_job(*, fail_horizons=(), horizons=("short", "medium")):
     db = MagicMock()
     _FakeTradingGraph.fail_horizons = set(fail_horizons)
     _FakeGraphStream.fail_horizons = set(fail_horizons)
+    _FakeTradingGraph.empty_horizons = set(empty_horizons)
+    _FakeGraphStream.empty_horizons = set(empty_horizons)
+    _FakeTradingGraph.build_fail_horizons = set(build_fail_horizons)
 
     request = main.AnalyzeRequest(
         symbol="600519.SH",
@@ -248,3 +258,150 @@ def test_dual_horizon_all_failures_surface_as_failed_job():
     assert any("event: job.failed" in chunk for chunk in chunks)
     assert any("event: done" in chunk for chunk in chunks)
     assert not any('"mode": "dual_horizon"' in chunk for chunk in chunks)
+
+
+def test_dual_horizon_short_only_failure_keeps_other_horizon_result_and_gaps():
+    """Scenario 4: short horizon fails; medium horizon's result/gaps survive."""
+    job, saved_reports, chunks = _run_dual_horizon_job(fail_horizons=("short",))
+
+    assert job["status"] == "completed"
+    result = job["result"]
+    assert result["mode"] == "dual_horizon"
+    assert result["status"] == "partial"
+    assert result["horizon_status"] == {"short": "failed", "medium": "completed"}
+    assert result["failed_horizons"] == ["short"]
+
+    failed = result["short_term"]
+    assert failed["status"] == "failed"
+    assert failed["horizon"] == "short"
+    assert failed["error"]
+    assert failed["not_applicable"] is None
+
+    medium = result["medium_term"]
+    assert medium["status"] == "completed"
+    assert medium["data_gaps"] == [
+        "【数据获取失败】medium horizon 新闻接口超时",
+        "模型补充：medium 数据不完整",
+    ]
+    assert result["data_gaps"] == [
+        "【数据获取失败】short horizon：short provider unavailable",
+        "【数据获取失败】medium horizon 新闻接口超时",
+        "模型补充：medium 数据不完整",
+    ]
+    assert result["not_applicable"] is False
+    assert result["falsification_conditions"] == ["条件：medium 业绩不达预期"]
+
+    assert len(saved_reports) == 1
+    assert saved_reports[0]["result_data"]["short_term"]["status"] == "failed"
+    assert saved_reports[0]["result_data"]["medium_term"]["status"] == "completed"
+    assert saved_reports[0]["data_gaps"] == result["data_gaps"]
+    assert any('"status": "partial"' in chunk for chunk in chunks)
+    assert any("agent.horizon_failed" in chunk for chunk in chunks)
+
+
+def test_dual_horizon_real_db_all_failures_marks_report_failed():
+    """Scenario 5: all horizons fail with a real SQLite DB -> ReportDB marked status='failed'."""
+    from contextlib import contextmanager
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from api.database import Base, ReportDB
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    TestingSession = sessionmaker(bind=engine)
+
+    @contextmanager
+    def _fake_db_ctx():
+        sess = TestingSession()
+        try:
+            yield sess
+            sess.commit()
+        except Exception:
+            sess.rollback()
+            raise
+        finally:
+            sess.close()
+
+    job_id = f"dual-db-{uuid4().hex}"
+    store = InMemoryJobStore()
+    collector = MagicMock()
+    collector.collect.return_value = {"market_data_context": {"source": "fixture"}}
+    _FakeTradingGraph.fail_horizons = {"short", "medium"}
+    _FakeGraphStream.fail_horizons = {"short", "medium"}
+
+    request = main.AnalyzeRequest(
+        symbol="600519.SH",
+        trade_date="2026-07-31",
+        horizons=["short", "medium"],
+        selected_analysts=[],
+    )
+
+    db = TestingSession()
+    report_service.init_report(db, job_id, "600519.SH", "2026-07-31")
+
+    with (
+        patch.object(main, "_job_store_instance", store),
+        patch.object(main, "_shared_data_collector", collector),
+        patch.object(main, "TradingAgentsGraph", side_effect=lambda **_kwargs: _FakeTradingGraph(**_kwargs)),
+        patch.object(main, "_build_runtime_config", return_value={}),
+        patch.object(main, "_resolve_and_freeze_custom_prompts", return_value=({}, False)),
+        patch.object(main, "get_db_ctx", _fake_db_ctx),
+    ):
+        asyncio.run(main._run_job_inner(job_id, request, stream_events=False, save_report=True))
+
+    db.expire_all()
+    db_report = db.query(ReportDB).filter(ReportDB.id == job_id).first()
+    assert db_report is not None
+    assert db_report.status == "failed"
+    assert db_report.error is not None
+    assert "All requested horizons failed" in db_report.error
+    assert "short" in db_report.error
+    assert "medium" in db_report.error
+
+    job = store.get_job(job_id)
+    assert job["status"] == "failed"
+    assert "All requested horizons failed" in job["error"]
+
+
+def test_dual_horizon_empty_stream_fails_horizon_and_survives_partial():
+    """Scenario 6: empty stream on one horizon treated as failed; other horizon completes."""
+    job, saved_reports, chunks = _run_dual_horizon_job(empty_horizons=("medium",))
+
+    assert job["status"] == "completed"
+    result = job["result"]
+    assert result["mode"] == "dual_horizon"
+    assert result["status"] == "partial"
+    assert result["horizon_status"] == {"short": "completed", "medium": "failed"}
+    assert result["failed_horizons"] == ["medium"]
+    assert result["short_term"]["status"] == "completed"
+    assert result["medium_term"]["status"] == "failed"
+    assert len(saved_reports) == 1
+
+
+def test_dual_horizon_all_empty_streams_fails_job():
+    """Scenario 7: all horizons return empty stream -> job fails."""
+    job, saved_reports, chunks = _run_dual_horizon_job(empty_horizons=("short", "medium"))
+
+    assert job["status"] == "failed"
+    assert "All requested horizons failed" in job["error"]
+    assert saved_reports == []
+
+
+def test_dual_horizon_post_processing_failure_records_failed_horizon():
+    """Scenario 8: horizon fails in post-processing build -> marked failed horizon."""
+    job, saved_reports, chunks = _run_dual_horizon_job(build_fail_horizons=("medium",))
+
+    assert job["status"] == "completed"
+    result = job["result"]
+    assert result["mode"] == "dual_horizon"
+    assert result["status"] == "partial"
+    assert result["horizon_status"] == {"short": "completed", "medium": "failed"}
+    assert result["failed_horizons"] == ["medium"]
+    assert len(saved_reports) == 1
+
+

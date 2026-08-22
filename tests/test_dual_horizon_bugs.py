@@ -139,3 +139,61 @@ def test_dual_horizon_save_uses_safe_defaults_when_structured_fields_are_empty()
     assert len(saved_reports) == 1
     assert saved_reports[0]["not_applicable"] is False
     assert saved_reports[0]["falsification_conditions"] == []
+
+
+def test_create_report_with_all_failed_dual_horizon_sets_status_failed():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from api.database import Base, ReportDB
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    TestingSession = sessionmaker(bind=engine)
+    db = TestingSession()
+
+    result_data = {
+        "mode": "dual_horizon",
+        "status": "partial",
+        "horizon_status": {"short": "failed", "medium": "failed"},
+        "failed_horizons": ["short", "medium"],
+        "error": "All requested horizons failed: short: timeout; medium: network error",
+    }
+
+    report = report_service.create_report(
+        db=db,
+        symbol="600519.SH",
+        trade_date="2026-07-31",
+        result_data=result_data,
+    )
+    assert report.status == "failed"
+    assert report.error == "All requested horizons failed: short: timeout; medium: network error"
+
+
+def test_create_report_with_partial_dual_horizon_sets_status_completed():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from api.database import Base, ReportDB
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    TestingSession = sessionmaker(bind=engine)
+    db = TestingSession()
+
+    result_data = {
+        "mode": "dual_horizon",
+        "status": "partial",
+        "horizon_status": {"short": "completed", "medium": "failed"},
+        "failed_horizons": ["medium"],
+        "short_term": {"status": "completed", "final_trade_decision": "BUY"},
+        "medium_term": {"status": "failed", "error": "timeout"},
+    }
+
+    report = report_service.create_report(
+        db=db,
+        symbol="600519.SH",
+        trade_date="2026-07-31",
+        result_data=result_data,
+    )
+    assert report.status == "completed"
+    assert report.error is None
+

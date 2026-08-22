@@ -1023,6 +1023,7 @@ def create_report(
     target_price_override: Optional[float] = None,
     stop_loss_override: Optional[float] = None,
     report_id: Optional[str] = None,  # If provided, update existing
+    status: Optional[str] = None,
 ) -> ReportDB:
     """Create or finalize a report."""
     validated_probability = _coerce_probability_value(probability)
@@ -1041,7 +1042,15 @@ def create_report(
     )
 
     now = datetime.now(timezone.utc)
-    
+    target_status = status or "completed"
+    if status is None and result_data and isinstance(result_data, dict):
+        if result_data.get("status") == "failed":
+            target_status = "failed"
+        elif result_data.get("mode") == "dual_horizon":
+            h_status = result_data.get("horizon_status") or {}
+            if h_status and all(st == "failed" for st in h_status.values()):
+                target_status = "failed"
+
     # Check if we should update an existing record (initialized via init_report)
     db_report = None
     if report_id:
@@ -1049,10 +1058,13 @@ def create_report(
 
     if db_report:
         # Update existing
-        db_report.status = "completed"
+        db_report.status = target_status
         # A report may previously have been marked failed by an older worker
         # or timeout policy.  Successful finalisation is authoritative.
-        db_report.error = None
+        if target_status == "completed":
+            db_report.error = None
+        else:
+            db_report.error = (result_data.get("error") if isinstance(result_data, dict) else None) or "Report analysis failed"
         db_report.decision = decision
         db_report.direction = resolved["direction"]
         db_report.confidence = resolved["confidence"]
@@ -1085,7 +1097,8 @@ def create_report(
             user_id=user_id,
             symbol=symbol,
             trade_date=trade_date,
-            status="completed",
+            status=target_status,
+            error=None if target_status == "completed" else ((result_data.get("error") if isinstance(result_data, dict) else None) or "Report analysis failed"),
             decision=decision,
             direction=resolved["direction"],
             confidence=resolved["confidence"],

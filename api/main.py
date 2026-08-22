@@ -2887,6 +2887,9 @@ async def _run_job_inner(
                 finally:
                     current_tracker_var.reset(_tracker_token)
 
+                if horizon_final is None:
+                    raise RuntimeError(f"Horizon '{horizon}' produced no output")
+
                 horizon_states[horizon] = horizon_final
                 for agent, st in h_tracker.status.items():
                     if st not in ("completed", "skipped"):
@@ -2958,53 +2961,85 @@ async def _run_job_inner(
                         }
                         continue
 
-                    horizon_result = graph._build_horizon_result(
-                        horizon,
-                        horizon_states.get(horizon) or {},
-                    )
-                    structured = None
                     try:
-                        structured = await asyncio.to_thread(
-                            report_service.extract_structured_data,
-                            final_trade_decision=horizon_result.get("final_trade_decision", ""),
-                            fundamentals_report=horizon_result.get("fundamentals_report", ""),
-                            config=config,
+                        horizon_state = horizon_states.get(horizon)
+                        if not horizon_state:
+                            raise RuntimeError(f"Horizon '{horizon}' produced no output state")
+                        horizon_result = graph._build_horizon_result(
+                            horizon,
+                            horizon_state,
                         )
-                    except Exception as exc:
-                        _log(f"Structured extraction failed for {horizon} (non-fatal): {exc}")
+                        structured = None
+                        try:
+                            structured = await asyncio.to_thread(
+                                report_service.extract_structured_data,
+                                final_trade_decision=horizon_result.get("final_trade_decision", ""),
+                                fundamentals_report=horizon_result.get("fundamentals_report", ""),
+                                config=config,
+                            )
+                        except Exception as exc:
+                            _log(f"Structured extraction failed for {horizon} (non-fatal): {exc}")
 
-                    resolved = await asyncio.to_thread(
-                        report_service.resolve_report_fields,
-                        result_data=horizon_result,
-                        confidence_override=structured.confidence if structured else None,
-                        target_price_override=structured.target_price if structured else None,
-                        stop_loss_override=structured.stop_loss_price if structured else None,
-                    )
-                    graph_decision = graph.process_signal(
-                        horizon_result.get("final_trade_decision", "")
-                    )
-                    decision = _apply_structured_report_fields(
-                        horizon_result,
-                        structured=structured,
-                        graph_decision=graph_decision,
-                        resolved=resolved,
-                    )
-                    horizon_result.update(
-                        {
-                            "status": "completed",
-                            "risk_items": (
-                                [item.model_dump() for item in structured.risks]
-                                if structured
-                                else []
-                            ),
-                            "key_metrics": (
-                                [item.model_dump() for item in structured.key_metrics]
-                                if structured
-                                else []
+                        resolved = await asyncio.to_thread(
+                            report_service.resolve_report_fields,
+                            result_data=horizon_result,
+                            confidence_override=structured.confidence if structured else None,
+                            target_price_override=structured.target_price if structured else None,
+                            stop_loss_override=structured.stop_loss_price if structured else None,
+                        )
+                        graph_decision = graph.process_signal(
+                            horizon_result.get("final_trade_decision", "")
+                        )
+                        decision = _apply_structured_report_fields(
+                            horizon_result,
+                            structured=structured,
+                            graph_decision=graph_decision,
+                            resolved=resolved,
+                        )
+                        horizon_result.update(
+                            {
+                                "status": "completed",
+                                "risk_items": (
+                                    [item.model_dump() for item in structured.risks]
+                                    if structured
+                                    else []
+                                ),
+                                "key_metrics": (
+                                    [item.model_dump() for item in structured.key_metrics]
+                                    if structured
+                                    else []
+                                ),
+                            }
+                        )
+                        horizon_results[horizon] = horizon_result
+                    except Exception as exc:
+                        _log(f"Horizon '{horizon}' post-processing failed: {exc}")
+                        horizon_errors[horizon] = exc
+                        horizon_results[horizon] = {
+                            "horizon": horizon,
+                            "status": "failed",
+                            "error": _humanize_analysis_error(str(exc)),
+                            "not_applicable": None,
+                            "impact": (
+                                f"{horizon} horizon is unavailable; downstream consumers must use only the "
+                                "completed horizon and treat this result as partial."
                             ),
                         }
+
+                completed_horizons = [
+                    h for h in request.horizons
+                    if horizon_results.get(h, {}).get("status") == "completed"
+                ]
+                if not completed_horizons:
+                    failure_reasons = []
+                    for h in request.horizons:
+                        h_err = horizon_results.get(h, {}).get("error") or (
+                            str(horizon_errors.get(h)) if h in horizon_errors else "分析失败"
+                        )
+                        failure_reasons.append(f"{h}: {h_err}")
+                    raise RuntimeError(
+                        "All requested horizons failed: " + "; ".join(failure_reasons)
                     )
-                    horizon_results[horizon] = horizon_result
 
                 def _not_requested(horizon: str) -> Dict[str, Any]:
                     return {"horizon": horizon, "status": "not_requested"}
@@ -3015,6 +3050,10 @@ async def _run_job_inner(
                     horizon: horizon_results[horizon].get("status", "completed")
                     for horizon in request.horizons
                 }
+                failed_horizons = [
+                    horizon for horizon in request.horizons
+                    if horizon_results[horizon].get("status") == "failed" or horizon in horizon_errors
+                ]
                 all_data_gaps: List[str] = []
                 seen_gaps: set[str] = set()
                 for horizon in request.horizons:
@@ -3051,10 +3090,10 @@ async def _run_job_inner(
                         None,
                     ),
                     "mode": "dual_horizon",
-                    "status": "partial" if horizon_errors else "completed",
+                    "status": "partial" if failed_horizons else "completed",
                     "requested_horizons": list(request.horizons),
                     "horizon_status": horizon_status,
-                    "failed_horizons": [horizon for horizon in request.horizons if horizon in horizon_errors],
+                    "failed_horizons": failed_horizons,
                     "user_intent": user_intent,
                     "model_config_snapshot": model_snapshot,
                     "market_data_context": {
