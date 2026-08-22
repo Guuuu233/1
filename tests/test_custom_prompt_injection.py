@@ -105,10 +105,12 @@ def test_T2_switch_off_prompt_byte_identical():
     base = get_prompt("bull_prompt", config=get_config())
 
     common_kwargs = dict(
+        macro_report="Macro",
         market_research_report="M",
         sentiment_report="S",
         news_report="N",
         fundamentals_report="F",
+        smart_money_report="SM",
         volume_price_report="V",
         history="H",
         current_response="CR",

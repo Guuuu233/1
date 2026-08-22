@@ -186,6 +186,7 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             "current_response": full_content,
             "count": investment_debate_state["count"],
             "claims": claims,
+            "round_messages": investment_debate_state.get("round_messages", []),
             "focus_claim_ids": investment_debate_state.get("focus_claim_ids", []),
             "open_claim_ids": investment_debate_state.get("open_claim_ids", []),
             "resolved_claim_ids": investment_debate_state.get("resolved_claim_ids", []),

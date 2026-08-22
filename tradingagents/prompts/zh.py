@@ -155,10 +155,12 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 - 当多个分析师结论矛盾时（如技术面偏弱但基本面强劲），必须明确说明如何权衡取舍并给出权重依据。
 
 {custom_prompt_before_data}可用材料：
+宏观报告：{macro_report}
 市场报告：{market_research_report}
 情绪报告：{sentiment_report}
 新闻报告：{news_report}
 基本面报告：{fundamentals_report}
+主力资金报告：{smart_money_report}
 量价报告：{volume_price_report}
 辩论历史：{history}
 上轮空头观点：{current_response}
@@ -203,10 +205,12 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空（数据有方�
 - 当多个分析师结论矛盾时（如技术面偏强但基本面恶化），必须明确说明如何权衡取舍并给出权重依据。
 
 {custom_prompt_before_data}可用材料：
+宏观报告：{macro_report}
 市场报告：{market_research_report}
 情绪报告：{sentiment_report}
 新闻报告：{news_report}
 基本面报告：{fundamentals_report}
+主力资金报告：{smart_money_report}
 量价报告：{volume_price_report}
 辩论历史：{history}
 上轮多头观点：{current_response}

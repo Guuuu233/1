@@ -85,6 +85,7 @@ class Propagator:
                     "judge_decision": "",
                     "count": 0,
                     "claims": [],
+                    "round_messages": [],
                     "focus_claim_ids": [],
                     "open_claim_ids": [],
                     "resolved_claim_ids": [],
