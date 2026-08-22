@@ -304,13 +304,12 @@ _BASE_INDUSTRY_LINKAGE_MAP: Dict[str, IndustryLinkage] = {
         upstream_cost=[
             IndustryLinkageIndicator(
                 name="碳酸锂价格",
-                source="pending_api",
-                symbol=None,
+                source="tushare",
+                symbol="LC.GFE",
                 frequency="daily",
-                unit="万元/吨",
+                unit="元/吨",
                 role="upstream",
-                status="pending_api",
-                note="待接入API",
+                status="active",
                 transmission_logic="动力电池正极核心原材料成本传导",
             ),
             IndustryLinkageIndicator(
@@ -387,13 +386,12 @@ _BASE_INDUSTRY_LINKAGE_MAP: Dict[str, IndustryLinkage] = {
         upstream_cost=[
             IndustryLinkageIndicator(
                 name="多晶硅致密料价格",
-                source="pending_api",
-                symbol=None,
-                frequency="weekly",
-                unit="元/千克",
+                source="tushare",
+                symbol="PS.GFE",
+                frequency="daily",
+                unit="元/吨",
                 role="upstream",
-                status="pending_api",
-                note="待接入API",
+                status="active",
                 transmission_logic="光伏全产业链最源头硅料成本与供需博弈传导",
             ),
             IndustryLinkageIndicator(
@@ -469,13 +467,12 @@ _BASE_INDUSTRY_LINKAGE_MAP: Dict[str, IndustryLinkage] = {
         upstream_cost=[
             IndustryLinkageIndicator(
                 name="电池级碳酸锂价格",
-                source="pending_api",
-                symbol=None,
+                source="tushare",
+                symbol="LC.GFE",
                 frequency="daily",
-                unit="万元/吨",
+                unit="元/吨",
                 role="upstream",
-                status="pending_api",
-                note="待接入API",
+                status="active",
                 transmission_logic="动力电池正极材料与电芯最核心金属原材料成本传导",
             ),
             IndustryLinkageIndicator(

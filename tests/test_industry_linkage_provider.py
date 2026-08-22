@@ -45,6 +45,64 @@ def mock_samsung_dataframe():
     return df
 
 
+@pytest.fixture
+def mock_tushare_lc_response():
+    """构造 Tushare fut_daily LC.GFE (碳酸锂主力) 70 个交易日合成数据。"""
+    dates = pd.date_range("2026-05-01", periods=70, freq="B")
+    items = []
+    for i, dt in enumerate(dates):
+        d_str = dt.strftime("%Y%m%d")
+        # 模拟从 140000 稳步上涨到 158680.0
+        close = 140000.0 + (i * 270.0) if i < 69 else 158680.0
+        items.append(["LC.GFE", d_str, close - 500, close + 500, close - 800, close, 15000])
+    return {
+        "code": 0,
+        "msg": None,
+        "data": {
+            "fields": ["ts_code", "trade_date", "open", "high", "low", "close", "vol"],
+            "items": list(reversed(items)),  # Tushare 倒序返回
+        },
+    }
+
+
+@pytest.fixture
+def mock_tushare_spx_response():
+    """构造 Tushare index_global SPX 70 个交易日合成数据。"""
+    dates = pd.date_range("2026-05-01", periods=70, freq="B")
+    items = []
+    for i, dt in enumerate(dates):
+        d_str = dt.strftime("%Y%m%d")
+        close = 5000.0 + (i * 10.0)
+        items.append(["SPX", d_str, close - 10, close + 15, close - 15, close, 1000000])
+    return {
+        "code": 0,
+        "msg": None,
+        "data": {
+            "fields": ["ts_code", "trade_date", "open", "high", "low", "close", "vol"],
+            "items": list(reversed(items)),
+        },
+    }
+
+
+@pytest.fixture
+def mock_tushare_cu_shf_response():
+    """构造 Tushare fut_daily CU.SHF (沪铜主力) 70 个交易日合成数据。"""
+    dates = pd.date_range("2026-05-01", periods=70, freq="B")
+    items = []
+    for i, dt in enumerate(dates):
+        d_str = dt.strftime("%Y%m%d")
+        close = 72000.0 + (i * 50.0)
+        items.append(["CU.SHF", d_str, close - 100, close + 200, close - 200, close, 50000])
+    return {
+        "code": 0,
+        "msg": None,
+        "data": {
+            "fields": ["ts_code", "trade_date", "open", "high", "low", "close", "vol"],
+            "items": list(reversed(items)),
+        },
+    }
+
+
 class TestIndustryLinkageProvider:
     """测试 IndustryLinkageProvider 核心功能与指标采集。"""
 
@@ -97,25 +155,38 @@ class TestIndustryLinkageProvider:
             assert samsung["confidence"] == "高"
             assert samsung["status"] == "active"
 
-    def test_new_energy_vehicle_data_fetch_success(self):
-        """测试新能源车行业数据采集（包含待接入API指标与手动指标）。"""
+    def test_new_energy_vehicle_data_fetch_success(
+        self, monkeypatch, mock_tushare_lc_response
+    ):
+        """测试新能源车行业数据采集（包含 Tushare 碳酸锂已付费源与手动指标）。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
         provider = IndustryLinkageProvider()
-        with patch("yfinance.Ticker", side_effect=Exception("Offline test")):
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_tushare_lc_response
+
+        with patch("requests.post", return_value=mock_resp), \
+             patch("yfinance.Ticker", side_effect=Exception("Offline test")):
             data = provider.get_industry_linkage("新能源车", use_cache=False)
 
             assert data is not None
             assert data["industry_name"] == "新能源汽车与智能汽车"
             assert any("购置税减免" in cat for cat in data["policy_catalysts"])
 
-            # 上游成本端：碳酸锂价格（待接入API）
+            # 上游成本端：碳酸锂价格 (Tushare fut_daily LC.GFE)
             upstream_list = data["upstream_cost"]
             assert len(upstream_list) >= 1
             lithium = [u for u in upstream_list if "碳酸锂" in u["name"]][0]
-            assert lithium["current_value"] is None
-            assert lithium["trend"] == "数据缺失"
-            assert lithium["confidence"] == "低（待接入API）"
-            assert lithium["note"] == "待接入API"
-            assert lithium["status"] == "pending_api"
+            assert lithium["source"] == "tushare"
+            assert lithium["symbol"] == "LC.GFE"
+            assert lithium["current_value"] == 158680.0
+            assert lithium["unit"] == "元/吨"
+            assert lithium["trend"] == "上升"
+            assert lithium["confidence"] == "高"
+            assert lithium["status"] == "active"
+            assert lithium["mom_change"] is not None and lithium["mom_change"] > 0
+            assert "动力电池正极核心原材料成本传导" in (lithium.get("transmission_logic") or "")
 
             # 下游需求端：新能源车渗透率
             downstream_list = data["downstream_demand"]
@@ -279,3 +350,257 @@ class TestIndustryLinkageProvider:
         assert provider.get_industry_linkage("未知行业") is None
         assert provider.get_industry_linkage("") is None
         assert provider.get_industry_linkage(None) is None  # type: ignore
+
+    def test_tushare_fut_daily_lc_gfe_success(
+        self, monkeypatch, mock_tushare_lc_response
+    ):
+        """测试 Tushare fut_daily 碳酸锂 LC.GFE 指标拉取与趋势计算成功。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        provider = IndustryLinkageProvider()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_tushare_lc_response
+
+        ind = IndustryLinkageIndicator(
+            name="碳酸锂价格",
+            source="tushare",
+            symbol="LC.GFE",
+            unit="元/吨",
+        )
+
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            result = provider._fetch_indicator(ind)
+
+            assert mock_post.call_count == 1
+            call_json = mock_post.call_args.kwargs.get("json", {})
+            assert call_json.get("api_name") == "fut_daily"
+            assert call_json.get("params", {}).get("ts_code") == "LC.GFE"
+
+            assert result["current_value"] == 158680.0
+            assert result["unit"] == "元/吨"
+            assert result["trend"] == "上升"
+            assert result["confidence"] == "高"
+            assert result["status"] == "active"
+            assert result["mom_change"] is not None and result["mom_change"] > 0
+            assert "tushare" in result["note"]
+
+    def test_tushare_index_global_spx_success(
+        self, monkeypatch, mock_tushare_spx_response
+    ):
+        """测试 Tushare index_global 标普500 SPX 指标拉取与趋势计算成功。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        provider = IndustryLinkageProvider()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_tushare_spx_response
+
+        ind = IndustryLinkageIndicator(
+            name="标普500指数",
+            source="tushare",
+            symbol="SPX",
+            unit="点",
+        )
+
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            result = provider._fetch_indicator(ind)
+
+            assert mock_post.call_count == 1
+            call_json = mock_post.call_args.kwargs.get("json", {})
+            assert call_json.get("api_name") == "index_global"
+            assert call_json.get("params", {}).get("ts_code") == "SPX"
+
+            assert result["current_value"] == 5690.0
+            assert result["trend"] == "上升"
+            assert result["confidence"] == "高"
+            assert result["status"] == "active"
+
+    def test_tushare_token_missing_categorization(self, monkeypatch):
+        """测试 TUSHARE_TOKEN 缺失时准确分类为「Token缺失」，绝不伪装为 pending_api。"""
+        monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+        provider = IndustryLinkageProvider()
+
+        ind = IndustryLinkageIndicator(
+            name="碳酸锂价格",
+            source="tushare",
+            symbol="LC.GFE",
+        )
+        result = provider._fetch_indicator(ind)
+
+        assert result["current_value"] is None
+        assert result["trend"] == "数据缺失"
+        assert result["confidence"] == "低（Token缺失）"
+        assert "TUSHARE_TOKEN missing" in result["note"]
+
+    def test_tushare_permission_denied_403_categorization(self, monkeypatch):
+        """测试 Tushare 接口 403 / 权限不足时准确分类为「无权限403」。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        provider = IndustryLinkageProvider()
+
+        # 1. Tushare code 40101 无权限
+        mock_resp1 = MagicMock()
+        mock_resp1.status_code = 200
+        mock_resp1.json.return_value = {"code": 40101, "msg": "您没有访问该接口的权限"}
+
+        ind = IndustryLinkageIndicator(
+            name="美股NVDA股价",
+            source="tushare",
+            symbol="NVDA",
+            metadata={"api_name": "us_daily"},
+        )
+
+        with patch("requests.post", return_value=mock_resp1):
+            res1 = provider._fetch_indicator(ind)
+            assert res1["current_value"] is None
+            assert res1["trend"] == "数据缺失"
+            assert res1["confidence"] == "低（无权限403）"
+            assert "权限不足" in res1["note"]
+
+        # 2. HTTP 403 状态码
+        mock_resp2 = MagicMock()
+        mock_resp2.status_code = 403
+
+        with patch("requests.post", return_value=mock_resp2):
+            res2 = provider._fetch_indicator(ind)
+            assert res2["current_value"] is None
+            assert res2["trend"] == "数据缺失"
+            assert res2["confidence"] == "低（无权限403）"
+
+    def test_tushare_empty_rows_categorization(self, monkeypatch):
+        """测试 Tushare 返回空数据或空行时准确分类为「数据源为空」。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        provider = IndustryLinkageProvider()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "code": 0,
+            "msg": None,
+            "data": {
+                "fields": ["ts_code", "trade_date", "close"],
+                "items": [],
+            },
+        }
+
+        ind = IndustryLinkageIndicator(
+            name="碳酸锂价格",
+            source="tushare",
+            symbol="LC.GFE",
+        )
+
+        with patch("requests.post", return_value=mock_resp):
+            result = provider._fetch_indicator(ind)
+            assert result["current_value"] is None
+            assert result["trend"] == "数据缺失"
+            assert result["confidence"] == "低（数据源为空）"
+            assert "空行" in result["note"]
+
+    def test_tushare_rate_limit_categorization(self, monkeypatch):
+        """测试 Tushare 限频 (429/40203) 时准确分类为「频率限制」。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        provider = IndustryLinkageProvider()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"code": 40203, "msg": "每分钟最多访问该接口200次"}
+
+        ind = IndustryLinkageIndicator(
+            name="碳酸锂价格",
+            source="tushare",
+            symbol="LC.GFE",
+        )
+
+        with patch("requests.post", return_value=mock_resp):
+            result = provider._fetch_indicator(ind)
+            assert result["current_value"] is None
+            assert result["trend"] == "数据缺失"
+            assert result["confidence"] == "低（频率限制）"
+            assert "限频" in result["note"]
+
+    def test_tushare_as_of_lookahead_truncation(
+        self, monkeypatch, mock_tushare_lc_response
+    ):
+        """测试 Tushare 指标严格执行 as_of 防前视截断，绝不泄露未来行情。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        provider = IndustryLinkageProvider()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_tushare_lc_response
+
+        # mock 数据集中第 20 个交易日（升序排列）：索引 20
+        # items 是倒序排列的
+        dates = pd.date_range("2026-05-01", periods=70, freq="B")
+        cutoff_date = dates[20].strftime("%Y-%m-%d")
+        expected_cutoff_price = 140000.0 + (20 * 270.0)
+
+        ind = IndustryLinkageIndicator(
+            name="碳酸锂价格",
+            source="tushare",
+            symbol="LC.GFE",
+            unit="元/吨",
+        )
+
+        with patch("requests.post", return_value=mock_resp):
+            result = provider._fetch_indicator(ind, as_of=cutoff_date)
+
+            assert result["current_value"] == expected_cutoff_price
+            assert result["current_value"] != 158680.0
+            assert result["confidence"] == "高"
+
+    def test_lme_copper_akshare_fails_falls_back_to_tushare_cu_shf(
+        self, monkeypatch, mock_tushare_cu_shf_response
+    ):
+        """测试 LME铜价 在 akshare 失败时自动平滑回退到 Tushare 沪铜 CU.SHF 备用数据源。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        provider = IndustryLinkageProvider()
+
+        mock_ts_resp = MagicMock()
+        mock_ts_resp.status_code = 200
+        mock_ts_resp.json.return_value = mock_tushare_cu_shf_response
+
+        ind = IndustryLinkageIndicator(
+            name="LME铜价",
+            source="akshare",
+            symbol="铜",
+            unit="美元/吨",
+        )
+
+        with patch("akshare.futures_foreign_hist", side_effect=TimeoutError("LME timeout")), \
+             patch("requests.post", return_value=mock_ts_resp) as mock_post:
+
+            result = provider._fetch_indicator(ind)
+
+            assert mock_post.call_count == 1
+            call_json = mock_post.call_args.kwargs.get("json", {})
+            assert call_json.get("api_name") == "fut_daily"
+            assert call_json.get("params", {}).get("ts_code") == "CU.SHF"
+
+            # 验证成功使用 Tushare 备源结果
+            expected_price = 72000.0 + (69 * 50.0)
+            assert result["current_value"] == expected_price
+            assert result["confidence"] == "高"
+            assert result["status"] == "active"
+            assert "CU.SHF" in result["note"]
+
+    def test_lme_copper_both_sources_fail_gracefully(self, monkeypatch):
+        """测试 LME铜价 在 akshare 与 Tushare 均异常时优雅降级为数据缺失，不抛出异常。"""
+        monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+        provider = IndustryLinkageProvider()
+
+        ind = IndustryLinkageIndicator(
+            name="LME铜价",
+            source="akshare",
+            symbol="铜",
+            unit="美元/吨",
+        )
+
+        with patch("akshare.futures_foreign_hist", side_effect=TimeoutError("LME akshare timeout")):
+            result = provider._fetch_indicator(ind)
+
+            assert result["current_value"] is None
+            assert result["trend"] == "数据缺失"
+            assert result["confidence"] == "低（接口异常）"
+            assert "akshare 失败" in result["note"]
+            assert "Tushare 备源失败" in result["note"]

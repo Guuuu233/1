@@ -20,6 +20,7 @@ import pandas as pd
 import pytest
 
 from tradingagents.dataflows.industry_linkage import (
+    DEFAULT_INDUSTRY_LINKAGE_MISSING_PROMPT,
     INDUSTRY_LINKAGE_MAP,
     IndustryLinkage,
     IndustryLinkageIndicator,
@@ -168,19 +169,40 @@ def test_get_industry_linkage_consumer_electronics(
         assert "【数据缺失】全球智能手机出货量：手动" in prompt_text
 
 
-def test_get_industry_linkage_new_energy():
+def test_get_industry_linkage_new_energy(monkeypatch):
     """测试新能源汽车行业数据采集与缺失/手动标注 (核心用例 2).
 
     验证点：
     1. 成功匹配并获取 '新能源汽车与智能汽车' 配置；
-    2. 上游成本端：碳酸锂价格明确标注为 '待接入API' (pending_api)，current_value 为 None，置信度 '低（待接入API）'，不产生异常；
+    2. 上游成本端：碳酸锂价格对接已付费 Tushare (LC.GFE)，返回真实采集数值 158680.00 元/吨 与置信度 '高'；
     3. 下游需求端：新能源车渗透率标注为 '手动'，current_value 为 None，趋势 '数据缺失'；
     4. 国际对标：特斯拉交付量标注为 '手动'，current_value 为 None，趋势 '数据缺失'；
     5. 行业政策催化关键词包含 '新能源汽车购置税减免'；
-    6. 验证 Prompt 渲染中所有未接入/手动指标均带有显式【数据缺失】标识，严禁杜撰虚构。
+    6. 验证 Prompt 渲染中碳酸锂包含准确价格与单位，手动指标带有显式【数据缺失】标识。
     """
+    monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
     provider = IndustryLinkageProvider()
-    with patch("yfinance.Ticker", side_effect=Exception("Offline test")):
+
+    dates = pd.date_range("2026-05-01", periods=70, freq="B")
+    items = []
+    for i, dt in enumerate(dates):
+        d_str = dt.strftime("%Y%m%d")
+        close = 140000.0 + (i * 270.0) if i < 69 else 158680.0
+        items.append(["LC.GFE", d_str, close - 500, close + 500, close - 800, close, 15000])
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "code": 0,
+        "msg": None,
+        "data": {
+            "fields": ["ts_code", "trade_date", "open", "high", "low", "close", "vol"],
+            "items": list(reversed(items)),
+        },
+    }
+
+    with patch("requests.post", return_value=mock_resp), \
+         patch("yfinance.Ticker", side_effect=Exception("Offline test")):
         data = provider.get_industry_linkage("新能源车", as_of="2026-08-20", use_cache=False)
 
         assert data is not None, "新能源汽车产业链数据采集结果不应为 None"
@@ -188,17 +210,17 @@ def test_get_industry_linkage_new_energy():
         assert data["as_of"] == "2026-08-20"
         assert any("购置税减免" in cat for cat in data["policy_catalysts"])
 
-        # 1. 验证上游成本端：碳酸锂价格（待接入API）
+        # 1. 验证上游成本端：碳酸锂价格（Tushare 已付费源）
         upstream_list = data["upstream_cost"]
         assert len(upstream_list) >= 1
         lithium = [u for u in upstream_list if "碳酸锂" in u["name"]][0]
-        assert lithium["source"] == "pending_api"
-        assert lithium["current_value"] is None
-        assert lithium["unit"] == "万元/吨"
-        assert lithium["trend"] == "数据缺失"
-        assert lithium["confidence"] == "低（待接入API）"
-        assert lithium["note"] == "待接入API"
-        assert lithium["status"] == "pending_api"
+        assert lithium["source"] == "tushare"
+        assert lithium["symbol"] == "LC.GFE"
+        assert lithium["current_value"] == 158680.0
+        assert lithium["unit"] == "元/吨"
+        assert lithium["trend"] == "上升"
+        assert lithium["confidence"] == "高"
+        assert lithium["status"] == "active"
         assert "动力电池正极核心原材料成本传导" in (lithium.get("transmission_logic") or "")
 
         # 2. 验证下游需求端：新能源车渗透率（手动标注）
@@ -228,7 +250,7 @@ def test_get_industry_linkage_new_energy():
         # 4. 验证 Prompt 渲染文本
         prompt_text = format_industry_linkage_for_prompt(data)
         assert "【产业链联想数据】：新能源汽车与智能汽车" in prompt_text
-        assert "【数据缺失】碳酸锂价格：待接入API" in prompt_text
+        assert "碳酸锂价格：158680.00 元/吨" in prompt_text
         assert "【数据缺失】新能源车渗透率：手动" in prompt_text
         assert "【数据缺失】特斯拉交付量：手动" in prompt_text
 
@@ -363,11 +385,11 @@ def test_unknown_industry():
         assert "【数据缺失】LME铜价" in prompt_text
         assert "【数据缺失】三星电子股价" in prompt_text
 
-    # 3. 边界输入格式化防护
-    assert format_industry_linkage_for_prompt(None) == ""
-    assert format_industry_linkage_for_prompt({}) == ""
-    assert format_industry_linkage_for_prompt({"industry_name": ""}) == ""
-    assert format_industry_linkage_for_prompt("invalid_type") == ""  # type: ignore
+    # 3. 边界输入格式化防护 (fail-closed 契约)
+    assert format_industry_linkage_for_prompt(None) == DEFAULT_INDUSTRY_LINKAGE_MISSING_PROMPT
+    assert format_industry_linkage_for_prompt({}) == DEFAULT_INDUSTRY_LINKAGE_MISSING_PROMPT
+    assert format_industry_linkage_for_prompt({"industry_name": ""}) == DEFAULT_INDUSTRY_LINKAGE_MISSING_PROMPT
+    assert format_industry_linkage_for_prompt("invalid_type") == DEFAULT_INDUSTRY_LINKAGE_MISSING_PROMPT
 
 
 def test_data_collector_integration():
