@@ -688,6 +688,67 @@ def _determine_industry_linkage_status(value: Any) -> Tuple[str, Optional[str]]:
         return "unavailable", "所有指标均无有效数据"
 
 
+def _extract_industry_linkage_actual_as_of(value: Any, requested_as_of: str) -> Optional[str]:
+    """Recursively collect valid actual_as_of from underlying indicators within industry_linkage.
+
+    Never use top-level requested as_of or cached_at as the real data date.
+    Only dates <= requested_as_of from indicators with valid data or explicit actual_as_of are considered.
+    """
+    if not isinstance(value, dict):
+        return None
+
+    actual_dates: list[str] = []
+
+    def _collect_dates(obj: Any):
+        if isinstance(obj, dict):
+            val = obj.get("current_value")
+            trend = obj.get("trend")
+            has_valid_data = val is not None or (
+                obj.get("status") == "active" and trend not in ("数据缺失", None, "")
+            )
+
+            act_date = obj.get("actual_as_of")
+            if act_date is not None:
+                match = re.search(r"20\d{2}-\d{2}-\d{2}", str(act_date))
+                if match and match.group(0) <= requested_as_of:
+                    actual_dates.append(match.group(0))
+            elif has_valid_data:
+                for k in ("data_as_of", "quote_as_of", "date", "trade_date", "as_of"):
+                    cand = obj.get(k)
+                    if cand is not None:
+                        match = re.search(r"20\d{2}-\d{2}-\d{2}", str(cand))
+                        if match and match.group(0) <= requested_as_of:
+                            actual_dates.append(match.group(0))
+
+                note = obj.get("note")
+                if note and isinstance(note, str):
+                    for m in re.finditer(r"20\d{2}-\d{2}-\d{2}", note):
+                        if m.group(0) <= requested_as_of:
+                            actual_dates.append(m.group(0))
+
+            for k, v in obj.items():
+                if k not in ("as_of", "cached_at", "requested_as_of") and isinstance(v, (dict, list)):
+                    _collect_dates(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _collect_dates(item)
+
+    for section in ("upstream_cost", "downstream_demand", "international_benchmark"):
+        section_items = value.get(section)
+        if section_items:
+            _collect_dates(section_items)
+
+    for k, v in value.items():
+        if (
+            k not in ("as_of", "cached_at", "requested_as_of", "upstream_cost", "downstream_demand", "international_benchmark")
+            and isinstance(v, (dict, list))
+        ):
+            _collect_dates(v)
+
+    valid_dates = [d for d in actual_dates if d <= requested_as_of]
+    return max(valid_dates) if valid_dates else None
+
+
 def _build_source_provenance(
     results: Dict[str, Any],
     requested_as_of: str,
@@ -698,15 +759,17 @@ def _build_source_provenance(
     for source, value in results.items():
         if source == "industry_linkage":
             status, reason = _determine_industry_linkage_status(value)
-            as_of = _extract_source_as_of(value, requested_as_of)
+            actual_as_of = _extract_industry_linkage_actual_as_of(value, requested_as_of)
             entry: Dict[str, Any] = {
                 "requested_as_of": requested_as_of,
-                "actual_as_of": as_of,
-                "as_of": as_of,
+                "actual_as_of": actual_as_of,
+                "as_of": actual_as_of,
                 "status": status,
             }
             if status == "unavailable":
                 entry["gap"] = f"【数据获取失败】industry_linkage：{reason or '数据源不可用'}"
+            elif actual_as_of is None:
+                entry["gap"] = "【数据获取失败】industry_linkage：未返回可验证数据日期"
             provenance[str(source)] = entry
             continue
 

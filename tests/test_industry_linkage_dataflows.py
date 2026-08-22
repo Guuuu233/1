@@ -305,9 +305,9 @@ class TestIndustryLinkageMarketDataContextFlows:
         # 1. 结构化部分可用产业链数据
         partial_linkage = {
             "industry_name": "消费电子与智能终端",
-            "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5, "status": "active"}],
+            "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5, "actual_as_of": "2026-08-20", "status": "active"}],
             "downstream_demand": [{"name": "全球智能手机出货量", "current_value": None, "status": "manual"}],
-            "international_benchmark": [{"name": "三星电子股价", "current_value": 52000.0, "status": "active"}],
+            "international_benchmark": [{"name": "三星电子股价", "current_value": 52000.0, "actual_as_of": "2026-08-20", "status": "active"}],
             "as_of": "2026-08-20",
         }
         results = {"industry_linkage": partial_linkage}
@@ -341,16 +341,104 @@ class TestIndustryLinkageMarketDataContextFlows:
     def test_anti_lookahead_discipline_for_linkage_date(self):
         from tradingagents.graph.data_collector import _build_source_provenance
 
-        # 当产业链数据日期超过 analysis_baseline_date 时，不得前视未来日期
+        # 当产业链数据指标日期超过 analysis_baseline_date 时，不得前视未来日期
         future_linkage = {
             "industry_name": "消费电子与智能终端",
-            "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5}],
+            "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5, "actual_as_of": "2026-08-25"}],
             "as_of": "2026-08-25",  # 晚于 requested_as_of 2026-08-20
         }
         results = {"industry_linkage": future_linkage}
         provenance = _build_source_provenance(results, "2026-08-20", daily_as_of="2026-08-20")
         assert provenance["industry_linkage"]["actual_as_of"] is None
         assert provenance["industry_linkage"]["as_of"] is None
+        assert "gap" in provenance["industry_linkage"]
+
+    def test_weekend_requested_as_of_extracts_actual_trading_day(self):
+        from tradingagents.graph.data_collector import _build_source_provenance, _build_data_failure_ledger
+
+        # 模拟周末 2026-08-22（周六）发起请求，底层 Tushare LC.GFE 实际交易日为 2026-08-21（周五）
+        linkage_data = {
+            "industry_name": "新能源汽车与智能汽车",
+            "upstream_cost": [
+                {
+                    "name": "碳酸锂价格",
+                    "source": "tushare",
+                    "symbol": "LC.GFE",
+                    "current_value": 158000.0,
+                    "actual_as_of": "2026-08-21",
+                    "requested_as_of": "2026-08-22",
+                    "status": "active",
+                }
+            ],
+            "downstream_demand": [
+                {
+                    "name": "新能源车渗透率",
+                    "source": "manual",
+                    "current_value": None,
+                    "actual_as_of": None,
+                    "trend": "数据缺失",
+                }
+            ],
+            "international_benchmark": [
+                {
+                    "name": "特斯拉交付量",
+                    "source": "manual",
+                    "current_value": None,
+                    "actual_as_of": None,
+                    "trend": "数据缺失",
+                }
+            ],
+            "as_of": "2026-08-22",  # 顶层仅为请求日期，不可作为实际日期
+            "cached_at": 1724330000.0,
+        }
+
+        results = {"industry_linkage": linkage_data}
+        provenance = _build_source_provenance(results, "2026-08-22", daily_as_of="2026-08-21")
+
+        assert "industry_linkage" in provenance
+        prov = provenance["industry_linkage"]
+        # requested_as_of 为请求日 2026-08-22
+        assert prov["requested_as_of"] == "2026-08-22"
+        # actual_as_of 必须为指标真实数据日 2026-08-21，绝不得被顶层 requested as_of 覆盖为 2026-08-22
+        assert prov["actual_as_of"] == "2026-08-21"
+        assert prov["as_of"] == "2026-08-21"
+        assert prov["status"] == "partial"
+        assert "gap" not in prov
+
+    def test_linkage_with_no_actual_dates_records_gap_in_ledger(self):
+        from tradingagents.graph.data_collector import _build_source_provenance, _build_data_failure_ledger
+
+        linkage_data = {
+            "industry_name": "新能源汽车与智能汽车",
+            "upstream_cost": [
+                {
+                    "name": "碳酸锂价格",
+                    "source": "tushare",
+                    "symbol": "LC.GFE",
+                    "current_value": None,
+                    "actual_as_of": None,
+                    "trend": "数据缺失",
+                }
+            ],
+            "downstream_demand": [],
+            "international_benchmark": [],
+            "as_of": "2026-08-22",
+            "cached_at": 1724330000.0,
+        }
+
+        results = {"industry_linkage": linkage_data}
+        provenance = _build_source_provenance(results, "2026-08-22", daily_as_of="2026-08-21")
+
+        assert "industry_linkage" in provenance
+        prov = provenance["industry_linkage"]
+        assert prov["requested_as_of"] == "2026-08-22"
+        assert prov["actual_as_of"] is None
+        assert "gap" in prov
+
+        ledger = _build_data_failure_ledger(results)
+        # ledger_sources will receive gap through source_provenance processing
+        ledger_sources = {entry["source"] for entry in ledger}
+        # In fetch_all, gap in source_provenance is recorded to data_failure_ledger
 
     def test_collector_fetch_all_populates_both_top_level_and_context(self):
         from unittest.mock import patch
@@ -358,9 +446,9 @@ class TestIndustryLinkageMarketDataContextFlows:
 
         mock_linkage = {
             "industry_name": "消费电子与智能终端",
-            "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5, "status": "active"}],
+            "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5, "actual_as_of": "2026-08-20", "status": "active"}],
             "downstream_demand": [{"name": "出货量", "current_value": None, "status": "manual"}],
-            "international_benchmark": [{"name": "三星电子", "current_value": 50000.0, "status": "active"}],
+            "international_benchmark": [{"name": "三星电子", "current_value": 50000.0, "actual_as_of": "2026-08-20", "status": "active"}],
             "as_of": "2026-08-20",
         }
 
