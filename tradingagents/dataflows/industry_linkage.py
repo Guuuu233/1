@@ -2517,30 +2517,37 @@ def _format_indicator_item(ind: Dict[str, Any]) -> str:
     return line
 
 
+DEFAULT_INDUSTRY_LINKAGE_MISSING_PROMPT = (
+    "【产业链联想数据】：【数据缺失】（未映射行业或采集失败，不得据此推断景气中性）"
+)
+
+
 def format_industry_linkage_for_prompt(
     industry_linkage: Optional[Union[Dict[str, Any], IndustryLinkage]]
 ) -> str:
     """将产业链联动数据格式化为可直接注入 Prompt 的结构化文本。
 
+    永远返回非空文本。若无数据或未映射行业，返回 fail-closed 的【数据缺失】提示段落。
+
     Args:
-        industry_linkage: 产业链数据字典或 IndustryLinkage 模型实例，若为 None 则返回空字符串
+        industry_linkage: 产业链数据字典或 IndustryLinkage 模型实例
 
     Returns:
-        结构化 Markdown 文本段落；若无数据或未映射则返回空字符串
+        结构化 Markdown 文本段落；若无数据或未映射则返回 fail-closed 缺省提示段落
     """
     if not industry_linkage:
-        return ""
+        return DEFAULT_INDUSTRY_LINKAGE_MISSING_PROMPT
 
     if hasattr(industry_linkage, "model_dump"):
         data = industry_linkage.model_dump()
     elif isinstance(industry_linkage, dict):
         data = industry_linkage
     else:
-        return ""
+        return DEFAULT_INDUSTRY_LINKAGE_MISSING_PROMPT
 
     industry_name = data.get("industry_name")
     if not industry_name:
-        return ""
+        return DEFAULT_INDUSTRY_LINKAGE_MISSING_PROMPT
 
     lines = [f"【产业链联想数据】：{industry_name}"]
 

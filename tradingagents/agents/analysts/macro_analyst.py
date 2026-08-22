@@ -161,10 +161,8 @@ def create_macro_analyst(llm, data_collector=None):
             horizon_ctx + "\n" + f"请分析 {ticker_display} 在 {current_date} 的宏观与板块环境。",
             f"【今日行业板块资金流向】\n{board_flow}",
             f"【近期相关新闻】\n{recent_news}",
+            f"{industry_linkage_text}",
         ]
-
-        if industry_linkage_text:
-            human_content_lines.append(f"{industry_linkage_text}")
 
         macro_view_blocks = []
         if global_indices != "无数据":

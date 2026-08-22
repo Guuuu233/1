@@ -1,11 +1,11 @@
-"""针对分析师 Prompt 产业链数据注入 (DAV-201 / DAV-274) 的单元测试。
+"""针对分析师 Prompt 产业链数据 fail-closed 注入 (DAV-201 / DAV-274 / DAV-303) 的单元测试。
 
 测试覆盖：
-1. `format_industry_linkage_for_prompt` 格式化函数的完整输出、缺失标注与边界兼容；
-2. 宏观分析师 (`macro_analyst`) 中产业链数据的正确挂载与 Prompt 注入；
-3. 基本面分析师 (`fundamentals_analyst`) 中产业链数据的正确挂载与 Prompt 注入；
-4. 未映射股票（如 999999.SH）的安全隔离（不出现产业链数据段落）；
-5. 无 DataCollector 时的异步回退路径中的产业链数据获取与注入。
+1. `format_industry_linkage_for_prompt` 格式化函数的 fail-closed 契约：永远返回非空，无映射/无采集时返回标准缺失段落；
+2. 有映射但指标失败时，保留标题与行业名，失败指标行写【数据缺失】，不丢失整段；
+3. 宏观分析师 (`macro_analyst`) 在有数据、无数据、未映射、回退模式下均注入「【产业链联想数据】」段落；
+4. 基本面分析师 (`fundamentals_analyst`) 在有数据、无数据、未映射、回退模式下均注入「【产业链联想数据】」段落；
+5. 边界输入与异常降级时的 fail-closed 保障。
 """
 
 import asyncio
@@ -17,6 +17,7 @@ from langchain_core.messages import HumanMessage
 from tradingagents.agents.analysts.fundamentals_analyst import create_fundamentals_analyst
 from tradingagents.agents.analysts.macro_analyst import create_macro_analyst
 from tradingagents.dataflows.industry_linkage import (
+    DEFAULT_INDUSTRY_LINKAGE_MISSING_PROMPT,
     INDUSTRY_LINKAGE_MAP,
     format_industry_linkage_for_prompt,
 )
@@ -24,14 +25,18 @@ from tradingagents.graph.data_collector import DataCollector
 
 
 class TestFormatIndustryLinkageForPrompt:
-    """测试 format_industry_linkage_for_prompt 文本格式化逻辑。"""
+    """测试 format_industry_linkage_for_prompt 文本格式化与 fail-closed 逻辑。"""
 
-    def test_empty_or_none_returns_empty_string(self):
-        """测试 None、空字典或无效输入返回空字符串。"""
-        assert format_industry_linkage_for_prompt(None) == ""
-        assert format_industry_linkage_for_prompt({}) == ""
-        assert format_industry_linkage_for_prompt({"industry_name": ""}) == ""
-        assert format_industry_linkage_for_prompt("invalid_str") == ""  # type: ignore
+    def test_empty_or_none_returns_fail_closed_fallback(self):
+        """测试 None、空字典或无效输入返回标准 fail-closed 缺失提示段落。"""
+        expected = "【产业链联想数据】：【数据缺失】（未映射行业或采集失败，不得据此推断景气中性）"
+        assert format_industry_linkage_for_prompt(None) == expected
+        assert format_industry_linkage_for_prompt({}) == expected
+        assert format_industry_linkage_for_prompt({"industry_name": ""}) == expected
+        assert format_industry_linkage_for_prompt({"industry_name": None}) == expected
+        assert format_industry_linkage_for_prompt("invalid_str") == expected  # type: ignore
+        assert format_industry_linkage_for_prompt(12345) == expected  # type: ignore
+        assert format_industry_linkage_for_prompt(None) == DEFAULT_INDUSTRY_LINKAGE_MISSING_PROMPT
 
     def test_consumer_electronics_formatting_with_active_and_missing_data(self):
         """测试消费电子行业数据格式化（包含活跃数据、缺失标注与政策催化）。"""
@@ -149,6 +154,52 @@ class TestFormatIndustryLinkageForPrompt:
         assert "【数据缺失】特斯拉交付量：手动" in formatted
         assert "行业政策催化关键词：新能源汽车购置税减免、车路云一体化试点" in formatted
 
+    def test_mapped_industry_with_all_failed_indicators_retains_header(self):
+        """契约2：有映射但指标失败时，保留标题+行业名，失败指标行写【数据缺失】，禁止丢整段。"""
+        payload = {
+            "industry_name": "半导体与集成电路",
+            "upstream_cost": [
+                {
+                    "name": "电子级硅片价格",
+                    "current_value": None,
+                    "unit": "美元/片",
+                    "trend": "数据缺失",
+                    "confidence": "低（接口异常）",
+                    "note": "网络超时",
+                    "transmission_logic": "晶圆制造核心原材料成本",
+                }
+            ],
+            "downstream_demand": [
+                {
+                    "name": "全球半导体销售额",
+                    "current_value": None,
+                    "trend": "数据缺失",
+                    "confidence": "低（待手动录入）",
+                    "note": "手动",
+                }
+            ],
+            "international_benchmark": [
+                {
+                    "name": "费城半导体指数",
+                    "current_value": None,
+                    "trend": "数据缺失",
+                    "confidence": "低（接口异常）",
+                    "note": "Rate limited",
+                }
+            ],
+        }
+
+        formatted = format_industry_linkage_for_prompt(payload)
+
+        assert "【产业链联想数据】：半导体与集成电路" in formatted
+        assert "- 上游成本端核心指标：" in formatted
+        assert "【数据缺失】电子级硅片价格：网络超时" in formatted
+        assert "传导逻辑：晶圆制造核心原材料成本" in formatted
+        assert "- 下游需求端核心指标：" in formatted
+        assert "【数据缺失】全球半导体销售额：手动" in formatted
+        assert "- 国际对标核心标的/指标：" in formatted
+        assert "【数据缺失】费城半导体指数：Rate limited" in formatted
+
     def test_pydantic_model_input_direct_support(self):
         """测试直接传入 IndustryLinkage Pydantic 模型对象。"""
         model = INDUSTRY_LINKAGE_MAP["消费电子"]
@@ -159,7 +210,7 @@ class TestFormatIndustryLinkageForPrompt:
 
 
 class TestAnalystPromptInjectionIntegration:
-    """测试宏观分析师与基本面分析师 Prompt 注入产业链数据。"""
+    """测试宏观分析师与基本面分析师 Prompt 注入产业链数据及 fail-closed 契约。"""
 
     def _create_mock_llm(self, sample_verdict):
         mock_llm = MagicMock()
@@ -280,8 +331,8 @@ class TestAnalystPromptInjectionIntegration:
         assert "动力电池正极核心原材料成本传导" in prompt_content
         assert "新能源汽车购置税减免" in prompt_content
 
-    def test_analyst_unmapped_stock_does_not_inject_linkage(self):
-        """测试未映射股票（如 999999.SH）不注入产业链联想数据段落。"""
+    def test_macro_analyst_unmapped_stock_injects_fail_closed_linkage(self):
+        """契约3：未映射股票（如 999999.SH）在 pool 无数据时必须把 fail-closed 段落放入 prompt。"""
         sample_verdict = '<!-- VERDICT: {"direction": "中性", "reason": "业务稳健"} -->'
         mock_llm, received = self._create_mock_llm(sample_verdict)
 
@@ -307,7 +358,36 @@ class TestAnalystPromptInjectionIntegration:
         asyncio.run(node(state))
 
         human_msg = next(m for m in received if isinstance(m, HumanMessage))
-        assert "【产业链联想数据】" not in human_msg.content
+        assert "【产业链联想数据】：【数据缺失】（未映射行业或采集失败，不得据此推断景气中性）" in human_msg.content
+
+    def test_fundamentals_analyst_unmapped_stock_injects_fail_closed_linkage(self):
+        """契约3：基本面分析师在 pool 无产业链数据时必须把 fail-closed 段落放入 prompt。"""
+        sample_verdict = '<!-- VERDICT: {"direction": "中性", "reason": "业务稳健"} -->'
+        mock_llm, received = self._create_mock_llm(sample_verdict)
+
+        collector = DataCollector()
+        collector._cache["999999.SH_2026-08-20"] = {
+            "fundamentals": "无数据",
+            "balance_sheet": "无数据",
+            "cashflow": "无数据",
+            "income_statement": "无数据",
+            "global_indices": "无数据",
+            "major_assets": "无数据",
+            "cn_indices": "无数据",
+            "industry_linkage": None,
+        }
+
+        node = create_fundamentals_analyst(mock_llm, collector)
+        state = {
+            "trade_date": "2026-08-20",
+            "company_of_interest": "999999.SH",
+            "user_intent": {},
+        }
+
+        asyncio.run(node(state))
+
+        human_msg = next(m for m in received if isinstance(m, HumanMessage))
+        assert "【产业链联想数据】：【数据缺失】（未映射行业或采集失败，不得据此推断景气中性）" in human_msg.content
 
     def test_analyst_fallback_mode_fetches_and_injects_linkage(self):
         """测试在无 DataCollector 时的 fallback 回退分支能正确获取并注入产业链数据。"""
@@ -347,3 +427,71 @@ class TestAnalystPromptInjectionIntegration:
             human_msg = next(m for m in received if isinstance(m, HumanMessage))
             assert "【产业链联想数据】：消费电子与智能终端" in human_msg.content
             assert "LME铜价：9123.50 美元/吨" in human_msg.content
+
+    def test_analyst_fallback_mode_unmapped_stock_injects_fail_closed_linkage(self):
+        """测试在无 DataCollector 且股票未映射时的 fallback 回退分支注入 fail-closed 缺失提示。"""
+        sample_verdict = '<!-- VERDICT: {"direction": "中性", "reason": "无映射"} -->'
+        mock_llm, received = self._create_mock_llm(sample_verdict)
+
+        with patch("tradingagents.agents.analysts.macro_analyst.get_cn_stock_name", return_value="未知股"), \
+             patch("tradingagents.agents.utils.agent_utils.get_board_fund_flow") as mock_board, \
+             patch("tradingagents.agents.utils.agent_utils.get_news") as mock_news, \
+             patch("tradingagents.agents.utils.agent_utils.get_global_news") as mock_gnews, \
+             patch("tradingagents.agents.utils.agent_utils.get_northbound_flow") as mock_nb, \
+             patch("tradingagents.agents.utils.agent_utils.get_global_indices", create=True) as mock_gidx, \
+             patch("tradingagents.agents.utils.agent_utils.get_major_assets", create=True) as mock_masset, \
+             patch("tradingagents.agents.utils.agent_utils.get_cn_indices", create=True) as mock_cnidx, \
+             patch("tradingagents.graph.data_collector._map_stock_to_industry", return_value=None):
+
+            mock_board.invoke.return_value = "资金流"
+            mock_news.invoke.return_value = "新闻"
+            mock_gnews.invoke.return_value = "宏观新闻"
+            mock_nb.invoke.return_value = "北向"
+            mock_gidx.invoke.return_value = "全球指数"
+            mock_masset.invoke.return_value = "大类资产"
+            mock_cnidx.invoke.return_value = "国内指数"
+
+            node = create_macro_analyst(mock_llm, data_collector=None)
+            state = {
+                "trade_date": "2026-08-20",
+                "company_of_interest": "999999.SH",
+            }
+
+            asyncio.run(node(state))
+
+            human_msg = next(m for m in received if isinstance(m, HumanMessage))
+            assert "【产业链联想数据】：【数据缺失】（未映射行业或采集失败，不得据此推断景气中性）" in human_msg.content
+
+    def test_fundamentals_fallback_mode_unmapped_stock_injects_fail_closed_linkage(self):
+        """测试基本面分析师在无 DataCollector 且股票未映射时的 fallback 回退分支注入 fail-closed 缺失提示。"""
+        sample_verdict = '<!-- VERDICT: {"direction": "中性", "reason": "无映射"} -->'
+        mock_llm, received = self._create_mock_llm(sample_verdict)
+
+        with patch("tradingagents.agents.analysts.fundamentals_analyst.get_cn_stock_name", return_value="未知股"), \
+             patch("tradingagents.agents.utils.agent_utils.get_fundamentals") as mock_f, \
+             patch("tradingagents.agents.utils.agent_utils.get_balance_sheet") as mock_bs, \
+             patch("tradingagents.agents.utils.agent_utils.get_cashflow") as mock_cf, \
+             patch("tradingagents.agents.utils.agent_utils.get_income_statement") as mock_is, \
+             patch("tradingagents.agents.utils.agent_utils.get_global_indices", create=True) as mock_gidx, \
+             patch("tradingagents.agents.utils.agent_utils.get_major_assets", create=True) as mock_masset, \
+             patch("tradingagents.agents.utils.agent_utils.get_cn_indices", create=True) as mock_cnidx, \
+             patch("tradingagents.graph.data_collector._map_stock_to_industry", return_value=None):
+
+            mock_f.invoke.return_value = "基本面"
+            mock_bs.invoke.return_value = "资产负债"
+            mock_cf.invoke.return_value = "现金流"
+            mock_is.invoke.return_value = "利润表"
+            mock_gidx.invoke.return_value = "全球指数"
+            mock_masset.invoke.return_value = "大类资产"
+            mock_cnidx.invoke.return_value = "国内指数"
+
+            node = create_fundamentals_analyst(mock_llm, data_collector=None)
+            state = {
+                "trade_date": "2026-08-20",
+                "company_of_interest": "999999.SH",
+            }
+
+            asyncio.run(node(state))
+
+            human_msg = next(m for m in received if isinstance(m, HumanMessage))
+            assert "【产业链联想数据】：【数据缺失】（未映射行业或采集失败，不得据此推断景气中性）" in human_msg.content
