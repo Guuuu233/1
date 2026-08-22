@@ -187,6 +187,12 @@ class TestIndustryLinkageProvider:
             assert lithium["status"] == "active"
             assert lithium["mom_change"] is not None and lithium["mom_change"] > 0
             assert "动力电池正极核心原材料成本传导" in (lithium.get("transmission_logic") or "")
+            # 验证 Tushare Provenance 证据链
+            assert lithium["requested_as_of"] is None
+            assert lithium["actual_as_of"] == "2026-08-06"
+            assert lithium["retrieved_at"] is not None
+            assert lithium["transport_provider"] == "tushare"
+            assert lithium["api_name"] == "fut_daily"
 
             # 下游需求端：新能源车渗透率
             downstream_list = data["downstream_demand"]
@@ -384,6 +390,11 @@ class TestIndustryLinkageProvider:
             assert result["status"] == "active"
             assert result["mom_change"] is not None and result["mom_change"] > 0
             assert "tushare" in result["note"]
+            assert result["requested_as_of"] is None
+            assert result["actual_as_of"] == "2026-08-06"
+            assert result["retrieved_at"] is not None
+            assert result["transport_provider"] == "tushare"
+            assert result["api_name"] == "fut_daily"
 
     def test_tushare_index_global_spx_success(
         self, monkeypatch, mock_tushare_spx_response
@@ -415,6 +426,11 @@ class TestIndustryLinkageProvider:
             assert result["trend"] == "上升"
             assert result["confidence"] == "高"
             assert result["status"] == "active"
+            assert result["requested_as_of"] is None
+            assert result["actual_as_of"] == "2026-08-06"
+            assert result["retrieved_at"] is not None
+            assert result["transport_provider"] == "tushare"
+            assert result["api_name"] == "index_global"
 
     def test_tushare_token_missing_categorization(self, monkeypatch):
         """测试 TUSHARE_TOKEN 缺失时准确分类为「Token缺失」，绝不伪装为 pending_api。"""
@@ -432,6 +448,11 @@ class TestIndustryLinkageProvider:
         assert result["trend"] == "数据缺失"
         assert result["confidence"] == "低（Token缺失）"
         assert "TUSHARE_TOKEN missing" in result["note"]
+        assert result["requested_as_of"] is None
+        assert result["actual_as_of"] is None
+        assert result["transport_provider"] == "tushare"
+        assert result["api_name"] == "fut_daily"
+        assert result["category"] == "token"
 
     def test_tushare_permission_denied_403_categorization(self, monkeypatch):
         """测试 Tushare 接口 403 / 权限不足时准确分类为「无权限403」。"""
@@ -456,6 +477,11 @@ class TestIndustryLinkageProvider:
             assert res1["trend"] == "数据缺失"
             assert res1["confidence"] == "低（无权限403）"
             assert "权限不足" in res1["note"]
+            assert res1["requested_as_of"] is None
+            assert res1["actual_as_of"] is None
+            assert res1["transport_provider"] == "tushare"
+            assert res1["api_name"] == "us_daily"
+            assert res1["category"] == "403"
 
         # 2. HTTP 403 状态码
         mock_resp2 = MagicMock()
@@ -466,6 +492,11 @@ class TestIndustryLinkageProvider:
             assert res2["current_value"] is None
             assert res2["trend"] == "数据缺失"
             assert res2["confidence"] == "低（无权限403）"
+            assert res2["requested_as_of"] is None
+            assert res2["actual_as_of"] is None
+            assert res2["transport_provider"] == "tushare"
+            assert res2["api_name"] == "us_daily"
+            assert res2["category"] == "403"
 
     def test_tushare_empty_rows_categorization(self, monkeypatch):
         """测试 Tushare 返回空数据或空行时准确分类为「数据源为空」。"""
@@ -495,6 +526,11 @@ class TestIndustryLinkageProvider:
             assert result["trend"] == "数据缺失"
             assert result["confidence"] == "低（数据源为空）"
             assert "空行" in result["note"]
+            assert result["requested_as_of"] is None
+            assert result["actual_as_of"] is None
+            assert result["transport_provider"] == "tushare"
+            assert result["api_name"] == "fut_daily"
+            assert result["category"] == "empty_rows"
 
     def test_tushare_rate_limit_categorization(self, monkeypatch):
         """测试 Tushare 限频 (429/40203) 时准确分类为「频率限制」。"""
@@ -517,6 +553,11 @@ class TestIndustryLinkageProvider:
             assert result["trend"] == "数据缺失"
             assert result["confidence"] == "低（频率限制）"
             assert "限频" in result["note"]
+            assert result["requested_as_of"] is None
+            assert result["actual_as_of"] is None
+            assert result["transport_provider"] == "tushare"
+            assert result["api_name"] == "fut_daily"
+            assert result["category"] == "rate_limited"
 
     def test_tushare_as_of_lookahead_truncation(
         self, monkeypatch, mock_tushare_lc_response
@@ -548,6 +589,11 @@ class TestIndustryLinkageProvider:
             assert result["current_value"] == expected_cutoff_price
             assert result["current_value"] != 158680.0
             assert result["confidence"] == "高"
+            assert result["requested_as_of"] == cutoff_date
+            assert result["actual_as_of"] == cutoff_date
+            assert result["actual_as_of"] <= result["requested_as_of"]
+            assert result["transport_provider"] == "tushare"
+            assert result["api_name"] == "fut_daily"
 
     def test_lme_copper_akshare_fails_falls_back_to_tushare_cu_shf(
         self, monkeypatch, mock_tushare_cu_shf_response
@@ -583,6 +629,11 @@ class TestIndustryLinkageProvider:
             assert result["confidence"] == "高"
             assert result["status"] == "active"
             assert "CU.SHF" in result["note"]
+            assert result["requested_as_of"] is None
+            assert result["actual_as_of"] == "2026-08-06"
+            assert result["retrieved_at"] is not None
+            assert result["transport_provider"] == "tushare"
+            assert result["api_name"] == "fut_daily"
 
     def test_lme_copper_both_sources_fail_gracefully(self, monkeypatch):
         """测试 LME铜价 在 akshare 与 Tushare 均异常时优雅降级为数据缺失，不抛出异常。"""
@@ -604,3 +655,90 @@ class TestIndustryLinkageProvider:
             assert result["confidence"] == "低（接口异常）"
             assert "akshare 失败" in result["note"]
             assert "Tushare 备源失败" in result["note"]
+
+    def test_tushare_fail_closed_on_lookahead_violation(self, monkeypatch):
+        """测试当 Tushare 返回数据存在未来日期违背防前视纪律时，必须 fail-closed。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        provider = IndustryLinkageProvider()
+
+        # 构造全部晚于 requested_as_of 的未来数据
+        future_data = {
+            "code": 0,
+            "msg": None,
+            "data": {
+                "fields": ["ts_code", "trade_date", "open", "high", "low", "close", "vol"],
+                "items": [
+                    ["LC.GFE", "20260820", 160000, 161000, 159000, 160500, 20000],
+                    ["LC.GFE", "20260819", 158000, 159000, 157000, 158500, 18000],
+                ],
+            },
+        }
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = future_data
+
+        ind = IndustryLinkageIndicator(
+            name="碳酸锂价格",
+            source="tushare",
+            symbol="LC.GFE",
+            unit="元/吨",
+        )
+
+        # 请求基准日早于数据中的实际日期 (2026-08-10 < 2026-08-19)
+        with patch("requests.post", return_value=mock_resp):
+            result = provider._fetch_indicator(ind, as_of="2026-08-10")
+
+            # 验证 fail-closed: 不返回虚假行情，保留 requested_as_of 与类型化 category
+            assert result["current_value"] is None
+            assert result["mom_change"] is None
+            assert result["qoq_change"] is None
+            assert result["trend"] == "数据缺失"
+            assert result["requested_as_of"] == "2026-08-10"
+            assert result["actual_as_of"] is None
+            assert result["transport_provider"] == "tushare"
+            assert result["api_name"] == "fut_daily"
+            assert result["category"] in ("empty_rows", "lookahead_violation")
+
+    def test_tushare_token_safety_and_provenance_integrity(self, monkeypatch):
+        """测试 Tushare 调用在成功与失败时严禁打印/泄漏 Token，且完整保留 Provenance 元数据。"""
+        secret_token = "secret_tushare_token_abc_xyz_98765"
+        monkeypatch.setenv("TUSHARE_TOKEN", secret_token)
+        provider = IndustryLinkageProvider()
+
+        # 1. 模拟网络异常场景
+        ind = IndustryLinkageIndicator(
+            name="碳酸锂价格",
+            source="tushare",
+            symbol="LC.GFE",
+            unit="元/吨",
+        )
+        with patch("requests.post", side_effect=Exception(f"Connection error to API with token")):
+            result_err = provider._fetch_indicator(ind, as_of="2026-08-15")
+
+            assert result_err["current_value"] is None
+            assert result_err["requested_as_of"] == "2026-08-15"
+            assert result_err["actual_as_of"] is None
+            assert result_err["transport_provider"] == "tushare"
+            assert result_err["api_name"] == "fut_daily"
+            assert result_err["category"] in ("network_error", "api_error")
+            assert secret_token not in str(result_err)
+
+    def test_tushare_missing_symbol_provenance(self, monkeypatch):
+        """测试缺少 symbol 时返回类型化分类与 Provenance 元数据。"""
+        monkeypatch.setenv("TUSHARE_TOKEN", "mock_token_configured")
+        provider = IndustryLinkageProvider()
+
+        ind = IndustryLinkageIndicator(
+            name="碳酸锂价格",
+            source="tushare",
+            symbol="",
+        )
+        result = provider._fetch_indicator(ind, as_of="2026-08-15")
+
+        assert result["current_value"] is None
+        assert result["trend"] == "数据缺失"
+        assert result["confidence"] == "低（代码缺失）"
+        assert result["requested_as_of"] == "2026-08-15"
+        assert result["actual_as_of"] is None
+        assert result["transport_provider"] == "tushare"
+        assert result["category"] == "symbol_missing"

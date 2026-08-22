@@ -17,6 +17,7 @@
 """
 
 import copy
+from datetime import datetime, timezone
 import logging
 import os
 import threading
@@ -87,6 +88,20 @@ def _resolve_tushare_api_name(
     if sym_upper.endswith(_FUTURES_EXCHANGE_SUFFIXES):
         return "fut_daily"
     return "index_global"
+
+
+def _normalize_as_of_date(as_of: Optional[str]) -> Optional[str]:
+    """标准化 as_of 日期为 YYYY-MM-DD 字符串，若无法解析则返回 None。"""
+    if not as_of:
+        return None
+    clean = str(as_of).strip()
+    if not clean:
+        return None
+    try:
+        dt = pd.to_datetime(clean, format="mixed")
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return None
 
 
 def _query_tushare_api(
@@ -313,7 +328,7 @@ class IndustryLinkageProvider:
                 return self._fetch_lme_copper(config, as_of=as_of)
 
             # 4. Tushare 付费数据源标的 (碳酸锂 LC.GFE、多晶硅 PS.GFE、全球指数 SPX 等)
-            if config.source == "tushare" and config.symbol:
+            if config.source == "tushare":
                 return self._fetch_tushare_indicator(config, as_of=as_of)
 
             # 5. yfinance 标的 (三星电子股价、费城半导体指数、台积电、布伦特原油、埃克森美孚、摩根大通、标普500金融指数等)
@@ -337,6 +352,15 @@ class IndustryLinkageProvider:
                 "confidence": "低（接口异常）",
                 "note": f"数据获取失败: {e}",
             })
+            if config.source == "tushare":
+                base_dict.update({
+                    "requested_as_of": as_of,
+                    "actual_as_of": None,
+                    "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                    "transport_provider": "tushare",
+                    "api_name": _resolve_tushare_api_name(config.symbol or "", config.metadata),
+                    "category": "api_error",
+                })
             return base_dict
 
     def _fetch_tushare_indicator(
@@ -344,19 +368,26 @@ class IndustryLinkageProvider:
         config: IndustryLinkageIndicator,
         as_of: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """采集 Tushare 标的历史行情并计算最新值、月环比、季度环比与趋势。"""
+        """采集 Tushare 标的历史行情并计算最新值、月环比、季度环比与趋势，附带完整 Provenance 证据链。"""
         result = config.model_dump()
+        retrieved_at = datetime.now(timezone.utc).isoformat()
         symbol = config.symbol
+        api_name = _resolve_tushare_api_name(symbol or "", config.metadata)
+
         if not symbol:
             result.update({
                 "current_value": None,
                 "trend": "数据缺失",
                 "confidence": "低（代码缺失）",
                 "note": "未配置有效的 Tushare 证券代码",
+                "requested_as_of": as_of,
+                "actual_as_of": None,
+                "retrieved_at": retrieved_at,
+                "transport_provider": "tushare",
+                "api_name": api_name,
+                "category": "symbol_missing",
             })
             return result
-
-        api_name = _resolve_tushare_api_name(symbol, config.metadata)
 
         df, err_cat, err_note = _query_tushare_api(
             api_name=api_name,
@@ -382,6 +413,12 @@ class IndustryLinkageProvider:
                 "trend": "数据缺失",
                 "confidence": confidence,
                 "note": err_note or "Tushare 数据获取失败",
+                "requested_as_of": as_of,
+                "actual_as_of": None,
+                "retrieved_at": retrieved_at,
+                "transport_provider": "tushare",
+                "api_name": api_name,
+                "category": err_cat or "api_error",
             })
             return result
 
@@ -395,6 +432,38 @@ class IndustryLinkageProvider:
                 "trend": "数据缺失",
                 "confidence": "低（有效数据不足）",
                 "note": "无符合截止日期的有效价格序列",
+                "requested_as_of": as_of,
+                "actual_as_of": None,
+                "retrieved_at": retrieved_at,
+                "transport_provider": "tushare",
+                "api_name": api_name,
+                "category": "empty_rows",
+            })
+            return result
+
+        actual_as_of = metrics.get("actual_as_of")
+        normalized_req = _normalize_as_of_date(as_of)
+
+        # 严格防前视纪律校验：actual_as_of <= requested_as_of，不满足时 fail-closed
+        if normalized_req is not None and actual_as_of is not None and actual_as_of > normalized_req:
+            logger.warning(
+                "IndustryLinkageProvider: 防前视校验失败，actual_as_of (%s) > requested_as_of (%s)",
+                actual_as_of,
+                as_of,
+            )
+            result.update({
+                "current_value": None,
+                "mom_change": None,
+                "qoq_change": None,
+                "trend": "数据缺失",
+                "confidence": "低（前视偏差异常）",
+                "note": f"防前视校验失败: 实际数据日期 ({actual_as_of}) 晚于请求基准日期 ({as_of})",
+                "requested_as_of": as_of,
+                "actual_as_of": None,
+                "retrieved_at": retrieved_at,
+                "transport_provider": "tushare",
+                "api_name": api_name,
+                "category": "lookahead_violation",
             })
             return result
 
@@ -406,6 +475,11 @@ class IndustryLinkageProvider:
             "confidence": "高",
             "status": "active",
             "note": f"数据源: tushare (接口: {api_name}, 代码: {symbol})",
+            "requested_as_of": as_of,
+            "actual_as_of": actual_as_of,
+            "retrieved_at": retrieved_at,
+            "transport_provider": "tushare",
+            "api_name": api_name,
         })
         return result
 
@@ -458,6 +532,7 @@ class IndustryLinkageProvider:
             akshare_conf = "低（接口异常）"
 
         # akshare 不可用时，尝试 Tushare fut_daily CU.SHF 作为备用数据源
+        retrieved_at_ts = datetime.now(timezone.utc).isoformat()
         df_ts, ts_err_cat, ts_err_note = _query_tushare_api(
             api_name="fut_daily",
             ts_code="CU.SHF",
@@ -468,16 +543,24 @@ class IndustryLinkageProvider:
                 df_ts, as_of=as_of, price_col="close", date_col="trade_date"
             )
             if metrics_ts:
-                result.update({
-                    "current_value": metrics_ts["current_value"],
-                    "mom_change": metrics_ts["mom_change"],
-                    "qoq_change": metrics_ts["qoq_change"],
-                    "trend": metrics_ts["trend"],
-                    "confidence": "高",
-                    "status": "active",
-                    "note": "数据源: tushare (备源接口: fut_daily, 代码: CU.SHF)",
-                })
-                return result
+                actual_as_of_ts = metrics_ts.get("actual_as_of")
+                normalized_req = _normalize_as_of_date(as_of)
+                if not (normalized_req is not None and actual_as_of_ts is not None and actual_as_of_ts > normalized_req):
+                    result.update({
+                        "current_value": metrics_ts["current_value"],
+                        "mom_change": metrics_ts["mom_change"],
+                        "qoq_change": metrics_ts["qoq_change"],
+                        "trend": metrics_ts["trend"],
+                        "confidence": "高",
+                        "status": "active",
+                        "note": "数据源: tushare (备源接口: fut_daily, 代码: CU.SHF)",
+                        "requested_as_of": as_of,
+                        "actual_as_of": actual_as_of_ts,
+                        "retrieved_at": retrieved_at_ts,
+                        "transport_provider": "tushare",
+                        "api_name": "fut_daily",
+                    })
+                    return result
 
         result.update({
             "current_value": None,
@@ -626,7 +709,14 @@ class IndustryLinkageProvider:
         if real_price_col is None:
             return None
 
-        df_work["_std_date"] = pd.to_datetime(df_work[real_date_col], errors="coerce")
+        # 日期安全解析（兼容 int YYYYMMDD, str YYYYMMDD, ISO 字符串与 datetime 对象）
+        date_series = df_work[real_date_col]
+        if pd.api.types.is_datetime64_any_dtype(date_series):
+            df_work["_std_date"] = pd.to_datetime(date_series, errors="coerce")
+        else:
+            df_work["_std_date"] = pd.to_datetime(
+                date_series.astype(str), format="mixed", errors="coerce"
+            )
         df_work["_std_price"] = pd.to_numeric(df_work[real_price_col], errors="coerce")
         df_work = df_work.dropna(subset=["_std_date", "_std_price"])
 
@@ -639,7 +729,8 @@ class IndustryLinkageProvider:
         # 防前视纪律过滤
         if as_of:
             try:
-                as_of_dt = pd.to_datetime(as_of)
+                as_of_str = str(as_of).strip()
+                as_of_dt = pd.to_datetime(as_of_str, format="mixed")
                 df_work = df_work[df_work["_std_date"] <= as_of_dt]
             except Exception as e:
                 logger.warning("IndustryLinkageProvider: 解析 as_of 日期 '%s' 失败: %s", as_of, e)
@@ -648,7 +739,9 @@ class IndustryLinkageProvider:
             return None
 
         total_rows = len(df_work)
-        latest_price = float(df_work.iloc[-1]["_std_price"])
+        latest_row = df_work.iloc[-1]
+        latest_price = float(latest_row["_std_price"])
+        actual_as_of = latest_row["_std_date"].strftime("%Y-%m-%d")
 
         # 计算月环比 (MoM)
         mom_change: Optional[float] = None
@@ -687,4 +780,5 @@ class IndustryLinkageProvider:
             "mom_change": mom_change,
             "qoq_change": qoq_change,
             "trend": trend,
+            "actual_as_of": actual_as_of,
         }
