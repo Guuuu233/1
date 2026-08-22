@@ -63,9 +63,10 @@ def _get_client():
 
 def _auth(client: TestClient) -> str:
     """Register a test user and return a valid JWT token."""
-    r = client.post("/v1/auth/request-code", json={"email": "apitest@test.com"})
+    email = f"apitest-{uuid4().hex[:8]}@test.com"
+    r = client.post("/v1/auth/request-code", json={"email": email})
     code = r.json()["dev_code"]
-    r2 = client.post("/v1/auth/verify-code", json={"email": "apitest@test.com", "code": code})
+    r2 = client.post("/v1/auth/verify-code", json={"email": email, "code": code})
     return r2.json()["access_token"]
 
 
