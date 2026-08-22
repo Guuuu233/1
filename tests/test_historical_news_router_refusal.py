@@ -136,8 +136,8 @@ def test_news_historical_routes_only_to_verified_sources(past_date):
     yfinance.get_news.assert_not_called()
 
 
-def test_global_news_today_still_routes_to_provider():
-    today = cn_today_str()
+def test_global_news_today_still_routes_to_provider(frozen_trade_date):
+    today = frozen_trade_date
     provider = MagicMock()
     provider.get_global_news.return_value = "## live global news"
 
@@ -151,8 +151,8 @@ def test_global_news_today_still_routes_to_provider():
     provider.get_global_news.assert_called_once()
 
 
-def test_news_today_still_routes_to_provider():
-    today = cn_today_str()
+def test_news_today_still_routes_to_provider(frozen_trade_date):
+    today = frozen_trade_date
     start = (now_cn().date() - timedelta(days=7)).isoformat()
     provider = MagicMock()
     provider.get_news.return_value = "## live stock news"

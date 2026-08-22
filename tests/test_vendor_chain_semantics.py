@@ -181,32 +181,32 @@ def _provider_with_sina(result: str):
     return p
 
 
-def test_akshare_global_news_sina_failure_is_vendor_fail():
+def test_akshare_global_news_sina_failure_is_vendor_fail(frozen_trade_date):
     p = _provider_with_sina("新浪财经快讯获取失败：ConnectionError: boom")
-    out = p.get_global_news(cn_today_str())
+    out = p.get_global_news(frozen_trade_date)
     assert isinstance(out, VendorFail)
     assert "新浪财经快讯获取失败" in out.error
 
 
-def test_akshare_global_news_sina_empty_is_vendor_empty():
+def test_akshare_global_news_sina_empty_is_vendor_empty(frozen_trade_date):
     p = _provider_with_sina("未获取到新浪财经快讯")
-    today = cn_today_str()
+    today = frozen_trade_date
     out = p.get_global_news(today)
     assert isinstance(out, VendorEmpty)
     assert "未获取到全球市场新闻" in out.message
 
 
-def test_akshare_global_news_sina_hit_returns_string():
+def test_akshare_global_news_sina_hit_returns_string(frozen_trade_date):
     p = _provider_with_sina("## 新浪财经快讯（第1页，共3条）：\n### [10:00] 标题")
-    out = p.get_global_news(cn_today_str())
+    out = p.get_global_news(frozen_trade_date)
     assert isinstance(out, str)
     assert out.startswith("## ")
 
 
-def test_akshare_global_news_signature_accepts_look_back_and_limit():
+def test_akshare_global_news_signature_accepts_look_back_and_limit(frozen_trade_date):
     """Signature must match the base/router call shape (curr_date, look_back_days, limit)."""
     p = _provider_with_sina("## ok")
-    out = p.get_global_news(cn_today_str(), look_back_days=7, limit=50)
+    out = p.get_global_news(frozen_trade_date, look_back_days=7, limit=50)
     assert out.startswith("## ")
 
 
@@ -324,7 +324,7 @@ def test_yfinance_get_insider_transactions_error_is_vendor_fail():
 # ── Router integration: akshare fail -> yfinance serves global news ───
 
 
-def test_router_akshare_global_news_fail_falls_to_yfinance():
+def test_router_akshare_global_news_fail_falls_to_yfinance(frozen_trade_date):
     """The classic KNOWN_ISSUES case: akshare sina failure must not look like
     'confirmed no news' and block the next vendor."""
     ak = _FakeProvider(
@@ -340,11 +340,11 @@ def test_router_akshare_global_news_fail_falls_to_yfinance():
     registry = _FakeRegistry({"cn_akshare": ak, "yfinance": yf})
     with patch.object(iface, "_registry", registry), \
          patch.object(iface, "get_vendor", return_value="cn_akshare,yfinance"):
-        out = iface.route_to_vendor("get_global_news", cn_today_str(), 7, 10)
+        out = iface.route_to_vendor("get_global_news", frozen_trade_date, 7, 10)
     assert out == "## yfinance global news"
 
 
-def test_router_akshare_global_news_empty_stops_chain():
+def test_router_akshare_global_news_empty_stops_chain(frozen_trade_date):
     """Confirmed empty from akshare stops the chain (does not fall to yfinance)."""
     ak = _FakeProvider(
         "cn_akshare",
@@ -359,7 +359,7 @@ def test_router_akshare_global_news_empty_stops_chain():
     registry = _FakeRegistry({"cn_akshare": ak, "yfinance": yf})
     with patch.object(iface, "_registry", registry), \
          patch.object(iface, "get_vendor", return_value="cn_akshare,yfinance"):
-        out = iface.route_to_vendor("get_global_news", cn_today_str(), 7, 10)
+        out = iface.route_to_vendor("get_global_news", frozen_trade_date, 7, 10)
     assert out == "未获取到全球市场新闻"
 
 

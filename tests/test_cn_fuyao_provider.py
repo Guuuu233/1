@@ -738,7 +738,7 @@ def test_route_lhb_falls_back_to_fuyao_when_akshare_vendor_fail():
 # ── akshare 东财失败 → VendorFail（保证链路可切到 fuyao）────────────
 
 
-def test_akshare_get_zt_pool_failure_is_vendor_fail():
+def test_akshare_get_zt_pool_failure_is_vendor_fail(frozen_trade_date):
     from tradingagents.dataflows import trade_calendar as tc
     from tradingagents.dataflows.providers.cn_akshare_provider import CnAkshareProvider
 

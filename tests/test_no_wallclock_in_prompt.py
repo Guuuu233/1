@@ -50,7 +50,7 @@ def _offline_collected_pool(analysis: str) -> dict[str, object]:
     }
 
 
-def test_akshare_hist_header_has_no_wallclock():
+def test_akshare_hist_header_has_no_wallclock(frozen_trade_date):
     provider = CnAkshareProvider()
     df = pd.DataFrame(
         {
@@ -66,12 +66,12 @@ def test_akshare_hist_header_has_no_wallclock():
     for marker in WALLCLOCK_MARKERS:
         assert marker not in text
     # Must not inject wall-clock day either
-    today = now_cn().date().isoformat()
+    today = frozen_trade_date
     assert today not in text
     assert "2026-04-30" in text  # analysis range stays
 
 
-def test_yfinance_stock_header_has_no_wallclock():
+def test_yfinance_stock_header_has_no_wallclock(frozen_trade_date):
     df = pd.DataFrame(
         {
             "Open": [1.0],
@@ -91,10 +91,10 @@ def test_yfinance_stock_header_has_no_wallclock():
         patch.stopall()
     for marker in WALLCLOCK_MARKERS:
         assert marker not in text
-    assert now_cn().date().isoformat() not in text
+    assert frozen_trade_date not in text
 
 
-def test_full_collect_no_date_after_analysis():
+def test_full_collect_no_date_after_analysis(frozen_trade_date):
     """Collected pool fixture: no date string in any pool text after analysis day."""
     from tradingagents.graph import data_collector as dc
 

@@ -27,9 +27,10 @@ from tradingagents.dataflows.trade_calendar import cn_today_str
 
 
 @pytest.fixture
-def trading_day(monkeypatch):
+def trading_day(monkeypatch, frozen_trade_date):
     """Inject a deterministic trading-day calendar only for tests that need it."""
     monkeypatch.setattr(cn_akshare_provider, "is_cn_trading_day", lambda _date: True)
+    return frozen_trade_date
 
 
 # ── Task 2: Eastmoney backup sources ──────────────────────────────────
