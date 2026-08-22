@@ -151,10 +151,8 @@ def create_fundamentals_analyst(llm, data_collector=None):
         human_content_blocks = [
             horizon_ctx + "\n" + f"以下是 {ticker_display} 在 {current_date} 的基本面资料与产业链/宏观背景。",
             phase1_reports_text,
+            f"{industry_linkage_text}",
         ]
-
-        if industry_linkage_text:
-            human_content_blocks.append(f"{industry_linkage_text}")
 
         if industry_ctx:
             human_content_blocks.append(f"{industry_ctx}")
