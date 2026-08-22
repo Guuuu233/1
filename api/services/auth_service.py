@@ -14,7 +14,7 @@ from cryptography.fernet import Fernet, InvalidToken
 import jwt
 from sqlalchemy.orm import Session
 
-from api.database import EmailVerificationCodeDB, UserDB, UserLLMConfigDB
+from api.database import EmailVerificationCodeDB, ProviderDB, UserDB, UserLLMConfigDB
 
 
 ALGORITHM = "HS256"
@@ -326,6 +326,23 @@ def upsert_user_llm_config(
         row.default_analysts = json.dumps(default_analysts)
 
     row.updated_at = now
+
+    # Role routing reads providers.base_url / api_key_encrypted, not this row.
+    # Settings-page saves historically only updated user_llm_configs, so the
+    # 15 agents kept using a stale public URL after the user changed Tailscale.
+    provider_values = {"updated_at": now}
+    if backend_url is not None:
+        provider_values["base_url"] = backend_url
+    if clear_api_key:
+        provider_values["api_key_encrypted"] = None
+    elif api_key:
+        provider_values["api_key_encrypted"] = row.api_key_encrypted
+    if len(provider_values) > 1:
+        db.query(ProviderDB).filter(ProviderDB.user_id == user_id).update(
+            provider_values,
+            synchronize_session="fetch",
+        )
+
     db.commit()
     db.refresh(row)
     return row
