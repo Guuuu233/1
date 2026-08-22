@@ -473,8 +473,11 @@ def sanitize_debate_response(
     return _quarantine_rejected_machine_blocks(text, tags)
 
 
-def build_debate_report_manifest(reports_or_state: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    """Build report input manifest recording length and passed=True for 7 input reports."""
+def build_debate_report_manifest(
+    reports_or_state: Mapping[str, Any],
+    pass_info: Mapping[str, tuple[str, int]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Build report input manifest recording length, mode, passed chars, and passed=True for 7 input reports."""
     report_keys = (
         ("macro_report", "macro_report"),
         ("market_report", "market_report"),
@@ -485,12 +488,25 @@ def build_debate_report_manifest(reports_or_state: Mapping[str, Any]) -> dict[st
         ("volume_price_report", "volume_price_report"),
     )
     manifest: dict[str, dict[str, Any]] = {}
+    pass_info = pass_info or {}
     for manifest_key, state_key in report_keys:
         content = reports_or_state.get(state_key, "")
         text = str(content or "")
+        raw_length = len(text)
+        info = pass_info.get(manifest_key)
+        if info:
+            mode, passed_chars = info
+        else:
+            mode = "full" if raw_length > 0 else "empty"
+            passed_chars = raw_length
         manifest[manifest_key] = {
-            "length": len(text),
+            "length": raw_length,
+            "raw_length": raw_length,
             "passed": True,
+            "mode": mode,
+            "pass_mode": mode,
+            "passed_chars": passed_chars,
+            "char_count": passed_chars,
         }
     return manifest
 
