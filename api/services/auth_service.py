@@ -171,6 +171,7 @@ def upsert_login_code(db: Session, email: str, purpose: str = "login") -> str:
         email=email,
         code_hash=hash_code(email, code),
         purpose=purpose,
+        attempts=0,
         expires_at=now + timedelta(minutes=10),
         created_at=now,
     )
@@ -192,10 +193,24 @@ def verify_login_code(db: Session, email: str, code: str, purpose: str = "login"
         .order_by(EmailVerificationCodeDB.created_at.desc())
         .first()
     )
-    expires_at = _as_utc(code_row.expires_at) if code_row else None
-    if not code_row or not expires_at or expires_at < now:
+    if not code_row:
         return None
+    expires_at = _as_utc(code_row.expires_at)
+    if not expires_at or expires_at < now:
+        return None
+
+    current_attempts = getattr(code_row, "attempts", 0) or 0
+    if current_attempts >= 5:
+        if not code_row.consumed_at:
+            code_row.consumed_at = now
+            db.commit()
+        return None
+
     if code_row.code_hash != hash_code(email, code):
+        code_row.attempts = current_attempts + 1
+        if code_row.attempts >= 5:
+            code_row.consumed_at = now
+        db.commit()
         return None
 
     code_row.consumed_at = now
