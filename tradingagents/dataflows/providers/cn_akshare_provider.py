@@ -4242,6 +4242,184 @@ class CnAkshareProvider(BaseMarketDataProvider):
         self._set_macro_cache(cache_key, result_md)
         return result_md
 
+    def _fetch_global_indices_em_ulist(self, curr_date: str) -> dict[str, dict]:
+        """Fetch real-time snapshot of global indices from Eastmoney ulist API."""
+        import requests
+        import json
+
+        url = (
+            "https://push2.eastmoney.com/api/qt/ulist.np/get?"
+            "secids=100.NDX,100.SPX,100.DJIA,100.N225,100.GDAXI,100.KS11,100.FTSE,100.FCHI,100.HSI,100.HSTECH"
+            "&fields=f1,f2,f3,f4,f12,f13,f14,f124"
+        )
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+        }
+        try:
+            resp = requests.get(url, headers=headers, timeout=5)
+            payload = resp.json()
+        except Exception:
+            return {}
+
+        if not isinstance(payload, dict) or payload.get("rc") != 0:
+            return {}
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return {}
+        diff = data.get("diff")
+        if not isinstance(diff, list):
+            return {}
+
+        secid_map = {
+            "SPX": ("标普500", "SPX"),
+            "NDX": ("纳斯达克100", "NDX"),
+            "DJIA": ("道琼斯", "DJIA"),
+            "HSI": ("恒生指数", "HSI"),
+            "HSTECH": ("恒生科技指数", "HSTECH"),
+            "N225": ("日经225", "N225"),
+            "KS11": ("韩国KOSPI", "KS11"),
+            "GDAXI": ("德国DAX", "GDAXI"),
+            "FTSE": ("英国富时100", "FTSE"),
+            "FCHI": ("法国CAC40", "FCHI"),
+        }
+
+        retrieved_at = datetime.now(timezone.utc).isoformat()
+        out = {}
+        for item in diff:
+            if not isinstance(item, dict):
+                continue
+            code_raw = str(item.get("f12") or "").strip().upper()
+            if code_raw not in secid_map:
+                continue
+            std_name, std_code = secid_map[code_raw]
+            price = safe_float(item.get("f2"))
+            change_1d_pct = safe_float(item.get("f3"))
+            if price is None or price <= 0:
+                continue
+            if change_1d_pct is None:
+                change_1d_pct = 0.0
+
+            ts_raw = item.get("f124")
+            as_of = curr_date
+            if ts_raw:
+                try:
+                    ts_int = int(ts_raw)
+                    if ts_int > 1000000000:
+                        as_of = datetime.fromtimestamp(ts_int, timezone.utc).strftime("%Y-%m-%d")
+                except (ValueError, TypeError, OverflowError):
+                    pass
+
+            if as_of > curr_date:
+                continue
+
+            out[std_name] = {
+                "name": std_name,
+                "code": std_code,
+                "latest_close": price,
+                "change_1d_pct": change_1d_pct,
+                "change_5d_pct": None,
+                "change_20d_pct": None,
+                "as_of": as_of,
+                "period_kind": "session_snapshot",
+                "retrieved_at": retrieved_at,
+                "source": "eastmoney_ulist",
+                "trend_desc": "上涨反弹" if change_1d_pct > 0.5 else ("回调下跌" if change_1d_pct < -0.5 else "平稳震荡"),
+            }
+        return out
+
+    def _fetch_global_indices_sina_hq(self, curr_date: str) -> dict[str, dict]:
+        """Fetch real-time snapshot of global indices from Sina Finance HQ API."""
+        import requests
+        import re
+
+        symbols = [
+            ("标普500", "^GSPC", "gb_inx"),
+            ("纳斯达克综合", "^IXIC", "gb_ixic"),
+            ("道琼斯", "^DJI", "gb_dji"),
+            ("恒生指数", "HSI", "rt_hkHSI"),
+            ("恒生科技指数", "HSTECH", "rt_hkHSTECH"),
+            ("日经225", "N225", "int_nikkei"),
+            ("韩国KOSPI", "KS11", "b_KOSPI"),
+            ("德国DAX", "GDAXI", "b_DAX"),
+            ("英国富时100", "FTSE", "b_FTSE"),
+            ("法国CAC40", "FCHI", "b_CAC"),
+        ]
+
+        code_list = [s[2] for s in symbols]
+        url = "https://hq.sinajs.cn/list=" + ",".join(code_list)
+        headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": "Mozilla/5.0"}
+        try:
+            resp = requests.get(url, headers=headers, timeout=5)
+            resp.encoding = "gbk"
+        except Exception:
+            return {}
+
+        res_map = {}
+        for line in resp.text.strip().splitlines():
+            line = line.strip()
+            if not line or '="' not in line:
+                continue
+            k, v = line.split('="', 1)
+            raw_code = k.split("_")[-1]
+            res_map[raw_code] = v.rstrip('";').split(",")
+
+        retrieved_at = datetime.now(timezone.utc).isoformat()
+        out = {}
+        for name, code, sina_symbol in symbols:
+            raw_key = sina_symbol.split("_")[-1]
+            raw = res_map.get(raw_key)
+            if not raw or len(raw) < 2 or not raw[1]:
+                continue
+            try:
+                if sina_symbol.startswith("gb_"):
+                    # fields: [name, price, change_pct, datetime, change_amt, ...]
+                    price = safe_float(raw[1])
+                    change_1d_pct = safe_float(raw[2])
+                    as_of = raw[3][:10] if len(raw) > 3 and len(raw[3]) >= 10 else curr_date
+                elif sina_symbol.startswith("rt_hk"):
+                    # fields: [symbol, name, prev_close, open, high, low, latest, change_amt, change_pct, ..., date, time]
+                    price = safe_float(raw[6])
+                    change_1d_pct = safe_float(raw[8])
+                    as_of = raw[17].replace("/", "-") if len(raw) > 17 and len(raw[17]) >= 10 else curr_date
+                elif sina_symbol.startswith("b_"):
+                    # fields: [name, latest, change_amt, change_pct, ...]
+                    price = safe_float(raw[1])
+                    change_1d_pct = safe_float(raw[3])
+                    candidates = [f for f in raw if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", f) and f <= curr_date]
+                    as_of = max(candidates) if candidates else curr_date
+                elif sina_symbol.startswith("int_"):
+                    # fields: [name, latest, change_amt, change_pct]
+                    price = safe_float(raw[1])
+                    change_1d_pct = safe_float(raw[3])
+                    as_of = curr_date
+                else:
+                    continue
+
+                if price is None or price <= 0:
+                    continue
+                if change_1d_pct is None:
+                    change_1d_pct = 0.0
+                if as_of > curr_date:
+                    continue
+
+                out[name] = {
+                    "name": name,
+                    "code": code,
+                    "latest_close": price,
+                    "change_1d_pct": change_1d_pct,
+                    "change_5d_pct": None,
+                    "change_20d_pct": None,
+                    "as_of": as_of,
+                    "period_kind": "session_snapshot",
+                    "retrieved_at": retrieved_at,
+                    "source": "sina_hq",
+                    "trend_desc": "上涨反弹" if change_1d_pct > 0.5 else ("回调下跌" if change_1d_pct < -0.5 else "平稳震荡"),
+                }
+            except Exception:
+                continue
+        return out
+
     def get_global_indices(self, curr_date: str = None, look_back_days: int = 30) -> str:
         if curr_date is None:
             return "【数据获取失败】全球核心指数 — 原因：缺少分析基准日期 (来源: cn_akshare)"
@@ -4258,42 +4436,83 @@ class CnAkshareProvider(BaseMarketDataProvider):
         if cached is not None:
             return cached
 
+        is_historical = is_historical_analysis_date(curr_date)
+        results: dict[str, dict] = {}
+
         global_targets = [
             ("标普500", ".INX", "标普500"),
-            ("纳斯达克", ".IXIC", "纳斯达克"),
+            ("纳斯达克综合", ".IXIC", "纳斯达克"),
             ("道琼斯", ".DJI", "道琼斯"),
             ("恒生指数", "HSI", "恒生指数"),
             ("恒生科技指数", "HSTECH", "恒生科技指数"),
             ("日经225", "N225", "日经225"),
+            ("韩国KOSPI", "KS11", "韩国KOSPI"),
             ("德国DAX", "GDAXI", "德国DAX30"),
             ("法国CAC40", "FCHI", "法国CAC40"),
             ("英国富时100", "FTSE", "英国富时100"),
         ]
 
-        results = {}
-        ak = self._ak()
-        for name, code, ak_name in global_targets:
-            df = None
-            try:
-                if hasattr(ak, "index_global_hist_em"):
-                    with AKSHARE_CALL_LOCK:
-                        df = ak.index_global_hist_em(symbol=ak_name)
-            except Exception:
-                df = None
+        def _fetch_from_hist():
+            ak = self._ak()
+            for name, code, ak_name in global_targets:
+                if name in results:
+                    continue
+                if name == "纳斯达克综合" and ("纳斯达克" in results or "纳斯达克100" in results):
+                    continue
+                if name == "恒生科技指数" and "恒生科技" in results:
+                    continue
+                if name == "韩国KOSPI" and "KOSPI" in results:
+                    continue
 
-            if df is None or df.empty:
+                df = None
                 try:
-                    if hasattr(ak, "stock_hk_index_daily_em") and code in ("HSI", "HSTECH"):
+                    if hasattr(ak, "index_global_hist_em"):
                         with AKSHARE_CALL_LOCK:
-                            df = ak.stock_hk_index_daily_em(symbol=code)
+                            df = ak.index_global_hist_em(symbol=ak_name)
                 except Exception:
                     df = None
 
-            if df is not None and not df.empty:
-                metrics = calculate_series_metrics(df, curr_date)
-                if metrics:
-                    metrics["code"] = code
-                    results[name] = metrics
+                if df is None or df.empty:
+                    try:
+                        if hasattr(ak, "stock_hk_index_daily_em") and code in ("HSI", "HSTECH"):
+                            with AKSHARE_CALL_LOCK:
+                                df = ak.stock_hk_index_daily_em(symbol=code)
+                    except Exception:
+                        df = None
+
+                if df is not None and not df.empty:
+                    metrics = calculate_series_metrics(df, curr_date)
+                    if metrics:
+                        metrics["code"] = code
+                        results[name] = metrics
+
+        def _fetch_from_snapshots():
+            # Step 1: Eastmoney ulist
+            try:
+                em_snapshots = self._fetch_global_indices_em_ulist(curr_date)
+                for k, v in em_snapshots.items():
+                    if k not in results and v.get("as_of", "") <= curr_date:
+                        results[k] = v
+            except Exception as exc:
+                _provider_logger.debug("EM ulist global indices failed: %s", exc)
+
+            # Step 2: Sina hq fallback for missing items
+            try:
+                sina_snapshots = self._fetch_global_indices_sina_hq(curr_date)
+                for k, v in sina_snapshots.items():
+                    if k not in results and v.get("as_of", "") <= curr_date:
+                        results[k] = v
+            except Exception as exc:
+                _provider_logger.debug("Sina HQ global indices failed: %s", exc)
+
+        if is_historical:
+            # 历史日期：优先 hist 接口，若 hist 失败且快照日期 <= curr_date 才可用
+            _fetch_from_hist()
+            _fetch_from_snapshots()
+        else:
+            # 非历史日期（当日/实时）：优先 ulist -> sina hq 实时快照，再回退 hist 接口
+            _fetch_from_snapshots()
+            _fetch_from_hist()
 
         if not results:
             return "【数据获取失败】全球核心指数 — 原因：所有全球指数接口调用失败或无有效数据 (来源: cn_akshare)"

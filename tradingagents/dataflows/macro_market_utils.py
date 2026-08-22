@@ -177,7 +177,14 @@ def build_global_indices_markdown(
     if not items:
         return f"【数据获取失败】全球核心指数 — 原因：无有效全球指数数据 (来源: {source})"
 
-    valid_dates = [m["as_of"] for m in items.values() if isinstance(m, dict) and "as_of" in m]
+    valid_items = {
+        k: v for k, v in items.items()
+        if isinstance(v, dict) and v.get("latest_close") is not None
+    }
+    if not valid_items:
+        return f"【数据获取失败】全球核心指数 — 原因：无有效全球指数数据 (来源: {source})"
+
+    valid_dates = [m["as_of"] for m in valid_items.values() if isinstance(m, dict) and "as_of" in m]
     actual_as_of = max(valid_dates) if valid_dates else requested_as_of
 
     lines = [
@@ -188,37 +195,94 @@ def build_global_indices_markdown(
     ]
 
     for name, data in items.items():
-        if not isinstance(data, dict) or "latest_close" not in data:
-            lines.append(f"| {name} | - | 【数据获取失败】 | - | - | - | - |")
+        if not isinstance(data, dict) or data.get("latest_close") is None:
+            code = data.get("code", "-") if isinstance(data, dict) else "-"
+            lines.append(f"| {name} | {code} | 【数据缺失】 | - | - | - | - |")
             continue
 
+        display_name = name
         code = data.get("code", "-")
+        if display_name == "纳斯达克":
+            if "100" in str(code) or "NDX" in str(code):
+                display_name = "纳斯达克100"
+            else:
+                display_name = "纳斯达克综合"
+
         close_val = f"{data['latest_close']:.2f}"
-        d1 = f"{data['change_1d_pct']:+.2f}%"
-        d5 = f"{data['change_5d_pct']:+.2f}%"
-        d20 = f"{data['change_20d_pct']:+.2f}%"
+        d1 = f"{data['change_1d_pct']:+.2f}%" if data.get("change_1d_pct") is not None else "【数据缺失】"
+        d5 = f"{data['change_5d_pct']:+.2f}%" if data.get("change_5d_pct") is not None else "【数据缺失】"
+        d20 = f"{data['change_20d_pct']:+.2f}%" if data.get("change_20d_pct") is not None else "【数据缺失】"
         trend = data.get("trend_desc", "平稳")
-        lines.append(f"| {name} | {code} | {close_val} | {d1} | {d5} | {d20} | {trend} |")
+        lines.append(f"| {display_name} | {code} | {close_val} | {d1} | {d5} | {d20} | {trend} |")
 
     lines.append("\n### 跨市场宏观联动观察")
     # US markets check
     sp500 = items.get("标普500") or items.get("S&P 500")
-    nasdaq = items.get("纳斯达克") or items.get("Nasdaq")
-    hsi = items.get("恒生指数") or items.get("Hang Seng")
+    nasdaq = items.get("纳斯达克综合") or items.get("纳斯达克100") or items.get("纳斯达克") or items.get("Nasdaq")
+    dji = items.get("道琼斯") or items.get("DJIA") or items.get("Dow Jones")
 
-    sp_chg = sp500.get("change_1d_pct", 0) if isinstance(sp500, dict) else None
-    nasdaq_chg = nasdaq.get("change_1d_pct", 0) if isinstance(nasdaq, dict) else None
-    hsi_chg = hsi.get("change_1d_pct", 0) if isinstance(hsi, dict) else None
+    sp_chg = sp500.get("change_1d_pct") if isinstance(sp500, dict) else None
+    nasdaq_chg = nasdaq.get("change_1d_pct") if isinstance(nasdaq, dict) else None
+    dji_chg = dji.get("change_1d_pct") if isinstance(dji, dict) else None
+
+    nasdaq_label = "纳斯达克100" if (nasdaq and ("100" in str(nasdaq.get("code", "")) or "NDX" in str(nasdaq.get("code", "")))) else "纳斯达克综合"
 
     if sp_chg is not None and nasdaq_chg is not None:
         if sp_chg > 0 and nasdaq_chg > 0:
-            lines.append("- **美股外盘氛围**: 美股核心指数上扬，科技股表现强劲，为全球风险资产提供正面情绪支撑。")
+            lines.append(f"- **美股外盘氛围**: 标普500 ({sp_chg:+.2f}%) 与{nasdaq_label} ({nasdaq_chg:+.2f}%) 上扬，科技股表现活跃，为全球风险资产提供正面情绪支撑。")
         elif sp_chg < 0 and nasdaq_chg < 0:
-            lines.append("- **美股外盘氛围**: 美股出现走弱调整，需关注全球流动性收紧与外生风险传导。")
+            lines.append(f"- **美股外盘氛围**: 美股核心指数（标普500 {sp_chg:+.2f}%、{nasdaq_label} {nasdaq_chg:+.2f}%）走弱调整，需关注全球流动性收紧与外生风险传导。")
         else:
-            lines.append("- **美股外盘氛围**: 美股价值与成长板块呈现分化态势。")
-    if hsi_chg is not None:
+            lines.append(f"- **美股外盘氛围**: 美股价值与成长板块分化（标普500 {sp_chg:+.2f}%，{nasdaq_label} {nasdaq_chg:+.2f}%）。")
+    elif sp_chg is not None:
+        lines.append(f"- **美股外盘氛围**: 标普500单日涨跌幅为 {sp_chg:+.2f}%。")
+    elif nasdaq_chg is not None:
+        lines.append(f"- **美股外盘氛围**: {nasdaq_label}单日涨跌幅为 {nasdaq_chg:+.2f}%。")
+
+    # HK markets check
+    hsi = items.get("恒生指数") or items.get("Hang Seng")
+    hstech = items.get("恒生科技指数") or items.get("恒生科技") or items.get("HSTECH")
+    hsi_chg = hsi.get("change_1d_pct") if isinstance(hsi, dict) else None
+    hstech_chg = hstech.get("change_1d_pct") if isinstance(hstech, dict) else None
+
+    if hsi_chg is not None and hstech_chg is not None:
+        lines.append(f"- **港股联动纽带**: 恒生指数单日涨跌幅为 {hsi_chg:+.2f}%，恒生科技指数为 {hstech_chg:+.2f}%，反映离岸中国资产与海外科技流动性定价反应。")
+    elif hsi_chg is not None:
         lines.append(f"- **港股联动纽带**: 恒生指数单日涨跌幅为 {hsi_chg:+.2f}%，反映离岸中国资产对外部宏观及海外利率的定价反应。")
+    elif hstech_chg is not None:
+        lines.append(f"- **港股联动纽带**: 恒生科技指数单日涨跌幅为 {hstech_chg:+.2f}%。")
+
+    # Asia-Pacific check (Nikkei 225 & KOSPI)
+    nikkei = items.get("日经225") or items.get("Nikkei 225") or items.get("日经指数")
+    kospi = items.get("韩国KOSPI") or items.get("KOSPI") or items.get("首尔综合指数")
+    nikkei_chg = nikkei.get("change_1d_pct") if isinstance(nikkei, dict) else None
+    kospi_chg = kospi.get("change_1d_pct") if isinstance(kospi, dict) else None
+
+    if nikkei_chg is not None and kospi_chg is not None:
+        lines.append(f"- **亚太市场温度**: 日经225 ({nikkei_chg:+.2f}%) 与韩国KOSPI ({kospi_chg:+.2f}%) 呈现联动，作为亚太半导体供应链与制造业风险温度计。")
+    elif nikkei_chg is not None:
+        lines.append(f"- **亚太市场温度**: 日经225单日涨跌幅为 {nikkei_chg:+.2f}%，映射亚太区域市场风险偏好。")
+    elif kospi_chg is not None:
+        lines.append(f"- **亚太市场温度**: 韩国KOSPI单日涨跌幅为 {kospi_chg:+.2f}%，反映韩国科技与出口供应链景气。")
+
+    # Europe check (DAX, FTSE 100, CAC 40)
+    dax = items.get("德国DAX") or items.get("德国DAX30") or items.get("DAX")
+    ftse = items.get("英国富时100") or items.get("富时100") or items.get("FTSE")
+    cac = items.get("法国CAC40") or items.get("CAC40") or items.get("法国CAC")
+    dax_chg = dax.get("change_1d_pct") if isinstance(dax, dict) else None
+    ftse_chg = ftse.get("change_1d_pct") if isinstance(ftse, dict) else None
+    cac_chg = cac.get("change_1d_pct") if isinstance(cac, dict) else None
+
+    euro_parts = []
+    if dax_chg is not None:
+        euro_parts.append(f"德国DAX {dax_chg:+.2f}%")
+    if ftse_chg is not None:
+        euro_parts.append(f"英国富时100 {ftse_chg:+.2f}%")
+    if cac_chg is not None:
+        euro_parts.append(f"法国CAC40 {cac_chg:+.2f}%")
+
+    if euro_parts:
+        lines.append(f"- **欧洲外围环境**: 欧洲核心市场（{' / '.join(euro_parts)}）表现，映射欧洲央行政策预期与欧洲经济增长动能。")
 
     return "\n".join(lines)
 

@@ -396,6 +396,9 @@ def default_market_data_context() -> Dict[str, Any]:
             "error": "实时行情上下文不可用",
             "quote": None,
         },
+        "global_indices": None,
+        "cn_indices": None,
+        "major_assets": None,
         "source_provenance": {},
         "data_failure_ledger": [],
     }
@@ -1297,6 +1300,9 @@ def _fetch_all(
         "fund_flow_evidence": fund_flow_context,
         "daily": daily_context,
         "realtime": realtime_context,
+        "global_indices": results.get("global_indices"),
+        "cn_indices": results.get("cn_indices"),
+        "major_assets": results.get("major_assets"),
         "source_provenance": source_provenance,
         "data_failure_ledger": data_failure_ledger,
     }

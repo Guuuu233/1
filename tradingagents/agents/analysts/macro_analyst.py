@@ -166,16 +166,18 @@ def create_macro_analyst(llm, data_collector=None):
         if industry_linkage_text:
             human_content_lines.append(f"{industry_linkage_text}")
 
-        if global_indices != "无数据" or major_assets != "无数据" or cn_indices != "无数据":
-            macro_view_blocks = []
-            if global_indices != "无数据":
-                macro_view_blocks.append(f"【全球核心指数】\n{global_indices}")
-            if major_assets != "无数据":
-                macro_view_blocks.append(f"【大类资产与宏观商品】\n{major_assets}")
-            if cn_indices != "无数据":
-                macro_view_blocks.append(f"【国内大盘核心指数】\n{cn_indices}")
-            if macro_view_blocks:
-                human_content_lines.append("\n\n".join(macro_view_blocks))
+        macro_view_blocks = []
+        if global_indices != "无数据":
+            macro_view_blocks.append(f"【全球核心指数】\n{global_indices}")
+        else:
+            macro_view_blocks.append("【全球核心指数】\n【数据缺失】全球核心市场指数数据未获取到")
+
+        if major_assets != "无数据":
+            macro_view_blocks.append(f"【大类资产与宏观商品】\n{major_assets}")
+        if cn_indices != "无数据":
+            macro_view_blocks.append(f"【国内大盘核心指数】\n{cn_indices}")
+        if macro_view_blocks:
+            human_content_lines.append("\n\n".join(macro_view_blocks))
 
         if northbound_flow != "无数据":
             human_content_lines.append(f"【北向资金与跨市场流动性】\n{northbound_flow}")
