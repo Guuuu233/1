@@ -121,10 +121,12 @@ class YFinanceProvider(BaseMarketDataProvider):
 
         indices_map = {
             "标普500": {"symbol": "^GSPC", "code": "^GSPC"},
-            "纳斯达克": {"symbol": "^IXIC", "code": "^IXIC"},
+            "纳斯达克综合": {"symbol": "^IXIC", "code": "^IXIC"},
             "道琼斯": {"symbol": "^DJI", "code": "^DJI"},
             "恒生指数": {"symbol": "^HSI", "code": "^HSI"},
+            "恒生科技指数": {"symbol": "^HSTECH", "code": "^HSTECH"},
             "日经225": {"symbol": "^N225", "code": "^N225"},
+            "韩国KOSPI": {"symbol": "^KS11", "code": "^KS11"},
             "德国DAX": {"symbol": "^GDAXI", "code": "^GDAXI"},
             "法国CAC40": {"symbol": "^FCHI", "code": "^FCHI"},
             "英国富时100": {"symbol": "^FTSE", "code": "^FTSE"},
