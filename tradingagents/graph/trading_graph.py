@@ -40,6 +40,7 @@ from .intent_parser import parse_intent
 from .setup import GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
+from .report_quality_gate import apply_report_quality_gate
 from .signal_processing import SignalProcessor
 
 
@@ -348,6 +349,7 @@ class TradingAgentsGraph:
 
         # Store current state for reflection
         self.curr_state = final_state
+        apply_report_quality_gate(final_state)
 
         # Log state
         self._log_state(trade_date, final_state)
@@ -425,6 +427,7 @@ class TradingAgentsGraph:
 
     def _build_horizon_result(self, horizon: str, final_state: Dict[str, Any]) -> Dict[str, Any]:
         """Extract a compact result dict from a completed graph state."""
+        apply_report_quality_gate(final_state)
         market_context = final_state.get("market_context", {})
         trade_date = final_state.get("trade_date", "")
         market_data_context = final_state.get("market_data_context", {})
