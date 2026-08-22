@@ -158,6 +158,88 @@ def check_global_indices_compliance(
     return passed, reasons
 
 
+def is_industry_linkage_present(
+    market_data_context: Optional[Dict[str, Any]],
+) -> bool:
+    """Determine whether industry_linkage exists in market_data_context."""
+    if not isinstance(market_data_context, dict):
+        return False
+
+    linkage = market_data_context.get("industry_linkage")
+    if isinstance(linkage, dict):
+        if (
+            linkage.get("industry_name")
+            or linkage.get("upstream_cost")
+            or linkage.get("downstream_demand")
+            or linkage.get("international_benchmark")
+        ):
+            return True
+
+    provenance = market_data_context.get("source_provenance")
+    if isinstance(provenance, dict):
+        ind_prov = provenance.get("industry_linkage")
+        if isinstance(ind_prov, dict) and ind_prov.get("status") in ("available", "partial"):
+            return True
+
+    return False
+
+
+def check_industry_linkage_compliance(
+    macro_report: str = "",
+    fundamentals_report: str = "",
+    market_data_context: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, List[str]]:
+    """Check if report contains industry linkage data section or explicit indicators when context has industry_linkage."""
+    if not is_industry_linkage_present(market_data_context):
+        return True, []
+
+    linkage = (
+        market_data_context.get("industry_linkage")
+        if isinstance(market_data_context, dict)
+        else None
+    )
+
+    indicator_names: List[str] = []
+    if isinstance(linkage, dict):
+        for section in ("upstream_cost", "downstream_demand", "international_benchmark"):
+            items = linkage.get(section)
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        name = item.get("name")
+                        if name and isinstance(name, str) and len(name.strip()) >= 2:
+                            indicator_names.append(name.strip())
+                        symbol = item.get("symbol")
+                        if symbol and isinstance(symbol, str) and len(symbol.strip()) >= 2:
+                            indicator_names.append(symbol.strip())
+
+    def _satisfies_linkage(text: str) -> bool:
+        if not text or not isinstance(text, str):
+            return False
+        if "【产业链联想数据】" in text:
+            return True
+        if "产业链" in text:
+            if any(marker in text for marker in ALLOWED_EXPLICIT_MISSING_MARKERS):
+                return True
+            if indicator_names and any(name in text for name in indicator_names):
+                return True
+            common_indicators = (
+                "铜价", "LME", "碳酸锂", "原油", "三星", "台积电",
+                "出货量", "渗透率", "交付量", "指数", "价格", "对标"
+            )
+            if any(ind in text for ind in common_indicators):
+                return True
+        return False
+
+    if _satisfies_linkage(macro_report) or _satisfies_linkage(fundamentals_report):
+        return True, []
+
+    return (
+        False,
+        ["context包含产业链数据但宏观与基本面报告均缺少【产业链联想数据】或明确产业链指标/数据缺失标注"],
+    )
+
+
 def check_report_quality(
     macro_report: str = "",
     fundamentals_report: str = "",
@@ -168,21 +250,29 @@ def check_report_quality(
     if not target_text and isinstance(fundamentals_report, str) and fundamentals_report.strip():
         target_text = fundamentals_report.strip()
 
-    if not target_text:
-        # No report text available to validate
-        return True, []
-
     all_reasons: List[str] = []
 
     # 1. Keyword validation
-    kw_passed, kw_reasons = check_report_keywords(target_text)
-    if not kw_passed:
-        all_reasons.extend(kw_reasons)
+    if target_text:
+        kw_passed, kw_reasons = check_report_keywords(target_text)
+        if not kw_passed:
+            all_reasons.extend(kw_reasons)
 
-    # 2. Global market rewrite compliance
-    gi_passed, gi_reasons = check_global_indices_compliance(target_text, market_data_context)
-    if not gi_passed:
-        all_reasons.extend(gi_reasons)
+        # 2. Global market rewrite compliance
+        gi_passed, gi_reasons = check_global_indices_compliance(target_text, market_data_context)
+        if not gi_passed:
+            all_reasons.extend(gi_reasons)
+    elif not is_industry_linkage_present(market_data_context):
+        return True, []
+
+    # 3. Industry linkage compliance
+    il_passed, il_reasons = check_industry_linkage_compliance(
+        macro_report=macro_report,
+        fundamentals_report=fundamentals_report,
+        market_data_context=market_data_context,
+    )
+    if not il_passed:
+        all_reasons.extend(il_reasons)
 
     return (len(all_reasons) == 0, all_reasons)
 
@@ -205,6 +295,15 @@ def apply_report_quality_gate(
             if isinstance(sub_val, dict) and isinstance(sub_val.get("market_data_context"), dict):
                 market_data_context = sub_val["market_data_context"]
                 break
+
+    if not macro_report or not fundamentals_report:
+        for sub_key in ("short_term", "medium_term", "result_data"):
+            sub_val = state_or_result.get(sub_key)
+            if isinstance(sub_val, dict):
+                if not macro_report and sub_val.get("macro_report"):
+                    macro_report = sub_val["macro_report"]
+                if not fundamentals_report and sub_val.get("fundamentals_report"):
+                    fundamentals_report = sub_val["fundamentals_report"]
 
     passed, failure_reasons = check_report_quality(
         macro_report=macro_report,

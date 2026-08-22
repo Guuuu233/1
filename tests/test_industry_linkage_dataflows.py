@@ -287,3 +287,104 @@ class TestIndustryLinkageMap:
         assert "半导体与集成电路" in industries
         assert "消费电子与智能终端" in industries
         assert "新能源汽车与智能汽车" in industries
+
+
+class TestIndustryLinkageMarketDataContextFlows:
+    """测试产业链数据进入 market_data_context、source_provenance 与 failure_ledger 的数据流 (DAV-311)。"""
+
+    def test_default_market_data_context_contains_industry_linkage(self):
+        from tradingagents.graph.data_collector import default_market_data_context
+
+        ctx = default_market_data_context()
+        assert "industry_linkage" in ctx
+        assert ctx["industry_linkage"] is None
+
+    def test_source_provenance_and_ledger_for_available_and_partial_linkage(self):
+        from tradingagents.graph.data_collector import _build_source_provenance, _build_data_failure_ledger
+
+        # 1. 结构化部分可用产业链数据
+        partial_linkage = {
+            "industry_name": "消费电子与智能终端",
+            "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5, "status": "active"}],
+            "downstream_demand": [{"name": "全球智能手机出货量", "current_value": None, "status": "manual"}],
+            "international_benchmark": [{"name": "三星电子股价", "current_value": 52000.0, "status": "active"}],
+            "as_of": "2026-08-20",
+        }
+        results = {"industry_linkage": partial_linkage}
+        provenance = _build_source_provenance(results, "2026-08-20", daily_as_of="2026-08-20")
+
+        assert "industry_linkage" in provenance
+        prov = provenance["industry_linkage"]
+        assert prov["requested_as_of"] == "2026-08-20"
+        assert prov["actual_as_of"] == "2026-08-20"
+        assert prov["as_of"] == "2026-08-20"
+        assert prov["status"] == "partial"
+        assert "gap" not in prov
+
+        ledger = _build_data_failure_ledger(results)
+        assert not any(entry.get("source") == "industry_linkage" for entry in ledger)
+
+    def test_source_provenance_and_ledger_for_unavailable_linkage(self):
+        from tradingagents.graph.data_collector import _build_source_provenance, _build_data_failure_ledger
+
+        # 完全失败时 (None 或 error string)
+        results = {"industry_linkage": None}
+        provenance = _build_source_provenance(results, "2026-08-20", daily_as_of="2026-08-20")
+
+        assert "industry_linkage" in provenance
+        prov = provenance["industry_linkage"]
+        assert prov["requested_as_of"] == "2026-08-20"
+        assert prov["actual_as_of"] is None
+        assert prov["status"] == "unavailable"
+        assert "gap" in prov
+
+    def test_anti_lookahead_discipline_for_linkage_date(self):
+        from tradingagents.graph.data_collector import _build_source_provenance
+
+        # 当产业链数据日期超过 analysis_baseline_date 时，不得前视未来日期
+        future_linkage = {
+            "industry_name": "消费电子与智能终端",
+            "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5}],
+            "as_of": "2026-08-25",  # 晚于 requested_as_of 2026-08-20
+        }
+        results = {"industry_linkage": future_linkage}
+        provenance = _build_source_provenance(results, "2026-08-20", daily_as_of="2026-08-20")
+        assert provenance["industry_linkage"]["actual_as_of"] is None
+        assert provenance["industry_linkage"]["as_of"] is None
+
+    def test_collector_fetch_all_populates_both_top_level_and_context(self):
+        from unittest.mock import patch
+        from tradingagents.graph import data_collector
+
+        mock_linkage = {
+            "industry_name": "消费电子与智能终端",
+            "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5, "status": "active"}],
+            "downstream_demand": [{"name": "出货量", "current_value": None, "status": "manual"}],
+            "international_benchmark": [{"name": "三星电子", "current_value": 50000.0, "status": "active"}],
+            "as_of": "2026-08-20",
+        }
+
+        mock_provider = data_collector.IndustryLinkageProvider()
+        with patch.object(data_collector, "_safe", return_value="dummy"), \
+             patch.object(data_collector, "FETCH_ALL_TIMEOUT", 1), \
+             patch.object(mock_provider, "get_industry_linkage", return_value=mock_linkage):
+            res = data_collector._fetch_all("000725.SZ", "2026-08-20", industry_provider=mock_provider)
+
+        # 1. 顶层保留 results["industry_linkage"]
+        assert "industry_linkage" in res
+        assert res["industry_linkage"] == mock_linkage
+
+        # 2. context 写入 market_data_context.industry_linkage
+        ctx = res["market_data_context"]
+        assert "industry_linkage" in ctx
+        assert ctx["industry_linkage"] == mock_linkage
+
+        # 3. source_provenance 正确
+        prov = ctx["source_provenance"]["industry_linkage"]
+        assert prov["requested_as_of"] == "2026-08-20"
+        assert prov["actual_as_of"] == "2026-08-20"
+        assert prov["status"] == "partial"
+
+        # 4. failure_ledger 中无 industry_linkage 错误（因为已成功获取部分有效数据）
+        assert not any(e.get("source") == "industry_linkage" for e in ctx["data_failure_ledger"])
+

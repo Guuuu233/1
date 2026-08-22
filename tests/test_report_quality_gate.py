@@ -271,3 +271,134 @@ class TestReportQualityGate:
         # Completed horizon result is still returned normally
         assert result["horizon"] == "short"
         assert result["final_trade_decision"] == "HOLD"
+
+    def test_industry_linkage_with_title_passes(self):
+        macro_text = (
+            "【全球宏观与跨市场联动】\n"
+            "美股标普500指数上涨0.8%，恒生指数上涨1.2%。海外科技板块向国内形成积极传导与联动。\n"
+            "【产业链联想数据】：消费电子与智能终端\n"
+            "- 上游成本端核心指标：LME铜价 9123.5 美元/吨"
+        )
+        ctx = {
+            "industry_linkage": {
+                "industry_name": "消费电子与智能终端",
+                "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5}],
+            },
+            "data_failure_ledger": [],
+        }
+        passed, reasons = check_report_quality(macro_report=macro_text, market_data_context=ctx)
+        assert passed is True
+        assert reasons == []
+
+    def test_industry_linkage_with_indicator_name_passes(self):
+        macro_text = (
+            "【全球宏观与跨市场联动】\n"
+            "美股标普500指数上涨0.8%，对A股形成传导与联动。\n"
+            "从产业链维度看，上游LME铜价报9123.5美元/吨，成本压力有所缓解。"
+        )
+        ctx = {
+            "industry_linkage": {
+                "industry_name": "消费电子与智能终端",
+                "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5}],
+            },
+            "data_failure_ledger": [],
+        }
+        passed, reasons = check_report_quality(macro_report=macro_text, market_data_context=ctx)
+        assert passed is True
+        assert reasons == []
+
+    def test_industry_linkage_with_missing_marker_passes(self):
+        macro_text = (
+            "【全球宏观与跨市场联动】\n"
+            "海外市场传导效应显著，跨市场联动平稳。\n"
+            "当前产业链数据【数据缺失】，未获取到最新有效指标。"
+        )
+        ctx = {
+            "industry_linkage": {
+                "industry_name": "消费电子与智能终端",
+                "upstream_cost": [{"name": "LME铜价", "current_value": None}],
+            },
+            "data_failure_ledger": [],
+        }
+        passed, reasons = check_report_quality(macro_report=macro_text, market_data_context=ctx)
+        assert passed is True
+        assert reasons == []
+
+    def test_industry_linkage_in_fundamentals_report_passes(self):
+        macro_text = (
+            "【全球宏观与跨市场联动】\n"
+            "美股标普500指数上涨0.8%，对国内市场形成积极传导与联动。"
+        )
+        fund_text = (
+            "基本面分析：\n"
+            "【产业链联想数据】：消费电子与智能终端\n"
+            "- 上游成本端核心指标：LME铜价"
+        )
+        ctx = {
+            "industry_linkage": {
+                "industry_name": "消费电子与智能终端",
+                "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5}],
+            },
+            "data_failure_ledger": [],
+        }
+        passed, reasons = check_report_quality(
+            macro_report=macro_text,
+            fundamentals_report=fund_text,
+            market_data_context=ctx,
+        )
+        assert passed is True
+        assert reasons == []
+
+    def test_industry_linkage_present_but_both_reports_deleted_title_fails_and_records_ledger(self):
+        macro_text = (
+            "【全球宏观与跨市场联动】\n"
+            "美股标普500指数上涨0.8%，对国内市场形成积极传导与联动效应。"
+        )
+        fund_text = (
+            "基本面分析：公司主营业务收入稳步增长，现金流充裕。"
+        )
+        ctx = {
+            "industry_linkage": {
+                "industry_name": "消费电子与智能终端",
+                "upstream_cost": [{"name": "LME铜价", "current_value": 9123.5}],
+            },
+            "data_failure_ledger": [],
+        }
+        passed, reasons = check_report_quality(
+            macro_report=macro_text,
+            fundamentals_report=fund_text,
+            market_data_context=ctx,
+        )
+        assert passed is False
+        assert any("产业链" in r for r in reasons)
+
+        state = {
+            "macro_report": macro_text,
+            "fundamentals_report": fund_text,
+            "market_data_context": ctx,
+        }
+        gate_passed = apply_report_quality_gate(state)
+        assert gate_passed is False
+        gate_entries = [
+            e for e in state["market_data_context"]["data_failure_ledger"]
+            if e.get("source") == "report_quality_gate"
+        ]
+        assert len(gate_entries) >= 1
+        assert "产业链" in gate_entries[0]["reason"]
+
+    def test_no_industry_linkage_in_context_does_not_require_linkage(self):
+        macro_text = (
+            "【全球宏观与跨市场联动】\n"
+            "美股标普500指数上涨0.8%，对国内市场形成积极传导与联动。"
+        )
+        ctx = {
+            "industry_linkage": None,
+            "data_failure_ledger": [],
+        }
+        passed, reasons = check_report_quality(
+            macro_report=macro_text,
+            market_data_context=ctx,
+        )
+        assert passed is True
+        assert reasons == []
+

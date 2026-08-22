@@ -399,6 +399,7 @@ def default_market_data_context() -> Dict[str, Any]:
         "global_indices": None,
         "cn_indices": None,
         "major_assets": None,
+        "industry_linkage": None,
         "source_provenance": {},
         "data_failure_ledger": [],
     }
@@ -497,6 +498,7 @@ _DATA_FAILURE_SOURCE_ORDER = (
     "balance_sheet",
     "cashflow",
     "income_statement",
+    "industry_linkage",
     "realtime",
 )
 _DATA_FAILURE_MARKERS = (
@@ -614,9 +616,21 @@ _SOURCE_AS_OF_PATTERNS = (
 def _extract_source_as_of(value: Any, requested_as_of: str) -> Optional[str]:
     """Extract the latest explicitly reported source date, excluding request windows."""
     if isinstance(value, dict):
-        for key in ("as_of", "quote_as_of", "data_as_of"):
+        for key in ("as_of", "actual_as_of", "quote_as_of", "data_as_of"):
             candidate = value.get(key)
             match = re.search(r"20\d{2}-\d{2}-\d{2}", str(candidate or ""))
+            if match and match.group(0) <= requested_as_of:
+                return match.group(0)
+        cached_at = value.get("cached_at")
+        if isinstance(cached_at, (int, float)):
+            try:
+                dt_str = datetime.fromtimestamp(cached_at).strftime("%Y-%m-%d")
+                if dt_str <= requested_as_of:
+                    return dt_str
+            except Exception:
+                pass
+        elif isinstance(cached_at, str):
+            match = re.search(r"20\d{2}-\d{2}-\d{2}", cached_at)
             if match and match.group(0) <= requested_as_of:
                 return match.group(0)
         return None
@@ -629,6 +643,51 @@ def _extract_source_as_of(value: Any, requested_as_of: str) -> Optional[str]:
     return max(dates) if dates else None
 
 
+def _determine_industry_linkage_status(value: Any) -> Tuple[str, Optional[str]]:
+    """Determine status (available, partial, unavailable) and failure reason for industry_linkage."""
+    if value is None:
+        return "unavailable", "未映射行业或数据源不可用"
+    if isinstance(value, str):
+        return "unavailable", value or "接口调用失败"
+    if not isinstance(value, dict):
+        return "unavailable", "返回结构异常"
+
+    if "status" in value and value["status"] in ("available", "partial", "unavailable", "failed"):
+        st = "unavailable" if value["status"] == "failed" else value["status"]
+        return st, value.get("gap") or value.get("reason")
+
+    all_inds: list[dict] = []
+    for key in ("upstream_cost", "downstream_demand", "international_benchmark"):
+        inds = value.get(key)
+        if isinstance(inds, list):
+            for ind in inds:
+                if isinstance(ind, dict):
+                    all_inds.append(ind)
+                elif hasattr(ind, "model_dump"):
+                    all_inds.append(ind.model_dump())
+
+    if not all_inds:
+        if value.get("industry_name"):
+            return "partial", None
+        return "unavailable", "未包含有效产业链指标数据"
+
+    valid_count = 0
+    for ind in all_inds:
+        if ind.get("current_value") is not None:
+            valid_count += 1
+        elif ind.get("status") == "active" and ind.get("trend") not in ("数据缺失", None, ""):
+            valid_count += 1
+
+    if valid_count == len(all_inds):
+        return "available", None
+    elif valid_count > 0:
+        return "partial", None
+    else:
+        if value.get("industry_name"):
+            return "partial", None
+        return "unavailable", "所有指标均无有效数据"
+
+
 def _build_source_provenance(
     results: Dict[str, Any],
     requested_as_of: str,
@@ -637,12 +696,27 @@ def _build_source_provenance(
     """Persist per-source cutoff evidence beside the compact failure ledger."""
     provenance: Dict[str, Dict[str, Any]] = {}
     for source, value in results.items():
+        if source == "industry_linkage":
+            status, reason = _determine_industry_linkage_status(value)
+            as_of = _extract_source_as_of(value, requested_as_of)
+            entry: Dict[str, Any] = {
+                "requested_as_of": requested_as_of,
+                "actual_as_of": as_of,
+                "as_of": as_of,
+                "status": status,
+            }
+            if status == "unavailable":
+                entry["gap"] = f"【数据获取失败】industry_linkage：{reason or '数据源不可用'}"
+            provenance[str(source)] = entry
+            continue
+
         status = _classify_failure_value(value) or "available"
         as_of = _extract_source_as_of(value, requested_as_of)
         if source == "stock_data":
             as_of = daily_as_of
-        entry: Dict[str, Any] = {
+        entry = {
             "requested_as_of": requested_as_of,
+            "actual_as_of": as_of,
             "as_of": as_of,
             "status": status,
         }
@@ -1162,6 +1236,20 @@ def _fetch_all(
         # is finite and keeps stuck worker/socket threads from outliving the job.
         executor.shutdown(wait=True, cancel_futures=True)
 
+    # ── 产业链数据层采集 (MVP: 消费电子 / 新能源车 / 27 行业) ─────────────
+    industry = _map_stock_to_industry(ticker)
+    if industry:
+        provider = industry_provider or _DEFAULT_INDUSTRY_LINKAGE_PROVIDER
+        try:
+            results["industry_linkage"] = provider.get_industry_linkage(
+                industry, as_of=norm_trade_date
+            )
+        except Exception as exc:
+            logger.warning("  [Warning] 产业链数据采集异常 (%s, %s): %s", ticker, industry, exc)
+            results["industry_linkage"] = None
+    else:
+        results["industry_linkage"] = None
+
     data_failure_ledger = _build_data_failure_ledger(results)
 
     fund_flow_value = results.get("fund_flow_individual")
@@ -1303,6 +1391,7 @@ def _fetch_all(
         "global_indices": results.get("global_indices"),
         "cn_indices": results.get("cn_indices"),
         "major_assets": results.get("major_assets"),
+        "industry_linkage": results.get("industry_linkage"),
         "source_provenance": source_provenance,
         "data_failure_ledger": data_failure_ledger,
     }
@@ -1351,20 +1440,6 @@ def _fetch_all(
             results["vpa_indicators"] = "VPA 数据不足"
     except Exception as e:
         results["vpa_indicators"] = f"VPA 计算失败：{e}"
-
-    # ── 产业链数据层采集 (MVP: 消费电子 / 新能源车) ─────────────
-    industry = _map_stock_to_industry(ticker)
-    if industry:
-        provider = industry_provider or _DEFAULT_INDUSTRY_LINKAGE_PROVIDER
-        try:
-            results["industry_linkage"] = provider.get_industry_linkage(
-                industry, as_of=norm_trade_date
-            )
-        except Exception as exc:
-            logger.warning("  [Warning] 产业链数据采集异常 (%s, %s): %s", ticker, industry, exc)
-            results["industry_linkage"] = None
-    else:
-        results["industry_linkage"] = None
 
     logger.debug("[Timer] Total Data Collection for %s took %.2fs", ticker, time.time() - fetch_start)
     return results
