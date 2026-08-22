@@ -445,6 +445,34 @@ def test_volume_price_analyst_receives_phase1_reports():
         assert "市场热情回暖" in human_msg.content
 
 
+def test_volume_price_analyst_missing_phase1_reports_shows_missing():
+    """量价分析师未提供阶段一产物时，prompt 显式标注【数据缺失】。"""
+    received_messages = []
+    mock_llm = MagicMock()
+    mock_llm.model_name = "test_model"
+
+    async def _mock_astream(messages):
+        received_messages.extend(messages)
+        yield SimpleNamespace(content='<!-- VERDICT: {"direction": "中性", "reason": "缺数据"} -->')
+
+    mock_llm.astream = _mock_astream
+    collector = _make_mock_collector()
+
+    with patch("tradingagents.agents.analysts.volume_price_analyst.get_cn_stock_name", return_value="贵州茅台"):
+        node = create_volume_price_analyst(mock_llm, data_collector=collector)
+        state = {
+            "trade_date": "2026-07-31",
+            "company_of_interest": "600519",
+        }
+
+        asyncio.run(node(state))
+
+        human_msg = next(m for m in received_messages if isinstance(m, HumanMessage))
+        assert "【数据缺失】宏观板块分析报告缺失" in human_msg.content
+        assert "【数据缺失】大盘市场技术分析报告缺失" in human_msg.content
+        assert "【数据缺失】市场情绪舆情分析报告缺失" in human_msg.content
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. 端到端执行顺序测试（真实编译图）
 # ─────────────────────────────────────────────────────────────────────────────

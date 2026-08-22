@@ -15,6 +15,7 @@ import pytest
 
 from tradingagents.prompts import get_prompt
 from tradingagents.prompts.zh import PROMPTS as ZH_PROMPTS
+from tradingagents.prompts.en import PROMPTS as EN_PROMPTS
 from tradingagents.agents.utils.agent_states import extract_verdict
 from tradingagents.agents.analysts.macro_analyst import create_macro_analyst
 from tradingagents.agents.analysts.fundamentals_analyst import create_fundamentals_analyst
@@ -22,6 +23,7 @@ from tradingagents.agents.analysts.news_analyst import create_news_analyst
 from tradingagents.agents.analysts.social_media_analyst import create_social_media_analyst
 from tradingagents.agents.analysts.market_analyst import create_market_analyst
 from tradingagents.agents.analysts.smart_money_analyst import create_smart_money_analyst
+from tradingagents.agents.analysts.volume_price_analyst import create_volume_price_analyst
 from tradingagents.graph.data_collector import DataCollector
 
 
@@ -32,6 +34,7 @@ ANALYST_PROMPT_KEYS = [
     "social_system_message",
     "market_system_message",
     "smart_money_system_message",
+    "volume_price_system_message",
 ]
 
 
@@ -152,14 +155,71 @@ def test_fundamentals_system_message_deep_framework():
     assert "不要用 Markdown 表格" in prompt
 
 
-@pytest.mark.parametrize("key", ["news_system_message", "social_system_message", "market_system_message", "smart_money_system_message"])
+@pytest.mark.parametrize("key", ["news_system_message", "social_system_message", "market_system_message", "smart_money_system_message", "volume_price_system_message"])
 def test_what_why_sowhat_whatnext_framework_present(key):
-    """T4: news, social, market, and smart_money must inject the What/Why/SoWhat/WhatNext framework."""
+    """T4: news, social, market, smart_money, and volume_price must inject the What/Why/SoWhat/WhatNext framework."""
     prompt = ZH_PROMPTS[key]
     assert "What" in prompt
     assert "Why" in prompt
     assert "So What" in prompt or "SoWhat" in prompt
     assert "What Next" in prompt or "WhatNext" in prompt
+
+
+def test_fundamentals_no_impossible_news_analyst_promise():
+    """DAV-325: Fundamentals prompt must not falsely promise extraction from concurrent news analyst report.
+    It should extract from Phase 1 macro/sentiment reports or direct news data."""
+    prompt_zh = ZH_PROMPTS["fundamentals_system_message"]
+    assert "新闻分析师报告" not in prompt_zh
+    assert any(term in prompt_zh for term in ("阶段一宏观", "直接新闻数据", "阶段一宏观/情绪分析师报告"))
+
+
+def test_volume_price_system_message_deep_framework():
+    """DAV-325: volume_price_system_message must include What/Why/SoWhat/WhatNext,
+    Wyckoff laws, false breakout/anomaly detection, Phase 1 cross-validation,
+    real data principle, and strict data missing discipline."""
+    prompt = ZH_PROMPTS["volume_price_system_message"]
+
+    # 1. 深度分析框架 (What / Why / SoWhat / WhatNext)
+    assert "What" in prompt and "客观K线量能事实" in prompt
+    assert "Why" in prompt and "供求关系与筹码博弈动因" in prompt
+    assert ("So What" in prompt or "SoWhat" in prompt) and "阶段定性与假突破/异常识别" in prompt
+    assert ("What Next" in prompt or "WhatNext" in prompt) and "推演验证、失效条件与阶段一跨报告交叉验证" in prompt
+
+    # 2. 威科夫三大定律与理论
+    assert any(term in prompt for term in ("供求定律", "因果定律", "投入产出定律"))
+    assert any(term in prompt for term in ("吸筹", "供给测试", "派筹", "需求测试", "抛售高峰", "买入高峰"))
+
+    # 3. 阶段一跨报告交叉验证强制要求（确认/冲突/无关）
+    assert "阶段一分析师产物" in prompt or "阶段一" in prompt
+    assert "确认" in prompt and "冲突" in prompt and "无关" in prompt
+    assert "不得让宏观叙事覆盖量价事实" in prompt or "宏观叙事" in prompt
+
+    # 4. 未来推演、验证条件、失效条件与时间窗口
+    assert "验证条件" in prompt
+    assert "失效条件" in prompt
+    assert "时间窗口" in prompt or "1-5" in prompt
+
+    # 5. 数据真实性与【数据缺失】铁律（无 volume 严禁推断吸筹/派发）
+    assert "真实存在原则" in prompt or "真实存在于输入数据中" in prompt
+    assert "严禁从无 volume 推断" in prompt or "严禁在无成交量" in prompt or "从无 volume" in prompt
+    assert "【数据缺失】" in prompt
+    assert "fail-closed" in prompt or "数据缺失" in prompt
+
+
+def test_volume_price_missing_volume_negative_and_fail_closed():
+    """DAV-325: Verify volume_price prompt enforces fail-closed and forbids volume-less speculation."""
+    prompt_zh = ZH_PROMPTS["volume_price_system_message"]
+    prompt_en = EN_PROMPTS["volume_price_system_message"]
+
+    # Chinese prompt constraints
+    assert "严禁从无 volume 推断" in prompt_zh or "无 volume" in prompt_zh
+    assert "【数据缺失】" in prompt_zh
+    assert "不得伪造引用" in prompt_zh
+
+    # English prompt constraints
+    assert "Never infer or guess accumulation, distribution" in prompt_en
+    assert "[DATA MISSING]" in prompt_en
+    assert "CONFIRMED" in prompt_en and "CONFLICTING" in prompt_en and "IRRELEVANT" in prompt_en
 
 
 def test_news_system_message_deep_framework():
@@ -307,6 +367,7 @@ def _stub_collector_pool():
         "balance_sheet": "资产负债率 35%，货币资金充裕，有息负债率低于 5%",
         "cashflow": "经营活动现金流净额 15 亿元，自由现金流充沛",
         "income_statement": "营业收入 100 亿元，归母净利润 25 亿元",
+        "vpa_indicators": "放量突破关键阻力位，威科夫阶段处于拉升期",
         "_data_window": "14天",
         "_horizon": "short",
     }
@@ -321,6 +382,7 @@ def _stub_collector_pool():
         (create_social_media_analyst, "sentiment_report", "social_media_analyst"),
         (create_market_analyst, "market_report", "market_analyst"),
         (create_smart_money_analyst, "smart_money_report", "smart_money_analyst"),
+        (create_volume_price_analyst, "volume_price_report", "volume_price_analyst"),
     ],
 )
 def test_analyst_nodes_end_to_end_with_new_prompts(analyst_factory, report_key, expected_agent):
