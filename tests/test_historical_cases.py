@@ -59,6 +59,7 @@ from tradingagents.knowledge.historical_cases import (
     DATA_MISSING_PLACEHOLDER,
     HISTORICAL_CASE_MISSING_BLOCK,
     HISTORICAL_CASE_MISSING_FALLBACK,
+    backfill_pending_cases,
     calculate_t1_return,
     evaluate_prediction_error,
     extract_claims_from_report,
@@ -682,3 +683,386 @@ def test_report_service_create_report_hooks_historical_case(test_db_session):
         assert case.industry == "liquor_beverage"
         assert case.actual_outcome == "+2.50%"
         assert case.claims[0]["claim"] == "端午回款动销良好"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. 历史案例 T+1 实际值回填测试 (DAV-287 回填闭环补全)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_backfill_pending_cases_success(test_db_session):
+    """验证回填成功路径：扫描 actual_outcome=【数据缺失】且 eval_date <= as_of 的案例，重算并更新。"""
+    case = HistoricalCaseDB(
+        id="case-backfill-1",
+        symbol="000725",
+        industry="electronics_semiconductor",
+        trade_date="2024-05-10",
+        eval_date="2024-05-13",
+        decision="BUY",
+        direction="看多",
+        confidence=70,
+        claims=[{"claim": "面板价格筑底回升"}],
+        actual_change_pct=None,
+        actual_outcome=DATA_MISSING_PLACEHOLDER,
+        is_error=None,
+    )
+    test_db_session.add(case)
+    test_db_session.commit()
+
+    with patch("tradingagents.knowledge.historical_cases.calculate_t1_return", return_value=("2024-05-13", 3.25, "+3.25%")):
+        stats = backfill_pending_cases(test_db_session, as_of="2024-05-15")
+
+        assert stats["total_scanned"] == 1
+        assert stats["backfilled"] == 1
+        assert stats["still_missing"] == 0
+        assert stats["skipped_future"] == 0
+
+        # 验证数据库中记录已更新
+        updated = test_db_session.query(HistoricalCaseDB).filter(HistoricalCaseDB.id == "case-backfill-1").first()
+        assert updated.actual_outcome == "+3.25%"
+        assert updated.actual_change_pct == 3.25
+        assert updated.is_error is False
+        assert updated.eval_date == "2024-05-13"
+
+
+def test_backfill_pending_cases_eval_date_future_skipped(test_db_session):
+    """验证 eval_date 未到（eval_date > as_of）跳过回填，保持【数据缺失】。"""
+    case = HistoricalCaseDB(
+        id="case-future-1",
+        symbol="000725",
+        industry="electronics_semiconductor",
+        trade_date="2026-08-22",
+        eval_date="2026-08-24",
+        decision="BUY",
+        direction="看多",
+        confidence=70,
+        actual_change_pct=None,
+        actual_outcome=DATA_MISSING_PLACEHOLDER,
+        is_error=None,
+    )
+    test_db_session.add(case)
+    test_db_session.commit()
+
+    with patch("tradingagents.knowledge.historical_cases.calculate_t1_return") as mock_calc:
+        stats = backfill_pending_cases(test_db_session, as_of="2026-08-22")
+
+        assert stats["total_scanned"] == 1
+        assert stats["skipped_future"] == 1
+        assert stats["backfilled"] == 0
+        assert stats["still_missing"] == 0
+        mock_calc.assert_not_called()
+
+        updated = test_db_session.query(HistoricalCaseDB).filter(HistoricalCaseDB.id == "case-future-1").first()
+        assert updated.actual_outcome == DATA_MISSING_PLACEHOLDER
+        assert updated.actual_change_pct is None
+        assert updated.is_error is None
+
+
+def test_backfill_pending_cases_market_data_missing_remains_missing(test_db_session):
+    """验证仍取不到行情时保持【数据缺失】并记录失败台账，禁止填 0 或臆造。"""
+    case = HistoricalCaseDB(
+        id="case-missing-quote-1",
+        symbol="600000",
+        industry="banking",
+        trade_date="2024-05-10",
+        eval_date="2024-05-13",
+        decision="BUY",
+        direction="看多",
+        confidence=65,
+        actual_change_pct=None,
+        actual_outcome=DATA_MISSING_PLACEHOLDER,
+        is_error=None,
+    )
+    test_db_session.add(case)
+    test_db_session.commit()
+
+    with patch("tradingagents.knowledge.historical_cases.calculate_t1_return", return_value=("2024-05-13", None, DATA_MISSING_PLACEHOLDER)):
+        stats = backfill_pending_cases(test_db_session, as_of="2024-05-15")
+
+        assert stats["total_scanned"] == 1
+        assert stats["backfilled"] == 0
+        assert stats["still_missing"] == 1
+
+        updated = test_db_session.query(HistoricalCaseDB).filter(HistoricalCaseDB.id == "case-missing-quote-1").first()
+        assert updated.actual_outcome == DATA_MISSING_PLACEHOLDER
+        assert updated.actual_change_pct is None
+        assert updated.is_error is None
+
+
+def test_backfill_pending_cases_is_error_recomputed(test_db_session):
+    """验证回填成功后重算 is_error（看多/看空/中性各类偏差与一致场景）。"""
+    cases = [
+        HistoricalCaseDB(
+            id="c-err-bull-wrong",
+            symbol="000001",
+            trade_date="2024-05-10",
+            eval_date="2024-05-13",
+            decision="BUY",
+            direction="看多",
+            actual_outcome=DATA_MISSING_PLACEHOLDER,
+        ),
+        HistoricalCaseDB(
+            id="c-err-bear-wrong",
+            symbol="000002",
+            trade_date="2024-05-10",
+            eval_date="2024-05-13",
+            decision="SELL",
+            direction="看空",
+            actual_outcome=DATA_MISSING_PLACEHOLDER,
+        ),
+        HistoricalCaseDB(
+            id="c-err-bear-correct",
+            symbol="000003",
+            trade_date="2024-05-10",
+            eval_date="2024-05-13",
+            decision="SELL",
+            direction="看空",
+            actual_outcome=DATA_MISSING_PLACEHOLDER,
+        ),
+        HistoricalCaseDB(
+            id="c-err-neutral-big-move",
+            symbol="000004",
+            trade_date="2024-05-10",
+            eval_date="2024-05-13",
+            decision="HOLD",
+            direction="中性",
+            actual_outcome=DATA_MISSING_PLACEHOLDER,
+        ),
+        HistoricalCaseDB(
+            id="c-err-neutral-flat",
+            symbol="000005",
+            trade_date="2024-05-10",
+            eval_date="2024-05-13",
+            decision="HOLD",
+            direction="中性",
+            actual_outcome=DATA_MISSING_PLACEHOLDER,
+        ),
+    ]
+    for c in cases:
+        test_db_session.add(c)
+    test_db_session.commit()
+
+    def _mock_calc(symbol, trade_date, eval_date=None):
+        if symbol == "000001":
+            return (eval_date, -2.10, "-2.10%")
+        elif symbol == "000002":
+            return (eval_date, 1.80, "+1.80%")
+        elif symbol == "000003":
+            return (eval_date, -3.00, "-3.00%")
+        elif symbol == "000004":
+            return (eval_date, 4.50, "+4.50%")
+        elif symbol == "000005":
+            return (eval_date, 0.40, "+0.40%")
+        return (eval_date, None, DATA_MISSING_PLACEHOLDER)
+
+    with patch("tradingagents.knowledge.historical_cases.calculate_t1_return", side_effect=_mock_calc):
+        stats = backfill_pending_cases(test_db_session, as_of="2024-05-15")
+        assert stats["backfilled"] == 5
+
+        # 逐个检查 is_error 判定
+        c1 = test_db_session.query(HistoricalCaseDB).filter(HistoricalCaseDB.id == "c-err-bull-wrong").first()
+        assert c1.actual_outcome == "-2.10%"
+        assert c1.is_error is True  # 看多却下跌
+
+        c2 = test_db_session.query(HistoricalCaseDB).filter(HistoricalCaseDB.id == "c-err-bear-wrong").first()
+        assert c2.actual_outcome == "+1.80%"
+        assert c2.is_error is True  # 看空却上涨
+
+        c3 = test_db_session.query(HistoricalCaseDB).filter(HistoricalCaseDB.id == "c-err-bear-correct").first()
+        assert c3.actual_outcome == "-3.00%"
+        assert c3.is_error is False  # 看空且下跌
+
+        c4 = test_db_session.query(HistoricalCaseDB).filter(HistoricalCaseDB.id == "c-err-neutral-big-move").first()
+        assert c4.actual_outcome == "+4.50%"
+        assert c4.is_error is True  # 中性但剧烈波动超过 3%
+
+        c5 = test_db_session.query(HistoricalCaseDB).filter(HistoricalCaseDB.id == "c-err-neutral-flat").first()
+        assert c5.actual_outcome == "+0.40%"
+        assert c5.is_error is False  # 中性且波动幅度在 3% 以内
+
+
+def test_backfill_pending_cases_idempotent(test_db_session):
+    """验证回填幂等性：重复执行不重复写入，已回填记录不被重复处理。"""
+    case = HistoricalCaseDB(
+        id="case-idem-1",
+        symbol="000725",
+        trade_date="2024-05-10",
+        eval_date="2024-05-13",
+        decision="BUY",
+        direction="看多",
+        actual_outcome=DATA_MISSING_PLACEHOLDER,
+    )
+    test_db_session.add(case)
+    test_db_session.commit()
+
+    with patch("tradingagents.knowledge.historical_cases.calculate_t1_return", return_value=("2024-05-13", 1.50, "+1.50%")):
+        # 第一次运行：回填 1 条
+        stats1 = backfill_pending_cases(test_db_session, as_of="2024-05-15")
+        assert stats1["total_scanned"] == 1
+        assert stats1["backfilled"] == 1
+
+        # 第二次运行：待处理数为 0，不重复写入
+        stats2 = backfill_pending_cases(test_db_session, as_of="2024-05-15")
+        assert stats2["total_scanned"] == 0
+        assert stats2["backfilled"] == 0
+
+
+def test_report_service_completion_triggers_backfill(test_db_session):
+    """验证当新报告 completed 落库时，自动顺带回填历史待处理案例。"""
+    # 预设一条之前的待回填案例
+    prior_case = HistoricalCaseDB(
+        id="prior-case-1",
+        symbol="600519",
+        trade_date="2024-05-10",
+        eval_date="2024-05-13",
+        decision="BUY",
+        direction="看多",
+        actual_outcome=DATA_MISSING_PLACEHOLDER,
+    )
+    test_db_session.add(prior_case)
+    test_db_session.commit()
+
+    def _mock_calc(symbol, trade_date, eval_date=None):
+        if symbol == "600519":
+            return ("2024-05-13", 2.10, "+2.10%")
+        elif symbol == "000001":
+            return ("2024-05-14", None, DATA_MISSING_PLACEHOLDER)
+        return (eval_date, None, DATA_MISSING_PLACEHOLDER)
+
+    fake_now = datetime(2024, 5, 20, 16, 0, tzinfo=timezone.utc)
+    with patch("tradingagents.knowledge.historical_cases.calculate_t1_return", side_effect=_mock_calc), \
+         patch("tradingagents.knowledge.historical_cases.now_cn", return_value=fake_now), \
+         patch("api.services.report_service.extract_structured_data", return_value=None):
+
+        # 创建新报告并 completed
+        db_report = report_service.create_report(
+            db=test_db_session,
+            symbol="000001",
+            trade_date="2024-05-13",
+            decision="BUY",
+        )
+
+        assert db_report.status == "completed"
+
+        # 验证 prior_case 在新报告创建后被顺带回填成功
+        updated_prior = test_db_session.query(HistoricalCaseDB).filter(HistoricalCaseDB.id == "prior-case-1").first()
+        assert updated_prior.actual_outcome == "+2.10%"
+        assert updated_prior.actual_change_pct == 2.10
+        assert updated_prior.is_error is False
+
+
+def test_update_report_partial_triggers_backfill(test_db_session):
+    """验证 update_report_partial 将报告更新为 completed 时顺带触发回填。"""
+    prior_case = HistoricalCaseDB(
+        id="prior-case-2",
+        symbol="688981",
+        trade_date="2024-05-10",
+        eval_date="2024-05-13",
+        decision="BUY",
+        direction="看多",
+        actual_outcome=DATA_MISSING_PLACEHOLDER,
+    )
+    test_db_session.add(prior_case)
+
+    # 初始处于 running 状态的报告
+    running_report = ReportDB(
+        id="rep-running-1",
+        symbol="000002",
+        trade_date="2024-05-13",
+        status="running",
+    )
+    test_db_session.add(running_report)
+    test_db_session.commit()
+
+    def _mock_calc(symbol, trade_date, eval_date=None):
+        if symbol == "688981":
+            return ("2024-05-13", 3.00, "+3.00%")
+        return (eval_date, None, DATA_MISSING_PLACEHOLDER)
+
+    fake_now = datetime(2024, 5, 20, 16, 0, tzinfo=timezone.utc)
+    with patch("tradingagents.knowledge.historical_cases.calculate_t1_return", side_effect=_mock_calc), \
+         patch("tradingagents.knowledge.historical_cases.now_cn", return_value=fake_now):
+
+        updated_report = report_service.update_report_partial(
+            db=test_db_session,
+            report_id="rep-running-1",
+            status="completed",
+            decision="BUY",
+            direction="看多",
+        )
+
+        assert updated_report.status == "completed"
+        # 验证 prior_case 已被回填
+        updated_prior = test_db_session.query(HistoricalCaseDB).filter(HistoricalCaseDB.id == "prior-case-2").first()
+        assert updated_prior.actual_outcome == "+3.00%"
+        assert updated_prior.actual_change_pct == 3.00
+
+
+def test_api_lifespan_triggers_backfill():
+    """验证 FastAPI lifespan 启动时自动触发 historical_cases 回填流程。"""
+    from sqlalchemy.pool import StaticPool
+    from api.main import lifespan, app
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+        echo=False,
+    )
+    Base.metadata.create_all(bind=engine)
+    TestingSession = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    session = TestingSession()
+
+    prior_case = HistoricalCaseDB(
+        id="startup-case-1",
+        symbol="000725",
+        trade_date="2024-05-10",
+        eval_date="2024-05-13",
+        decision="BUY",
+        direction="看多",
+        actual_outcome=DATA_MISSING_PLACEHOLDER,
+    )
+    session.add(prior_case)
+    session.commit()
+
+    def _mock_calc(symbol, trade_date, eval_date=None):
+        if symbol == "000725":
+            return ("2024-05-13", 4.10, "+4.10%")
+        return (eval_date, None, DATA_MISSING_PLACEHOLDER)
+
+    fake_now = datetime(2024, 5, 20, 16, 0, tzinfo=timezone.utc)
+    with patch("tradingagents.knowledge.historical_cases.calculate_t1_return", side_effect=_mock_calc), \
+         patch("tradingagents.knowledge.historical_cases.now_cn", return_value=fake_now), \
+         patch("api.main.get_db_ctx") as mock_get_db_ctx, \
+         patch("api.main.init_db"), \
+         patch("api.main._report_version_stats"), \
+         patch("api.main._load_cn_stock_map"), \
+         patch("tradingagents.dataflows.trade_calendar._load_cn_trade_dates"), \
+         patch("api.services.report_service.recover_stale_active_reports", return_value={"failed": 0}), \
+         patch("api.services.auth_service.ensure_secure_secret_configured"), \
+         patch("api.services.auth_service.is_custom_secret_configured", return_value=True):
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _fake_ctx():
+            s = TestingSession()
+            try:
+                yield s
+            finally:
+                s.close()
+
+        mock_get_db_ctx.side_effect = _fake_ctx
+
+        async def _run():
+            async with lifespan(app):
+                pass
+
+        asyncio.run(_run())
+
+        check_session = TestingSession()
+        updated = check_session.query(HistoricalCaseDB).filter(HistoricalCaseDB.id == "startup-case-1").first()
+        assert updated.actual_outcome == "+4.10%"
+        assert updated.actual_change_pct == 4.10
+        assert updated.is_error is False
+        check_session.close()
+        session.close()

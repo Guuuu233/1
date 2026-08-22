@@ -929,10 +929,14 @@ def update_report_partial(
 
     if db_report.status == "completed":
         try:
-            from tradingagents.knowledge.historical_cases import record_historical_case
+            from tradingagents.knowledge.historical_cases import (
+                backfill_pending_cases,
+                record_historical_case,
+            )
             record_historical_case(db=db, report=db_report)
+            backfill_pending_cases(db=db)
         except Exception as exc:
-            logger.warning("[report_service] record_historical_case failed in update_report_partial: %s", exc)
+            logger.warning("[report_service] historical_cases recording/backfill failed in update_report_partial: %s", exc)
 
     return db_report
 
@@ -1118,13 +1122,17 @@ def create_report(
         db.rollback()
         raise
 
-    # 落库历史案例学习闭环（只在 completed 时落库）
+    # 落库历史案例学习闭环（只在 completed 时落库并顺带触发回填）
     if db_report.status == "completed":
         try:
-            from tradingagents.knowledge.historical_cases import record_historical_case
+            from tradingagents.knowledge.historical_cases import (
+                backfill_pending_cases,
+                record_historical_case,
+            )
             record_historical_case(db=db, report=db_report)
+            backfill_pending_cases(db=db)
         except Exception as exc:
-            logger.warning("[report_service] record_historical_case failed in create_report: %s", exc)
+            logger.warning("[report_service] historical_cases recording/backfill failed in create_report: %s", exc)
 
     return db_report
 

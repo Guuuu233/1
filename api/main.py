@@ -391,6 +391,23 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         _log(f"Stale report recovery failed (non-fatal): {exc}")
 
+    # Backfill pending historical cases whose T+1 eval_date has arrived (DAV-287)
+    try:
+        from tradingagents.knowledge.historical_cases import backfill_pending_cases
+
+        def _startup_backfill_sync():
+            with get_db_ctx() as _db:
+                return backfill_pending_cases(_db)
+
+        bf_stats = await asyncio.to_thread(_startup_backfill_sync)
+        _log(
+            f"Historical cases startup backfill completed: scanned={bf_stats.get('total_scanned', 0)}, "
+            f"backfilled={bf_stats.get('backfilled', 0)}, still_missing={bf_stats.get('still_missing', 0)}, "
+            f"skipped_future={bf_stats.get('skipped_future', 0)}."
+        )
+    except Exception as exc:
+        _log(f"Historical cases startup backfill failed (non-fatal): {exc}")
+
     yield
     _log("Shutting down: Cleaning up resources...")
     _executor.shutdown(wait=True)
