@@ -42,8 +42,16 @@ from tradingagents.graph.data_collector import DataCollector
 from tradingagents.knowledge.industry_linkage import INDUSTRY_PROFILES
 from tradingagents.knowledge.macro_events import MACRO_EVENT_SCENARIOS
 from tradingagents.knowledge.rag import (
+    DEFAULT_KNOWN_FINANCE_EN_CODES,
+    DEFAULT_STOP_CHARS,
+    DEFAULT_STOP_WORDS,
+    TA_RAG_VOCAB_ENV_KEY,
     KnowledgeRAGIndex,
+    RAGVocabulary,
     get_global_rag_index,
+    get_rag_vocabulary,
+    load_rag_vocabulary,
+    reload_rag_vocabulary,
     tokenize_cn_en,
 )
 
@@ -395,3 +403,139 @@ def test_no_v2_prompts_and_contract_compliance():
     for k in PROMPTS.keys():
         assert not k.endswith("_v2"), f"禁止存在 _v2 并行 Prompt key: {k}"
         assert "_v2" not in k, f"禁止存在 _v2 Prompt key: {k}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. RAG 词表配置外置、环境变量覆盖与异常回退测试 (Vocabulary Configuration & Fallback Tests)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def restore_default_rag_vocab():
+    """确保测试前后 RAG 词表与全局索引恢复默认状态。"""
+    try:
+        yield
+    finally:
+        reload_rag_vocabulary(None)
+
+
+def test_rag_vocab_default_loading():
+    """验证默认词表从 rag_vocab.json 正确加载并包含权威金融代码及停用词。"""
+    vocab = get_rag_vocabulary()
+    assert isinstance(vocab, RAGVocabulary)
+    assert "sox" in vocab.known_finance_en_codes
+    assert "cxo" in vocab.known_finance_en_codes
+    assert "lpr" in vocab.known_finance_en_codes
+    assert "mlf" in vocab.known_finance_en_codes
+    assert "wti" in vocab.known_finance_en_codes
+    assert "oled" in vocab.known_finance_en_codes
+    assert "aisc" in vocab.known_finance_en_codes
+
+    # 验证停用单字与通用停用词
+    assert "的" in vocab.stop_chars
+    assert "和" in vocab.stop_chars
+    assert "公司" in vocab.stop_words
+    assert "发布" in vocab.stop_words
+
+
+def test_rag_vocab_missing_file_fallback(tmp_path):
+    """验证指定不存在的外部词表文件时，安全回退到内置默认词表且不抛出异常。"""
+    non_existent = tmp_path / "missing_rag_vocab_12345.json"
+    vocab = load_rag_vocabulary(custom_path=non_existent)
+    assert isinstance(vocab, RAGVocabulary)
+    assert vocab.source == "builtin_default"
+    assert "sox" in vocab.known_finance_en_codes
+    assert "lpr" in vocab.known_finance_en_codes
+    assert "的" in vocab.stop_chars
+    assert "公司" in vocab.stop_words
+
+
+def test_rag_vocab_corrupted_json_fallback(tmp_path):
+    """验证外部词表 JSON 语法损坏或非字典根结构时，记录日志并安全回退默认。"""
+    corrupt_file = tmp_path / "corrupted_vocab.json"
+    corrupt_file.write_text("invalid json content {{{ [[[", encoding="utf-8")
+
+    vocab = load_rag_vocabulary(custom_path=corrupt_file)
+    assert isinstance(vocab, RAGVocabulary)
+    assert "fallback_due_to_error" in vocab.source
+    assert "sox" in vocab.known_finance_en_codes
+    assert "公司" in vocab.stop_words
+
+    # 非字典根结构回退
+    list_file = tmp_path / "list_vocab.json"
+    list_file.write_text('["sox", "lpr", "cxo"]', encoding="utf-8")
+    vocab_list = load_rag_vocabulary(custom_path=list_file)
+    assert "fallback_due_to_error" in vocab_list.source
+    assert "sox" in vocab_list.known_finance_en_codes
+
+
+def test_rag_vocab_partial_keys_fallback(tmp_path):
+    """验证词表 JSON 仅提供部分键时，未提供的键自动回退至默认值。"""
+    import json
+    partial_file = tmp_path / "partial_vocab.json"
+    partial_data = {
+        "known_finance_en_codes": ["customtech", "deepseek"],
+    }
+    partial_file.write_text(json.dumps(partial_data), encoding="utf-8")
+
+    vocab = load_rag_vocabulary(custom_path=partial_file)
+    assert "customtech" in vocab.known_finance_en_codes
+    assert "deepseek" in vocab.known_finance_en_codes
+    # 未提供的键回退到默认
+    assert "的" in vocab.stop_chars
+    assert "公司" in vocab.stop_words
+
+
+def test_rag_vocab_env_override(tmp_path, monkeypatch, restore_default_rag_vocab):
+    """验证通过环境变量 TA_RAG_VOCAB_PATH 能够动态指向外部词表文件并生效。"""
+    import json
+    custom_vocab_file = tmp_path / "external_custom_vocab.json"
+    custom_data = {
+        "known_finance_en_codes": ["customcode", "fintechai", "sox"],
+        "stop_chars": ["的", "了"],
+        "stop_words": ["测试过滤停用词", "公司"],
+    }
+    custom_vocab_file.write_text(json.dumps(custom_data, ensure_ascii=False), encoding="utf-8")
+
+    monkeypatch.setenv(TA_RAG_VOCAB_ENV_KEY, str(custom_vocab_file))
+
+    # 热重载并验证
+    reloaded_vocab = reload_rag_vocabulary()
+    assert "customcode" in reloaded_vocab.known_finance_en_codes
+    assert "fintechai" in reloaded_vocab.known_finance_en_codes
+    assert "测试过滤停用词" in reloaded_vocab.stop_words
+
+    # 验证分词器能够提取新增代码并过滤新增停用词
+    text = "customcode 算法模型发布，测试过滤停用词被剔除。"
+    tokens = tokenize_cn_en(text)
+    assert "customcode" in tokens
+    assert "测试过滤停用词" not in tokens
+
+
+def test_rag_vocab_env_missing_file_fallback(monkeypatch, restore_default_rag_vocab):
+    """验证环境变量指定的文件不存在时安全回退默认。"""
+    monkeypatch.setenv(TA_RAG_VOCAB_ENV_KEY, "/tmp/definitely_not_existing_vocab_xyz999.json")
+    vocab = reload_rag_vocabulary()
+    assert vocab.source == "builtin_default"
+    assert "sox" in vocab.known_finance_en_codes
+    assert "公司" in vocab.stop_words
+
+
+def test_reload_rag_vocabulary_resets_global_index(tmp_path, restore_default_rag_vocab):
+    """验证 reload_rag_vocabulary 重置 _GLOBAL_RAG_INDEX 单例并在下次获取时重新构建。"""
+    import json
+    custom_file = tmp_path / "rebuild_vocab.json"
+    custom_data = {
+        "known_finance_en_codes": ["aisc", "sox", "rebuiltcode"],
+        "stop_chars": list(DEFAULT_STOP_CHARS),
+        "stop_words": list(DEFAULT_STOP_WORDS),
+    }
+    custom_file.write_text(json.dumps(custom_data, ensure_ascii=False), encoding="utf-8")
+
+    idx1 = get_global_rag_index()
+    assert idx1 is not None
+
+    reload_rag_vocabulary(custom_file)
+    # 单例已被清空
+    idx2 = get_global_rag_index()
+    assert idx2 is not idx1
+    assert "rebuiltcode" in idx2.vocabulary.known_finance_en_codes
