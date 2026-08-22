@@ -435,6 +435,150 @@ def record_historical_case(
     return case_obj
 
 
+def backfill_pending_cases(
+    db: Optional[Session] = None,
+    as_of: Optional[Union[str, date, datetime]] = None,
+) -> Dict[str, int]:
+    """回填缺失 T+1 实际表现的历史案例（§5.4 预测 vs 实际闭环补全）。
+
+    契约与逻辑：
+    1. 扫描 actual_outcome 为【数据缺失】或空值的案例；
+    2. 检查评估日 eval_date（若记录缺失则尝试推导下一交易日）：
+       - 若 eval_date > as_of（尚未到达评估日），跳过回填；
+       - 若 eval_date <= as_of，调用 calculate_t1_return 重新计算；
+    3. 若行情计算成功（change_pct 不为 None）：
+       - 更新 actual_change_pct, actual_outcome, eval_date;
+       - 调用 evaluate_prediction_error 重新评估 is_error;
+       - 更新 updated_at;
+    4. 若仍取不到行情（如停牌、行情接口缺失）：
+       - 保持 actual_outcome=【数据缺失】，记录失败台账日志，严禁填 0 或臆造；
+    5. 具备严格幂等性与异常隔离。
+
+    返回统计字典：{"total_scanned": int, "backfilled": int, "still_missing": int, "skipped_future": int, "errors": int}
+    """
+    def _do_backfill(session: Session) -> Dict[str, int]:
+        if as_of is None:
+            as_of_str = now_cn().date().strftime("%Y-%m-%d")
+        elif isinstance(as_of, (date, datetime)):
+            as_of_str = as_of.strftime("%Y-%m-%d")
+        else:
+            as_of_str = str(as_of).strip()
+
+        pending_cases = (
+            session.query(HistoricalCaseDB)
+            .filter(
+                (HistoricalCaseDB.actual_outcome == DATA_MISSING_PLACEHOLDER)
+                | (HistoricalCaseDB.actual_outcome.is_(None))
+                | (HistoricalCaseDB.actual_outcome == "")
+            )
+            .order_by(HistoricalCaseDB.trade_date.asc())
+            .all()
+        )
+
+        stats: Dict[str, int] = {
+            "total_scanned": len(pending_cases),
+            "backfilled": 0,
+            "still_missing": 0,
+            "skipped_future": 0,
+            "errors": 0,
+        }
+
+        if not pending_cases:
+            return stats
+
+        modified = False
+        for case in pending_cases:
+            target_eval_date = case.eval_date or get_next_cn_trading_day(case.trade_date)
+            if not target_eval_date:
+                stats["still_missing"] += 1
+                logger.warning(
+                    "[historical_cases] Backfill skipped for %s (%s): cannot determine eval_date",
+                    case.symbol,
+                    case.trade_date,
+                )
+                continue
+
+            if case.eval_date != target_eval_date:
+                case.eval_date = target_eval_date
+                modified = True
+
+            if target_eval_date > as_of_str:
+                stats["skipped_future"] += 1
+                logger.debug(
+                    "[historical_cases] Backfill skipped for %s: eval_date %s > as_of %s",
+                    case.symbol,
+                    target_eval_date,
+                    as_of_str,
+                )
+                continue
+
+            try:
+                new_eval_date, change_pct, outcome_str = calculate_t1_return(
+                    case.symbol,
+                    case.trade_date,
+                    eval_date=target_eval_date,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[historical_cases] Backfill failed for %s (%s -> %s): %s",
+                    case.symbol,
+                    case.trade_date,
+                    target_eval_date,
+                    exc,
+                )
+                stats["errors"] += 1
+                stats["still_missing"] += 1
+                continue
+
+            if new_eval_date and case.eval_date != new_eval_date:
+                case.eval_date = new_eval_date
+                modified = True
+
+            if outcome_str != DATA_MISSING_PLACEHOLDER and change_pct is not None:
+                is_error = evaluate_prediction_error(case.decision, case.direction, change_pct)
+                case.actual_change_pct = change_pct
+                case.actual_outcome = outcome_str
+                case.is_error = is_error
+                case.updated_at = datetime.now(timezone.utc)
+                stats["backfilled"] += 1
+                modified = True
+                logger.info(
+                    "[historical_cases] Backfilled case for %s (%s -> %s): outcome=%s, is_error=%s",
+                    case.symbol,
+                    case.trade_date,
+                    case.eval_date,
+                    outcome_str,
+                    is_error,
+                )
+            else:
+                case.actual_outcome = DATA_MISSING_PLACEHOLDER
+                case.actual_change_pct = None
+                case.is_error = None
+                stats["still_missing"] += 1
+                logger.warning(
+                    "[historical_cases] Backfill unresolved for %s (%s -> %s): market data unavailable",
+                    case.symbol,
+                    case.trade_date,
+                    target_eval_date,
+                )
+
+        if modified:
+            try:
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                logger.error("[historical_cases] Failed to commit backfilled cases: %s", exc)
+                raise
+
+        return stats
+
+    if db is not None:
+        return _do_backfill(db)
+
+    with get_db_ctx() as ctx_db:
+        return _do_backfill(ctx_db)
+
+
 def retrieve_similar_historical_cases(
     symbol: str,
     industry: Optional[str] = None,
