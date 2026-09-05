@@ -2123,6 +2123,7 @@ def _build_result_payload(final_state: Dict[str, Any]) -> Dict[str, Any]:
         "analysis_status": final_state.get("analysis_status"),
         "trade_action": final_state.get("trade_action"),
         "risk_status": final_state.get("risk_status"),
+        "horizon_run_metadata": deepcopy(final_state.get("horizon_run_metadata")) if isinstance(final_state.get("horizon_run_metadata"), dict) else final_state.get("horizon_run_metadata"),
     }
 
     return _mount_or_refresh_protocol_metadata_and_metrics(result, source_state=final_state)
@@ -2871,11 +2872,22 @@ async def _run_job_inner(
         )
         final_state: Optional[Dict[str, Any]] = None
 
-        request.horizons = _normalize_analysis_horizons(
+        res = resolve_analysis_horizons(
             request.horizons,
             query=request.query,
             explicit=request.horizons_explicit,
         )
+        if request.horizons_resolution_source and not request.horizons_explicit:
+            res = HorizonResolution(
+                resolved=res.resolved,
+                resolution_source=request.horizons_resolution_source,
+                notice=res.notice or request.horizons_notice,
+            )
+        request.horizons = res.resolved
+        request.horizons_explicit = (res.resolution_source == RESOLUTION_SOURCE_EXPLICIT)
+        request.horizons_resolution_source = res.resolution_source
+        request.horizons_notice = res.notice
+        horizon_resolution = res
 
         # ── Dual-horizon intent-driven path ──────────────────────────────────
         if request.query or len(request.horizons) > 1:
@@ -3005,6 +3017,7 @@ async def _run_job_inner(
                     market_data_context=market_data_context,
                     social_data_context=social_data_context,
                     runtime_config=config,
+                    horizon_resolution=horizon_resolution,
                 )
                 last_report: Dict[str, str] = {}
                 seen: Dict[str, bool] = {}   # 追踪哪些字段已出现过，避免重复事件
@@ -3147,6 +3160,36 @@ async def _run_job_inner(
                 # Each horizon owns its structured fields.  Keeping the
                 # values nested prevents a primary horizon from being
                 # accidentally presented as the result of the other graph.
+                def _build_failed_slice_meta() -> Dict[str, Any]:
+                    slice_offsets = {
+                        h: HORIZON_PROFILE_V1[h]["primary_eval_offset"]
+                        for h in request.horizons
+                        if h in HORIZON_PROFILE_V1
+                    }
+                    meta: Dict[str, Any] = {
+                        "requested": (
+                            list(horizon_resolution.requested)
+                            if getattr(horizon_resolution, "requested", None) is not None
+                            else (list(request.horizons) if request.horizons_explicit else None)
+                        ),
+                        "resolved": list(request.horizons),
+                        "resolution_source": (
+                            request.horizons_resolution_source
+                            or ("explicit" if request.horizons_explicit else "default")
+                        ),
+                        "profile_id": "horizon_profile_v1",
+                        "primary_eval_offsets": slice_offsets,
+                        "cutoff": (
+                            market_data_context.get("daily", {}).get("as_of")
+                            if isinstance(market_data_context, dict)
+                            else None
+                        ),
+                        "investment_horizon": user_context_payload.get("investment_horizon") or None,
+                    }
+                    if request.horizons_notice is not None:
+                        meta["notice"] = request.horizons_notice
+                    return meta
+
                 horizon_results: Dict[str, Dict[str, Any]] = {}
                 for horizon in request.horizons:
                     if horizon in horizon_errors:
@@ -3159,6 +3202,7 @@ async def _run_job_inner(
                                 f"{horizon} horizon is unavailable; downstream consumers must use only the "
                                 "completed horizon and treat this result as partial."
                             ),
+                            "horizon_run_metadata": _build_failed_slice_meta(),
                         }
                         continue
 
@@ -3226,6 +3270,7 @@ async def _run_job_inner(
                                 f"{horizon} horizon is unavailable; downstream consumers must use only the "
                                 "completed horizon and treat this result as partial."
                             ),
+                            "horizon_run_metadata": _build_failed_slice_meta(),
                         }
 
                 completed_horizons = [
@@ -3328,6 +3373,42 @@ async def _run_job_inner(
                         for trace in horizon_results[horizon].get("analyst_traces", [])
                     ],
                 }
+                top_cutoff = next(
+                    (
+                        horizon_results[horizon].get("data_as_of")
+                        for horizon in request.horizons
+                        if horizon_results[horizon].get("data_as_of")
+                    ),
+                    (
+                        market_data_context.get("daily", {}).get("as_of")
+                        if isinstance(market_data_context, dict)
+                        else None
+                    ),
+                )
+                top_meta = {
+                    "requested": (
+                        list(horizon_resolution.requested)
+                        if getattr(horizon_resolution, "requested", None) is not None
+                        else (list(request.horizons) if request.horizons_explicit else None)
+                    ),
+                    "resolved": list(request.horizons),
+                    "resolution_source": (
+                        request.horizons_resolution_source
+                        or ("explicit" if request.horizons_explicit else "default")
+                    ),
+                    "profile_id": "horizon_profile_v1",
+                    "primary_eval_offsets": {
+                        h: HORIZON_PROFILE_V1[h]["primary_eval_offset"]
+                        for h in request.horizons
+                        if h in HORIZON_PROFILE_V1
+                    },
+                    "cutoff": top_cutoff,
+                    "investment_horizon": user_context_payload.get("investment_horizon") or None,
+                }
+                if request.horizons_notice is not None:
+                    top_meta["notice"] = request.horizons_notice
+                result["horizon_run_metadata"] = top_meta
+
                 # D-009 P0-1: aggregate short/medium decision_status onto the top-level row.
                 from tradingagents.agents.utils.decision_status import (
                     aggregate_horizon_decision_statuses,
@@ -3346,6 +3427,15 @@ async def _run_job_inner(
                     result, horizon_status_agg["decision_status"]
                 )
                 dual_decision = horizon_status_agg.get("trade_action")
+                if len(request.horizons) > 1:
+                    result.pop("direction", None)
+                    result.pop("decision", None)
+                    result.pop("confidence", None)
+                    result.pop("probability", None)
+                    result.pop("target_price", None)
+                    result.pop("stop_loss_price", None)
+                    result.pop("trade_action", None)
+
                 primary_horizon = next(
                     (h for h in request.horizons if horizon_results.get(h, {}).get("status") == "completed"),
                     request.horizons[0] if request.horizons else "short",
@@ -3355,20 +3445,21 @@ async def _run_job_inner(
                 _attach_custom_prompt_snapshot(result, _prompt_snapshot)
 
                 if save_report:
+                    report_decision = None if len(request.horizons) > 1 else dual_decision
                     def _save_dual_report_sync():
                         with get_db_ctx() as save_db:
                             report_service.create_report(
                                 db=save_db,
                                 symbol=request.symbol,
                                 trade_date=request.trade_date,
-                                decision=dual_decision,
+                                decision=report_decision,
                                 result_data=result,
                                 user_id=user_id,
                                 risk_items=None,
                                 key_metrics=None,
                                 probability=(
                                     None
-                                    if dual_decision in {"NO_TRADE", "WAIT"}
+                                    if len(request.horizons) > 1 or dual_decision in {"NO_TRADE", "WAIT"}
                                     else result.get("probability")
                                 ),
                                 data_gaps=result["data_gaps"],
@@ -3388,7 +3479,7 @@ async def _run_job_inner(
                     job_id,
                     status="completed",
                     result=result,
-                    decision=dual_decision,
+                    decision=None if len(request.horizons) > 1 else dual_decision,
                     error=None,
                     overtime=False,
                     overtime_at=None,
@@ -3567,6 +3658,17 @@ async def _run_job_inner(
                 if isinstance(collected_pool, dict)
                 else None
             )
+            horizon_res = resolve_analysis_horizons(
+                request.horizons,
+                query=request.query,
+                explicit=request.horizons_explicit,
+            )
+            if request.horizons_resolution_source and not request.horizons_explicit:
+                horizon_res = HorizonResolution(
+                    resolved=horizon_res.resolved,
+                    resolution_source=request.horizons_resolution_source,
+                    notice=horizon_res.notice or request.horizons_notice,
+                )
             init_state = graph.propagator.create_initial_state(
                 request.symbol,
                 request.trade_date,
@@ -3577,6 +3679,7 @@ async def _run_job_inner(
                 market_data_context=market_data_context,
                 social_data_context=social_data_context,
                 runtime_config=config,
+                horizon_resolution=horizon_res,
             )
             args = graph.propagator.get_graph_args()
             
@@ -3740,6 +3843,7 @@ async def _run_job_inner(
                     selected_analysts=request.selected_analysts,
                     request_source=request_source,
                     thread_id=job_id,
+                    horizon_resolution=horizon_resolution,
                 )
             else:
                 # TradingAgentsGraph.propagate historically defaults the
@@ -3771,6 +3875,7 @@ async def _run_job_inner(
                     market_data_context=market_data_context,
                     social_data_context=social_data_context,
                     runtime_config=config,
+                    horizon_resolution=horizon_resolution,
                 )
                 args = graph.propagator.get_graph_args()
                 if "config" not in args:

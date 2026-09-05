@@ -1,5 +1,6 @@
 """Report service for database operations."""
 
+import copy
 import json
 import json_repair
 import logging
@@ -844,6 +845,159 @@ def ensure_report_cohort_persisted(
     return result_data
 
 
+def ensure_report_horizon_metadata_persisted(
+    result_data: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Persist H-02b horizon run metadata into result_data root and nested slices.
+
+    Rules:
+    - Written to ReportDB.result_data root dictionary.
+    - Propagates to dual-horizon nested slices ('short_term', 'medium_term', 'horizons').
+    - Ensures evaluation_eligible is never True.
+    """
+    if not isinstance(result_data, dict):
+        return result_data
+
+    from tradingagents.graph.horizon_profile import HORIZON_PROFILE_V1
+
+    meta = result_data.get("horizon_run_metadata")
+    if isinstance(meta, dict):
+        if meta.get("evaluation_eligible") is True:
+            meta.pop("evaluation_eligible", None)
+    else:
+        resolved = ["short"]
+        if (
+            result_data.get("mode") == "dual_horizon"
+            or "short_term" in result_data
+            or "medium_term" in result_data
+        ):
+            resolved = list(result_data.get("requested_horizons") or ["short", "medium"])
+        elif result_data.get("horizon"):
+            resolved = [result_data["horizon"]]
+
+        primary_eval_offsets = {
+            h: HORIZON_PROFILE_V1[h]["primary_eval_offset"]
+            for h in resolved
+            if h in HORIZON_PROFILE_V1
+        }
+        meta = {
+            "requested": list(resolved) if result_data.get("horizons_explicit") else None,
+            "resolved": resolved,
+            "resolution_source": (
+                result_data.get("horizons_resolution_source")
+                or ("explicit" if result_data.get("horizons_explicit") else "default")
+            ),
+            "profile_id": "horizon_profile_v1",
+            "primary_eval_offsets": primary_eval_offsets,
+            "cutoff": result_data.get("data_as_of"),
+            "investment_horizon": (
+                result_data.get("user_context", {}).get("investment_horizon")
+                if isinstance(result_data.get("user_context"), dict)
+                else None
+            ),
+        }
+        result_data["horizon_run_metadata"] = meta
+
+    root_meta = result_data["horizon_run_metadata"]
+    for key in ("short_term", "medium_term"):
+        nested = result_data.get(key)
+        if isinstance(nested, dict):
+            if "horizon_run_metadata" not in nested or not isinstance(nested["horizon_run_metadata"], dict):
+                nested["horizon_run_metadata"] = copy.deepcopy(root_meta)
+            elif nested["horizon_run_metadata"].get("evaluation_eligible") is True:
+                nested["horizon_run_metadata"].pop("evaluation_eligible", None)
+
+    horizons_dict = result_data.get("horizons")
+    if isinstance(horizons_dict, dict):
+        for nested in horizons_dict.values():
+            if isinstance(nested, dict):
+                if "horizon_run_metadata" not in nested or not isinstance(nested["horizon_run_metadata"], dict):
+                    nested["horizon_run_metadata"] = copy.deepcopy(root_meta)
+                elif nested["horizon_run_metadata"].get("evaluation_eligible") is True:
+                    nested["horizon_run_metadata"].pop("evaluation_eligible", None)
+
+    return result_data
+
+
+def ensure_horizon_run_metadata_on_read(
+    result_data: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Ensure horizon_run_metadata is present when reading reports, marking legacy if missing.
+
+    Rules:
+    - If horizon_run_metadata is present: preserve it, ensure no evaluation_eligible=True,
+      and ensure nested slices have it.
+    - If absent: mark as legacy/unknown.
+    - CRITICAL: Never backfill T+40 (primary_eval_offsets must never contain 40 or 'medium').
+    """
+    if not isinstance(result_data, dict):
+        return result_data
+
+    if "horizon_run_metadata" not in result_data or not isinstance(result_data["horizon_run_metadata"], dict):
+        resolved = ["short"]
+        if (
+            result_data.get("mode") == "dual_horizon"
+            or "short_term" in result_data
+            or "medium_term" in result_data
+        ):
+            resolved = list(result_data.get("requested_horizons") or ["short", "medium"])
+        elif result_data.get("horizon"):
+            resolved = [result_data["horizon"]]
+
+        primary_eval_offsets: Dict[str, int] = {}
+        if "short" in resolved:
+            primary_eval_offsets["short"] = 10
+
+        legacy_meta = {
+            "requested": None,
+            "resolved": resolved,
+            "resolution_source": "legacy",
+            "profile_id": "unknown",
+            "primary_eval_offsets": primary_eval_offsets,
+            "cutoff": result_data.get("data_as_of"),
+            "investment_horizon": (
+                result_data.get("user_context", {}).get("investment_horizon")
+                if isinstance(result_data.get("user_context"), dict)
+                else None
+            ),
+        }
+        result_data["horizon_run_metadata"] = legacy_meta
+    else:
+        meta = result_data["horizon_run_metadata"]
+        if meta.get("evaluation_eligible") is True:
+            meta.pop("evaluation_eligible", None)
+
+    root_meta = result_data["horizon_run_metadata"]
+    for key in ("short_term", "medium_term"):
+        nested = result_data.get(key)
+        if isinstance(nested, dict):
+            if "horizon_run_metadata" not in nested or not isinstance(nested["horizon_run_metadata"], dict):
+                nested_meta = copy.deepcopy(root_meta)
+                if nested_meta.get("resolution_source") == "legacy":
+                    nested_meta["primary_eval_offsets"] = {
+                        k: v for k, v in nested_meta.get("primary_eval_offsets", {}).items() if k != "medium" and v != 40
+                    }
+                nested["horizon_run_metadata"] = nested_meta
+            elif nested["horizon_run_metadata"].get("evaluation_eligible") is True:
+                nested["horizon_run_metadata"].pop("evaluation_eligible", None)
+
+    horizons_dict = result_data.get("horizons")
+    if isinstance(horizons_dict, dict):
+        for nested in horizons_dict.values():
+            if isinstance(nested, dict):
+                if "horizon_run_metadata" not in nested or not isinstance(nested["horizon_run_metadata"], dict):
+                    nested_meta = copy.deepcopy(root_meta)
+                    if nested_meta.get("resolution_source") == "legacy":
+                        nested_meta["primary_eval_offsets"] = {
+                            k: v for k, v in nested_meta.get("primary_eval_offsets", {}).items() if k != "medium" and v != 40
+                        }
+                    nested["horizon_run_metadata"] = nested_meta
+                elif nested["horizon_run_metadata"].get("evaluation_eligible") is True:
+                    nested["horizon_run_metadata"].pop("evaluation_eligible", None)
+
+    return result_data
+
+
 def canonicalize_report_result_data(
     result_data: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
@@ -1226,6 +1380,7 @@ def update_report_partial(
             # Already completed historical rows must NOT be backfilled with v1.
             if status == "completed" and prior_status != "completed":
                 ensure_report_cohort_persisted(db_report.result_data)
+                ensure_report_horizon_metadata_persisted(db_report.result_data)
             from sqlalchemy.orm.attributes import flag_modified
             flag_modified(db_report, "result_data")
             from tradingagents.agents.utils.shadow_credit import extract_report_industry
@@ -1416,8 +1571,10 @@ def create_report(
 
     # DAV-604: Persist H1b cohort metadata on newly completed reports (first completion).
     # Already completed historical rows must NOT be backfilled with v1.
-    if target_status == "completed" and prior_status != "completed" and isinstance(canonical_result_data, dict):
-        ensure_report_cohort_persisted(canonical_result_data)
+    if isinstance(canonical_result_data, dict):
+        if target_status == "completed" and prior_status != "completed":
+            ensure_report_cohort_persisted(canonical_result_data)
+        ensure_report_horizon_metadata_persisted(canonical_result_data)
 
     # Track A13: Determine resolved industry for SQL column
     resolved_industry = None
@@ -1478,6 +1635,18 @@ def create_report(
                 effective_probability = None
                 if db_report.direction in {None, "", "中性", "NEUTRAL", "HOLD"}:
                     db_report.direction = "N/A"
+            if (
+                canonical_result_data.get("mode") == "dual_horizon"
+                or "short_term" in canonical_result_data
+                or "medium_term" in canonical_result_data
+            ):
+                db_report.direction = None
+                db_report.decision = None
+                db_report.confidence = None
+                db_report.probability = None
+                db_report.target_price = None
+                db_report.stop_loss_price = None
+                db_report.trade_action = None
         db_report.result_data = canonical_result_data
         db_report.risk_items = canonical_risk_items
         db_report.key_metrics = canonical_key_metrics
@@ -1537,6 +1706,18 @@ def create_report(
                 effective_probability = None
                 if direction_value in {None, "", "中性", "NEUTRAL", "HOLD"}:
                     direction_value = "N/A"
+            if (
+                canonical_result_data.get("mode") == "dual_horizon"
+                or "short_term" in canonical_result_data
+                or "medium_term" in canonical_result_data
+            ):
+                direction_value = None
+                decision_value = None
+                conf_value = None
+                prob_value = None
+                target_value = None
+                stop_value = None
+                trade_action = None
         db_report = ReportDB(
             id=report_id or str(uuid4()),
             user_id=user_id,
@@ -1605,10 +1786,11 @@ def get_report(db: Session, report_id: str, user_id: Optional[str] = None) -> Op
         query = query.filter(ReportDB.user_id == user_id)
     report = query.first()
     if report and report.result_data and isinstance(report.result_data, dict):
-        if "social_data_context" not in report.result_data or report.result_data["social_data_context"] is None:
-            rd = dict(report.result_data)
+        rd = dict(report.result_data)
+        if "social_data_context" not in rd or rd["social_data_context"] is None:
             rd["social_data_context"] = {}
-            report.result_data = rd
+        ensure_horizon_run_metadata_on_read(rd)
+        report.result_data = rd
     return report
 
 

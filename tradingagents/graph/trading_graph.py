@@ -1,5 +1,6 @@
 # TradingAgents/graph/trading_graph.py
 
+import copy
 import os
 import re
 from pathlib import Path
@@ -331,6 +332,7 @@ class TradingAgentsGraph:
         selected_analysts: Optional[List[str]] = None,
         request_source: str = "api",
         thread_id: Optional[str] = None,
+        horizon_resolution: Optional[Any] = None,
     ):
         """Run the trading agents graph for a company on a specific date."""
 
@@ -357,6 +359,7 @@ class TradingAgentsGraph:
             market_data_context=market_data_context,
             social_data_context=social_data_context,
             runtime_config=self.config,
+            horizon_resolution=horizon_resolution,
         )
         args = self.propagator.get_graph_args()
 
@@ -534,6 +537,7 @@ class TradingAgentsGraph:
             "analysis_status": final_state.get("analysis_status"),
             "trade_action": final_state.get("trade_action"),
             "risk_status": final_state.get("risk_status"),
+            "horizon_run_metadata": copy.deepcopy(final_state.get("horizon_run_metadata")) if isinstance(final_state.get("horizon_run_metadata"), dict) else final_state.get("horizon_run_metadata"),
         }
 
         # Normalize protocol metadata and compute debate metrics without mutating final_state

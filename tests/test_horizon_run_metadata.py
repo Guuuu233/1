@@ -284,3 +284,343 @@ class TestHorizonRunMetadataContract:
         assert "primary_eval_offsets" in run_meta_annotations
         assert "cutoff" in run_meta_annotations
         assert "investment_horizon" in run_meta_annotations
+
+
+class TestHorizonRunMetadataPersistenceEchoContract:
+    """Test suite for H-02b persistence and read echo contracts."""
+
+    @pytest.fixture
+    def db_session(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from api.database import Base
+        engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+        session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        Base.metadata.create_all(bind=engine)
+        db = session_factory()
+        try:
+            yield db
+        finally:
+            db.close()
+            engine.dispose()
+
+    def test_build_horizon_result_copies_horizon_run_metadata(self):
+        """TradingAgentsGraph._build_horizon_result copies horizon_run_metadata from final_state."""
+        from tradingagents.graph.trading_graph import TradingAgentsGraph
+        ta = TradingAgentsGraph.__new__(TradingAgentsGraph)
+        ta.debug = False
+        ta.config = {}
+
+        meta = {
+            "requested": ["medium"],
+            "resolved": ["medium"],
+            "resolution_source": "explicit",
+            "profile_id": "horizon_profile_v1",
+            "primary_eval_offsets": {"medium": 40},
+            "cutoff": "2026-07-31",
+            "investment_horizon": None,
+        }
+        final_state = {
+            "horizon": "medium",
+            "company_of_interest": "600519.SH",
+            "trade_date": "2026-07-31",
+            "market_data_context": {},
+            "social_data_context": {},
+            "horizon_run_metadata": meta,
+        }
+        result = ta._build_horizon_result("medium", final_state)
+        assert "horizon_run_metadata" in result
+        assert result["horizon_run_metadata"] == meta
+        assert result["horizon_run_metadata"]["resolved"] == ["medium"]
+        assert result["horizon_run_metadata"]["resolution_source"] == "explicit"
+        assert result["horizon_run_metadata"]["primary_eval_offsets"] == {"medium": 40}
+
+    def test_build_result_payload_copies_horizon_run_metadata(self):
+        """api.main._build_result_payload copies horizon_run_metadata from final_state."""
+        from api import main
+        meta = {
+            "requested": None,
+            "resolved": ["short"],
+            "resolution_source": "default",
+            "profile_id": "horizon_profile_v1",
+            "primary_eval_offsets": {"short": 10},
+            "cutoff": "2026-07-31",
+            "investment_horizon": None,
+        }
+        final_state = {
+            "horizon": "short",
+            "company_of_interest": "600519.SH",
+            "trade_date": "2026-07-31",
+            "market_data_context": {},
+            "social_data_context": {},
+            "horizon_run_metadata": meta,
+        }
+        result = main._build_result_payload(final_state)
+        assert "horizon_run_metadata" in result
+        assert result["horizon_run_metadata"] == meta
+        assert result["horizon_run_metadata"]["resolution_source"] == "default"
+
+    def test_create_report_persists_explicit_medium_metadata(self, db_session):
+        """create_report persists explicit medium metadata and get_report returns it faithfully."""
+        from api.services import report_service
+        meta = {
+            "requested": ["medium"],
+            "resolved": ["medium"],
+            "resolution_source": "explicit",
+            "profile_id": "horizon_profile_v1",
+            "primary_eval_offsets": {"medium": 40},
+            "cutoff": "2026-07-31",
+            "investment_horizon": None,
+        }
+        result_data = {
+            "symbol": "600519.SH",
+            "trade_date": "2026-07-31",
+            "horizon": "medium",
+            "horizon_run_metadata": meta,
+            "status": "completed",
+        }
+        report = report_service.create_report(
+            db=db_session,
+            symbol="600519.SH",
+            trade_date="2026-07-31",
+            result_data=result_data,
+        )
+        fetched = report_service.get_report(db_session, report.id)
+        assert fetched is not None
+        assert "horizon_run_metadata" in fetched.result_data
+        echoed = fetched.result_data["horizon_run_metadata"]
+        assert echoed["resolution_source"] == "explicit"
+        assert echoed["resolved"] == ["medium"]
+        assert echoed["primary_eval_offsets"] == {"medium": 40}
+        assert echoed.get("evaluation_eligible") is not True
+
+    def test_create_report_persists_default_short_metadata(self, db_session):
+        """create_report persists default short metadata and get_report returns it faithfully."""
+        from api.services import report_service
+        meta = {
+            "requested": None,
+            "resolved": ["short"],
+            "resolution_source": "default",
+            "profile_id": "horizon_profile_v1",
+            "primary_eval_offsets": {"short": 10},
+            "cutoff": "2026-07-31",
+            "investment_horizon": None,
+        }
+        result_data = {
+            "symbol": "600519.SH",
+            "trade_date": "2026-07-31",
+            "horizon": "short",
+            "horizon_run_metadata": meta,
+            "status": "completed",
+        }
+        report = report_service.create_report(
+            db=db_session,
+            symbol="600519.SH",
+            trade_date="2026-07-31",
+            result_data=result_data,
+        )
+        fetched = report_service.get_report(db_session, report.id)
+        assert fetched is not None
+        echoed = fetched.result_data["horizon_run_metadata"]
+        assert echoed["resolution_source"] == "default"
+        assert echoed["resolved"] == ["short"]
+        assert echoed["primary_eval_offsets"] == {"short": 10}
+
+    def test_dual_horizon_result_carries_metadata_at_root_and_nested_slices(self, db_session):
+        """Dual-horizon result has metadata at root and in short_term/medium_term/horizons."""
+        from api.services import report_service
+        root_meta = {
+            "requested": ["short", "medium"],
+            "resolved": ["short", "medium"],
+            "resolution_source": "explicit",
+            "profile_id": "horizon_profile_v1",
+            "primary_eval_offsets": {"short": 10, "medium": 40},
+            "cutoff": "2026-07-31",
+            "investment_horizon": None,
+        }
+        short_slice = {
+            "horizon": "short",
+            "status": "completed",
+            "horizon_run_metadata": root_meta,
+        }
+        medium_slice = {
+            "horizon": "medium",
+            "status": "completed",
+            "horizon_run_metadata": root_meta,
+        }
+        result_data = {
+            "mode": "dual_horizon",
+            "symbol": "600519.SH",
+            "trade_date": "2026-07-31",
+            "requested_horizons": ["short", "medium"],
+            "horizon_run_metadata": root_meta,
+            "short_term": short_slice,
+            "medium_term": medium_slice,
+            "horizons": {"short": short_slice, "medium": medium_slice},
+            "status": "completed",
+        }
+        report = report_service.create_report(
+            db=db_session,
+            symbol="600519.SH",
+            trade_date="2026-07-31",
+            result_data=result_data,
+        )
+        fetched = report_service.get_report(db_session, report.id)
+        rd = fetched.result_data
+        assert rd["horizon_run_metadata"]["resolved"] == ["short", "medium"]
+        assert rd["horizon_run_metadata"]["primary_eval_offsets"] == {"short": 10, "medium": 40}
+        assert rd["short_term"]["horizon_run_metadata"]["resolved"] == ["short", "medium"]
+        assert rd["short_term"]["horizon"] == "short"
+        assert rd["medium_term"]["horizon_run_metadata"]["resolved"] == ["short", "medium"]
+        assert rd["medium_term"]["horizon"] == "medium"
+        assert rd["horizons"]["short"]["horizon_run_metadata"] is not None
+        assert rd["horizons"]["medium"]["horizon_run_metadata"] is not None
+
+    def test_dual_horizon_partial_failure_retains_metadata(self, db_session):
+        """When a horizon fails, failed slice still retains horizon_run_metadata."""
+        from api.services import report_service
+        root_meta = {
+            "requested": ["short", "medium"],
+            "resolved": ["short", "medium"],
+            "resolution_source": "explicit",
+            "profile_id": "horizon_profile_v1",
+            "primary_eval_offsets": {"short": 10, "medium": 40},
+            "cutoff": "2026-07-31",
+            "investment_horizon": None,
+        }
+        failed_medium = {
+            "horizon": "medium",
+            "status": "failed",
+            "error": "medium provider unavailable",
+            "horizon_run_metadata": root_meta,
+        }
+        result_data = {
+            "mode": "dual_horizon",
+            "status": "partial",
+            "symbol": "600519.SH",
+            "trade_date": "2026-07-31",
+            "requested_horizons": ["short", "medium"],
+            "horizon_run_metadata": root_meta,
+            "short_term": {"horizon": "short", "status": "completed", "horizon_run_metadata": root_meta},
+            "medium_term": failed_medium,
+            "horizons": {"short": {"horizon": "short", "status": "completed", "horizon_run_metadata": root_meta}, "medium": failed_medium},
+        }
+        report = report_service.create_report(
+            db=db_session,
+            symbol="600519.SH",
+            trade_date="2026-07-31",
+            result_data=result_data,
+        )
+        fetched = report_service.get_report(db_session, report.id)
+        rd = fetched.result_data
+        assert rd["status"] == "partial"
+        assert rd["medium_term"]["status"] == "failed"
+        assert rd["medium_term"]["horizon_run_metadata"]["resolved"] == ["short", "medium"]
+        assert rd["medium_term"]["horizon_run_metadata"]["primary_eval_offsets"] == {"short": 10, "medium": 40}
+
+    def test_read_legacy_report_without_metadata_marks_legacy_unknown_without_t40(self, db_session):
+        """Old single-horizon report lacking metadata is marked legacy/unknown without backfilling T+40."""
+        from api.services import report_service
+        from api.database import ReportDB
+        import uuid
+        old_result_data = {
+            "symbol": "600519.SH",
+            "trade_date": "2024-01-15",
+            "horizon": "short",
+            "status": "completed",
+            "data_as_of": "2024-01-15",
+        }
+        report = ReportDB(
+            id=str(uuid.uuid4()),
+            symbol="600519.SH",
+            trade_date="2024-01-15",
+            status="completed",
+            result_data=old_result_data,
+        )
+        db_session.add(report)
+        db_session.commit()
+
+        fetched = report_service.get_report(db_session, report.id)
+        assert "horizon_run_metadata" in fetched.result_data
+        meta = fetched.result_data["horizon_run_metadata"]
+        assert meta["resolution_source"] == "legacy"
+        assert meta["profile_id"] in ("legacy", "unknown")
+        assert meta.get("evaluation_eligible") is not True
+        # Must NEVER backfill T+40
+        assert "medium" not in meta.get("primary_eval_offsets", {})
+        assert 40 not in meta.get("primary_eval_offsets", {}).values()
+
+    def test_read_legacy_dual_report_without_metadata_marks_legacy_unknown_without_t40(self, db_session):
+        """Old dual-horizon report lacking metadata is marked legacy/unknown without backfilling T+40."""
+        from api.services import report_service
+        from api.database import ReportDB
+        import uuid
+        old_result_data = {
+            "mode": "dual_horizon",
+            "symbol": "600519.SH",
+            "trade_date": "2024-01-15",
+            "requested_horizons": ["short", "medium"],
+            "short_term": {"horizon": "short", "status": "completed"},
+            "medium_term": {"horizon": "medium", "status": "completed"},
+            "status": "completed",
+        }
+        report = ReportDB(
+            id=str(uuid.uuid4()),
+            symbol="600519.SH",
+            trade_date="2024-01-15",
+            status="completed",
+            result_data=old_result_data,
+        )
+        db_session.add(report)
+        db_session.commit()
+
+        fetched = report_service.get_report(db_session, report.id)
+        rd = fetched.result_data
+        assert "horizon_run_metadata" in rd
+        root_meta = rd["horizon_run_metadata"]
+        assert root_meta["resolution_source"] == "legacy"
+        assert root_meta["profile_id"] in ("legacy", "unknown")
+        # Must NEVER backfill T+40
+        assert 40 not in root_meta.get("primary_eval_offsets", {}).values()
+        assert "medium" not in root_meta.get("primary_eval_offsets", {})
+
+        # Slices also have legacy metadata without T+40
+        assert "horizon_run_metadata" in rd["short_term"]
+        assert "horizon_run_metadata" in rd["medium_term"]
+        assert rd["medium_term"]["horizon_run_metadata"]["resolution_source"] == "legacy"
+        assert 40 not in rd["medium_term"]["horizon_run_metadata"].get("primary_eval_offsets", {}).values()
+
+    def test_social_context_preserved_with_horizon_run_metadata(self, db_session):
+        """Social context is preserved alongside horizon_run_metadata in report persistence."""
+        from api.services import report_service
+        meta = {
+            "requested": None,
+            "resolved": ["short"],
+            "resolution_source": "default",
+            "profile_id": "horizon_profile_v1",
+            "primary_eval_offsets": {"short": 10},
+            "cutoff": "2026-07-31",
+            "investment_horizon": None,
+        }
+        social_ctx = {
+            "status": "available",
+            "mode": "active",
+            "direction_allowed": True,
+        }
+        result_data = {
+            "symbol": "600519.SH",
+            "trade_date": "2026-07-31",
+            "horizon": "short",
+            "horizon_run_metadata": meta,
+            "social_data_context": social_ctx,
+            "status": "completed",
+        }
+        report = report_service.create_report(
+            db=db_session,
+            symbol="600519.SH",
+            trade_date="2026-07-31",
+            result_data=result_data,
+        )
+        fetched = report_service.get_report(db_session, report.id)
+        assert fetched.result_data["horizon_run_metadata"]["resolved"] == ["short"]
+        assert fetched.result_data["social_data_context"] == social_ctx

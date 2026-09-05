@@ -41,6 +41,7 @@ class _FakePropagator:
         state = {
             "horizon": kwargs.get("horizon", "short"),
             "market_data_context": kwargs.get("market_data_context"),
+            "horizon_resolution": kwargs.get("horizon_resolution"),
         }
         _FakeTradingGraph.initial_states.append(state)
         return state
@@ -50,14 +51,55 @@ class _FakeGraphStream:
     @staticmethod
     def _state(init_state):
         horizon = init_state["horizon"]
+        hr = init_state.get("horizon_resolution")
+        meta = None
+        if hr is not None:
+            if hasattr(hr, "to_dict"):
+                meta = hr.to_dict()
+            elif isinstance(hr, dict):
+                meta = dict(hr)
+            else:
+                meta = {
+                    "resolved": [horizon],
+                    "resolution_source": "default",
+                }
+            if "primary_eval_offsets" not in meta:
+                meta["primary_eval_offsets"] = {
+                    h: (10 if h == "short" else 40)
+                    for h in meta.get("resolved", [horizon])
+                }
+            if "profile_id" not in meta:
+                meta["profile_id"] = "horizon_profile_v1"
+            if "cutoff" not in meta:
+                meta["cutoff"] = "2026-07-31"
+            if "investment_horizon" not in meta:
+                meta["investment_horizon"] = None
+        else:
+            meta = {
+                "requested": None,
+                "resolved": ["short"],
+                "resolution_source": "default",
+                "profile_id": "horizon_profile_v1",
+                "primary_eval_offsets": {"short": 10},
+                "cutoff": "2026-07-31",
+                "investment_horizon": None,
+            }
+        report_text = f"{horizon} 分析师报告内容，各维度分析完成，无异常。"
         return {
             "company_of_interest": "600519.SH",
             "trade_date": "2026-07-31",
             "horizon": horizon,
+            "market_report": report_text,
+            "sentiment_report": report_text,
             "news_report": f"{horizon} report",
+            "fundamentals_report": report_text,
+            "macro_report": report_text,
+            "smart_money_report": report_text,
+            "volume_price_report": report_text,
             "final_trade_decision": f"{horizon} decision",
             "market_data_context": init_state["market_data_context"],
             "analyst_traces": [{"horizon": horizon}],
+            "horizon_run_metadata": meta,
         }
 
     def invoke(self, init_state, **_kwargs):
@@ -93,7 +135,10 @@ class _FakeTradingGraph:
         return "BUY" if "short" in decision else "SELL"
 
     def _build_horizon_result(self, _horizon, state):
-        return dict(state)
+        res = dict(state)
+        if "horizon_run_metadata" in state:
+            res["horizon_run_metadata"] = dict(state["horizon_run_metadata"])
+        return res
 
 
 def _run_dual_job(
@@ -216,6 +261,13 @@ def test_dual_job_keeps_horizon_scoped_fields_and_propagates_result_sse_and_repo
         "medium",
     }
     assert all(thread_id.startswith("dual-") for thread_id in _FakeTradingGraph.thread_ids)
+    assert "horizon_run_metadata" in result
+    assert result["horizon_run_metadata"]["resolved"] == ["short", "medium"]
+    assert result["horizon_run_metadata"]["resolution_source"] == "explicit"
+    assert result["short_term"]["horizon_run_metadata"]["resolved"] == ["short", "medium"]
+    assert result["medium_term"]["horizon_run_metadata"]["resolved"] == ["short", "medium"]
+    assert result["short_term"]["horizon"] == "short"
+    assert result["medium_term"]["horizon"] == "medium"
     assert saved_reports[0]["result_data"] == result
     assert saved_reports[0]["decision"] is None
     assert saved_reports[0]["data_gaps"] == result["data_gaps"]
@@ -277,6 +329,9 @@ def test_dual_job_allows_partial_result_with_failed_horizon_status_and_impact():
     assert failed["horizon"] == "medium"
     assert failed["not_applicable"] is None
     assert failed["impact"]
+    assert "horizon_run_metadata" in result
+    assert "horizon_run_metadata" in failed
+    assert failed["horizon_run_metadata"]["resolved"] == ["short", "medium"]
     assert "medium" in result["data_gaps"][0] or result["data_gaps"]
     assert saved_reports[0]["result_data"]["medium_term"]["status"] == "failed"
     assert saved_reports[0]["decision"] is None
@@ -337,6 +392,10 @@ def test_dual_result_round_trips_nested_horizons_through_reportdb():
         assert persisted.result_data["medium_term"]["status"] == "completed"
         assert persisted.result_data["short_term"]["not_applicable"] is False
         assert persisted.result_data["medium_term"]["not_applicable"] is True
+        assert "horizon_run_metadata" in persisted.result_data
+        assert persisted.result_data["horizon_run_metadata"]["resolved"] == ["short", "medium"]
+        assert persisted.result_data["short_term"]["horizon_run_metadata"]["resolved"] == ["short", "medium"]
+        assert persisted.result_data["medium_term"]["horizon_run_metadata"]["resolved"] == ["short", "medium"]
         assert persisted.decision is None
         assert persisted.direction is None
         assert persisted.confidence is None
