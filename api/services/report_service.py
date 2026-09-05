@@ -1809,16 +1809,42 @@ def get_reports_by_user(
     return query.order_by(ReportDB.created_at.desc()).offset(skip).limit(limit).all()
 
 
+def _report_matches_horizon(report: ReportDB, target_horizon: str) -> bool:
+    """Check if report matches the target horizon based on result_data metadata."""
+    target = target_horizon.strip().lower()
+    rd = getattr(report, "result_data", None)
+    if not isinstance(rd, dict):
+        # Legacy reports without result_data default to short
+        return target == "short"
+    meta = rd.get("horizon_run_metadata")
+    if isinstance(meta, dict) and meta.get("resolved"):
+        resolved = [str(h).lower() for h in meta["resolved"]]
+        return target in resolved
+    if rd.get("horizon"):
+        return str(rd["horizon"]).lower() == target
+    if rd.get("short_term") and target == "short":
+        return True
+    if rd.get("medium_term") and target == "medium":
+        return True
+    # Legacy default fallback is short
+    return target == "short"
+
+
 def get_latest_reports_by_symbols(
     db: Session,
     symbols: List[str],
     user_id: Optional[str] = None,
+    horizon: Optional[str] = None,
 ) -> List[ReportDB]:
     normalized_symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
     if not normalized_symbols:
         return []
 
-    query = db.query(ReportDB).options(load_only(*REPORT_SUMMARY_COLUMNS))
+    cols = REPORT_SUMMARY_COLUMNS
+    if horizon:
+        cols = REPORT_SUMMARY_COLUMNS + (ReportDB.result_data,)
+
+    query = db.query(ReportDB).options(load_only(*cols))
     if user_id:
         query = query.filter(ReportDB.user_id == user_id)
 
@@ -1832,6 +1858,8 @@ def get_latest_reports_by_symbols(
     for row in rows:
         symbol = str(row.symbol or "").upper()
         if symbol and symbol not in latest_by_symbol:
+            if horizon and not _report_matches_horizon(row, horizon):
+                continue
             latest_by_symbol[symbol] = row
 
     return [latest_by_symbol[symbol] for symbol in normalized_symbols if symbol in latest_by_symbol]

@@ -38,6 +38,7 @@ from tradingagents.agents.utils.agent_utils import (
 from .conditional_logic import ConditionalLogic
 from .data_collector import DataCollector
 from .intent_parser import parse_intent
+from .horizon_profile import HorizonResolution
 from .setup import GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
@@ -55,12 +56,46 @@ _logger = logging.getLogger(__name__)
 def _state_logging_enabled() -> bool:
     """Whether full-state eval_results logging is enabled.
 
-    Disabled by default; opt in via TA_TRACE=1 (or true/yes/on). When enabled,
-    logs are written under TA_RESULTS_DIR (default ./results) instead of a
+    Disabled by default; opt in via TA_TRACE=1 (or true/yes/on) or TA_STATE_LOGS=1.
+    When enabled, logs are written under TA_RESULTS_DIR (default ./results) instead of a
     hardcoded eval_results/ directory.
     """
     raw = os.getenv("TA_TRACE")
-    return raw is not None and raw.strip().lower() in ("1", "true", "yes", "on")
+    if raw is not None and raw.strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    raw_state = os.getenv("TA_STATE_LOGS")
+    return raw_state is not None and raw_state.strip().lower() in ("1", "true", "yes", "on")
+
+
+class _LogStatesDict(dict):
+    """Dictionary supporting horizon-isolated state keys while retaining backward compatibility."""
+
+    def __getitem__(self, key: Any) -> Any:
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        # Fallback for legacy trade_date lookup: e.g. "2026-08-26" -> "2026-08-26_short"
+        if isinstance(key, str):
+            prefix = f"{key}_"
+            matches = [v for k, v in self.items() if isinstance(k, str) and k.startswith(prefix)]
+            if len(matches) == 1:
+                return matches[0]
+        raise KeyError(key)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key: Any) -> bool:
+        if super().__contains__(key):
+            return True
+        if isinstance(key, str):
+            prefix = f"{key}_"
+            matches = [k for k in self.keys() if isinstance(k, str) and k.startswith(prefix)]
+            if len(matches) == 1:
+                return True
+        return False
 
 
 def _summarize_social_context(ctx: Optional[Union[Dict[str, Any], Any]]) -> Dict[str, Any]:
@@ -235,7 +270,7 @@ class TradingAgentsGraph:
         # State tracking
         self.curr_state = None
         self.ticker = None
-        self.log_states_dict = {}  # date to full state dict
+        self.log_states_dict = _LogStatesDict()  # date/horizon to full state dict
 
         # Set up the graph with checkpointer
         self.graph = self.graph_setup.setup_graph(selected_analysts, checkpointer=self.checkpointer)
@@ -333,10 +368,21 @@ class TradingAgentsGraph:
         request_source: str = "api",
         thread_id: Optional[str] = None,
         horizon_resolution: Optional[Any] = None,
+        horizon: Optional[str] = None,
     ):
         """Run the trading agents graph for a company on a specific date."""
 
         self.ticker = company_name
+
+        effective_horizon = horizon
+        if effective_horizon is None:
+            if isinstance(horizon_resolution, HorizonResolution) and len(horizon_resolution.resolved) == 1:
+                effective_horizon = horizon_resolution.resolved[0]
+            elif isinstance(horizon_resolution, dict) and len(horizon_resolution.get("resolved", [])) == 1:
+                effective_horizon = horizon_resolution["resolved"][0]
+            else:
+                effective_horizon = "short"
+
         collected = self.data_collector.collect(company_name, trade_date)
         market_data_context = (
             collected.get("market_data_context")
@@ -360,15 +406,18 @@ class TradingAgentsGraph:
             social_data_context=social_data_context,
             runtime_config=self.config,
             horizon_resolution=horizon_resolution,
+            horizon=effective_horizon,
         )
         args = self.propagator.get_graph_args()
+
+        state_horizon = init_agent_state.get("horizon") or effective_horizon
 
         # Use thread_id for checkpointer
         if thread_id:
             args["config"]["configurable"] = {"thread_id": thread_id}
         elif not args["config"].get("configurable"):
-            # Default fallback for standalone runs
-            args["config"]["configurable"] = {"thread_id": f"{company_name}_{trade_date}"}
+            # Default fallback for standalone runs: isolate by horizon to prevent thread collision
+            args["config"]["configurable"] = {"thread_id": f"{company_name}_{trade_date}_{state_horizon}"}
 
         if self.debug:
             # Debug mode with tracing
@@ -619,9 +668,65 @@ class TradingAgentsGraph:
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""
-        self.log_states_dict[str(trade_date)] = {
-            "company_of_interest": final_state["company_of_interest"],
-            "trade_date": final_state["trade_date"],
+        if not isinstance(self.log_states_dict, _LogStatesDict):
+            self.log_states_dict = _LogStatesDict(self.log_states_dict)
+
+        horizon = final_state.get("horizon")
+        if not horizon and isinstance(final_state.get("horizon_run_metadata"), dict):
+            resolved = final_state["horizon_run_metadata"].get("resolved")
+            if resolved and len(resolved) == 1:
+                horizon = resolved[0]
+
+        log_key = f"{trade_date}_{horizon}" if horizon else str(trade_date)
+
+        inv_state = final_state.get("investment_debate_state")
+        if isinstance(inv_state, dict):
+            logged_inv_state = {
+                "bull_history": inv_state.get("bull_history", ""),
+                "bear_history": inv_state.get("bear_history", ""),
+                "history": inv_state.get("history", ""),
+                "current_speaker": inv_state.get("current_speaker", ""),
+                "current_response": inv_state.get("current_response", ""),
+                "judge_decision": inv_state.get("judge_decision", ""),
+                "claims": inv_state.get("claims", []),
+                "round_messages": inv_state.get("round_messages", []),
+                "focus_claim_ids": inv_state.get("focus_claim_ids", []),
+                "open_claim_ids": inv_state.get("open_claim_ids", []),
+                "resolved_claim_ids": inv_state.get("resolved_claim_ids", []),
+                "unresolved_claim_ids": inv_state.get("unresolved_claim_ids", []),
+                "round_summary": inv_state.get("round_summary", ""),
+                "round_goal": inv_state.get("round_goal", ""),
+                "manager_verdict": inv_state.get("manager_verdict"),
+                "evidence_verification": inv_state.get("evidence_verification", []),
+                "report_manifest": inv_state.get("report_manifest"),
+            }
+        else:
+            logged_inv_state = {}
+
+        risk_state = final_state.get("risk_debate_state")
+        if isinstance(risk_state, dict):
+            logged_risk_state = {
+                "aggressive_history": risk_state.get("aggressive_history", ""),
+                "conservative_history": risk_state.get("conservative_history", ""),
+                "neutral_history": risk_state.get("neutral_history", ""),
+                "history": risk_state.get("history", ""),
+                "judge_decision": risk_state.get("judge_decision", ""),
+                "claims": risk_state.get("claims", []),
+                "focus_claim_ids": risk_state.get("focus_claim_ids", []),
+                "open_claim_ids": risk_state.get("open_claim_ids", []),
+                "resolved_claim_ids": risk_state.get("resolved_claim_ids", []),
+                "unresolved_claim_ids": risk_state.get("unresolved_claim_ids", []),
+                "round_summary": risk_state.get("round_summary", ""),
+                "round_goal": risk_state.get("round_goal", ""),
+            }
+        else:
+            logged_risk_state = {}
+
+        entry = {
+            "company_of_interest": final_state.get("company_of_interest") or self.ticker or "unknown",
+            "trade_date": final_state.get("trade_date") or str(trade_date),
+            "horizon": horizon,
+            "horizon_run_metadata": copy.deepcopy(final_state.get("horizon_run_metadata")) if isinstance(final_state.get("horizon_run_metadata"), dict) else final_state.get("horizon_run_metadata"),
             "instrument_context": final_state.get("instrument_context", {}),
             "market_context": final_state.get("market_context", {}),
             "market_data_context": final_state.get("market_data_context", {}),
@@ -629,64 +734,30 @@ class TradingAgentsGraph:
             "fund_flow_consensus_guard": final_state.get("fund_flow_consensus_guard", {}),
             "user_context": final_state.get("user_context", {}),
             "workflow_context": final_state.get("workflow_context", {}),
-            "market_report": final_state["market_report"],
-            "sentiment_report": final_state["sentiment_report"],
-            "news_report": final_state["news_report"],
-            "fundamentals_report": final_state["fundamentals_report"],
+            "market_report": final_state.get("market_report", ""),
+            "sentiment_report": final_state.get("sentiment_report", ""),
+            "news_report": final_state.get("news_report", ""),
+            "fundamentals_report": final_state.get("fundamentals_report", ""),
             "macro_report": final_state.get("macro_report", ""),
             "smart_money_report": final_state.get("smart_money_report", ""),
             "volume_price_report": final_state.get("volume_price_report", ""),
-            "investment_debate_state": {
-                "bull_history": final_state["investment_debate_state"]["bull_history"],
-                "bear_history": final_state["investment_debate_state"]["bear_history"],
-                "history": final_state["investment_debate_state"]["history"],
-                "current_speaker": final_state["investment_debate_state"].get("current_speaker", ""),
-                "current_response": final_state["investment_debate_state"][
-                    "current_response"
-                ],
-                "judge_decision": final_state["investment_debate_state"][
-                    "judge_decision"
-                ],
-                "claims": final_state["investment_debate_state"].get("claims", []),
-                "round_messages": final_state["investment_debate_state"].get("round_messages", []),
-                "focus_claim_ids": final_state["investment_debate_state"].get("focus_claim_ids", []),
-                "open_claim_ids": final_state["investment_debate_state"].get("open_claim_ids", []),
-                "resolved_claim_ids": final_state["investment_debate_state"].get("resolved_claim_ids", []),
-                "unresolved_claim_ids": final_state["investment_debate_state"].get("unresolved_claim_ids", []),
-                "round_summary": final_state["investment_debate_state"].get("round_summary", ""),
-                "round_goal": final_state["investment_debate_state"].get("round_goal", ""),
-                "manager_verdict": final_state["investment_debate_state"].get("manager_verdict"),
-                "evidence_verification": final_state["investment_debate_state"].get("evidence_verification", []),
-                "report_manifest": final_state["investment_debate_state"].get("report_manifest"),
-            },
-            "manager_verdict": final_state.get("manager_verdict") or (final_state.get("investment_debate_state", {}).get("manager_verdict") if isinstance(final_state.get("investment_debate_state"), dict) else None),
-            "evidence_verification": final_state.get("evidence_verification") or (final_state.get("investment_debate_state", {}).get("evidence_verification") if isinstance(final_state.get("investment_debate_state"), dict) else []),
-            "report_manifest": final_state.get("report_manifest") or (final_state.get("investment_debate_state", {}).get("report_manifest") if isinstance(final_state.get("investment_debate_state"), dict) else None),
-            "trader_investment_decision": final_state["trader_investment_plan"],
-            "risk_debate_state": {
-                "aggressive_history": final_state["risk_debate_state"]["aggressive_history"],
-                "conservative_history": final_state["risk_debate_state"]["conservative_history"],
-                "neutral_history": final_state["risk_debate_state"]["neutral_history"],
-                "history": final_state["risk_debate_state"]["history"],
-                "judge_decision": final_state["risk_debate_state"]["judge_decision"],
-                "claims": final_state["risk_debate_state"].get("claims", []),
-                "focus_claim_ids": final_state["risk_debate_state"].get("focus_claim_ids", []),
-                "open_claim_ids": final_state["risk_debate_state"].get("open_claim_ids", []),
-                "resolved_claim_ids": final_state["risk_debate_state"].get("resolved_claim_ids", []),
-                "unresolved_claim_ids": final_state["risk_debate_state"].get("unresolved_claim_ids", []),
-                "round_summary": final_state["risk_debate_state"].get("round_summary", ""),
-                "round_goal": final_state["risk_debate_state"].get("round_goal", ""),
-            },
+            "investment_debate_state": logged_inv_state,
+            "manager_verdict": final_state.get("manager_verdict") or (inv_state.get("manager_verdict") if isinstance(inv_state, dict) else None),
+            "evidence_verification": final_state.get("evidence_verification") or (inv_state.get("evidence_verification") if isinstance(inv_state, dict) else []),
+            "report_manifest": final_state.get("report_manifest") or (inv_state.get("report_manifest") if isinstance(inv_state, dict) else None),
+            "trader_investment_decision": final_state.get("trader_investment_plan", ""),
+            "risk_debate_state": logged_risk_state,
             "risk_feedback_state": final_state.get("risk_feedback_state", {}),
-            "investment_plan": final_state["investment_plan"],
-            "final_trade_decision": final_state["final_trade_decision"],
+            "investment_plan": final_state.get("investment_plan", ""),
+            "final_trade_decision": final_state.get("final_trade_decision", ""),
         }
+        self.log_states_dict[log_key] = entry
 
         # Save to file — only when state logging is explicitly enabled; writes
         # land under TA_RESULTS_DIR instead of a hardcoded eval_results/ dir.
         if not _state_logging_enabled():
             return
-        safe_ticker = self._safe_ticker(self.ticker or "unknown")
+        safe_ticker = self._safe_ticker(self.ticker or final_state.get("company_of_interest") or "unknown")
         directory = (
             Path(os.getenv("TA_RESULTS_DIR", "./results"))
             / safe_ticker
@@ -694,8 +765,122 @@ class TradingAgentsGraph:
         )
         directory.mkdir(parents=True, exist_ok=True)
 
-        with open(directory / f"full_states_log_{trade_date}.json", "w") as f:
-            json.dump(self.log_states_dict, f, indent=4)
+        filename = f"full_states_log_{trade_date}_{horizon}.json" if horizon else f"full_states_log_{trade_date}.json"
+        with open(directory / filename, "w", encoding="utf-8") as f:
+            json.dump({log_key: entry}, f, indent=4, ensure_ascii=False)
+
+    @classmethod
+    def read_state_log(
+        cls,
+        ticker: str,
+        trade_date: str,
+        horizon: Optional[str] = None,
+        results_dir: Optional[Union[str, Path]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Read state log from disk for a ticker, trade_date, and horizon.
+
+        Handles:
+        - Horizon-isolated files: full_states_log_{trade_date}_{horizon}.json
+        - Legacy files: full_states_log_{trade_date}.json (without horizon suffix).
+          Legacy files are marked as horizon='legacy' and NEVER interpreted as a T+40 / medium run.
+        """
+        base_dir = Path(results_dir or os.getenv("TA_RESULTS_DIR", "./results"))
+        safe_ticker = cls._safe_ticker(ticker)
+        directory = base_dir / safe_ticker / "TradingAgentsStrategy_logs"
+        if not directory.exists():
+            return None
+
+        # 1. If horizon is specified, check for horizon-specific log first
+        if horizon:
+            horizon_str = str(horizon).lower()
+            file_path = directory / f"full_states_log_{trade_date}_{horizon_str}.json"
+            if file_path.exists():
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return cls._extract_entry_from_log_data(data, trade_date, horizon=horizon_str)
+            # If specifically looking for medium, legacy files (without suffix) MUST NOT match
+            if horizon_str == "medium":
+                return None
+
+        # 2. Check for legacy log file without horizon suffix
+        legacy_file = directory / f"full_states_log_{trade_date}.json"
+        if legacy_file.exists():
+            with open(legacy_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            entry = cls._extract_entry_from_log_data(data, trade_date, horizon=None)
+            if entry is not None:
+                # Mark as legacy/unknown; never interpret as T+40 run
+                return cls._mark_legacy_state(entry)
+
+        return None
+
+    @classmethod
+    def _extract_entry_from_log_data(
+        cls,
+        data: Any,
+        trade_date: str,
+        horizon: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(data, dict):
+            return None
+        candidates = []
+        if horizon:
+            candidates.append(f"{trade_date}_{horizon}")
+        candidates.append(str(trade_date))
+        for k in candidates:
+            if k in data and isinstance(data[k], dict):
+                return dict(data[k])
+        if "company_of_interest" in data or "final_trade_decision" in data:
+            return dict(data)
+        for v in data.values():
+            if isinstance(v, dict):
+                return dict(v)
+        return None
+
+    @classmethod
+    def _mark_legacy_state(cls, entry: Dict[str, Any]) -> Dict[str, Any]:
+        result = dict(entry)
+        curr_h = result.get("horizon")
+        if not curr_h or str(curr_h).lower() in ("unknown", "legacy", "none"):
+            result["horizon"] = "legacy"
+        meta = result.get("horizon_run_metadata")
+        if not isinstance(meta, dict):
+            result["horizon_run_metadata"] = {
+                "requested": None,
+                "resolved": ["short"],
+                "resolution_source": "legacy",
+                "profile_id": "unknown",
+                "primary_eval_offsets": {"short": 10},
+                "cutoff": result.get("data_as_of"),
+                "investment_horizon": None,
+            }
+        else:
+            meta = dict(meta)
+            meta["resolution_source"] = meta.get("resolution_source") or "legacy"
+            meta["profile_id"] = meta.get("profile_id") or "unknown"
+            offsets = meta.get("primary_eval_offsets") or {}
+            meta["primary_eval_offsets"] = {
+                k: v for k, v in offsets.items() if k != "medium" and v != 40
+            }
+            if not meta["primary_eval_offsets"]:
+                meta["primary_eval_offsets"] = {"short": 10}
+            result["horizon_run_metadata"] = meta
+        return result
+
+    def load_state_log(
+        self,
+        trade_date: str,
+        horizon: Optional[str] = None,
+        ticker: Optional[str] = None,
+        results_dir: Optional[Union[str, Path]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Instance helper to load state log from disk."""
+        return self.read_state_log(
+            ticker=ticker or self.ticker or "unknown",
+            trade_date=trade_date,
+            horizon=horizon,
+            results_dir=results_dir,
+        )
 
     def process_signal(self, full_signal):
         """Process a signal to extract the core decision."""
