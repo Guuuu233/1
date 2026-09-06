@@ -770,7 +770,8 @@ direction 只可填：看多 / 偏多 / 中性 / 偏空 / 看空。数据不足�
 注意：只输出 JSON，不要有任何前缀或后缀文字。""",
 
     "horizon_context_block": """【分析视角】
-当前分析维度：{horizon_label}
+本次研究档：{research_horizon_label}
+本节点专业观察窗：{observation_horizon_label}
 用户重点关注：{focus_areas_str}
 具体问题：{specific_questions_str}
 

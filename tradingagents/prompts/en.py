@@ -518,7 +518,8 @@ Example output:
 Output JSON only, no prefix or suffix text.""",
 
     "horizon_context_block": """[Analysis Perspective]
-Current horizon: {horizon_label}
+Research Horizon: {research_horizon_label}
+Node Observation Window: {observation_horizon_label}
 User focus: {focus_areas_str}
 Specific questions: {specific_questions_str}
 

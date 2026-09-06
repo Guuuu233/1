@@ -31,6 +31,7 @@ from .horizon_profile import (
     RESOLUTION_SOURCE_EXPLICIT,
     resolve_analysis_horizons,
 )
+from .intent_parser import bind_research_horizon, clear_research_horizon
 from tradingagents.dataflows.social.contracts import create_default_social_data_context
 
 
@@ -139,6 +140,11 @@ class Propagator:
         }
         if notice is not None:
             horizon_run_metadata["notice"] = notice
+
+        if horizon in resolved:
+            bind_research_horizon(horizon)
+        else:
+            clear_research_horizon()
 
         investment_debate_state_dict: Dict[str, Any] = {
             "history": "",

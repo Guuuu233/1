@@ -1,6 +1,8 @@
 """IntentParser: parse natural language query into structured trading intent."""
 from __future__ import annotations
 
+import contextvars
+from contextlib import contextmanager
 import json
 import re
 from typing import Any, Dict, List, Optional
@@ -9,12 +11,58 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from tradingagents.agents.utils.context_utils import normalize_user_context
 from tradingagents.prompts import get_prompt
+from tradingagents.prompts.catalog import _resolve_language
 from tradingagents.dataflows.config import get_config
 
-_HORIZON_LABELS = {
+_RESEARCH_HORIZON_VAR: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "_RESEARCH_HORIZON_VAR", default=None
+)
+
+
+def bind_research_horizon(horizon: Optional[str]) -> contextvars.Token[Optional[str]]:
+    """Bind the research horizon for the current context/thread."""
+    return _RESEARCH_HORIZON_VAR.set(horizon)
+
+
+def reset_research_horizon(token: contextvars.Token[Optional[str]]) -> None:
+    """Reset the research horizon binding using a token."""
+    _RESEARCH_HORIZON_VAR.reset(token)
+
+
+def clear_research_horizon() -> None:
+    """Clear the research horizon binding for the current context/thread."""
+    _RESEARCH_HORIZON_VAR.set(None)
+
+
+def get_bound_research_horizon() -> Optional[str]:
+    """Get the currently bound research horizon, if any."""
+    return _RESEARCH_HORIZON_VAR.get()
+
+
+@contextmanager
+def research_horizon_context(horizon: Optional[str]):
+    """Context manager for temporary research horizon binding."""
+    token = bind_research_horizon(horizon)
+    try:
+        yield
+    finally:
+        reset_research_horizon(token)
+
+
+_HORIZON_LABELS_ZH: Dict[str, str] = {
     "short": "短线（1-2周，技术面主导）",
     "medium": "中线（1-3月，基本面主导）",
 }
+
+_HORIZON_LABELS_EN: Dict[str, str] = {
+    "short": "Short-term (1-2 weeks, technicals-driven)",
+    "medium": "Medium-term (1-3 months, fundamentals-driven)",
+}
+
+_HORIZON_LABELS = _HORIZON_LABELS_ZH
+
+_UNBOUND_LABEL_ZH = "未绑定"
+_UNBOUND_LABEL_EN = "Unbound"
 
 
 def parse_intent(
@@ -67,20 +115,59 @@ def parse_intent(
 
 def build_horizon_context(
     horizon: str,
-    focus_areas: List[str],
-    specific_questions: List[str],
+    focus_areas: Optional[List[str]] = None,
+    specific_questions: Optional[List[str]] = None,
     agent_type: Optional[str] = None,
+    *,
+    research_horizon: Optional[str] = None,
+    run_horizon: Optional[str] = None,
 ) -> str:
-    """Build the horizon context block to prepend to any agent's system prompt."""
+    """Build the horizon context block to prepend to any agent's system prompt.
+
+    Args:
+        horizon: The node's observation window (专业观察窗).
+        focus_areas: Specific analysis dimensions requested by user.
+        specific_questions: Concrete questions requested by user.
+        agent_type: Optional analyst/researcher type identifier.
+        research_horizon: Explicit research horizon override (优先级: kwarg > binding > 未绑定).
+        run_horizon: Alias for research_horizon.
+    """
     config = get_config()
     template = get_prompt("horizon_context_block", config=config)
+    lang = _resolve_language(config)
 
-    horizon_label = _HORIZON_LABELS.get(horizon, horizon)
-    focus_str = "、".join(focus_areas) if focus_areas else "无特殊关注"
-    questions_str = "；".join(specific_questions) if specific_questions else "无"
+    focus_list = focus_areas if focus_areas is not None else []
+    questions_list = specific_questions if specific_questions is not None else []
+
+    # Resolution priority: explicit kwarg > thread binding > unbound
+    target_research = research_horizon if research_horizon is not None else run_horizon
+    if target_research is None:
+        target_research = get_bound_research_horizon()
+
+    if lang == "zh":
+        labels = _HORIZON_LABELS_ZH
+        unbound_label = _UNBOUND_LABEL_ZH
+        focus_str = "、".join(focus_list) if focus_list else "无特殊关注"
+        questions_str = "；".join(questions_list) if questions_list else "无"
+    else:
+        labels = _HORIZON_LABELS_EN
+        unbound_label = _UNBOUND_LABEL_EN
+        focus_str = ", ".join(focus_list) if focus_list else "None"
+        questions_str = "; ".join(questions_list) if questions_list else "None"
+
+    observation_horizon_label = labels.get(horizon, horizon)
+    research_horizon_label = (
+        labels.get(target_research, target_research)
+        if target_research is not None
+        else unbound_label
+    )
 
     return template.format(
-        horizon_label=horizon_label,
+        research_horizon_label=research_horizon_label,
+        observation_horizon_label=observation_horizon_label,
+        research_horizon=research_horizon_label,
+        observation_horizon=observation_horizon_label,
+        horizon_label=observation_horizon_label,
         focus_areas_str=focus_str,
         specific_questions_str=questions_str,
         weight_hint="",
