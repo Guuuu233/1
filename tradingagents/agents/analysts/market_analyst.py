@@ -8,7 +8,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
-from tradingagents.graph.intent_parser import build_horizon_context
+from tradingagents.graph.intent_parser import (
+    build_horizon_context,
+    get_bound_research_horizon,
+)
 from tradingagents.agents.utils.agent_states import current_tracker_var, extract_verdict, check_llm_output_degraded, check_stream_chunk_degraded
 from api.database import log_llm_call
 
@@ -63,6 +66,33 @@ def _format_market_data_context(context: dict) -> str:
     )
 
 
+def _resolve_research_horizon(state: dict | None) -> str:
+    """Resolve the active research horizon for the current run.
+
+    Priority:
+    1. state["horizon"] if present and truthy
+    2. state["horizon_run_metadata"]["resolved"][0] if present
+    3. state["horizon_run_metadata"]["requested"][0] if present
+    4. get_bound_research_horizon() from H-04a thread binding
+    5. fallback to "short"
+    """
+    if state:
+        if state.get("horizon"):
+            return state["horizon"]
+        metadata = state.get("horizon_run_metadata")
+        if isinstance(metadata, dict):
+            resolved = metadata.get("resolved")
+            if resolved and isinstance(resolved, list) and len(resolved) > 0:
+                return resolved[0]
+            requested = metadata.get("requested")
+            if requested and isinstance(requested, list) and len(requested) > 0:
+                return requested[0]
+    bound = get_bound_research_horizon()
+    if bound:
+        return bound
+    return "short"
+
+
 def create_market_analyst(llm, data_collector=None):
     async def market_analyst_node(state):
         current_date = state["trade_date"]
@@ -71,19 +101,26 @@ def create_market_analyst(llm, data_collector=None):
         stock_name = get_cn_stock_name(ticker)
 
         ticker_display = f"{ticker} ({stock_name})" if stock_name and stock_name != ticker else ticker
-        horizon = "short"  # 技术面固定短期视角
+        observation_horizon = "short"  # 技术面专业观察窗固定为短期
+        research_horizon = _resolve_research_horizon(state)
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])
         specific_questions = user_intent.get("specific_questions", [])
-        
+
         config = get_config()
-        horizon_ctx = build_horizon_context(horizon, focus_areas, specific_questions, agent_type="market")
+        horizon_ctx = build_horizon_context(
+            observation_horizon,
+            focus_areas,
+            specific_questions,
+            agent_type="market",
+            research_horizon=research_horizon,
+        )
         system_message = get_prompt("market_system_message", config=config)
 
         if data_collector is not None:
             pool = data_collector.get(ticker, current_date)
             if pool is not None:
-                windowed = data_collector.get_window(pool, horizon, current_date)
+                windowed = data_collector.get_window(pool, observation_horizon, current_date)
                 stock_data = windowed.get("stock_data", "无数据")
                 indicators = windowed.get("indicators", {})
                 data_window = windowed.get("_data_window", "14天")
@@ -91,10 +128,10 @@ def create_market_analyst(llm, data_collector=None):
                     "market_data_context", _default_market_data_context()
                 )
             else:
-                stock_data, indicators, data_window = await _fetch_direct(ticker, current_date, horizon)
+                stock_data, indicators, data_window = await _fetch_direct(ticker, current_date, observation_horizon)
                 market_data_context = _default_market_data_context()
         else:
-            stock_data, indicators, data_window = await _fetch_direct(ticker, current_date, horizon)
+            stock_data, indicators, data_window = await _fetch_direct(ticker, current_date, observation_horizon)
             market_data_context = _default_market_data_context()
 
         indicator_blocks = [
@@ -200,7 +237,9 @@ def create_market_analyst(llm, data_collector=None):
             "market_data_context": market_data_context,
             "analyst_traces": [{
                 "agent": "market_analyst",
-                "horizon": horizon,
+                "horizon": research_horizon,
+                "research_horizon": research_horizon,
+                "observation_horizon": observation_horizon,
                 "data_window": data_window,
                 "key_finding": f"市场技术面结论：{verdict}",
                 "verdict": verdict,
