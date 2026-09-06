@@ -6,7 +6,10 @@ from datetime import datetime, timedelta
 from langchain_core.messages import HumanMessage, SystemMessage
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
-from tradingagents.graph.intent_parser import build_horizon_context
+from tradingagents.graph.intent_parser import (
+    build_horizon_context,
+    get_bound_research_horizon,
+)
 from tradingagents.agents.utils.agent_states import (
     current_tracker_var,
     extract_verdict,
@@ -26,6 +29,33 @@ from tradingagents.graph.data_collector import _map_stock_to_industry
 from api.database import log_llm_call
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_research_horizon(state: dict | None) -> str:
+    """Resolve the active research horizon for the current run.
+
+    Priority:
+    1. state["horizon"] if present and truthy
+    2. state["horizon_run_metadata"]["resolved"][0] if present
+    3. state["horizon_run_metadata"]["requested"][0] if present
+    4. get_bound_research_horizon() from H-04a thread binding
+    5. fallback to "short"
+    """
+    if state:
+        if state.get("horizon"):
+            return state["horizon"]
+        metadata = state.get("horizon_run_metadata")
+        if isinstance(metadata, dict):
+            resolved = metadata.get("resolved")
+            if resolved and isinstance(resolved, list) and len(resolved) > 0:
+                return resolved[0]
+            requested = metadata.get("requested")
+            if requested and isinstance(requested, list) and len(requested) > 0:
+                return requested[0]
+    bound = get_bound_research_horizon()
+    if bound:
+        return bound
+    return "short"
 
 
 def create_macro_analyst(llm, data_collector=None):
@@ -60,14 +90,22 @@ def create_macro_analyst(llm, data_collector=None):
 
         ticker_display = f"{ticker} ({stock_name})" if stock_name and stock_name != ticker else ticker
         logger.debug("[Macro Analyst] START %s %s", ticker_display, current_date)
-        horizon = "medium"  # 宏观面固定中长期视角
+        observation_horizon = "medium"  # 宏观面专业观察窗固定为中长期
+        research_horizon = _resolve_research_horizon(state)
+        data_window = "板块数据"
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])
         specific_questions = user_intent.get("specific_questions", [])
 
         config = get_config()
         system_message = get_prompt("macro_system_message", config=config) or ""
-        horizon_ctx = build_horizon_context(horizon, focus_areas, specific_questions, agent_type="macro")
+        horizon_ctx = build_horizon_context(
+            observation_horizon,
+            focus_areas,
+            specific_questions,
+            agent_type="macro",
+            research_horizon=research_horizon,
+        )
 
         pool = data_collector.get(ticker, current_date) if data_collector else None
 
@@ -256,8 +294,10 @@ def create_macro_analyst(llm, data_collector=None):
             "macro_report": full_content,
             "analyst_traces": [{
                 "agent": "macro_analyst",
-                "horizon": horizon,
-                "data_window": "板块数据",
+                "horizon": research_horizon,
+                "research_horizon": research_horizon,
+                "observation_horizon": observation_horizon,
+                "data_window": data_window,
                 "key_finding": f"宏观板块分析结论：{verdict}",
                 "verdict": verdict,
                 "confidence": confidence,
