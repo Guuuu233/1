@@ -18,10 +18,12 @@ import {
     JOB_NOT_FOUND_MESSAGE,
     RECOVERY_POLL_TIMEOUT_MESSAGE,
 } from '@/utils/jobLifecycle'
+import AnalysisHorizonSelector from '@/components/AnalysisHorizonSelector'
 import type {
     AgentReportEvent,
     AgentSnapshotEvent,
     AgentStatusEvent,
+    AnalysisHorizon,
     AnalysisReport,
     ReportChunkEvent,
     Report,
@@ -142,6 +144,7 @@ function ReportCard({
 
 export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initialInput }: ChatCopilotPanelProps) {
     const [input, setInput] = useState(initialInput || '')
+    const [selectedHorizons, setSelectedHorizons] = useState<AnalysisHorizon[]>(['short'])
     const [streaming, setStreaming] = useState(false)
     // Tracks agent bubbles waiting for their first token (shows "正在推理分析中..." spinner)
     const pendingAgentMsgIdsRef = useRef<Set<string>>(new Set())
@@ -695,11 +698,12 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
         }
     }
 
-    const streamChat = async (prompt: string) => {
+    const streamChat = async (prompt: string, horizons: AnalysisHorizon[] = selectedHorizons) => {
         const response = await api.chatCompletion(
             [{ role: 'user', content: prompt }],
             true,
             selectedAnalysts,
+            horizons,
         )
 
         if (!response.body) throw new Error('SSE stream unavailable')
@@ -800,7 +804,7 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
         recoveryAbortRef.current = recoveryController
 
         try {
-            const terminalReceived = await streamChat(fullPrompt)
+            const terminalReceived = await streamChat(fullPrompt, selectedHorizons)
             if (!terminalReceived) {
                 const recovered = await recoverInterruptedJob(recoveryController.signal)
                 if (!recovered && !recoveryController.signal.aborted) {
@@ -1103,7 +1107,14 @@ export default function ChatCopilotPanel({ onSymbolDetected, onShowReport, initi
             </div>
 
             {/* 输入框 */}
-            <form onSubmit={handleSubmit} className="mt-3 shrink-0">
+            <form onSubmit={handleSubmit} className="mt-3 shrink-0 space-y-2">
+                <div className="flex items-center justify-between">
+                    <AnalysisHorizonSelector
+                        value={selectedHorizons}
+                        onChange={setSelectedHorizons}
+                        disabled={streaming || isAnalyzing}
+                    />
+                </div>
                 <div className="flex items-center gap-2">
                     <input
                         value={input}

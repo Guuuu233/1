@@ -1,4 +1,4 @@
-import type { Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, CalibrationResponse, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, Provider, ModelProfile, ModelProfileCreatePayload, RoleBinding, RoleBindingItem, ResolvedRole, CustomPrompt, CustomPromptItem } from '@/types'
+import type { Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisHorizon, AnalysisReport, AnalysisRequest, AnalysisResponse, CalibrationResponse, KlineResponse, LatestAnnouncementResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, Provider, ModelProfile, ModelProfileCreatePayload, RoleBinding, RoleBindingItem, ResolvedRole, CustomPrompt, CustomPromptItem } from '@/types'
 
 export function getBaseUrl(): string {
     const envUrl = (import.meta.env.VITE_API_URL as string) || ''
@@ -99,7 +99,9 @@ class ApiService {
         messages: Array<{ role: string; content: string }>,
         stream = true,
         selectedAnalysts?: string[],
+        horizons?: AnalysisHorizon[] | string[],
     ) {
+        const resolvedHorizons = horizons !== undefined ? horizons : ['short']
         const response = await fetch(`${getBaseUrl()}/v1/chat/completions`, {
             method: 'POST',
             headers: {
@@ -111,14 +113,36 @@ class ApiService {
                 stream,
                 selected_analysts: selectedAnalysts,
                 config_overrides: { v2_debate_enabled: true },
+                horizons: resolvedHorizons,
             }),
         })
 
         if (!response.ok) {
-            throw new ApiError(`HTTP error! status: ${response.status}`, response.status)
+            const status = response.status
+            const contentType = response.headers.get('content-type') || ''
+            if (contentType.includes('application/json')) {
+                const data = await response.json().catch(() => null)
+                const detail = typeof data?.detail === 'string'
+                    ? data.detail
+                    : (Array.isArray(data?.detail) ? JSON.stringify(data.detail) : (data?.message || ''))
+                throw new ApiError(detail || `HTTP error! status: ${status}`, status)
+            }
+            const error = await response.text().catch(() => '')
+            throw new ApiError(error || `HTTP error! status: ${status}`, status)
         }
 
         return response
+    }
+
+    async analyze(request: AnalysisRequest): Promise<AnalysisResponse> {
+        const resolvedHorizons = request.horizons !== undefined ? request.horizons : ['short']
+        return this.request<AnalysisResponse>('/v1/analyze', {
+            method: 'POST',
+            body: JSON.stringify({
+                ...request,
+                horizons: resolvedHorizons,
+            }),
+        })
     }
 
     // Report API Methods

@@ -84,6 +84,7 @@ export interface AnalysisRequest {
     symbol: string
     trade_date: string
     selected_analysts: string[]
+    horizons?: AnalysisHorizon[] | string[]
     objective?: string
     risk_profile?: string
     investment_horizon?: string
