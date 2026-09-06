@@ -5,7 +5,10 @@ import asyncio
 from langchain_core.messages import HumanMessage, SystemMessage
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
-from tradingagents.graph.intent_parser import build_horizon_context
+from tradingagents.graph.intent_parser import (
+    build_horizon_context,
+    get_bound_research_horizon,
+)
 from tradingagents.agents.utils.agent_states import (
     current_tracker_var,
     extract_verdict,
@@ -26,17 +29,67 @@ from api.database import log_llm_call
 logger = logging.getLogger(__name__)
 
 
-def create_news_analyst(llm, data_collector=None):
-    async def _safe(tool, payload):
-        try:
-            if hasattr(tool, "invoke"):
-                return await asyncio.to_thread(tool.invoke, payload)
-            elif callable(tool):
-                return await asyncio.to_thread(tool, **payload)
-            return str(tool)
-        except Exception as exc:
-            return f"调用失败：{exc}"
+def _resolve_research_horizon(state: dict | None) -> str:
+    """Resolve the active research horizon for the current run.
 
+    Priority:
+    1. state["horizon"] if present and truthy
+    2. state["horizon_run_metadata"]["resolved"][0] if present
+    3. state["horizon_run_metadata"]["requested"][0] if present
+    4. get_bound_research_horizon() from H-04a thread binding
+    5. fallback to "short"
+    """
+    if state:
+        if state.get("horizon"):
+            return state["horizon"]
+        metadata = state.get("horizon_run_metadata")
+        if isinstance(metadata, dict):
+            resolved = metadata.get("resolved")
+            if resolved and isinstance(resolved, list) and len(resolved) > 0:
+                return resolved[0]
+            requested = metadata.get("requested")
+            if requested and isinstance(requested, list) and len(requested) > 0:
+                return requested[0]
+    bound = get_bound_research_horizon()
+    if bound:
+        return bound
+    return "short"
+
+
+async def _safe_fetch(tool, payload):
+    try:
+        if hasattr(tool, "invoke"):
+            return await asyncio.to_thread(tool.invoke, payload)
+        elif callable(tool):
+            return await asyncio.to_thread(tool, **payload)
+        return str(tool)
+    except Exception as exc:
+        return f"调用失败：{exc}"
+
+
+async def _fetch_direct(ticker: str, current_date: str, horizon: str):
+    from datetime import datetime, timedelta
+    from tradingagents.agents.utils.agent_utils import get_news, get_global_news
+
+    days = 14 if horizon == "short" else 30
+    end_dt = datetime.strptime(current_date, "%Y-%m-%d")
+    start_dt = end_dt - timedelta(days=days)
+
+    # Parallelize fallback fetches
+    results = await asyncio.gather(
+        _safe_fetch(get_news, {
+            "ticker": ticker, "start_date": start_dt.strftime("%Y-%m-%d"), "end_date": current_date,
+        }),
+        _safe_fetch(get_global_news, {
+            "curr_date": current_date, "look_back_days": days, "limit": 10,
+        })
+    )
+    stock_news, global_news = results
+    data_window = f"{days}天"
+    return stock_news, global_news, data_window
+
+
+def create_news_analyst(llm, data_collector=None):
     async def news_analyst_node(state):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
@@ -44,39 +97,30 @@ def create_news_analyst(llm, data_collector=None):
         stock_name = get_cn_stock_name(ticker)
 
         ticker_display = f"{ticker} ({stock_name})" if stock_name and stock_name != ticker else ticker
-        horizon = "short"  # 新闻面固定短期视角
+        observation_horizon = "short"  # 新闻面专业观察窗固定为短期
+        research_horizon = _resolve_research_horizon(state)
         user_intent = state.get("user_intent") or {}
         focus_areas = user_intent.get("focus_areas", [])
         specific_questions = user_intent.get("specific_questions", [])
 
         config = get_config()
         system_message = get_prompt("news_system_message", config=config) or ""
-        horizon_ctx = build_horizon_context(horizon, focus_areas, specific_questions, agent_type="news")
+        horizon_ctx = build_horizon_context(
+            observation_horizon,
+            focus_areas,
+            specific_questions,
+            agent_type="news",
+            research_horizon=research_horizon,
+        )
 
         pool = data_collector.get(ticker, current_date) if data_collector else None
 
         if pool is not None:
-            data_window = pool.get("_data_window", "14天" if horizon == "short" else "90天")
+            data_window = pool.get("_data_window", "14天" if observation_horizon == "short" else "90天")
             stock_news = pool.get("news", "无数据")
             global_news = pool.get("global_news", "无数据")
         else:
-            from datetime import datetime, timedelta
-            from tradingagents.agents.utils.agent_utils import get_news, get_global_news
-            days = 14 if horizon == "short" else 30
-            end_dt = datetime.strptime(current_date, "%Y-%m-%d")
-            start_dt = end_dt - timedelta(days=days)
-
-            # Parallelize fallback fetches
-            results = await asyncio.gather(
-                _safe(get_news, {
-                    "ticker": ticker, "start_date": start_dt.strftime("%Y-%m-%d"), "end_date": current_date,
-                }),
-                _safe(get_global_news, {
-                    "curr_date": current_date, "look_back_days": days, "limit": 10,
-                })
-            )
-            stock_news, global_news = results
-            data_window = f"{days}天"
+            stock_news, global_news, data_window = await _fetch_direct(ticker, current_date, observation_horizon)
 
         # ── 结构化新闻事件证据与覆盖率计算 ──────────────────
         stock_evidences, stock_unparseable = parse_news_markdown_to_evidences(
@@ -195,7 +239,9 @@ def create_news_analyst(llm, data_collector=None):
             "event_coverage": event_coverage,
             "analyst_traces": [{
                 "agent": "news_analyst",
-                "horizon": horizon,
+                "horizon": research_horizon,
+                "research_horizon": research_horizon,
+                "observation_horizon": observation_horizon,
                 "data_window": data_window,
                 "key_finding": f"新闻分析结论：{verdict}",
                 "verdict": verdict,
