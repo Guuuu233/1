@@ -13,27 +13,32 @@ const WATCHLIST_BATCH_SPLIT_RE = /[,\s，、；;]+/
 const SCHEDULED_TEST_TOOLTIP =
     '会立刻对当前勾选的股票批量发起最近交易日分析请求，并自动带上已导入的持仓上下文；若已开启邮箱报告，也可以顺带检查邮箱是否收到结果。不会改动原有定时设置。'
 
-function HorizonSwitch({
+export function HorizonSwitch({
     value,
     onChange,
     disabled = false,
     compact = false,
+    testIdPrefix = 'horizon-switch',
 }: {
     value: 'short' | 'medium'
     onChange: (horizon: 'short' | 'medium') => void
     disabled?: boolean
     compact?: boolean
+    testIdPrefix?: string
 }) {
     const wrapperClass = compact ? 'h-8 w-[124px]' : 'h-10 w-[144px]'
     const knobClass = compact ? 'top-1 left-1 h-6 w-[calc(50%-4px)]' : 'top-1 left-1 h-8 w-[calc(50%-4px)]'
     const labelClass = compact ? 'text-[11px]' : 'text-xs'
 
     return (
-        <div className={`relative grid ${wrapperClass} grid-cols-2 rounded-full p-1 transition-colors ${
-            disabled
-                ? 'bg-slate-200 dark:bg-slate-700'
-                : 'bg-slate-100 dark:bg-slate-700/70'
-        }`}>
+        <div
+            data-testid={testIdPrefix}
+            className={`relative grid ${wrapperClass} grid-cols-2 rounded-full p-1 transition-colors ${
+                disabled
+                    ? 'bg-slate-200 dark:bg-slate-700'
+                    : 'bg-slate-100 dark:bg-slate-700/70'
+            }`}
+        >
             <div
                 className={`pointer-events-none absolute ${knobClass} rounded-full bg-white shadow-sm ring-1 ring-slate-200/80 transition-transform duration-300 dark:bg-slate-900 dark:ring-slate-700 ${
                     value === 'medium' ? 'translate-x-full' : ''
@@ -43,6 +48,8 @@ function HorizonSwitch({
                 <button
                     key={horizon}
                     type="button"
+                    data-testid={`${testIdPrefix}-${horizon}`}
+                    aria-pressed={value === horizon}
                     onClick={() => onChange(horizon)}
                     disabled={disabled}
                     className={`relative z-10 rounded-full px-3 font-medium transition-all duration-200 ${labelClass} ${
@@ -69,6 +76,8 @@ export default function Portfolio() {
     const [batchTriggerTime, setBatchTriggerTime] = useState('20:00')
     const [scheduledBatchBusyAction, setScheduledBatchBusyAction] = useState<string | null>(null)
     const [pendingHorizonTaskIds, setPendingHorizonTaskIds] = useState<Record<string, boolean>>({})
+    const [createHorizons, setCreateHorizons] = useState<Record<string, 'short' | 'medium'>>({})
+    const [pendingScheduledSymbols, setPendingScheduledSymbols] = useState<Record<string, boolean>>({})
 
     // Search state
     const [searchQuery, setSearchQuery] = useState('')
@@ -261,17 +270,28 @@ export default function Portfolio() {
         }
     }
 
-    const toggleScheduled = async (symbol: string, hasScheduled: boolean) => {
+    const toggleScheduled = async (
+        symbol: string,
+        hasScheduled: boolean,
+        horizon: 'short' | 'medium' = 'short',
+    ) => {
+        setPendingScheduledSymbols(current => ({ ...current, [symbol]: true }))
         try {
             if (hasScheduled) {
                 const task = scheduled.find(s => s.symbol === symbol)
                 if (task) await api.deleteScheduled(task.id)
             } else {
-                await api.createScheduled(symbol, 'short', '20:00')
+                await api.createScheduled(symbol, horizon, '20:00')
             }
-            fetchAll()
+            await fetchAll()
         } catch (e) {
             alert(e instanceof Error ? e.message : '操作失败')
+        } finally {
+            setPendingScheduledSymbols(current => {
+                const next = { ...current }
+                delete next[symbol]
+                return next
+            })
         }
     }
 
@@ -602,19 +622,63 @@ export default function Portfolio() {
                                                     </p>
                                                 )}
                                             </div>
-                                            {/* Schedule toggle */}
-                                            <button
-                                                onClick={() => toggleScheduled(item.symbol, item.has_scheduled)}
-                                                className={`flex items-center gap-1 px-2 py-1 text-xs rounded-lg transition-colors ${
-                                                    item.has_scheduled
-                                                        ? 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100'
-                                                        : 'bg-slate-100 dark:bg-slate-700 text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-600'
-                                                }`}
-                                                title={item.has_scheduled ? '已开启定时分析' : '开启定时分析'}
-                                            >
-                                                <Timer className="w-3 h-3" />
-                                                {item.has_scheduled ? '定时' : '定时'}
-                                            </button>
+                                            {/* Schedule toggle and horizon selector */}
+                                            <div className="flex items-center gap-1.5" data-testid={`schedule-controls-${item.symbol}`}>
+                                                {!item.has_scheduled ? (
+                                                    <>
+                                                        <HorizonSwitch
+                                                            value={createHorizons[item.symbol] || 'short'}
+                                                            compact
+                                                            disabled={Boolean(pendingScheduledSymbols[item.symbol])}
+                                                            testIdPrefix={`create-horizon-switch-${item.symbol}`}
+                                                            onChange={horizon =>
+                                                                setCreateHorizons(prev => ({ ...prev, [item.symbol]: horizon }))
+                                                            }
+                                                        />
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => toggleScheduled(item.symbol, false, createHorizons[item.symbol] || 'short')}
+                                                            disabled={Boolean(pendingScheduledSymbols[item.symbol])}
+                                                            className="flex items-center gap-1 px-2 py-1 text-xs rounded-lg transition-colors bg-slate-100 dark:bg-slate-700 text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-600 disabled:opacity-50"
+                                                            title="开启定时分析"
+                                                            data-testid={`enable-schedule-${item.symbol}`}
+                                                        >
+                                                            {pendingScheduledSymbols[item.symbol] ? (
+                                                                <Loader2 className="w-3 h-3 animate-spin" />
+                                                            ) : (
+                                                                <Timer className="w-3 h-3" />
+                                                            )}
+                                                            定时
+                                                        </button>
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        {(() => {
+                                                            const scheduledTask = scheduled.find(s => s.symbol === item.symbol)
+                                                            return scheduledTask ? (
+                                                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400">
+                                                                    {HORIZON_LABELS[scheduledTask.horizon as AnalysisHorizon] || scheduledTask.horizon}
+                                                                </span>
+                                                            ) : null
+                                                        })()}
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => toggleScheduled(item.symbol, true)}
+                                                            disabled={Boolean(pendingScheduledSymbols[item.symbol])}
+                                                            className="flex items-center gap-1 px-2 py-1 text-xs rounded-lg transition-colors bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 disabled:opacity-50"
+                                                            title="已开启定时分析"
+                                                            data-testid={`disable-schedule-${item.symbol}`}
+                                                        >
+                                                            {pendingScheduledSymbols[item.symbol] ? (
+                                                                <Loader2 className="w-3 h-3 animate-spin" />
+                                                            ) : (
+                                                                <Timer className="w-3 h-3" />
+                                                            )}
+                                                            定时
+                                                        </button>
+                                                    </>
+                                                )}
+                                            </div>
                                             {/* Analyze */}
                                             <button
                                                 onClick={() => navigate(`/analysis?symbol=${item.symbol}`)}
@@ -666,6 +730,7 @@ export default function Portfolio() {
                                         value={batchHorizon}
                                         compact
                                         disabled={isScheduledBatchBusy}
+                                        testIdPrefix="batch-horizon-switch"
                                         onChange={horizon => {
                                             setBatchHorizon(horizon)
                                             void applyBatchScheduledUpdate(`horizon-${horizon}`, { horizon }, '批量切换周期失败')
@@ -810,6 +875,7 @@ export default function Portfolio() {
                                             value={task.horizon === 'medium' ? 'medium' : 'short'}
                                             compact
                                             disabled={Boolean(pendingHorizonTaskIds[task.id]) || isScheduledBatchBusy}
+                                            testIdPrefix={`item-horizon-switch-${task.id}`}
                                             onChange={horizon => updateScheduledHorizon(task.id, horizon)}
                                         />
 
