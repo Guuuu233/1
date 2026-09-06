@@ -1,6 +1,6 @@
 """Scheduled analysis service for database operations."""
 
-from typing import Iterable, List, Optional
+from typing import Any, Iterable, List, Optional
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
@@ -66,8 +66,15 @@ def _normalize_item_ids(item_ids: Iterable[str]) -> list[str]:
     return normalized
 
 
-def _validate_horizon(horizon: str) -> str:
-    if horizon not in VALID_HORIZONS:
+def _validate_horizon(horizon: Any) -> str:
+    if isinstance(horizon, (list, tuple, set)):
+        if len(horizon) > 1:
+            raise ValueError("定时分析暂不支持多周期/双档，仅支持单周期 (short 或 medium)")
+        if len(horizon) == 1:
+            horizon = next(iter(horizon))
+        else:
+            raise ValueError("horizon 不能为空")
+    if not isinstance(horizon, str) or horizon not in VALID_HORIZONS:
         raise ValueError("horizon 必须为 short 或 medium")
     return horizon
 
@@ -77,7 +84,9 @@ def _apply_scheduled_updates(item: ScheduledAnalysisDB, **kwargs) -> None:
         item.is_active = kwargs["is_active"]
         if kwargs["is_active"]:
             item.consecutive_failures = 0
-    if "horizon" in kwargs:
+    if "horizons" in kwargs:
+        item.horizon = _validate_horizon(kwargs["horizons"])
+    elif "horizon" in kwargs:
         item.horizon = _validate_horizon(kwargs["horizon"])
     if "trigger_time" in kwargs:
         item.trigger_time = _validate_trigger_time(kwargs["trigger_time"])
@@ -87,8 +96,10 @@ def create_scheduled(
     db: Session,
     user_id: str,
     symbol: str,
-    horizon: str = "short",
+    horizon: Any = "short",
     trigger_time: str = "20:00",
+    *,
+    horizons: Optional[Any] = None,
 ) -> dict:
     """Create a scheduled analysis task."""
     count = db.query(ScheduledAnalysisDB).filter(
@@ -105,7 +116,10 @@ def create_scheduled(
     if existing:
         raise ValueError(f"{symbol} 已有定时分析任务")
 
-    horizon = _validate_horizon(horizon)
+    if horizons is not None:
+        horizon = _validate_horizon(horizons)
+    else:
+        horizon = _validate_horizon(horizon)
 
     trigger_time = _validate_trigger_time(trigger_time)
 
@@ -126,12 +140,17 @@ def ensure_scheduled_for_symbols(
     db: Session,
     user_id: str,
     symbols: Iterable[str],
-    horizon: str = "short",
+    horizon: Any = "short",
     trigger_time: str = "20:00",
+    *,
+    horizons: Optional[Any] = None,
 ) -> dict:
     """Ensure the given symbols exist in scheduled tasks without duplicating existing items."""
 
-    horizon = _validate_horizon(horizon)
+    if horizons is not None:
+        horizon = _validate_horizon(horizons)
+    else:
+        horizon = _validate_horizon(horizon)
 
     trigger_time = _validate_trigger_time(trigger_time)
 

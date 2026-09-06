@@ -223,7 +223,9 @@ def _build_scheduled_analyze_request(
     horizon: str,
     trade_date: str,
     scheduled_user_context: Optional[Dict[str, Any]] = None,
+    query: Optional[str] = None,
 ) -> "AnalyzeRequest":
+    valid_horizon = scheduled_service._validate_horizon(horizon)
     scheduled_user_context = scheduled_user_context or _build_imported_user_context(db, user_id, symbol)
     # Read user's saved analyst selection from DB
     user_cfg = auth_service.get_user_llm_config(db, user_id)
@@ -233,14 +235,16 @@ def _build_scheduled_analyze_request(
             selected = json.loads(user_cfg.default_analysts)
         except Exception:
             pass
+    req_query = query if query is not None else f"定时分析 {symbol}"
     req = AnalyzeRequest(
         symbol=symbol,
         trade_date=trade_date,
-        horizons=[horizon],
-        query=f"定时分析 {symbol}",
+        horizons=[valid_horizon],
+        horizons_explicit=True,
+        query=req_query,
         user_intent={
             "ticker": symbol,
-            "horizons": [horizon],
+            "horizons": [valid_horizon],
             "focus_areas": [],
             "specific_questions": [],
             "user_context": scheduled_user_context,
@@ -269,7 +273,11 @@ async def _run_manual_trigger(
     task_id = task["id"]
     user_id = task["user_id"]
     symbol = task["symbol"]
-    horizon = task.get("horizon") or "short"
+    horizon = task.get("horizon")
+    if horizon is None and "horizons" in task:
+        horizon = task.get("horizons")
+    if horizon is None:
+        horizon = "short"
 
     actual_trade_date: Optional[str] = None
 
@@ -1396,7 +1404,8 @@ class ScheduledBatchIdsRequest(BaseModel):
 class ScheduledBatchUpdateRequest(BaseModel):
     item_ids: List[str] = Field(default_factory=list)
     is_active: Optional[bool] = None
-    horizon: Optional[str] = None
+    horizon: Optional[Any] = None
+    horizons: Optional[Any] = None
     trigger_time: Optional[str] = None
 
 
@@ -6965,7 +6974,15 @@ def create_scheduled_analysis(
     db: Session = Depends(get_db),
 ):
     symbol = body.get("symbol", "").strip().upper()
-    horizon = body.get("horizon", "short")
+    if "horizons" in body:
+        horizons_val = body["horizons"]
+        if isinstance(horizons_val, (list, tuple, set)) and len(horizons_val) > 1:
+            raise HTTPException(400, "定时分析暂不支持多周期/双档，仅支持单周期 (short 或 medium)")
+        horizon = horizons_val
+    elif "horizon" in body:
+        horizon = body["horizon"]
+    else:
+        horizon = "short"
     trigger_time = body.get("trigger_time", "20:00")
     if not symbol:
         raise HTTPException(400, "symbol is required")
@@ -6985,7 +7002,12 @@ def _extract_scheduled_update_kwargs(body: dict) -> dict:
     kwargs = {}
     if "is_active" in body:
         kwargs["is_active"] = bool(body["is_active"])
-    if "horizon" in body:
+    if "horizons" in body:
+        horizons_val = body["horizons"]
+        if isinstance(horizons_val, (list, tuple, set)) and len(horizons_val) > 1:
+            raise ValueError("定时分析暂不支持多周期/双档，仅支持单周期 (short 或 medium)")
+        kwargs["horizon"] = horizons_val
+    elif "horizon" in body:
         kwargs["horizon"] = body["horizon"]
     if "trigger_time" in body:
         kwargs["trigger_time"] = body["trigger_time"]
@@ -6998,10 +7020,10 @@ def batch_update_scheduled_analyses(
     current_user: UserDB = Depends(_require_api_user),
     db: Session = Depends(get_db),
 ):
-    kwargs = _extract_scheduled_update_kwargs(body.model_dump(exclude_unset=True))
-    if not kwargs:
-        raise HTTPException(400, "至少提供一个更新字段")
     try:
+        kwargs = _extract_scheduled_update_kwargs(body.model_dump(exclude_unset=True))
+        if not kwargs:
+            raise HTTPException(400, "至少提供一个更新字段")
         items = scheduled_service.batch_update_scheduled(
             db,
             current_user.id,
@@ -7178,8 +7200,8 @@ def update_scheduled_analysis(
     current_user: UserDB = Depends(_require_api_user),
     db: Session = Depends(get_db),
 ):
-    kwargs = _extract_scheduled_update_kwargs(body)
     try:
+        kwargs = _extract_scheduled_update_kwargs(body)
         result = scheduled_service.update_scheduled(db, current_user.id, item_id, **kwargs)
     except ValueError as e:
         raise HTTPException(400, str(e))
