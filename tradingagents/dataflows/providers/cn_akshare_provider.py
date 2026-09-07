@@ -77,8 +77,43 @@ from ..cninfo_disclosure import (
     qualify_cninfo_content,
     query_cninfo_raw_announcements,
 )
+from api.services.price_basis_labels import (
+    PRICE_BASIS_VENDOR_QFQ,
+    PRICE_BASIS_RAW,
+    PRICE_BASIS_PIT_RAW,
+    PRICE_BASIS_PIT_ADJUSTED,
+    PRICE_BASIS_UNSPECIFIED,
+    PriceBasisError,
+    UnknownPriceBasisError,
+    validate_price_basis_short_label,
+)
 
 _provider_logger = logging.getLogger(__name__)
+
+
+class RawDailyFetchError(RuntimeError, PriceBasisError):
+    """Raised when fetching raw daily prices from Tushare fails."""
+
+    def __init__(self, error: str, category: str):
+        super().__init__(error)
+        self.error = str(error)
+        self.category = str(category)
+
+
+class UnsupportedPriceBasisError(NotImplementedError, PriceBasisError):
+    """Raised when a price basis label is recognized in the specification but not implemented as an available channel."""
+    pass
+
+
+class StockDataText(str):
+    """Prompt-compatible stock data CSV text carrying price_basis metadata."""
+
+    price_basis: str
+
+    def __new__(cls, value: str, *, price_basis: str = PRICE_BASIS_VENDOR_QFQ):
+        obj = super().__new__(cls, value)
+        obj.price_basis = str(price_basis)
+        return obj
 
 
 # ── akshare 并发控制 ──
@@ -754,6 +789,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             "日期": "Date",
             "date": "Date",
             "Date": "Date",
+            "trade_date": "Date",
             "开盘": "Open",
             "open": "Open",
             "Open": "Open",
@@ -769,6 +805,7 @@ class CnAkshareProvider(BaseMarketDataProvider):
             "成交量": "Volume",
             "volume": "Volume",
             "Volume": "Volume",
+            "vol": "Volume",
             "成交额": "Amount",
             "amount": "Amount",
             "Amount": "Amount",
@@ -792,11 +829,29 @@ class CnAkshareProvider(BaseMarketDataProvider):
 
         return out
 
-    def _format_ak_hist(self, df: pd.DataFrame, symbol: str, start: str, end: str) -> str:
+    def _format_ak_hist(
+        self,
+        df: pd.DataFrame,
+        symbol: str,
+        start: str,
+        end: str,
+        *,
+        price_basis: str = PRICE_BASIS_VENDOR_QFQ,
+    ) -> str:
+        effective_basis = getattr(df, "attrs", {}).get("price_basis", price_basis)
         if df is None or df.empty:
-            return f"No data found for symbol '{symbol}' between {start} and {end}"
+            return StockDataText(
+                f"No data found for symbol '{symbol}' between {start} and {end}",
+                price_basis=effective_basis,
+            )
         out = self._normalize_hist_df(df)
-        return format_hist_csv(out, symbol, start, end)
+        csv_text = format_hist_csv(out, symbol, start, end)
+        if "# price_basis:" not in csv_text:
+            lines = csv_text.splitlines(keepends=True)
+            if lines and lines[0].startswith("# Stock data for"):
+                lines.insert(1, f"# price_basis: {effective_basis}\n")
+                csv_text = "".join(lines)
+        return StockDataText(csv_text, price_basis=effective_basis)
 
     @staticmethod
     def _slice_hist_df(df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
@@ -834,7 +889,68 @@ class CnAkshareProvider(BaseMarketDataProvider):
         _ = max_cols
         return shrink_table(df, **kwargs)
 
-    def _fetch_hist_df(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+    def _fetch_hist_df(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        price_basis: str = PRICE_BASIS_VENDOR_QFQ,
+        *,
+        as_of: str | None = None,
+    ) -> pd.DataFrame:
+        norm_price_basis = validate_price_basis_short_label(price_basis)
+        if norm_price_basis in (
+            PRICE_BASIS_PIT_RAW,
+            PRICE_BASIS_PIT_ADJUSTED,
+            PRICE_BASIS_UNSPECIFIED,
+        ):
+            raise UnsupportedPriceBasisError(
+                f"price_basis={norm_price_basis!r} is not implemented as an available channel in CnAkshareProvider"
+            )
+
+        if norm_price_basis == PRICE_BASIS_RAW:
+            rows, error, category = self._fetch_tushare_raw_daily(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                as_of=as_of,
+            )
+            if error:
+                raise RawDailyFetchError(error, category or "error")
+            if not rows:
+                raise RawDailyFetchError(
+                    self._tushare_error(_TUSHARE_DAILY_API, "no_rows"), "no_rows"
+                )
+            if isinstance(rows, dict):
+                rows = [rows]
+
+            df = pd.DataFrame(rows)
+            field_col_map = {
+                "trade_date": "Date",
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "vol": "Volume",
+                "amount": "Amount",
+            }
+            for raw_col in ("trade_date", "open", "high", "low", "close", "vol"):
+                if raw_col not in df.columns:
+                    raise RawDailyFetchError(
+                        self._tushare_error(_TUSHARE_DAILY_API, "missing_field", raw_col),
+                        "missing_field",
+                    )
+            df = df.rename(columns=field_col_map)
+            out = self._normalize_hist_df(df)
+            out = self._slice_hist_df(out, start_date, end_date)
+            out = self._drop_incomplete_today_bar(out, end_date)
+            if out.empty:
+                raise RawDailyFetchError(
+                    self._tushare_error(_TUSHARE_DAILY_API, "no_rows"), "no_rows"
+                )
+            out.attrs["price_basis"] = PRICE_BASIS_RAW
+            return out
+
         with AKSHARE_CALL_LOCK:
             ak = self._ak()
             code = self._normalize_symbol(symbol)
@@ -850,7 +966,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     out = self._normalize_hist_df(df)
                     out = self._slice_hist_df(out, start_date, end_date)
                     if not out.empty:
-                        return self._drop_incomplete_today_bar(out, end_date)
+                        res = self._drop_incomplete_today_bar(out, end_date)
+                        res.attrs["price_basis"] = PRICE_BASIS_VENDOR_QFQ
+                        return res
                     etf_errors.append("fund_etf_hist_sina: empty after date filter")
                 except DuplicateBarConflictError:
                     # Data-integrity refusal: do not silently switch to another
@@ -869,7 +987,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     )
                     out = self._normalize_hist_df(df)
                     if not out.empty:
-                        return self._drop_incomplete_today_bar(out, end_date)
+                        res = self._drop_incomplete_today_bar(out, end_date)
+                        res.attrs["price_basis"] = PRICE_BASIS_VENDOR_QFQ
+                        return res
                     etf_errors.append("fund_etf_hist_em: empty dataframe")
                 except DuplicateBarConflictError:
                     raise
@@ -889,7 +1009,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                     )
                     out = self._normalize_hist_df(df)
                     out = self._slice_hist_df(out, start_date, end_date)
-                    return self._drop_incomplete_today_bar(out, end_date)
+                    res = self._drop_incomplete_today_bar(out, end_date)
+                    res.attrs["price_basis"] = PRICE_BASIS_VENDOR_QFQ
+                    return res
                 except DuplicateBarConflictError:
                     raise
                 except Exception as exc:
@@ -907,7 +1029,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 )
                 out = self._normalize_hist_df(df)
                 out = self._slice_hist_df(out, start_date, end_date)
-                return self._drop_incomplete_today_bar(out, end_date)
+                res = self._drop_incomplete_today_bar(out, end_date)
+                res.attrs["price_basis"] = PRICE_BASIS_VENDOR_QFQ
+                return res
             except DuplicateBarConflictError:
                 raise
             except Exception:
@@ -923,7 +1047,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 )
                 out = self._normalize_hist_df(df)
                 out = self._slice_hist_df(out, start_date, end_date)
-                return self._drop_incomplete_today_bar(out, end_date)
+                res = self._drop_incomplete_today_bar(out, end_date)
+                res.attrs["price_basis"] = PRICE_BASIS_VENDOR_QFQ
+                return res
             except DuplicateBarConflictError:
                 raise
             except Exception:
@@ -933,9 +1059,21 @@ class CnAkshareProvider(BaseMarketDataProvider):
                 f"cn_akshare is temporarily unavailable for price history (eastmoney/sina/tencent all failed): {em_last_exc}"
             ) from em_last_exc
 
-    def get_stock_data(self, symbol: str, start_date: str, end_date: str) -> str:
-        df = self._fetch_hist_df(symbol, start_date, end_date)
-        return self._format_ak_hist(df, symbol, start_date, end_date)
+    def get_stock_data(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        price_basis: str = PRICE_BASIS_VENDOR_QFQ,
+        *,
+        as_of: str | None = None,
+    ) -> str:
+        df = self._fetch_hist_df(
+            symbol, start_date, end_date, price_basis=price_basis, as_of=as_of
+        )
+        return self._format_ak_hist(
+            df, symbol, start_date, end_date, price_basis=price_basis
+        )
 
     def get_indicators(
         self, symbol: str, indicator: str, curr_date: str, look_back_days: int
