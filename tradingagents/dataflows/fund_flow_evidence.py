@@ -2337,3 +2337,428 @@ def validate_model_summary(
         "mismatches": mismatches,
         "tolerance": _decimal_text(tolerance),
     }
+
+
+# ---------------------------------------------------------------------------
+# Scale metrics normalization (D-03-1 / C-09-3)
+# Pure arithmetic: net_to_circ_mv, net_to_amount
+# ---------------------------------------------------------------------------
+
+
+class DecimalRatio(Decimal):
+    """Decimal representing a scale ratio with seamless float/approx comparisons."""
+
+    def __sub__(self, other: Any) -> Any:
+        if isinstance(other, float):
+            return float(self) - other
+        return super().__sub__(other)
+
+    def __rsub__(self, other: Any) -> Any:
+        if isinstance(other, float):
+            return other - float(self)
+        return super().__rsub__(other)
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, float):
+            return float(self) == other
+        return super().__eq__(other)
+
+    def __lt__(self, other: Any) -> bool:
+        if isinstance(other, float):
+            return float(self) < other
+        return super().__lt__(other)
+
+    def __le__(self, other: Any) -> bool:
+        if isinstance(other, float):
+            return float(self) <= other
+        return super().__le__(other)
+
+    def __gt__(self, other: Any) -> bool:
+        if isinstance(other, float):
+            return float(self) > other
+        return super().__gt__(other)
+
+    def __ge__(self, other: Any) -> bool:
+        if isinstance(other, float):
+            return float(self) >= other
+        return super().__ge__(other)
+
+
+SCALE_METRIC_VALID_UNITS: dict[str, Decimal] = {
+    "元": Decimal("1"),
+    "rmb": Decimal("1"),
+    "cny": Decimal("1"),
+    "yuan": Decimal("1"),
+    "万": Decimal("10000"),
+    "万元": Decimal("10000"),
+    "亿": Decimal("100000000"),
+    "亿元": Decimal("100000000"),
+}
+
+
+def _normalize_scale_metric_unit(unit: Any) -> tuple[Decimal | None, str | None]:
+    """Validate unit against explicit scale metric conversion table (万元/亿元/元).
+
+    Returns:
+        (multiplier_to_yuan, canonical_unit_name) or (None, None) if invalid/unsupported.
+    """
+    if unit is None:
+        return None, None
+    text = str(unit).strip().lower()
+    if not text:
+        return None, None
+    multiplier = SCALE_METRIC_VALID_UNITS.get(text)
+    if multiplier is None:
+        return None, None
+    if text in {"元", "rmb", "cny", "yuan"}:
+        canonical = "元"
+    elif text in {"万", "万元"}:
+        canonical = "万元"
+    elif text in {"亿", "亿元"}:
+        canonical = "亿元"
+    else:
+        canonical = text
+    return multiplier, canonical
+
+
+def _normalize_symbol_code(symbol: Any) -> str | None:
+    """Normalize A-share stock code/symbol to standard 6-digit or 6-digit.MARKET format."""
+    if symbol is None:
+        return None
+    text = str(symbol).strip().upper()
+    if not text:
+        return None
+    match = re.search(r"(\d{6})", text)
+    if not match:
+        return text
+    code = match.group(1)
+    if text.endswith((".SH", ".SZ", ".BJ")):
+        return f"{code}.{text[-2:]}"
+    if text.startswith(("SH", "SZ", "BJ")):
+        return f"{code}.{text[:2]}"
+    market = (
+        "SH"
+        if code.startswith(("5", "6", "9"))
+        else "BJ"
+        if code.startswith(("4", "8"))
+        else "SZ"
+    )
+    return f"{code}.{market}"
+
+
+def _to_yuan_decimal(
+    value: Any, unit: Any, field_name: str
+) -> tuple[Decimal | None, str | None, str | None]:
+    """Convert an amount to exact Decimal in 元.
+
+    Returns:
+        (amount_in_yuan, canonical_unit, gap_error)
+    """
+    if value is None:
+        return None, None, f"{field_name}缺失"
+    dec_val = decimal_value(value)
+    if dec_val is None:
+        return None, None, f"{field_name} ({value!r}) 无法解析为有效有限数值"
+    if unit is None or not str(unit).strip():
+        return None, None, f"{field_name}单位缺失，不得默认单位"
+    multiplier, canonical_unit = _normalize_scale_metric_unit(unit)
+    if multiplier is None:
+        return (
+            None,
+            None,
+            f"{field_name}单位 '{unit}' 无效或不支持（仅允许显式换算表：万元/亿元/元）",
+        )
+    try:
+        yuan_val = dec_val * multiplier
+    except (DecimalException, OverflowError, ValueError) as exc:
+        return None, None, f"{field_name} 换算溢出或异常: {exc}"
+    if not yuan_val.is_finite():
+        return None, None, f"{field_name} 换算后非有限数值"
+    return yuan_val, canonical_unit, None
+
+
+def calculate_fund_flow_scale_metrics(
+    ts_code: Any = None,
+    trade_date: Any = None,
+    net_amount: Any = None,
+    net_amount_unit: Any = None,
+    circ_mv: Any = None,
+    circ_mv_unit: Any = None,
+    amount: Any = None,
+    amount_unit: Any = None,
+    *,
+    circ_mv_source: Any = None,
+    circ_mv_trade_date: Any = None,
+    circ_mv_ts_code: Any = None,
+    amount_source: Any = None,
+    amount_trade_date: Any = None,
+    amount_ts_code: Any = None,
+    denominator_source: Any = None,
+    denominators: Mapping[str, Any] | None = None,
+    daily_basic: Mapping[str, Any] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Pure function calculating fund flow scale metrics: net_to_circ_mv and net_to_amount.
+
+    Contracts:
+    1. Input: at least ts_code, trade_date, net_amount+unit, denominator (circ_mv and/or amount)+unit.
+       Must be same-day and same-security.
+    2. Convert to same currency unit before division. Reject invalid units (explicit table: 万元/亿元/元).
+       No float default to 0.
+    3. Denominator <= 0 rejected with gap recorded. Absolute net amount preserved. Missing market cap
+       allows turnover ratio only; the two metrics never substitute for each other.
+    4. Outputs named fields net_to_circ_mv, net_to_amount, denominator_source, unit, gaps.
+       No ranking or main force strength ranking.
+    """
+    # 1. Unpack evidence if passed as first argument mapping
+    if isinstance(ts_code, Mapping):
+        evidence = ts_code
+        ts_code = evidence.get("ts_code") or evidence.get("symbol")
+        trade_date = (
+            trade_date
+            or evidence.get("trade_date")
+            or evidence.get("date")
+            or evidence.get("measurement_date")
+            or evidence.get("as_of")
+        )
+        if net_amount is None:
+            net_amount = (
+                evidence.get("net_amount")
+                or evidence.get("selected_value")
+                or evidence.get("value")
+                or evidence.get("r0_net")
+                or evidence.get("netamount")
+            )
+        if net_amount_unit is None:
+            net_amount_unit = (
+                evidence.get("net_amount_unit")
+                or evidence.get("selected_unit")
+                or evidence.get("unit")
+                or evidence.get("raw_unit")
+            )
+
+    # 2. Argument aliases
+    ts_code = ts_code or kwargs.get("symbol") or kwargs.get("code")
+    trade_date = trade_date or kwargs.get("date") or kwargs.get("as_of")
+    if net_amount is None:
+        net_amount = kwargs.get("net_value", kwargs.get("r0_net", kwargs.get("netamount")))
+    if net_amount_unit is None:
+        net_amount_unit = kwargs.get("net_unit") or kwargs.get("unit") or kwargs.get("raw_unit")
+
+    # 3. Unpack denominators or daily_basic dictionaries
+    denom_dict: dict[str, Any] = {}
+    if isinstance(denominators, Mapping):
+        denom_dict.update(denominators)
+    if isinstance(daily_basic, Mapping):
+        denom_dict.update(daily_basic)
+        if (
+            denominator_source is None
+            and "source" not in denom_dict
+            and "denominator_source" not in denom_dict
+        ):
+            denominator_source = "tushare.daily_basic"
+
+    if denom_dict:
+        if circ_mv is None:
+            circ_mv = denom_dict.get("circ_mv")
+        if circ_mv_unit is None:
+            circ_mv_unit = denom_dict.get("circ_mv_unit")
+        if circ_mv_source is None:
+            circ_mv_source = denom_dict.get("circ_mv_source") or denom_dict.get("source")
+        if circ_mv_trade_date is None:
+            circ_mv_trade_date = (
+                denom_dict.get("circ_mv_trade_date")
+                or denom_dict.get("trade_date")
+                or denom_dict.get("date")
+            )
+        if circ_mv_ts_code is None:
+            circ_mv_ts_code = (
+                denom_dict.get("circ_mv_ts_code")
+                or denom_dict.get("ts_code")
+                or denom_dict.get("symbol")
+            )
+
+        if amount is None:
+            amount = denom_dict.get("amount")
+        if amount_unit is None:
+            amount_unit = denom_dict.get("amount_unit")
+        if amount_source is None:
+            amount_source = denom_dict.get("amount_source") or denom_dict.get("source")
+        if amount_trade_date is None:
+            amount_trade_date = (
+                denom_dict.get("amount_trade_date")
+                or denom_dict.get("trade_date")
+                or denom_dict.get("date")
+            )
+        if amount_ts_code is None:
+            amount_ts_code = (
+                denom_dict.get("amount_ts_code")
+                or denom_dict.get("ts_code")
+                or denom_dict.get("symbol")
+            )
+
+        if denominator_source is None:
+            denominator_source = denom_dict.get("denominator_source") or denom_dict.get("source")
+
+    # Resolve sources cascade
+    if denominator_source is None:
+        if circ_mv_source and amount_source and circ_mv_source == amount_source:
+            denominator_source = circ_mv_source
+        elif circ_mv_source:
+            denominator_source = circ_mv_source
+        elif amount_source:
+            denominator_source = amount_source
+
+    if circ_mv_source is None and denominator_source:
+        circ_mv_source = denominator_source
+    if amount_source is None and denominator_source:
+        amount_source = denominator_source
+
+    gaps: list[str] = []
+
+    # 4. Validate ts_code and trade_date
+    norm_ts_code = _normalize_symbol_code(ts_code)
+    if not norm_ts_code:
+        gaps.append(f"证券代码 ts_code={ts_code!r} 缺失或无效，拒算")
+
+    norm_trade_date = _normalise_date_text(trade_date)
+    if not norm_trade_date:
+        gaps.append(f"交易日期 trade_date={trade_date!r} 缺失或无法解析为有效日期，拒算")
+
+    # 5. Parse net_amount
+    net_dec = decimal_value(net_amount)
+    net_in_yuan: Decimal | None = None
+    canonical_net_unit: str | None = None
+    if net_amount is None:
+        gaps.append("资金净额 (net_amount) 缺失，拒算")
+    elif net_dec is None:
+        gaps.append(f"资金净额 net_amount={net_amount!r} 无法解析为有效数值，拒算")
+    elif net_amount_unit is None or not str(net_amount_unit).strip():
+        gaps.append("资金净额单位 (net_amount_unit) 缺失，拒算")
+    else:
+        net_in_yuan, canonical_net_unit, net_err = _to_yuan_decimal(
+            net_amount, net_amount_unit, "资金净额"
+        )
+        if net_err:
+            gaps.append(net_err)
+
+    # 6. Calculate net_to_circ_mv
+    net_to_circ_mv: DecimalRatio | None = None
+    circ_mv_dec = decimal_value(circ_mv)
+    if circ_mv is None:
+        gaps.append("缺少流通市值 (circ_mv) 数据，流通市值占比 (net_to_circ_mv) 缺失")
+    elif circ_mv_dec is None:
+        gaps.append(f"流通市值 circ_mv={circ_mv!r} 无法解析为有效数值，拒算流通市值占比")
+    elif norm_trade_date is None or norm_ts_code is None or net_in_yuan is None:
+        # Prerequisites not met, error already in gaps
+        pass
+    else:
+        circ_date = _normalise_date_text(circ_mv_trade_date) if circ_mv_trade_date else None
+        circ_code = _normalize_symbol_code(circ_mv_ts_code) if circ_mv_ts_code else None
+        if circ_date and circ_date != norm_trade_date:
+            gaps.append(
+                f"跨交易日拒算: circ_mv 交易日 '{circ_mv_trade_date}' 与请求交易日 '{trade_date}' 不一致"
+            )
+        elif circ_code and circ_code != norm_ts_code:
+            gaps.append(
+                f"跨证券拒算: circ_mv 证券代码 '{circ_mv_ts_code}' 与请求证券代码 '{ts_code}' 不一致"
+            )
+        elif circ_mv_unit is None or not str(circ_mv_unit).strip():
+            gaps.append("流通市值单位 (circ_mv_unit) 缺失，不得默认单位，流通市值占比拒算")
+        else:
+            circ_in_yuan, canonical_circ_unit, circ_err = _to_yuan_decimal(
+                circ_mv, circ_mv_unit, "流通市值"
+            )
+            if circ_err:
+                gaps.append(circ_err)
+            elif circ_in_yuan <= Decimal("0"):
+                gaps.append(f"流通市值分母非正 (circ_mv={circ_mv_dec})，零或负分母拒算")
+            else:
+                net_to_circ_mv = DecimalRatio(net_in_yuan / circ_in_yuan)
+
+    # 7. Calculate net_to_amount
+    net_to_amount: DecimalRatio | None = None
+    amount_dec = decimal_value(amount)
+    if amount is None:
+        gaps.append("缺少成交额 (amount) 数据，成交额占比 (net_to_amount) 缺失")
+    elif amount_dec is None:
+        gaps.append(f"成交额 amount={amount!r} 无法解析为有效数值，拒算成交额占比")
+    elif norm_trade_date is None or norm_ts_code is None or net_in_yuan is None:
+        # Prerequisites not met, error already in gaps
+        pass
+    else:
+        amt_date = _normalise_date_text(amount_trade_date) if amount_trade_date else None
+        amt_code = _normalize_symbol_code(amount_ts_code) if amount_ts_code else None
+        if amt_date and amt_date != norm_trade_date:
+            gaps.append(
+                f"跨交易日拒算: amount 交易日 '{amount_trade_date}' 与请求交易日 '{trade_date}' 不一致"
+            )
+        elif amt_code and amt_code != norm_ts_code:
+            gaps.append(
+                f"跨证券拒算: amount 证券代码 '{amount_ts_code}' 与请求证券代码 '{ts_code}' 不一致"
+            )
+        elif amount_unit is None or not str(amount_unit).strip():
+            gaps.append("成交额单位 (amount_unit) 缺失，不得默认单位，成交额占比拒算")
+        else:
+            amt_in_yuan, canonical_amt_unit, amt_err = _to_yuan_decimal(
+                amount, amount_unit, "成交额"
+            )
+            if amt_err:
+                gaps.append(amt_err)
+            elif amt_in_yuan <= Decimal("0"):
+                gaps.append(f"成交额分母非正 (amount={amount_dec})，零或负分母拒算")
+            else:
+                net_to_amount = DecimalRatio(net_in_yuan / amt_in_yuan)
+
+    # 8. Status determination
+    if net_to_circ_mv is not None and net_to_amount is not None:
+        status = "available"
+    elif net_to_circ_mv is not None or net_to_amount is not None:
+        status = "partial"
+    else:
+        status = "unavailable"
+
+    canonical_circ_unit = (
+        _normalize_scale_metric_unit(circ_mv_unit)[1] if circ_mv_unit else None
+    )
+    canonical_amt_unit = (
+        _normalize_scale_metric_unit(amount_unit)[1] if amount_unit else None
+    )
+
+    return {
+        "ts_code": norm_ts_code or str(ts_code or ""),
+        "trade_date": norm_trade_date or str(trade_date or ""),
+        "net_amount": net_dec,
+        "net_amount_raw": str(net_amount) if net_amount is not None else None,
+        "net_amount_unit": canonical_net_unit or (str(net_amount_unit) if net_amount_unit else None),
+        "unit": canonical_net_unit or (str(net_amount_unit) if net_amount_unit else "亿元"),
+        "net_to_circ_mv": net_to_circ_mv,
+        "net_to_circ_mv_text": _decimal_text(net_to_circ_mv) if net_to_circ_mv is not None else None,
+        "net_to_amount": net_to_amount,
+        "net_to_amount_text": _decimal_text(net_to_amount) if net_to_amount is not None else None,
+        "net_circ_mv_ratio": net_to_circ_mv,
+        "net_amount_ratio": net_to_amount,
+        "circ_mv": circ_mv_dec,
+        "circ_mv_unit": canonical_circ_unit or (str(circ_mv_unit) if circ_mv_unit else None),
+        "circ_mv_source": circ_mv_source,
+        "amount": amount_dec,
+        "amount_unit": canonical_amt_unit or (str(amount_unit) if amount_unit else None),
+        "amount_source": amount_source,
+        "denominator_source": denominator_source,
+        "denominator_sources": {
+            "circ_mv": circ_mv_source,
+            "amount": amount_source,
+        },
+        "denominator_units": {
+            "circ_mv": canonical_circ_unit or (str(circ_mv_unit) if circ_mv_unit else None),
+            "amount": canonical_amt_unit or (str(amount_unit) if amount_unit else None),
+        },
+        "status": status,
+        "gaps": gaps,
+        "gap_list": gaps,
+    }
+
+
+# Public alias
+compute_fund_flow_scale_metrics = calculate_fund_flow_scale_metrics
+
