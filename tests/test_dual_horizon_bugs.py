@@ -141,6 +141,32 @@ def test_dual_horizon_save_uses_safe_defaults_when_structured_fields_are_empty()
     assert saved_reports[0]["falsification_conditions"] == []
 
 
+def test_dual_horizon_save_both_not_applicable_propagates_true():
+    job, saved_reports = _run_dual_save(
+        {
+            "short": report_service.StructuredReport(
+                data_gaps=[],
+                not_applicable=True,
+                falsification_conditions=["条件A"],
+            ),
+            "medium": report_service.StructuredReport(
+                data_gaps=[],
+                not_applicable=True,
+                falsification_conditions=["条件B"],
+            ),
+        }
+    )
+
+    assert job["status"] == "completed"
+    assert job["result"]["not_applicable"] is True
+    assert job["result"]["not_applicable_by_horizon"] == {
+        "short": True,
+        "medium": True,
+    }
+    assert len(saved_reports) == 1
+    assert saved_reports[0]["not_applicable"] is True
+
+
 def test_create_report_with_all_failed_dual_horizon_sets_status_failed():
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker

@@ -2626,7 +2626,10 @@ def _apply_structured_report_fields(
         ACTION_WAIT,
         apply_decision_status_to_result,
     )
-    from tradingagents.agents.utils.run_integrity import resolve_decision_status_for_result
+    from tradingagents.agents.utils.run_integrity import (
+        ANALYST_REPORT_FIELDS,
+        resolve_decision_status_for_result,
+    )
 
     legal_decisions = {"BUY", "SELL", "HOLD", "WAIT", "NO_TRADE"}
     structured_decision = getattr(structured, "decision", None) if structured else None
@@ -2677,13 +2680,16 @@ def _apply_structured_report_fields(
     )
     # D-009 P0-1: prefer explicit decision_status / recompute from analyst failures
     # so 7/7 upstream failures never persist as Neutral/HOLD with confidence.
-    status_obj = resolve_decision_status_for_result(result)
+    has_analyst_data = (
+        any(k in result for k in ANALYST_REPORT_FIELDS.values())
+        or bool(result.get("analyst_traces"))
+        or bool(result.get("decision_status"))
+        or bool(result.get("analysis_status"))
+    )
+    status_obj = resolve_decision_status_for_result(result) if has_analyst_data else None
     if status_obj is not None:
         apply_decision_status_to_result(result, status_obj)
         decision = str(result.get("trade_action") or result.get("decision") or decision)
-        if decision in {ACTION_NO_TRADE, ACTION_WAIT}:
-            # Keep lifecycle completed but mark not_applicable for UI/stats.
-            result["not_applicable"] = True
     post_resolved = report_service.resolve_report_fields(
         result_data=result,
         confidence_override=result.get("confidence"),
