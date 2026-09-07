@@ -159,14 +159,21 @@ def _get_trading_dates(start: str, end: str, interval_days: int) -> List[str]:
     return dates
 
 
-def _get_price_after(symbol: str, base_date: str, hold_days: int) -> Optional[float]:
-    """Fetch closing price hold_days trading days after base_date using akshare.
+def _get_price_after(
+    symbol: str,
+    base_date: str,
+    hold_days: int,
+    price_basis: Optional[str] = PRICE_BASIS_VENDOR_QFQ,
+) -> Optional[float]:
+    """Fetch closing price hold_days trading days after base_date using akshare or raw provider.
 
     Refuses to shorten hold_days when the fetched series is shorter than hold_days;
     returns None to ensure strict T+N evaluation (D-009 / P1-3).
+    When price_basis is PRICE_BASIS_VENDOR_QFQ (default): routes to existing vendor get_stock_data.
+    When price_basis is PRICE_BASIS_RAW: routes to cn_akshare provider with price_basis="raw".
+    When price_basis is neither (unspecified, pit_raw, pit_adjusted, unknown): fails closed (returns None).
     """
     try:
-        from tradingagents.dataflows.interface import route_to_vendor
         import pandas as pd
 
         fmt = "%Y-%m-%d"
@@ -175,11 +182,60 @@ def _get_price_after(symbol: str, base_date: str, hold_days: int) -> Optional[fl
         fetch_start = (start_dt + timedelta(days=1)).strftime(fmt)
         fetch_end = (start_dt + timedelta(days=hold_days + 30)).strftime(fmt)
 
-        csv_data = route_to_vendor("get_stock_data", symbol, fetch_start, fetch_end)
-        if not csv_data:
+        effective_basis = PRICE_BASIS_VENDOR_QFQ if price_basis is None else price_basis
+
+        if effective_basis == PRICE_BASIS_VENDOR_QFQ:
+            from tradingagents.dataflows.interface import route_to_vendor
+
+            csv_data = route_to_vendor("get_stock_data", symbol, fetch_start, fetch_end)
+            if not csv_data:
+                return None
+        elif effective_basis == PRICE_BASIS_RAW:
+            from tradingagents.dataflows.interface import _registry
+
+            prov = _registry.get("cn_akshare")
+            if prov is None or not hasattr(prov, "get_stock_data"):
+                try:
+                    from tradingagents.dataflows.providers.cn_akshare_provider import (
+                        CnAkshareProvider,
+                    )
+
+                    prov = CnAkshareProvider()
+                except Exception:
+                    prov = None
+
+            if prov is None:
+                logger.warning("cn_akshare provider unavailable for raw stock data fetch")
+                return None
+
+            try:
+                csv_data = prov.get_stock_data(
+                    symbol=symbol,
+                    start_date=fetch_start,
+                    end_date=fetch_end,
+                    price_basis=PRICE_BASIS_RAW,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "_get_price_after (raw) failed for %s @ %s (hold_days=%s): %s",
+                    symbol,
+                    base_date,
+                    hold_days,
+                    exc,
+                )
+                return None
+
+            if not csv_data or str(csv_data).startswith("【数据获取失败】") or str(csv_data).startswith("No data found"):
+                return None
+        else:
+            logger.warning(
+                "_get_price_after: unsupported or unknown price_basis %r for %s; fail-closed",
+                price_basis,
+                symbol,
+            )
             return None
 
-        df = pd.read_csv(pd.io.common.StringIO(csv_data))
+        df = pd.read_csv(pd.io.common.StringIO(csv_data), comment="#")
         # Find column for close price
         close_cols = [c for c in df.columns if "close" in c.lower() or "收盘" in c]
         date_cols = [c for c in df.columns if "date" in c.lower() or "日期" in c or "time" in c.lower()]
@@ -192,35 +248,102 @@ def _get_price_after(symbol: str, base_date: str, hold_days: int) -> Optional[fl
         return float(df[close_cols[0]].iloc[hold_days - 1])
     except Exception as exc:
         logger.warning(
-            "_get_price_after failed for %s @ %s (hold_days=%s): %s",
+            "_get_price_after failed for %s @ %s (hold_days=%s, price_basis=%s): %s",
             symbol,
             base_date,
             hold_days,
+            price_basis,
             exc,
         )
         return None
 
 
-def _get_price_on(symbol: str, date: str) -> Optional[float]:
-    """Fetch closing price on or just before date."""
+def _get_price_on(
+    symbol: str,
+    date: str,
+    price_basis: Optional[str] = PRICE_BASIS_VENDOR_QFQ,
+) -> Optional[float]:
+    """Fetch closing price on or just before date.
+
+    When price_basis is PRICE_BASIS_VENDOR_QFQ (default): routes to existing vendor get_stock_data.
+    When price_basis is PRICE_BASIS_RAW: routes to cn_akshare provider with price_basis="raw".
+    When price_basis is neither (unspecified, pit_raw, pit_adjusted, unknown): fails closed (returns None).
+    """
     try:
-        from tradingagents.dataflows.interface import route_to_vendor
         import pandas as pd
 
         fmt = "%Y-%m-%d"
         start = (datetime.strptime(date, fmt) - timedelta(days=5)).strftime(fmt)
-        csv_data = route_to_vendor("get_stock_data", symbol, start, date)
-        if not csv_data:
+
+        effective_basis = PRICE_BASIS_VENDOR_QFQ if price_basis is None else price_basis
+
+        if effective_basis == PRICE_BASIS_VENDOR_QFQ:
+            from tradingagents.dataflows.interface import route_to_vendor
+
+            csv_data = route_to_vendor("get_stock_data", symbol, start, date)
+            if not csv_data:
+                return None
+        elif effective_basis == PRICE_BASIS_RAW:
+            from tradingagents.dataflows.interface import _registry
+
+            prov = _registry.get("cn_akshare")
+            if prov is None or not hasattr(prov, "get_stock_data"):
+                try:
+                    from tradingagents.dataflows.providers.cn_akshare_provider import (
+                        CnAkshareProvider,
+                    )
+
+                    prov = CnAkshareProvider()
+                except Exception:
+                    prov = None
+
+            if prov is None:
+                logger.warning("cn_akshare provider unavailable for raw stock data fetch")
+                return None
+
+            try:
+                csv_data = prov.get_stock_data(
+                    symbol=symbol,
+                    start_date=start,
+                    end_date=date,
+                    price_basis=PRICE_BASIS_RAW,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "_get_price_on (raw) failed for %s @ %s: %s",
+                    symbol,
+                    date,
+                    exc,
+                )
+                return None
+
+            if not csv_data or str(csv_data).startswith("【数据获取失败】") or str(csv_data).startswith("No data found"):
+                return None
+        else:
+            logger.warning(
+                "_get_price_on: unsupported or unknown price_basis %r for %s; fail-closed",
+                price_basis,
+                symbol,
+            )
             return None
-        df = pd.read_csv(pd.io.common.StringIO(csv_data))
+
+        df = pd.read_csv(pd.io.common.StringIO(csv_data), comment="#")
         close_cols = [c for c in df.columns if "close" in c.lower() or "收盘" in c]
         date_cols = [c for c in df.columns if "date" in c.lower() or "日期" in c or "time" in c.lower()]
         if not close_cols or not date_cols:
             return None
         df = df.sort_values(date_cols[0]).reset_index(drop=True)
+        if df.empty:
+            return None
         return float(df[close_cols[0]].iloc[-1])
     except Exception as exc:
-        logger.warning("_get_price_on failed for %s @ %s: %s", symbol, date, exc)
+        logger.warning(
+            "_get_price_on failed for %s @ %s (price_basis=%s): %s",
+            symbol,
+            date,
+            price_basis,
+            exc,
+        )
         return None
 
 
@@ -483,8 +606,8 @@ def _run_backtest(job_id: str, symbol: str, start_date: str, end_date: str,
                 elif trade_action == "HOLD":
                     record["outcome_status"] = "excluded_hold"
                 elif trade_action in ("BUY", "SELL") and analysis_status == "VALID":
-                    entry_price = _get_price_on(symbol, trade_date)
-                    exit_price = _get_price_after(symbol, trade_date, hold_days)
+                    entry_price = _get_price_on(symbol, trade_date, price_basis=price_basis)
+                    exit_price = _get_price_after(symbol, trade_date, hold_days, price_basis=price_basis)
 
                     if entry_price is not None and entry_price > 0:
                         record["entry_price"] = round(entry_price, 2)

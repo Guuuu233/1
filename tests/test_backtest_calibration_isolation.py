@@ -23,13 +23,13 @@ from api.services import calibration_service as cal
 
 
 def _fake_price_after(price: float | None):
-    def _resolve(symbol: str, base_date: str, hold_days: int) -> float | None:
+    def _resolve(symbol: str, base_date: str, hold_days: int, *args, **kwargs) -> float | None:
         return price
     return _resolve
 
 
 def _fake_price_on(price: float | None):
-    def _resolve(symbol: str, date: str) -> float | None:
+    def _resolve(symbol: str, date: str, *args, **kwargs) -> float | None:
         return price
     return _resolve
 
@@ -336,6 +336,13 @@ class TestCalibrationIsolationIntegrity:
             db.commit()
             db.refresh(report)
             return report
+
+    def teardown_method(self):
+        from api.database import get_db_ctx, ReportDB, UserDB
+        with get_db_ctx() as db:
+            db.query(ReportDB).delete()
+            db.query(UserDB).delete()
+            db.commit()
 
     def test_calibration_excludes_invalid_abstain_wait_and_incomplete(self):
         from api.database import get_db_ctx, init_db, UserDB
