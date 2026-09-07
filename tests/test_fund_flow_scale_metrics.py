@@ -469,3 +469,122 @@ def test_evidence_mapping_as_first_argument():
     assert res["trade_date"] == "2026-08-14"
     assert res["net_amount"] == Decimal("1.5")
     assert res["net_to_circ_mv"] is not None
+
+
+def test_mapping_first_arg_zero_net_amount_and_field_priority():
+    """12. 验证 mapping 首参中 net_amount 为 0 / Decimal(0) 时不被当假值误判缺失，且高优先级字段不被覆盖。"""
+    # Case 12.1: mapping 首参包含 net_amount=0，不应报错「资金净额缺失」，比率应为 0
+    evidence_zero_int = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "net_amount": 0,
+        "net_amount_unit": "万元",
+    }
+    res_zero = calculate_fund_flow_scale_metrics(
+        evidence_zero_int,
+        circ_mv=10000.0,
+        circ_mv_unit="万元",
+        amount=5000.0,
+        amount_unit="万元",
+    )
+    assert res_zero["net_amount"] == Decimal(0)
+    assert res_zero["net_to_circ_mv"] == Decimal(0)
+    assert res_zero["net_to_amount"] == Decimal(0)
+    assert not any("资金净额" in g for g in res_zero["gaps"])
+    assert res_zero["status"] == "available"
+
+    # Case 12.2: mapping 同时包含 net_amount=Decimal(0) 与 selected_value=50，
+    # 高优先级 net_amount 严格保留 0，绝不能因为 0 为假值而回退覆盖为 50
+    evidence_override = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "net_amount": Decimal(0),
+        "selected_value": 50,
+        "net_amount_unit": "万元",
+    }
+    res_override = calculate_fund_flow_scale_metrics(
+        evidence_override,
+        circ_mv=10000.0,
+        circ_mv_unit="万元",
+    )
+    assert res_override["net_amount"] == Decimal(0)
+    assert res_override["net_to_circ_mv"] == Decimal(0)
+
+    # Case 12.3: 关键字传入 net_amount=0 正常计算为 0
+    res_kw_zero = calculate_fund_flow_scale_metrics(
+        ts_code="600519.SH",
+        trade_date="2026-08-14",
+        net_amount=0,
+        net_amount_unit="万元",
+        circ_mv=10000.0,
+        circ_mv_unit="万元",
+        amount=5000.0,
+        amount_unit="万元",
+    )
+    assert res_kw_zero["net_amount"] == Decimal(0)
+    assert res_kw_zero["net_to_circ_mv"] == Decimal(0)
+    assert res_kw_zero["net_to_amount"] == Decimal(0)
+    assert not any("资金净额" in g for g in res_kw_zero["gaps"])
+
+    # Case 12.4: mapping 内自带分母与单位
+    evidence_full = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "net_amount": 0.0,
+        "net_amount_unit": "万元",
+        "circ_mv": 10000.0,
+        "circ_mv_unit": "万元",
+        "amount": 5000.0,
+        "amount_unit": "万元",
+        "denominator_source": "tushare.daily_basic",
+    }
+    res_full = calculate_fund_flow_scale_metrics(evidence_full)
+    assert res_full["net_amount"] == Decimal(0)
+    assert res_full["net_to_circ_mv"] == Decimal(0)
+    assert res_full["net_to_amount"] == Decimal(0)
+    assert res_full["denominator_source"] == "tushare.daily_basic"
+
+
+def test_invalid_denominator_date_rejected():
+    """13. 验证显式传入无法解析的分母日期字符串时，严格拒绝相除并记入缺口。"""
+    # circ_mv_trade_date 非法无法解析
+    res_bad_circ_date = calculate_fund_flow_scale_metrics(
+        ts_code="600519.SH",
+        trade_date="2026-08-14",
+        net_amount=1.5,
+        net_amount_unit="亿元",
+        circ_mv=10000.0,
+        circ_mv_unit="万元",
+        circ_mv_trade_date="invalid_date_str",
+    )
+    assert res_bad_circ_date["net_to_circ_mv"] is None
+    assert any("circ_mv_trade_date='invalid_date_str' 无法解析为有效日期" in g for g in res_bad_circ_date["gaps"])
+
+    # amount_trade_date 非法月份无法解析
+    res_bad_amt_date = calculate_fund_flow_scale_metrics(
+        ts_code="600519.SH",
+        trade_date="2026-08-14",
+        net_amount=1.5,
+        net_amount_unit="亿元",
+        amount=5000.0,
+        amount_unit="万元",
+        amount_trade_date="20269999",
+    )
+    assert res_bad_amt_date["net_to_amount"] is None
+    assert any("amount_trade_date='20269999' 无法解析为有效日期" in g for g in res_bad_amt_date["gaps"])
+
+
+def test_decimal_ratio_hash_and_set_dict_membership():
+    """14. 验证 DecimalRatio 实现 __hash__，支持 set 集合与 dict 键。"""
+    r1 = DecimalRatio("0.01")
+    r2 = DecimalRatio("0.02")
+    r1_copy = DecimalRatio("0.01")
+
+    assert hash(r1) == hash(Decimal("0.01"))
+    s = {r1, r2}
+    assert r1 in s
+    assert r1_copy in s
+    d = {r1: "one", r2: "two"}
+    assert d[r1_copy] == "one"
+
+
