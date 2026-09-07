@@ -27,9 +27,14 @@ from __future__ import annotations
 
 import copy
 from decimal import Decimal
+import json
 from unittest.mock import MagicMock, patch
 import pytest
 
+from sqlalchemy import JSON
+from sqlalchemy.dialects import sqlite
+
+from api.services.report_service import canonicalize_report_result_data
 from tradingagents.dataflows.cninfo_disclosure import (
     CninfoDisclosureEnvelope,
     STATUS_OK,
@@ -48,8 +53,11 @@ from tradingagents.dataflows.providers.cn_akshare_provider import (
 )
 from tradingagents.graph.data_collector import (
     DataCollector,
+    default_market_data_context,
     _fetch_all,
+    _serialize_scale_metrics_for_json,
 )
+from tradingagents.llm_clients.thinking_cleaner import clean_report_result_data
 
 
 @pytest.fixture(autouse=True)
@@ -177,11 +185,13 @@ class TestFundFlowScaleCollectorNormalCircMv:
         assert "scale_metrics" in results["market_data_context"]["fund_flow_evidence"]
         scale_metrics = results["market_data_context"]["scale_metrics"]
 
-        # 验证数值计算：1.5亿元 (150,000,000元) / 2220600万元 (22,206,000,000元)
+        # 验证数值计算与序列化契约：1.5亿元 (150,000,000元) / 2220600万元 (22,206,000,000元)
         expected_ratio = Decimal("150000000") / Decimal("22206000000")
         assert scale_metrics["net_to_circ_mv"] is not None
-        assert scale_metrics["net_to_circ_mv"] == expected_ratio
-        assert scale_metrics["circ_mv"] == Decimal("2220600.0")
+        assert scale_metrics["net_to_circ_mv"] == str(expected_ratio)
+        assert Decimal(scale_metrics["net_to_circ_mv"]) == expected_ratio
+        assert scale_metrics["circ_mv"] == "2220600.0"
+        assert Decimal(scale_metrics["circ_mv"]) == Decimal("2220600.0")
         assert scale_metrics["circ_mv_unit"] == "万元"
         assert scale_metrics["circ_mv_source"] == "tushare.daily_basic"
         assert scale_metrics["denominator_source"] == "tushare.daily_basic"
@@ -251,9 +261,11 @@ class TestFundFlowScaleCollectorAmountUnitContract:
             results = _fetch_all("600519", "2026-08-14")
 
         scale_metrics = results["market_data_context"]["scale_metrics"]
+        expected_amt_ratio = Decimal("150000000") / Decimal("5500000000")
         assert scale_metrics["net_to_circ_mv"] is not None
         assert scale_metrics["net_to_amount"] is not None
-        assert scale_metrics["net_to_amount"] == Decimal("150000000") / Decimal("5500000000")
+        assert scale_metrics["net_to_amount"] == str(expected_amt_ratio)
+        assert Decimal(scale_metrics["net_to_amount"]) == expected_amt_ratio
         assert scale_metrics["status"] == "available"
 
 
@@ -356,9 +368,10 @@ class TestFundFlowScaleCollectorZeroNetAmount:
             results = _fetch_all("600519", "2026-08-14")
 
         scale_metrics = results["market_data_context"]["scale_metrics"]
-        assert scale_metrics["net_amount"] == Decimal("0")
-        assert scale_metrics["net_to_circ_mv"] == 0
-        assert scale_metrics["net_to_circ_mv"] == Decimal("0")
+        assert scale_metrics["net_amount"] == "0"
+        assert Decimal(scale_metrics["net_amount"]) == 0
+        assert scale_metrics["net_to_circ_mv"] == "0"
+        assert Decimal(scale_metrics["net_to_circ_mv"]) == 0
         assert not any("资金净额 (net_amount) 缺失" in gap for gap in scale_metrics["gaps"])
 
     def test_net_amount_decimal_zero_computes_zero_ratio(self):
@@ -383,9 +396,10 @@ class TestFundFlowScaleCollectorZeroNetAmount:
             results = _fetch_all("600519", "2026-08-14")
 
         scale_metrics = results["market_data_context"]["scale_metrics"]
-        assert scale_metrics["net_amount"] == Decimal("0")
-        assert scale_metrics["net_to_circ_mv"] == 0
-        assert scale_metrics["net_to_circ_mv"] == Decimal("0")
+        assert scale_metrics["net_amount"] == "0"
+        assert Decimal(scale_metrics["net_amount"]) == 0
+        assert scale_metrics["net_to_circ_mv"] == "0"
+        assert Decimal(scale_metrics["net_to_circ_mv"]) == 0
 
     def test_net_amount_missing_records_gap(self):
         """当 fund_flow_individual 完全不可用（无净额）时，净额记为缺失缺口。"""
@@ -580,6 +594,230 @@ class TestFundFlowScaleCollectorNeutralityAndIntegration:
         assert "scale_metrics" in pool["market_data_context"]
         assert "scale_metrics" in pool
         sm = pool["market_data_context"]["scale_metrics"]
-        assert sm["net_to_circ_mv"] == Decimal("150000000") / Decimal("22206000000")
+        expected_ratio = Decimal("150000000") / Decimal("22206000000")
+        assert sm["net_to_circ_mv"] == str(expected_ratio)
+        assert Decimal(sm["net_to_circ_mv"]) == expected_ratio
         assert sm["circ_mv_unit"] == "万元"
         assert sm["denominator_source"] == "tushare.daily_basic"
+
+
+class TestFundFlowScaleCollectorJsonSerialization:
+    """8. 契约 8：真实 collector 输出必须可 JSON 序列化并支持 SQLAlchemy SQLite JSON bind processor。"""
+
+    def test_normal_collector_output_json_serializable_and_sqlite_bindable(self):
+        """正常非零输入下，真实 collector 输出的所有 scale_metrics 挂载点必须支持标准 JSON 序列化及 SQLite JSON bind processor。"""
+        mock_prov = _make_mock_provider(
+            daily_basic_result=(
+                {
+                    "ts_code": "600519.SH",
+                    "trade_date": "20260814",
+                    "circ_mv": 2220600.0,
+                    "amount": 550000.0,
+                    "amount_unit": "万元",
+                },
+                None,
+                None,
+            )
+        )
+        mock_ff = _make_sample_fund_flow_value(selected_value=1.5, selected_unit="亿元")
+        mock_stock_tool = _make_mock_tool()
+
+        with patch.dict(_registry._providers, {"cn_akshare": mock_prov}), \
+             patch("tradingagents.graph.data_collector.get_stock_data", mock_stock_tool), \
+             patch("tradingagents.graph.data_collector.get_individual_fund_flow", _make_mock_tool(mock_ff)):
+            results = _fetch_all("600519", "2026-08-14")
+
+        # 1. 验证三处挂载
+        sm_top = results["scale_metrics"]
+        sm_ctx = results["market_data_context"]["scale_metrics"]
+        sm_ff = results["market_data_context"]["fund_flow_evidence"]["scale_metrics"]
+
+        # 2. 标准 json.dumps 必须无异常抛出
+        dumped_top = json.dumps(sm_top)
+        dumped_ctx = json.dumps(sm_ctx)
+        dumped_ff = json.dumps(sm_ff)
+        assert dumped_top is not None
+        assert dumped_ctx is not None
+        assert dumped_ff is not None
+
+        # 3. SQLAlchemy SQLite JSON bind processor 必须无异常抛出
+        bp = JSON().bind_processor(sqlite.dialect())
+        bound_top = bp(sm_top)
+        bound_ctx_scale = bp(sm_ctx)
+        bound_ff_scale = bp(sm_ff)
+        assert bound_top is not None
+        assert bound_ctx_scale is not None
+        assert bound_ff_scale is not None
+
+        # 4. 报告持久化全路径验证：canonicalize + clean + SQLite bind processor
+        report_result_data = {
+            "market_data_context": {
+                "scale_metrics": sm_ctx,
+            },
+            "scale_metrics": sm_top,
+        }
+        canonical = canonicalize_report_result_data(report_result_data)
+        cleaned = clean_report_result_data(canonical)
+        bound_report = bp(cleaned)
+        assert bound_report is not None
+
+        # 5. 反序列化往返验证：数值无损保留，精确十进制字符串契约
+        parsed = json.loads(bound_report)
+        scale_in_report = parsed["market_data_context"]["scale_metrics"]
+        expected_ratio = Decimal("150000000") / Decimal("22206000000")
+        expected_amt_ratio = Decimal("150000000") / Decimal("5500000000")
+        assert scale_in_report["net_to_circ_mv"] == str(expected_ratio)
+        assert Decimal(scale_in_report["net_to_circ_mv"]) == expected_ratio
+        assert scale_in_report["net_to_amount"] == str(expected_amt_ratio)
+        assert Decimal(scale_in_report["net_to_amount"]) == expected_amt_ratio
+        assert scale_in_report["net_amount"] == "1.5"
+        assert Decimal(scale_in_report["net_amount"]) == Decimal("1.5")
+        assert scale_in_report["circ_mv"] == "2220600.0"
+        assert Decimal(scale_in_report["circ_mv"]) == Decimal("2220600.0")
+        assert scale_in_report["amount"] == "550000.0"
+        assert Decimal(scale_in_report["amount"]) == Decimal("550000.0")
+
+    def test_zero_net_amount_json_serializable_and_sqlite_bindable(self):
+        """零净额输入下，0 原样保留且支持标准 JSON 序列化及 SQLite JSON bind processor。"""
+        mock_prov = _make_mock_provider(
+            daily_basic_result=(
+                {
+                    "ts_code": "600519.SH",
+                    "trade_date": "20260814",
+                    "circ_mv": 2220600.0,
+                },
+                None,
+                None,
+            )
+        )
+        mock_ff = _make_sample_fund_flow_value(selected_value=0, selected_unit="亿元")
+        mock_stock_tool = _make_mock_tool()
+
+        with patch.dict(_registry._providers, {"cn_akshare": mock_prov}), \
+             patch("tradingagents.graph.data_collector.get_stock_data", mock_stock_tool), \
+             patch("tradingagents.graph.data_collector.get_individual_fund_flow", _make_mock_tool(mock_ff)):
+            results = _fetch_all("600519", "2026-08-14")
+
+        sm = results["market_data_context"]["scale_metrics"]
+        assert json.dumps(sm) is not None
+
+        bp = JSON().bind_processor(sqlite.dialect())
+        bound = bp(sm)
+        assert bound is not None
+
+        report_result_data = {
+            "market_data_context": {"scale_metrics": sm},
+            "scale_metrics": results["scale_metrics"],
+        }
+        canonical = canonicalize_report_result_data(report_result_data)
+        cleaned = clean_report_result_data(canonical)
+        bound_report = bp(cleaned)
+        assert bound_report is not None
+
+        parsed = json.loads(bound_report)
+        sm_parsed = parsed["market_data_context"]["scale_metrics"]
+        assert sm_parsed["net_amount"] == "0"
+        assert Decimal(sm_parsed["net_amount"]) == 0
+        assert sm_parsed["net_to_circ_mv"] == "0"
+        assert Decimal(sm_parsed["net_to_circ_mv"]) == 0
+
+    def test_missing_denominator_json_serializable_and_sqlite_bindable(self):
+        """缺失分母（如 token_missing）导致比率全 None 时，缺口保留且能通过 JSON 序列化。"""
+        mock_prov = _make_mock_provider(
+            daily_basic_result=(None, "tushare.daily_basic:token_missing", "token_missing")
+        )
+        mock_ff = _make_sample_fund_flow_value(selected_value=1.5, selected_unit="亿元")
+        mock_stock_tool = _make_mock_tool()
+
+        with patch.dict(_registry._providers, {"cn_akshare": mock_prov}), \
+             patch("tradingagents.graph.data_collector.get_stock_data", mock_stock_tool), \
+             patch("tradingagents.graph.data_collector.get_individual_fund_flow", _make_mock_tool(mock_ff)):
+            results = _fetch_all("600519", "2026-08-14")
+
+        sm = results["market_data_context"]["scale_metrics"]
+        assert json.dumps(sm) is not None
+
+        bp = JSON().bind_processor(sqlite.dialect())
+        bound = bp(sm)
+        assert bound is not None
+
+        report_result_data = {
+            "market_data_context": {"scale_metrics": sm},
+            "scale_metrics": results["scale_metrics"],
+        }
+        canonical = canonicalize_report_result_data(report_result_data)
+        cleaned = clean_report_result_data(canonical)
+        bound_report = bp(cleaned)
+        assert bound_report is not None
+
+        parsed = json.loads(bound_report)
+        sm_parsed = parsed["market_data_context"]["scale_metrics"]
+        assert sm_parsed["net_to_circ_mv"] is None
+        assert sm_parsed["status"] == "unavailable"
+        assert any("token_missing" in g for g in sm_parsed["gaps"])
+
+    def test_missing_amount_unit_json_serializable_and_sqlite_bindable(self):
+        """成交额单位缺失时，仅 circ_mv 占比计算，成交额占比为 None，缺口与结果均可序列化。"""
+        mock_prov = _make_mock_provider(
+            daily_basic_result=(
+                {
+                    "ts_code": "600519.SH",
+                    "trade_date": "20260814",
+                    "circ_mv": 2220600.0,
+                    "amount": 550000.0,
+                },
+                None,
+                None,
+            )
+        )
+        mock_ff = _make_sample_fund_flow_value(selected_value=1.5, selected_unit="亿元")
+        mock_stock_tool = _make_mock_tool()
+
+        with patch.dict(_registry._providers, {"cn_akshare": mock_prov}), \
+             patch("tradingagents.graph.data_collector.get_stock_data", mock_stock_tool), \
+             patch("tradingagents.graph.data_collector.get_individual_fund_flow", _make_mock_tool(mock_ff)):
+            results = _fetch_all("600519", "2026-08-14")
+
+        sm = results["market_data_context"]["scale_metrics"]
+        assert json.dumps(sm) is not None
+
+        bp = JSON().bind_processor(sqlite.dialect())
+        bound = bp(sm)
+        assert bound is not None
+
+        report_result_data = {
+            "market_data_context": {"scale_metrics": sm},
+            "scale_metrics": results["scale_metrics"],
+        }
+        canonical = canonicalize_report_result_data(report_result_data)
+        cleaned = clean_report_result_data(canonical)
+        bound_report = bp(cleaned)
+        assert bound_report is not None
+
+        parsed = json.loads(bound_report)
+        sm_parsed = parsed["market_data_context"]["scale_metrics"]
+        assert sm_parsed["net_to_circ_mv"] is not None
+        assert sm_parsed["net_to_amount"] is None
+        assert sm_parsed["status"] == "partial"
+        assert any("成交额单位 (amount_unit) 缺失" in g for g in sm_parsed["gaps"])
+
+    def test_default_market_data_context_json_serializable(self):
+        """default_market_data_context 必须原生可 JSON 序列化。"""
+        ctx = default_market_data_context()
+        assert json.dumps(ctx) is not None
+        bp = JSON().bind_processor(sqlite.dialect())
+        bound = bp(ctx)
+        assert bound is not None
+        parsed = json.loads(bound)
+        assert parsed["scale_metrics"]["status"] == "unavailable"
+        assert parsed["scale_metrics"]["net_to_circ_mv"] is None
+        assert any("未提供市场数据上下文" in g for g in parsed["scale_metrics"]["gaps"])
+
+    def test_unknown_type_raises_type_error_no_default_str_masking(self):
+        """严禁使用 default=str 粗暴掩盖未知对象；遇到非 JSON 原生且非 Decimal 类型必须显式抛出 TypeError。"""
+        class DummyUnknown:
+            pass
+
+        with pytest.raises(TypeError, match="not JSON serializable"):
+            _serialize_scale_metrics_for_json({"unknown": DummyUnknown()})
+

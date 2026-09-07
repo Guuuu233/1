@@ -9,6 +9,7 @@ from concurrent.futures import (
 )
 import copy
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import math
 from typing import Any, Dict, List, Optional, Mapping
 import json
@@ -632,15 +633,35 @@ def _unavailable_realtime_context(retrieved_at: Optional[str], error: str) -> Di
     }
 
 
+def _serialize_scale_metrics_for_json(val: Any) -> Any:
+    """Convert scale_metrics dictionary to JSON-native types for storage and API boundaries.
+
+    Specifically:
+    - Decimal (including DecimalRatio) is converted to a decimal string to retain exact precision.
+    - Preserves None, bool, int, float, str, list, dict.
+    - Preserves 0, None, gaps, and nested dictionary structures.
+    - Raises TypeError for unhandled/unknown objects (no default=str masking).
+    """
+    if val is None or isinstance(val, (str, int, float, bool)):
+        return val
+    if isinstance(val, Decimal):
+        return "0" if val == 0 else format(val, "f")
+    if isinstance(val, Mapping):
+        return {str(k): _serialize_scale_metrics_for_json(v) for k, v in val.items()}
+    if isinstance(val, (list, tuple)):
+        return [_serialize_scale_metrics_for_json(item) for item in val]
+    raise TypeError(f"Object of type {type(val).__name__} in scale_metrics is not JSON serializable")
+
+
 def default_market_data_context() -> Dict[str, Any]:
     """Return a safe context when collection did not provide one."""
     empty_vpa = compute_vpa_deterministic_features(None)
-    default_scale = {
+    default_scale = _serialize_scale_metrics_for_json({
         "status": "unavailable",
         "net_to_circ_mv": None,
         "net_to_amount": None,
         "gaps": ["未提供市场数据上下文，资金规模归一指标不可用"],
-    }
+    })
     return {
         "analysis_baseline_date": None,
         "fund_flow_evidence": {
@@ -2335,6 +2356,8 @@ def _fetch_all(
             scale_metrics["gaps"].append(gap_msg)
         scale_metrics["error"] = basic_err
         scale_metrics["error_category"] = basic_cat
+
+    scale_metrics = _serialize_scale_metrics_for_json(scale_metrics)
 
     fund_flow_context["scale_metrics"] = scale_metrics
     results["scale_metrics"] = scale_metrics
