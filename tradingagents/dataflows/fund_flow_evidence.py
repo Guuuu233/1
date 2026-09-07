@@ -2348,6 +2348,9 @@ def validate_model_summary(
 class DecimalRatio(Decimal):
     """Decimal representing a scale ratio with seamless float/approx comparisons."""
 
+    def __hash__(self) -> int:
+        return super().__hash__()
+
     def __sub__(self, other: Any) -> Any:
         if isinstance(other, float):
             return float(self) - other
@@ -2513,37 +2516,63 @@ def calculate_fund_flow_scale_metrics(
     # 1. Unpack evidence if passed as first argument mapping
     if isinstance(ts_code, Mapping):
         evidence = ts_code
-        ts_code = evidence.get("ts_code") or evidence.get("symbol")
-        trade_date = (
-            trade_date
-            or evidence.get("trade_date")
-            or evidence.get("date")
-            or evidence.get("measurement_date")
-            or evidence.get("as_of")
-        )
+        extracted_ts = None
+        for key in ("ts_code", "symbol", "code"):
+            val = evidence.get(key)
+            if val is not None and str(val).strip():
+                extracted_ts = val
+                break
+        ts_code = extracted_ts
+        if trade_date is None:
+            for key in ("trade_date", "date", "measurement_date", "as_of"):
+                val = evidence.get(key)
+                if val is not None and str(val).strip():
+                    trade_date = val
+                    break
         if net_amount is None:
-            net_amount = (
-                evidence.get("net_amount")
-                or evidence.get("selected_value")
-                or evidence.get("value")
-                or evidence.get("r0_net")
-                or evidence.get("netamount")
-            )
+            for key in ("net_amount", "selected_value", "value", "r0_net", "netamount"):
+                if evidence.get(key) is not None:
+                    net_amount = evidence[key]
+                    break
         if net_amount_unit is None:
-            net_amount_unit = (
-                evidence.get("net_amount_unit")
-                or evidence.get("selected_unit")
-                or evidence.get("unit")
-                or evidence.get("raw_unit")
-            )
+            for key in ("net_amount_unit", "selected_unit", "unit", "raw_unit"):
+                val = evidence.get(key)
+                if val is not None and str(val).strip():
+                    net_amount_unit = val
+                    break
+        if circ_mv is None and evidence.get("circ_mv") is not None:
+            circ_mv = evidence.get("circ_mv")
+        if circ_mv_unit is None and evidence.get("circ_mv_unit") is not None:
+            circ_mv_unit = evidence.get("circ_mv_unit")
+        if amount is None and evidence.get("amount") is not None:
+            amount = evidence.get("amount")
+        if amount_unit is None and evidence.get("amount_unit") is not None:
+            amount_unit = evidence.get("amount_unit")
 
     # 2. Argument aliases
-    ts_code = ts_code or kwargs.get("symbol") or kwargs.get("code")
-    trade_date = trade_date or kwargs.get("date") or kwargs.get("as_of")
+    if ts_code is None:
+        for key in ("ts_code", "symbol", "code"):
+            val = kwargs.get(key)
+            if val is not None and str(val).strip():
+                ts_code = val
+                break
+    if trade_date is None:
+        for key in ("trade_date", "date", "as_of"):
+            val = kwargs.get(key)
+            if val is not None and str(val).strip():
+                trade_date = val
+                break
     if net_amount is None:
-        net_amount = kwargs.get("net_value", kwargs.get("r0_net", kwargs.get("netamount")))
+        for key in ("net_amount", "net_value", "r0_net", "netamount"):
+            if kwargs.get(key) is not None:
+                net_amount = kwargs[key]
+                break
     if net_amount_unit is None:
-        net_amount_unit = kwargs.get("net_unit") or kwargs.get("unit") or kwargs.get("raw_unit")
+        for key in ("net_amount_unit", "net_unit", "unit", "raw_unit"):
+            val = kwargs.get(key)
+            if val is not None and str(val).strip():
+                net_amount_unit = val
+                break
 
     # 3. Unpack denominators or daily_basic dictionaries
     denom_dict: dict[str, Any] = {}
@@ -2559,46 +2588,58 @@ def calculate_fund_flow_scale_metrics(
             denominator_source = "tushare.daily_basic"
 
     if denom_dict:
-        if circ_mv is None:
+        if circ_mv is None and denom_dict.get("circ_mv") is not None:
             circ_mv = denom_dict.get("circ_mv")
-        if circ_mv_unit is None:
+        if circ_mv_unit is None and denom_dict.get("circ_mv_unit") is not None:
             circ_mv_unit = denom_dict.get("circ_mv_unit")
         if circ_mv_source is None:
-            circ_mv_source = denom_dict.get("circ_mv_source") or denom_dict.get("source")
+            for key in ("circ_mv_source", "source"):
+                val = denom_dict.get(key)
+                if val is not None and str(val).strip():
+                    circ_mv_source = val
+                    break
         if circ_mv_trade_date is None:
-            circ_mv_trade_date = (
-                denom_dict.get("circ_mv_trade_date")
-                or denom_dict.get("trade_date")
-                or denom_dict.get("date")
-            )
+            for key in ("circ_mv_trade_date", "trade_date", "date"):
+                val = denom_dict.get(key)
+                if val is not None and str(val).strip():
+                    circ_mv_trade_date = val
+                    break
         if circ_mv_ts_code is None:
-            circ_mv_ts_code = (
-                denom_dict.get("circ_mv_ts_code")
-                or denom_dict.get("ts_code")
-                or denom_dict.get("symbol")
-            )
+            for key in ("circ_mv_ts_code", "ts_code", "symbol"):
+                val = denom_dict.get(key)
+                if val is not None and str(val).strip():
+                    circ_mv_ts_code = val
+                    break
 
-        if amount is None:
+        if amount is None and denom_dict.get("amount") is not None:
             amount = denom_dict.get("amount")
-        if amount_unit is None:
+        if amount_unit is None and denom_dict.get("amount_unit") is not None:
             amount_unit = denom_dict.get("amount_unit")
         if amount_source is None:
-            amount_source = denom_dict.get("amount_source") or denom_dict.get("source")
+            for key in ("amount_source", "source"):
+                val = denom_dict.get(key)
+                if val is not None and str(val).strip():
+                    amount_source = val
+                    break
         if amount_trade_date is None:
-            amount_trade_date = (
-                denom_dict.get("amount_trade_date")
-                or denom_dict.get("trade_date")
-                or denom_dict.get("date")
-            )
+            for key in ("amount_trade_date", "trade_date", "date"):
+                val = denom_dict.get(key)
+                if val is not None and str(val).strip():
+                    amount_trade_date = val
+                    break
         if amount_ts_code is None:
-            amount_ts_code = (
-                denom_dict.get("amount_ts_code")
-                or denom_dict.get("ts_code")
-                or denom_dict.get("symbol")
-            )
+            for key in ("amount_ts_code", "ts_code", "symbol"):
+                val = denom_dict.get(key)
+                if val is not None and str(val).strip():
+                    amount_ts_code = val
+                    break
 
         if denominator_source is None:
-            denominator_source = denom_dict.get("denominator_source") or denom_dict.get("source")
+            for key in ("denominator_source", "source"):
+                val = denom_dict.get(key)
+                if val is not None and str(val).strip():
+                    denominator_source = val
+                    break
 
     # Resolve sources cascade
     if denominator_source is None:
@@ -2653,9 +2694,14 @@ def calculate_fund_flow_scale_metrics(
         # Prerequisites not met, error already in gaps
         pass
     else:
-        circ_date = _normalise_date_text(circ_mv_trade_date) if circ_mv_trade_date else None
+        circ_has_date = circ_mv_trade_date is not None and bool(str(circ_mv_trade_date).strip())
+        circ_date = _normalise_date_text(circ_mv_trade_date) if circ_has_date else None
         circ_code = _normalize_symbol_code(circ_mv_ts_code) if circ_mv_ts_code else None
-        if circ_date and circ_date != norm_trade_date:
+        if circ_has_date and not circ_date:
+            gaps.append(
+                f"分母交易日非法: circ_mv 交易日 '{circ_mv_trade_date}' 无法解析为有效日期，拒算"
+            )
+        elif circ_date and circ_date != norm_trade_date:
             gaps.append(
                 f"跨交易日拒算: circ_mv 交易日 '{circ_mv_trade_date}' 与请求交易日 '{trade_date}' 不一致"
             )
@@ -2687,9 +2733,14 @@ def calculate_fund_flow_scale_metrics(
         # Prerequisites not met, error already in gaps
         pass
     else:
-        amt_date = _normalise_date_text(amount_trade_date) if amount_trade_date else None
+        amt_has_date = amount_trade_date is not None and bool(str(amount_trade_date).strip())
+        amt_date = _normalise_date_text(amount_trade_date) if amt_has_date else None
         amt_code = _normalize_symbol_code(amount_ts_code) if amount_ts_code else None
-        if amt_date and amt_date != norm_trade_date:
+        if amt_has_date and not amt_date:
+            gaps.append(
+                f"分母交易日非法: amount 交易日 '{amount_trade_date}' 无法解析为有效日期，拒算"
+            )
+        elif amt_date and amt_date != norm_trade_date:
             gaps.append(
                 f"跨交易日拒算: amount 交易日 '{amount_trade_date}' 与请求交易日 '{trade_date}' 不一致"
             )

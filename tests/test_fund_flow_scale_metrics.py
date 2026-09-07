@@ -469,3 +469,123 @@ def test_evidence_mapping_as_first_argument():
     assert res["trade_date"] == "2026-08-14"
     assert res["net_amount"] == Decimal("1.5")
     assert res["net_to_circ_mv"] is not None
+
+
+def test_mapping_zero_net_amount_not_swallowed_or_overwritten():
+    """12. 验证 mapping 首参中 net_amount 为 0 或 Decimal('0') 时不被误判为缺失或被 selected_value 覆盖。"""
+    # Case 12.1: net_amount 为 int 0，计算出 net_to_circ_mv == 0
+    res_zero = calculate_fund_flow_scale_metrics(
+        {
+            "ts_code": "600519.SH",
+            "trade_date": "2026-08-14",
+            "net_amount": 0,
+            "net_amount_unit": "亿元",
+        },
+        circ_mv=100.0,
+        circ_mv_unit="亿元",
+        denominator_source="fixture_test",
+    )
+    assert res_zero["net_amount"] == Decimal("0")
+    assert res_zero["net_to_circ_mv"] == 0
+    assert res_zero["net_to_circ_mv"] == Decimal("0")
+    assert not any("资金净额 (net_amount) 缺失" in gap for gap in res_zero["gaps"])
+
+    # Case 12.2: net_amount 为 Decimal("0")，计算出 net_to_circ_mv == 0
+    res_dec_zero = calculate_fund_flow_scale_metrics(
+        {
+            "ts_code": "600519.SH",
+            "trade_date": "2026-08-14",
+            "net_amount": Decimal("0"),
+            "net_amount_unit": "亿元",
+        },
+        circ_mv=100.0,
+        circ_mv_unit="亿元",
+        denominator_source="fixture_test",
+    )
+    assert res_dec_zero["net_amount"] == Decimal("0")
+    assert res_dec_zero["net_to_circ_mv"] == 0
+    assert res_dec_zero["net_to_circ_mv"] == Decimal("0")
+    assert not any("资金净额 (net_amount) 缺失" in gap for gap in res_dec_zero["gaps"])
+
+    # Case 12.3: net_amount=0 且存在非零 selected_value=50 时，仍使用 0，绝不能被覆盖成 50
+    res_override_int = calculate_fund_flow_scale_metrics(
+        {
+            "ts_code": "600519.SH",
+            "trade_date": "2026-08-14",
+            "net_amount": 0,
+            "selected_value": 50,
+            "net_amount_unit": "亿元",
+        },
+        circ_mv=100.0,
+        circ_mv_unit="亿元",
+        denominator_source="fixture_test",
+    )
+    assert res_override_int["net_amount"] == Decimal("0")
+    assert res_override_int["net_to_circ_mv"] == 0
+    assert res_override_int["net_amount"] != 50
+
+    # Case 12.4: net_amount=Decimal("0") 且存在非零 selected_value=50 时，仍使用 Decimal("0")，绝不能被覆盖成 50
+    res_override_dec = calculate_fund_flow_scale_metrics(
+        {
+            "ts_code": "600519.SH",
+            "trade_date": "2026-08-14",
+            "net_amount": Decimal("0"),
+            "selected_value": 50,
+            "net_amount_unit": "亿元",
+        },
+        circ_mv=100.0,
+        circ_mv_unit="亿元",
+        denominator_source="fixture_test",
+    )
+    assert res_override_dec["net_amount"] == Decimal("0")
+    assert res_override_dec["net_to_circ_mv"] == 0
+    assert res_override_dec["net_amount"] != 50
+
+
+def test_decimal_ratio_hashable():
+    """13. 验证 DecimalRatio 显式实现 __hash__，支持哈希和集合操作，并与数值等价 float/Decimal 保持哈希一致。"""
+    r = DecimalRatio("0.01")
+    h = hash(r)
+    assert isinstance(h, int)
+    assert hash(r) == hash(Decimal("0.01"))
+    assert hash(DecimalRatio("0.5")) == hash(0.5)
+
+    s = {r, DecimalRatio("0.02")}
+    assert DecimalRatio("0.01") in s
+    assert Decimal("0.01") in s
+
+
+def test_invalid_denominator_date_rejected():
+    """14. 验证分母日期为非法字符串时（如无法解析为有效日期），必须拒算对应比率并记录缺口。"""
+    res_circ = calculate_fund_flow_scale_metrics(
+        ts_code="600519.SH",
+        trade_date="2026-08-14",
+        net_amount=1.5,
+        net_amount_unit="亿元",
+        circ_mv=100.0,
+        circ_mv_unit="亿元",
+        circ_mv_trade_date="invalid-date",
+        amount=50.0,
+        amount_unit="亿元",
+        amount_trade_date="2026-08-14",
+    )
+    assert res_circ["net_to_circ_mv"] is None
+    assert res_circ["net_to_amount"] is not None
+    assert any("分母交易日非法" in gap and "circ_mv" in gap for gap in res_circ["gaps"])
+
+    res_amt = calculate_fund_flow_scale_metrics(
+        ts_code="600519.SH",
+        trade_date="2026-08-14",
+        net_amount=1.5,
+        net_amount_unit="亿元",
+        circ_mv=100.0,
+        circ_mv_unit="亿元",
+        circ_mv_trade_date="2026-08-14",
+        amount=50.0,
+        amount_unit="亿元",
+        amount_trade_date="not_a_date_2026",
+    )
+    assert res_amt["net_to_circ_mv"] is not None
+    assert res_amt["net_to_amount"] is None
+    assert any("分母交易日非法" in gap and "amount" in gap for gap in res_amt["gaps"])
+
