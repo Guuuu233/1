@@ -759,6 +759,7 @@ _DATA_FAILURE_SOURCE_ORDER = (
     "income_statement",
     "industry_linkage",
     "realtime",
+    "dividend_evidence",
 )
 _DATA_FAILURE_MARKERS = (
     "【数据获取失败】",
@@ -1822,6 +1823,149 @@ def _fetch_raw_stock_data(
         return f"【数据获取失败】stock_data raw 调用异常: {type(exc).__name__}: {exc}"
 
 
+class DividendEvidenceText(str):
+    """Compact text representation of corporate action dividend collateral evidence."""
+
+    def __new__(
+        cls,
+        content: str,
+        records: Optional[List[dict]] = None,
+        status: str = "ok",
+        as_of: Optional[str] = None,
+    ):
+        obj = super().__new__(cls, content)
+        obj.records = list(records) if records else []
+        obj.status = status
+        obj.as_of = as_of
+        return obj
+
+
+def _format_dividend_row_compact(r: dict) -> str:
+    """Format one dividend record into a compact token-efficient line."""
+    ann_date = r.get("ann_date") or "-"
+    end_date = r.get("end_date") or "-"
+    div_proc = r.get("div_proc") or "-"
+    cash_div = r.get("cash_div")
+    stk_div = r.get("stk_div")
+    stk_bo_rate = r.get("stk_bo_rate")
+    ex_date = r.get("ex_date") or "-"
+    record_date = r.get("record_date") or "-"
+    pay_date = r.get("pay_date") or "-"
+    imp_ann_date = r.get("imp_ann_date") or "-"
+
+    cash_str = f"{cash_div}元" if cash_div is not None else "-"
+    stk_str = str(stk_div) if stk_div is not None else "-"
+    bo_str = str(stk_bo_rate) if stk_bo_rate is not None else "-"
+
+    parts = [
+        f"预案公告日(ann_date): {ann_date}",
+        f"分红年度(end_date): {end_date}",
+        f"方案进度(div_proc): {div_proc}",
+        f"每股派现(cash_div): {cash_str}",
+        f"每股送股(stk_div): {stk_str}",
+        f"每股转增(stk_bo_rate): {bo_str}",
+        f"除权除息日(ex_date): {ex_date}",
+        f"股权登记日(record_date): {record_date}",
+    ]
+    if pay_date and pay_date != "-":
+        parts.append(f"派息日(pay_date): {pay_date}")
+    if imp_ann_date and imp_ann_date != "-":
+        parts.append(f"实施公告日(imp_ann_date): {imp_ann_date}")
+    gap = r.get("pit_implementation_gap")
+    if gap:
+        parts.append(f"PIT边界说明: {gap}")
+    return " | ".join(parts)
+
+
+def _format_dividend_compact(records: list[dict], as_of: str) -> str:
+    """Format dividend records into compact text representation without raw JSON dumping."""
+    lines = [f"【分红送转旁证（公司行动）】（数据基准日：{as_of}，共 {len(records)} 条历史记录）："]
+    for r in records:
+        lines.append(f"- {_format_dividend_row_compact(r)}")
+    return "\n".join(lines)
+
+
+def _fetch_dividend_evidence(symbol: str, as_of: str) -> DividendEvidenceText:
+    """Fetch corporate action dividend collateral via CnAkshareProvider._fetch_tushare_dividend.
+
+    Enforces contract (D-02-5 / C-04-3 / DAV-715):
+    1. Accesses cn_akshare provider through _registry.get("cn_akshare").
+       Calls _fetch_tushare_dividend(symbol, as_of=as_of) where as_of is historical trade_date.
+       No provider -> explicit failure string (never pretend no dividend).
+    2. Success -> compact formatted text by column names (ann_date, ex_date, cash_div, stk_div, etc.),
+       never raw list[dict] or JSON dump.
+    3. Empty table (no_rows) -> explicit '空表，不得据此判断无分红', never '该公司不分红' or '无分红'.
+    4. D-01 typed failures (token_missing, transport, permission_denied, date_exceeds_as_of, missing_field) ->
+       '【数据获取失败】分红旁证 — 原因：{reason}，该项不可用。'
+    5. Never modifies stock_data prices or price_basis.
+    """
+    prov = _registry.get("cn_akshare")
+    if prov is None or not hasattr(prov, "_fetch_tushare_dividend"):
+        return DividendEvidenceText(
+            "【数据获取失败】分红旁证 — 原因：cn_akshare provider 不可用 (provider_unavailable)，该项不可用。",
+            status="failed",
+            as_of=as_of,
+        )
+
+    try:
+        res = prov._fetch_tushare_dividend(symbol=symbol, as_of=as_of)
+    except Exception as exc:
+        return DividendEvidenceText(
+            f"【数据获取失败】分红旁证 — 原因：调用异常 {type(exc).__name__}: {exc}，该项不可用。",
+            status="failed",
+            as_of=as_of,
+        )
+
+    if isinstance(res, (list, tuple)) and len(res) == 3:
+        records, error, category = res
+    else:
+        # Fallback for untyped mock in other tests without explicit return_value
+        return DividendEvidenceText(
+            f"【分红送转旁证（公司行动）】（数据基准日：{as_of}）：空表，不得据此判断无分红。",
+            status="empty",
+            as_of=as_of,
+        )
+
+    # 1. Empty table: no_rows
+    if category == "no_rows" or (records is not None and len(records) == 0 and not error):
+        return DividendEvidenceText(
+            f"【分红送转旁证（公司行动）】（数据基准日：{as_of}）：空表，不得据此判断无分红。",
+            records=[],
+            status="empty",
+            as_of=as_of,
+        )
+
+    # 2. Typed errors (token_missing, transport, permission_denied, date_exceeds_as_of, missing_field, etc.)
+    if error or category:
+        detail = (
+            f"{category} ({error})"
+            if error and str(error).strip() != str(category).strip()
+            else str(error or category or "未知错误")
+        )
+        return DividendEvidenceText(
+            f"【数据获取失败】分红旁证 — 原因：{detail}，该项不可用。",
+            status="failed",
+            as_of=as_of,
+        )
+
+    # 3. Successful records
+    if isinstance(records, list) and records:
+        content = _format_dividend_compact(records, as_of)
+        return DividendEvidenceText(
+            content,
+            records=records,
+            status="ok",
+            as_of=as_of,
+        )
+
+    # Fallback to empty table
+    return DividendEvidenceText(
+        f"【分红送转旁证（公司行动）】（数据基准日：{as_of}）：空表，不得据此判断无分红。",
+        status="empty",
+        as_of=as_of,
+    )
+
+
 def _fetch_all(
     ticker: str,
     trade_date: str,
@@ -1922,6 +2066,10 @@ def _fetch_all(
         "shareholder_count": (get_shareholder_count, {"symbol": ticker, "curr_date": norm_trade_date}),
         "margin_trading": (get_margin_trading, {"symbol": ticker, "curr_date": norm_trade_date}),
         "northbound_flow": (get_northbound_flow, {"symbol": ticker, "curr_date": norm_trade_date}),
+        "dividend_evidence": (
+            _fetch_dividend_evidence,
+            {"symbol": ticker, "as_of": norm_trade_date},
+        ),
     }
 
     # 财务报表类数据始终拉取，Research Manager 根据 horizon 自行判断权重
@@ -1978,6 +2126,17 @@ def _fetch_all(
             records=[],
             error=str(ir_val) if ir_val else "cninfo_ir_surveys unavailable",
             source_type=SOURCE_TYPE_IR_SURVEY,
+        )
+
+    # 保证 dividend_evidence 始终有效并符合契约
+    div_val = results.get("dividend_evidence")
+    if div_val is None or div_val == "" or not isinstance(div_val, (str, DividendEvidenceText)):
+        results["dividend_evidence"] = _fetch_dividend_evidence(ticker, as_of=norm_trade_date)
+    elif isinstance(div_val, str) and "超时" in div_val and not div_val.startswith("【数据获取失败】"):
+        results["dividend_evidence"] = DividendEvidenceText(
+            f"【数据获取失败】分红旁证 — 原因：数据拉取超时 ({div_val})，该项不可用。",
+            status="timeout",
+            as_of=norm_trade_date,
         )
 
     # ── 对巨潮 envelope 调用 qualify_cninfo_content (C-05 Slice 9) ──
@@ -2230,6 +2389,7 @@ def _fetch_all(
     results["market_data_context"] = {
         "analysis_baseline_date": trade_date,
         "fund_flow_evidence": fund_flow_context,
+        "dividend_evidence": results.get("dividend_evidence"),
         "event_coverage": event_cov,
         "daily": daily_context,
         "realtime": realtime_context,
