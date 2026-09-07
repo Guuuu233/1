@@ -249,6 +249,35 @@ _TUSHARE_FUND_FLOW_MAX_ATTEMPTS = 2
 _TUSHARE_FUND_FLOW_RETRY_DELAY = 0.2
 _TUSHARE_DC_API = "moneyflow_dc"
 _TUSHARE_THS_API = "moneyflow_ths"
+_TUSHARE_DAILY_API = "daily"
+_TUSHARE_RAW_DAILY_API = "daily"
+_TUSHARE_DAILY_REQUIRED_FIELDS = (
+    "ts_code",
+    "trade_date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "pre_close",
+    "vol",
+    "amount",
+)
+_TUSHARE_RAW_DAILY_REQUIRED_FIELDS = _TUSHARE_DAILY_REQUIRED_FIELDS
+_TUSHARE_DIVIDEND_API = "dividend"
+_TUSHARE_DIVIDEND_REQUIRED_FIELDS = (
+    "ts_code",
+    "end_date",
+    "ann_date",
+    "div_proc",
+    "stk_div",
+    "stk_bo_rate",
+    "cash_div",
+    "cash_div_tax",
+    "record_date",
+    "ex_date",
+    "pay_date",
+    "imp_ann_date",
+)
 _TUSHARE_DAILY_BASIC_API = "daily_basic"
 _TUSHARE_DAILY_BASIC_REQUIRED_FIELDS = (
     "ts_code",
@@ -314,6 +343,13 @@ _TUSHARE_REQUEST_FIELDS = {
     _TUSHARE_THS_API: (
         "ts_code,trade_date,net_amount,buy_sm_amount,buy_md_amount,"
         "buy_lg_amount"
+    ),
+    _TUSHARE_DAILY_API: (
+        "ts_code,trade_date,open,high,low,close,pre_close,vol,amount"
+    ),
+    _TUSHARE_DIVIDEND_API: (
+        "ts_code,end_date,ann_date,div_proc,stk_div,stk_bo_rate,cash_div,"
+        "cash_div_tax,record_date,ex_date,pay_date,imp_ann_date"
     ),
     _TUSHARE_DAILY_BASIC_API: (
         "ts_code,trade_date,close,turnover_rate,turnover_rate_f,volume_ratio,"
@@ -2926,6 +2962,563 @@ class CnAkshareProvider(BaseMarketDataProvider):
             )
 
         return dict(matched_row), None, None
+
+    def _fetch_tushare_raw_daily(
+        self,
+        symbol: str,
+        trade_date: str | None = None,
+        as_of: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> tuple[dict | list[dict] | None, str | None, str | None]:
+        """Fetch unadjusted raw daily bar(s) via Tushare private gateway.
+
+        Enforces contract (D-01 / C-04-2 / DAV-703):
+        1. Raw unadjusted daily bars ONLY: request daily without adjustment params.
+           Strictly forbidden to pass adjustment params (adj, adj_factor) or label qfq as raw.
+        2. Column access by name (no iloc); WANTED at least ts_code, trade_date, open, high, low,
+           close, pre_close, vol, amount. Missing required fields reported as missing_field.
+        3. PIT boundary guard: trade_date > as_of must be rejected BEFORE network call
+           (date_exceeds_as_of).
+        4. Token missing: no network traffic (token_missing).
+        5. Typed error classifications consistent with daily_basic:
+           timeout, permission_denied, rate_limited, json_shape, no_rows, missing_field, validation.
+        """
+        # 1. Validation & PIT date boundary guard (before network call)
+        norm_as_of = None
+        if as_of:
+            norm_as_of = self._tushare_date(as_of)
+            if not norm_as_of:
+                return (
+                    None,
+                    self._tushare_error(_TUSHARE_DAILY_API, "validation", "as_of"),
+                    "validation",
+                )
+
+        norm_trade_date = None
+        if trade_date:
+            norm_trade_date = self._tushare_date(trade_date)
+            if not norm_trade_date:
+                return (
+                    None,
+                    self._tushare_error(_TUSHARE_DAILY_API, "validation", "trade_date"),
+                    "validation",
+                )
+            if norm_as_of and norm_trade_date > norm_as_of:
+                return (
+                    None,
+                    self._tushare_error(
+                        _TUSHARE_DAILY_API,
+                        "date_exceeds_as_of",
+                        f"{norm_trade_date}>{norm_as_of}",
+                    ),
+                    "date_exceeds_as_of",
+                )
+
+        norm_start_date = None
+        if start_date:
+            norm_start_date = self._tushare_date(start_date)
+            if not norm_start_date:
+                return (
+                    None,
+                    self._tushare_error(_TUSHARE_DAILY_API, "validation", "start_date"),
+                    "validation",
+                )
+            if norm_as_of and norm_start_date > norm_as_of:
+                return (
+                    None,
+                    self._tushare_error(
+                        _TUSHARE_DAILY_API,
+                        "date_exceeds_as_of",
+                        f"{norm_start_date}>{norm_as_of}",
+                    ),
+                    "date_exceeds_as_of",
+                )
+
+        norm_end_date = None
+        if end_date:
+            norm_end_date = self._tushare_date(end_date)
+            if not norm_end_date:
+                return (
+                    None,
+                    self._tushare_error(_TUSHARE_DAILY_API, "validation", "end_date"),
+                    "validation",
+                )
+            if norm_as_of and norm_end_date > norm_as_of:
+                return (
+                    None,
+                    self._tushare_error(
+                        _TUSHARE_DAILY_API,
+                        "date_exceeds_as_of",
+                        f"{norm_end_date}>{norm_as_of}",
+                    ),
+                    "date_exceeds_as_of",
+                )
+
+        if not norm_trade_date and not (norm_start_date and norm_end_date):
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DAILY_API, "validation", "trade_date"),
+                "validation",
+            )
+
+        # 2. Token check (must not make network call if token is missing)
+        token = os.getenv("TUSHARE_TOKEN", "").strip()
+        if not token:
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DAILY_API, "token_missing"),
+                "token_missing",
+            )
+
+        # 3. Symbol conversion
+        try:
+            ts_code = self._tushare_ts_code(symbol)
+        except (ValueError, Exception):
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DAILY_API, "validation", "symbol"),
+                "validation",
+            )
+
+        # 4. Request gateway via existing _tushare_post
+        # Strictly unadjusted raw daily bars without adjustment parameters
+        if norm_trade_date:
+            formatted_trade_date = norm_trade_date.replace("-", "")
+            payload, error, category = self._tushare_post(
+                _TUSHARE_DAILY_API, token, ts_code, formatted_trade_date
+            )
+        else:
+            params = {
+                "ts_code": ts_code,
+                "start_date": norm_start_date.replace("-", ""),
+                "end_date": norm_end_date.replace("-", ""),
+            }
+            payload, error, category = self._tushare_post(
+                _TUSHARE_DAILY_API, token, ts_code, params=params
+            )
+
+        if error:
+            return None, error, category
+
+        if not isinstance(payload, dict):
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DAILY_API, "json_shape"),
+                "json_shape",
+            )
+
+        # 5. Business code check
+        code = payload.get("code")
+        try:
+            code_value = int(code)
+        except (TypeError, ValueError):
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DAILY_API, "api_code_invalid"),
+                "api_code_invalid",
+            )
+        if code_value != 0:
+            cat = self._tushare_api_failure_category(code, payload.get("msg"))
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DAILY_API, cat, f"code={code}"),
+                cat,
+            )
+
+        # 6. Response structure check
+        if "data" not in payload:
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DAILY_API, "json_shape", "data_missing"),
+                "json_shape",
+            )
+        data = payload.get("data")
+        if data is None:
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DAILY_API, "no_rows"),
+                "no_rows",
+            )
+        if not isinstance(data, dict):
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DAILY_API, "json_shape", "data_not_object"),
+                "json_shape",
+            )
+        fields = data.get("fields")
+        items = data.get("items")
+        if not isinstance(fields, (list, tuple)):
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DAILY_API, "json_shape", "fields_not_list"),
+                "json_shape",
+            )
+        if not isinstance(items, (list, tuple)):
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DAILY_API, "json_shape", "items_not_list"),
+                "json_shape",
+            )
+        if not items:
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DAILY_API, "no_rows"),
+                "no_rows",
+            )
+
+        # 7. Required fields check (by name, not by index)
+        field_names = [str(f) for f in fields]
+        missing_fields = [
+            f for f in _TUSHARE_DAILY_REQUIRED_FIELDS if f not in field_names
+        ]
+        if missing_fields:
+            return (
+                None,
+                self._tushare_error(
+                    _TUSHARE_DAILY_API, "missing_field", ",".join(missing_fields)
+                ),
+                "missing_field",
+            )
+
+        # 8. Row extraction by column names (no iloc)
+        rows: list[dict] = []
+        malformed_rows = 0
+        for item in items:
+            if isinstance(item, dict):
+                row = dict(item)
+            elif isinstance(item, (list, tuple)) and len(item) >= len(field_names):
+                row = dict(zip(field_names, item))
+            else:
+                malformed_rows += 1
+                continue
+
+            row_date = self._tushare_date(row.get("trade_date"))
+            if not row_date:
+                continue
+
+            # PIT filtering: trade_date must not exceed as_of
+            if norm_as_of and row_date > norm_as_of:
+                continue
+
+            if norm_trade_date:
+                if row_date == norm_trade_date:
+                    rows.append(row)
+            else:
+                rows.append(row)
+
+        if not rows:
+            if malformed_rows == len(items):
+                return (
+                    None,
+                    self._tushare_error(_TUSHARE_DAILY_API, "json_shape", "row_shape"),
+                    "json_shape",
+                )
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DAILY_API, "no_rows"),
+                "no_rows",
+            )
+
+        if norm_trade_date:
+            if len(rows) > 1:
+                return (
+                    None,
+                    self._tushare_error(
+                        _TUSHARE_DAILY_API, "duplicate_date", norm_trade_date
+                    ),
+                    "duplicate_date",
+                )
+            matched_row = rows[0]
+            returned_ts_code = (
+                str(matched_row.get("ts_code") or "").strip().upper()
+            )
+            if returned_ts_code and returned_ts_code != ts_code.upper():
+                return (
+                    None,
+                    self._tushare_error(_TUSHARE_DAILY_API, "symbol_mismatch"),
+                    "symbol_mismatch",
+                )
+            return dict(matched_row), None, None
+
+        rows.sort(key=lambda r: str(r.get("trade_date") or ""))
+        return rows, None, None
+
+    # Alias for raw daily
+    _fetch_tushare_daily = _fetch_tushare_raw_daily
+
+    def _fetch_tushare_dividend(
+        self,
+        symbol: str,
+        as_of: str | None = None,
+        ann_date: str | None = None,
+        record_date: str | None = None,
+        ex_date: str | None = None,
+        imp_ann_date: str | None = None,
+    ) -> tuple[list[dict] | None, str | None, str | None]:
+        """Fetch dividend (分红送转) records via Tushare private gateway.
+
+        Enforces contract (D-01 / C-04-2 / DAV-703):
+        1. Required fields at least covering 3.1:
+           ts_code, end_date, ann_date, div_proc, stk_div, stk_bo_rate,
+           cash_div, cash_div_tax, record_date, ex_date, pay_date, imp_ann_date.
+        2. Empty table reported explicitly as no_rows, never interpreted as "no dividend".
+        3. PIT boundary guard: rows with ann_date (or implementation date) > as_of are
+           strictly discarded as lookahead rows and recorded as gaps. Never feed future
+           proposals to historical as_of.
+        4. Token missing: no network traffic (token_missing).
+        5. Column access by name (no iloc). Missing required fields reported as missing_field.
+        """
+        # 1. Validation & PIT parameter guard (before network call)
+        norm_as_of = None
+        if as_of:
+            norm_as_of = self._tushare_date(as_of)
+            if not norm_as_of:
+                return (
+                    None,
+                    self._tushare_error(_TUSHARE_DIVIDEND_API, "validation", "as_of"),
+                    "validation",
+                )
+
+        params: dict[str, str] = {}
+        for date_arg, param_key in (
+            (ann_date, "ann_date"),
+            (record_date, "record_date"),
+            (ex_date, "ex_date"),
+            (imp_ann_date, "imp_ann_date"),
+        ):
+            if date_arg:
+                norm_d = self._tushare_date(date_arg)
+                if not norm_d:
+                    return (
+                        None,
+                        self._tushare_error(_TUSHARE_DIVIDEND_API, "validation", param_key),
+                        "validation",
+                    )
+                if norm_as_of and norm_d > norm_as_of:
+                    return (
+                        None,
+                        self._tushare_error(
+                            _TUSHARE_DIVIDEND_API,
+                            "date_exceeds_as_of",
+                            f"{norm_d}>{norm_as_of}",
+                        ),
+                        "date_exceeds_as_of",
+                    )
+                params[param_key] = norm_d.replace("-", "")
+
+        # 2. Token check (must not make network call if token is missing)
+        token = os.getenv("TUSHARE_TOKEN", "").strip()
+        if not token:
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DIVIDEND_API, "token_missing"),
+                "token_missing",
+            )
+
+        # 3. Symbol conversion
+        try:
+            ts_code = self._tushare_ts_code(symbol)
+        except (ValueError, Exception):
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DIVIDEND_API, "validation", "symbol"),
+                "validation",
+            )
+        params["ts_code"] = ts_code
+
+        # 4. Request gateway via existing _tushare_post
+        payload, error, category = self._tushare_post(
+            _TUSHARE_DIVIDEND_API, token, ts_code, params=params
+        )
+        if error:
+            return None, error, category
+
+        if not isinstance(payload, dict):
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DIVIDEND_API, "json_shape"),
+                "json_shape",
+            )
+
+        # 5. Business code check
+        code = payload.get("code")
+        try:
+            code_value = int(code)
+        except (TypeError, ValueError):
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DIVIDEND_API, "api_code_invalid"),
+                "api_code_invalid",
+            )
+        if code_value != 0:
+            cat = self._tushare_api_failure_category(code, payload.get("msg"))
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DIVIDEND_API, cat, f"code={code}"),
+                cat,
+            )
+
+        # 6. Response structure check
+        if "data" not in payload:
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DIVIDEND_API, "json_shape", "data_missing"),
+                "json_shape",
+            )
+        data = payload.get("data")
+        if data is None:
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DIVIDEND_API, "no_rows"),
+                "no_rows",
+            )
+        if not isinstance(data, dict):
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DIVIDEND_API, "json_shape", "data_not_object"),
+                "json_shape",
+            )
+        fields = data.get("fields")
+        items = data.get("items")
+        if not isinstance(fields, (list, tuple)):
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DIVIDEND_API, "json_shape", "fields_not_list"),
+                "json_shape",
+            )
+        if not isinstance(items, (list, tuple)):
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DIVIDEND_API, "json_shape", "items_not_list"),
+                "json_shape",
+            )
+        if not items:
+            # Empty table reported explicitly as no_rows, never interpreted as "no dividend"
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DIVIDEND_API, "no_rows"),
+                "no_rows",
+            )
+
+        # 7. Required fields check (by name, not by index)
+        field_names = [str(f) for f in fields]
+        missing_fields = [
+            f for f in _TUSHARE_DIVIDEND_REQUIRED_FIELDS if f not in field_names
+        ]
+        if missing_fields:
+            return (
+                None,
+                self._tushare_error(
+                    _TUSHARE_DIVIDEND_API, "missing_field", ",".join(missing_fields)
+                ),
+                "missing_field",
+            )
+
+        # 8. Row extraction by column names (no iloc) and PIT filtering
+        records: list[dict] = []
+        dropped_lookahead_rows: list[dict] = []
+        malformed_rows = 0
+
+        for item in items:
+            if isinstance(item, dict):
+                raw_row = dict(item)
+            elif isinstance(item, (list, tuple)) and len(item) >= len(field_names):
+                raw_row = dict(zip(field_names, item))
+            else:
+                malformed_rows += 1
+                continue
+
+            row_ts_code = str(raw_row.get("ts_code") or "").strip().upper()
+            if row_ts_code and row_ts_code != ts_code.upper():
+                continue
+
+            row_ann_raw = raw_row.get("ann_date")
+            norm_row_ann = self._tushare_date(row_ann_raw) if row_ann_raw else None
+            row_imp_raw = raw_row.get("imp_ann_date")
+            norm_row_imp = self._tushare_date(row_imp_raw) if row_imp_raw else None
+
+            # PIT filtering: discard lookahead rows relative to as_of
+            if norm_as_of:
+                if norm_row_ann and norm_row_ann > norm_as_of:
+                    dropped_lookahead_rows.append(
+                        {
+                            "reason": "ann_date_exceeds_as_of",
+                            "ann_date": norm_row_ann,
+                            "as_of": norm_as_of,
+                            "end_date": str(raw_row.get("end_date") or ""),
+                        }
+                    )
+                    continue
+                if not norm_row_ann and norm_row_imp and norm_row_imp > norm_as_of:
+                    dropped_lookahead_rows.append(
+                        {
+                            "reason": "imp_ann_date_exceeds_as_of",
+                            "imp_ann_date": norm_row_imp,
+                            "as_of": norm_as_of,
+                            "end_date": str(raw_row.get("end_date") or ""),
+                        }
+                    )
+                    continue
+
+            record = {
+                "ts_code": row_ts_code or ts_code,
+                "end_date": str(raw_row.get("end_date") or "").strip(),
+                "ann_date": norm_row_ann or str(row_ann_raw or "").strip(),
+                "div_proc": str(raw_row.get("div_proc") or "").strip(),
+                "stk_div": raw_row.get("stk_div"),
+                "stk_bo_rate": raw_row.get("stk_bo_rate"),
+                "cash_div": raw_row.get("cash_div"),
+                "cash_div_tax": raw_row.get("cash_div_tax"),
+                "record_date": str(raw_row.get("record_date") or "").strip(),
+                "ex_date": str(raw_row.get("ex_date") or "").strip(),
+                "pay_date": str(raw_row.get("pay_date") or "").strip(),
+                "imp_ann_date": str(raw_row.get("imp_ann_date") or "").strip(),
+                "symbol": symbol,
+                "source_type": "tushare_dividend",
+                "canonical_event_id": None,
+            }
+
+            # Mask future implementation details if imp_ann_date > as_of
+            if norm_as_of and norm_row_imp and norm_row_imp > norm_as_of:
+                record["imp_ann_date"] = None
+                record["record_date"] = None
+                record["ex_date"] = None
+                record["pay_date"] = None
+                record["pit_implementation_gap"] = (
+                    f"imp_ann_date({norm_row_imp})>{norm_as_of}"
+                )
+
+            records.append(record)
+
+        if not records:
+            if malformed_rows == len(items):
+                return (
+                    None,
+                    self._tushare_error(_TUSHARE_DIVIDEND_API, "json_shape", "row_shape"),
+                    "json_shape",
+                )
+            if dropped_lookahead_rows:
+                # All rows were lookahead rows relative to as_of
+                return (
+                    [],
+                    self._tushare_error(
+                        _TUSHARE_DIVIDEND_API, "no_rows", "all_rows_exceed_as_of"
+                    ),
+                    "no_rows",
+                )
+            return (
+                None,
+                self._tushare_error(_TUSHARE_DIVIDEND_API, "no_rows"),
+                "no_rows",
+            )
+
+        if dropped_lookahead_rows:
+            for r in records:
+                r["lookahead_gaps"] = list(dropped_lookahead_rows)
+
+        records.sort(key=lambda r: str(r.get("ann_date") or ""), reverse=True)
+        return records, None, None
 
     def _fetch_tushare_forecast(
         self,
