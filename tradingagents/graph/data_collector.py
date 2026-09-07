@@ -46,6 +46,19 @@ from tradingagents.agents.utils.agent_utils import (
     get_northbound_flow,
 )
 from tradingagents.dataflows.interface import _registry, route_to_vendor
+from tradingagents.dataflows.providers.cn_akshare_provider import (
+    PRICE_BASIS_PIT_ADJUSTED,
+    PRICE_BASIS_PIT_RAW,
+    PRICE_BASIS_RAW,
+    PRICE_BASIS_UNSPECIFIED,
+    PRICE_BASIS_VENDOR_QFQ,
+    PriceBasisError,
+    UnknownPriceBasisError,
+    UnsupportedPriceBasisError,
+    RawDailyFetchError,
+    StockDataText,
+    validate_price_basis_short_label,
+)
 from tradingagents.dataflows.cninfo_disclosure import (
     CninfoDisclosureEnvelope,
     CONTENT_STATUS_UNAVAILABLE,
@@ -551,7 +564,22 @@ def _compute_vpa_indicators(df: pd.DataFrame, window: int = 20) -> str:
     return "\n".join(lines)
 
 
-def make_cache_key(ticker: str, trade_date: str) -> str:
+def make_cache_key(
+    ticker: str,
+    trade_date: str,
+    price_basis: str = PRICE_BASIS_VENDOR_QFQ,
+) -> str:
+    norm_price_basis = validate_price_basis_short_label(price_basis)
+    if norm_price_basis in (
+        PRICE_BASIS_PIT_RAW,
+        PRICE_BASIS_PIT_ADJUSTED,
+        PRICE_BASIS_UNSPECIFIED,
+    ):
+        raise UnsupportedPriceBasisError(
+            f"price_basis={norm_price_basis!r} is not implemented as an available channel"
+        )
+    if norm_price_basis == PRICE_BASIS_RAW:
+        return f"{ticker}_{trade_date}_{PRICE_BASIS_RAW}"
     return f"{ticker}_{trade_date}"
 
 
@@ -1762,16 +1790,59 @@ def _parse_collector_as_of(trade_date: Any) -> tuple[datetime, str]:
     )
 
 
+def _fetch_raw_stock_data(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    as_of: Optional[str] = None,
+) -> str:
+    """Fetch unadjusted (raw) daily bars directly from CnAkshareProvider in registry.
+
+    Fails closed if cn_akshare provider is missing or if raw daily fetch fails.
+    Never falls back to vendor qfq.
+    """
+    prov = _registry.get("cn_akshare")
+    if prov is None or not hasattr(prov, "get_stock_data"):
+        return (
+            "【数据获取失败】stock_data: cn_akshare provider 不可用，无法获取 raw 未复权日线行情 "
+            "(provider_unavailable)"
+        )
+    try:
+        return prov.get_stock_data(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            price_basis=PRICE_BASIS_RAW,
+            as_of=as_of or end_date,
+        )
+    except RawDailyFetchError as exc:
+        return f"【数据获取失败】stock_data raw 失败: {exc.error} ({exc.category})"
+    except Exception as exc:
+        return f"【数据获取失败】stock_data raw 调用异常: {type(exc).__name__}: {exc}"
+
+
 def _fetch_all(
     ticker: str,
     trade_date: str,
     industry_provider: Optional[IndustryLinkageProvider] = None,
+    price_basis: str = PRICE_BASIS_VENDOR_QFQ,
 ) -> Dict[str, Any]:
     """Fetch all data sources in parallel.
 
     Always fetches full data including financial statements, regardless of horizon.
     The horizon only affects the analysis window, not data collection.
     """
+    norm_price_basis = validate_price_basis_short_label(price_basis)
+    if norm_price_basis in (
+        PRICE_BASIS_PIT_RAW,
+        PRICE_BASIS_PIT_ADJUSTED,
+        PRICE_BASIS_UNSPECIFIED,
+    ):
+        raise UnsupportedPriceBasisError(
+            f"price_basis={norm_price_basis!r} is not implemented as an available channel in DataCollector"
+        )
+
     lookback = LONG_DAYS
     end_dt, trade_date = _parse_collector_as_of(trade_date)
     norm_trade_date = trade_date
@@ -1783,8 +1854,24 @@ def _fetch_all(
 
     cn_provider = _registry.get("cn_akshare")
 
+    if norm_price_basis == PRICE_BASIS_RAW:
+        stock_data_task = (
+            _fetch_raw_stock_data,
+            {
+                "symbol": ticker,
+                "start_date": start_str,
+                "end_date": norm_trade_date,
+                "as_of": norm_trade_date,
+            },
+        )
+    else:
+        stock_data_task = (
+            get_stock_data,
+            {"symbol": ticker, "start_date": start_str, "end_date": norm_trade_date},
+        )
+
     tasks: Dict[str, tuple] = {
-        "stock_data": (get_stock_data, {"symbol": ticker, "start_date": start_str, "end_date": norm_trade_date}),
+        "stock_data": stock_data_task,
         "cn_indices": (get_cn_indices, {"curr_date": norm_trade_date, "look_back_days": lookback}),
         "global_indices": (get_global_indices, {"curr_date": norm_trade_date, "look_back_days": lookback}),
         "major_assets": (get_major_assets, {"curr_date": norm_trade_date, "look_back_days": lookback}),
@@ -2014,28 +2101,62 @@ def _fetch_all(
         provenance.append(f"# requested-as-of: {trade_date}")
         provenance.append(f"# as-of: {actual_daily_as_of}")
         provenance.append("# normalized: sorted, deduped, date<=as-of, OHLCV columns")
-        results["stock_data"] = "\n".join(provenance) + "\n" + out.to_csv(index=False)
+        if norm_price_basis == PRICE_BASIS_RAW:
+            provenance = [line for line in provenance if line != f"# price_basis: {PRICE_BASIS_VENDOR_QFQ}"]
+            if not any(line.startswith("# price_basis:") for line in provenance):
+                provenance.insert(0, f"# price_basis: {PRICE_BASIS_RAW}")
+            formatted = "\n".join(provenance) + "\n" + out.to_csv(index=False)
+            results["stock_data"] = StockDataText(formatted, price_basis=PRICE_BASIS_RAW)
+        else:
+            provenance = [line for line in provenance if line != f"# price_basis: {PRICE_BASIS_RAW}"]
+            if not any(line.startswith("# price_basis:") for line in provenance):
+                provenance.insert(0, f"# price_basis: {PRICE_BASIS_VENDOR_QFQ}")
+            formatted = "\n".join(provenance) + "\n" + out.to_csv(index=False)
+            results["stock_data"] = StockDataText(formatted, price_basis=PRICE_BASIS_VENDOR_QFQ)
     else:
-        results["stock_data"] = (
-            f"【数据获取失败】{ticker} 在 {trade_date} 无有效完整日线数据"
-            "（缺列/非法日期/全部行无效/重复冲突），本项不可用。"
-        )
-        if not any(
-            isinstance(entry, dict) and entry.get("source") == "stock_data"
-            for entry in data_failure_ledger
-        ):
-            data_failure_ledger.append(
-                {
-                    "source": "stock_data",
-                    "status": "unavailable",
-                    "reason": "no valid completed daily bars",
-                    "gap": (
-                        f"【数据获取失败】stock_data：{ticker} 在 {trade_date} "
-                        "无有效完整日线数据"
-                    ),
-                    "gap_class": "operational",
-                }
+        if norm_price_basis == PRICE_BASIS_RAW:
+            err_details = (
+                str(raw_csv).strip()
+                if isinstance(raw_csv, str) and ("失败" in raw_csv or "tushare" in raw_csv or "provider" in raw_csv or "error" in raw_csv.lower())
+                else f"{ticker} 在 {trade_date} 无有效完整未复权日线数据（缺列/非法日期/全部行无效/重复冲突），本项不可用。"
             )
+            if not err_details.startswith("【数据获取失败】"):
+                err_details = f"【数据获取失败】stock_data raw 失败: {err_details}"
+            results["stock_data"] = err_details
+            if not any(
+                isinstance(entry, dict) and entry.get("source") == "stock_data"
+                for entry in data_failure_ledger
+            ):
+                data_failure_ledger.append(
+                    {
+                        "source": "stock_data",
+                        "status": "failed",
+                        "reason": "raw daily fetch failed",
+                        "gap": err_details,
+                        "gap_class": "operational",
+                    }
+                )
+        else:
+            results["stock_data"] = (
+                f"【数据获取失败】{ticker} 在 {trade_date} 无有效完整日线数据"
+                "（缺列/非法日期/全部行无效/重复冲突），本项不可用。"
+            )
+            if not any(
+                isinstance(entry, dict) and entry.get("source") == "stock_data"
+                for entry in data_failure_ledger
+            ):
+                data_failure_ledger.append(
+                    {
+                        "source": "stock_data",
+                        "status": "unavailable",
+                        "reason": "no valid completed daily bars",
+                        "gap": (
+                            f"【数据获取失败】stock_data：{ticker} 在 {trade_date} "
+                            "无有效完整日线数据"
+                        ),
+                        "gap_class": "operational",
+                    }
+                )
     daily_context = _build_daily_context(df, trade_date)
     source_provenance = _build_source_provenance(
         results,
@@ -2119,7 +2240,9 @@ def _fetch_all(
         "market_attention": market_attention,
         "source_provenance": source_provenance,
         "data_failure_ledger": data_failure_ledger,
+        "price_basis": norm_price_basis,
     }
+    results["price_basis"] = norm_price_basis
 
     # ── 核心加速：本地计算所有技术指标 ──────────────────
     indicators_res = {}
@@ -2314,13 +2437,29 @@ class DataCollector:
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-    def collect(self, ticker: str, trade_date: str, horizons: Optional[List[str]] = None) -> Dict[str, Any]:
+    def collect(
+        self,
+        ticker: str,
+        trade_date: str,
+        horizons: Optional[List[str]] = None,
+        price_basis: str = PRICE_BASIS_VENDOR_QFQ,
+    ) -> Dict[str, Any]:
         """Fetch all data and store in cache.
 
         Thread-safe: concurrent calls for the same ticker+date will block
         on a per-key lock, so data is fetched only once.
         """
-        key = make_cache_key(ticker, trade_date)
+        norm_price_basis = validate_price_basis_short_label(price_basis)
+        if norm_price_basis in (
+            PRICE_BASIS_PIT_RAW,
+            PRICE_BASIS_PIT_ADJUSTED,
+            PRICE_BASIS_UNSPECIFIED,
+        ):
+            raise UnsupportedPriceBasisError(
+                f"price_basis={norm_price_basis!r} is not implemented as an available channel in DataCollector"
+            )
+
+        key = make_cache_key(ticker, trade_date, price_basis=norm_price_basis)
         key_lock = self._get_key_lock(key)
         # 带超时的 acquire：即使持锁的抓取意外卡死，排队者也能在有限时间内
         # 报错退出，而不是把线程池 worker 一个个吸进来陪葬
@@ -2335,6 +2474,7 @@ class DataCollector:
                     ticker,
                     trade_date,
                     industry_provider=self.industry_linkage_provider,
+                    price_basis=norm_price_basis,
                 )
                 pool["social_data_context"] = self._fetch_social_context(
                     ticker, trade_date
@@ -2344,9 +2484,15 @@ class DataCollector:
         finally:
             key_lock.release()
 
-    def get(self, ticker: str, trade_date: str) -> Optional[Dict[str, Any]]:
+    def get(
+        self,
+        ticker: str,
+        trade_date: str,
+        price_basis: str = PRICE_BASIS_VENDOR_QFQ,
+    ) -> Optional[Dict[str, Any]]:
         """Retrieve cached pool, or None if not collected yet."""
-        cached = self._cache.get(make_cache_key(ticker, trade_date))
+        key = make_cache_key(ticker, trade_date, price_basis=price_basis)
+        cached = self._cache.get(key)
         return None if cached is None else copy.deepcopy(cached)
 
     def get_window(
@@ -2362,15 +2508,25 @@ class DataCollector:
         result["_horizon"] = horizon
         return result
 
-    def ref(self, ticker: str, trade_date: str) -> None:
+    def ref(
+        self,
+        ticker: str,
+        trade_date: str,
+        price_basis: str = PRICE_BASIS_VENDOR_QFQ,
+    ) -> None:
         """Increment reference count (call before using cached data)."""
-        key = make_cache_key(ticker, trade_date)
+        key = make_cache_key(ticker, trade_date, price_basis=price_basis)
         with self._meta_lock:
             self._refcounts[key] = self._refcounts.get(key, 0) + 1
 
-    def evict(self, ticker: str, trade_date: str) -> None:
+    def evict(
+        self,
+        ticker: str,
+        trade_date: str,
+        price_basis: str = PRICE_BASIS_VENDOR_QFQ,
+    ) -> None:
         """Decrement refcount and remove cached data when no one needs it."""
-        key = make_cache_key(ticker, trade_date)
+        key = make_cache_key(ticker, trade_date, price_basis=price_basis)
         with self._meta_lock:
             count = self._refcounts.get(key, 1) - 1
             if count <= 0:
