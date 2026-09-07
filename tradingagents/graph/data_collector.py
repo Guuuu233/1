@@ -10,7 +10,7 @@ from concurrent.futures import (
 import copy
 from datetime import datetime, timedelta, timezone
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Mapping
 import json
 import os
 import threading
@@ -71,6 +71,7 @@ from tradingagents.dataflows.cninfo_disclosure import (
 from tradingagents.dataflows.fund_flow_evidence import (
     build_gap_meta,
     build_provider_text,
+    calculate_fund_flow_scale_metrics,
     summarize_evidence,
 )
 from tradingagents.dataflows.news_event_evidence import (
@@ -634,6 +635,12 @@ def _unavailable_realtime_context(retrieved_at: Optional[str], error: str) -> Di
 def default_market_data_context() -> Dict[str, Any]:
     """Return a safe context when collection did not provide one."""
     empty_vpa = compute_vpa_deterministic_features(None)
+    default_scale = {
+        "status": "unavailable",
+        "net_to_circ_mv": None,
+        "net_to_amount": None,
+        "gaps": ["未提供市场数据上下文，资金规模归一指标不可用"],
+    }
     return {
         "analysis_baseline_date": None,
         "fund_flow_evidence": {
@@ -643,7 +650,9 @@ def default_market_data_context() -> Dict[str, Any]:
             "summary": summarize_evidence([], window_days=5),
             "validation": {"status": "not_checked", "mismatches": []},
             "gap": "【数据获取失败】资金流 evidence：未返回结构化逐日记录",
+            "scale_metrics": default_scale,
         },
+        "scale_metrics": default_scale,
         "vpa_context": empty_vpa,
         "vpa_structured": empty_vpa,
         "daily": {"as_of": None, "completeness": "unavailable"},
@@ -2248,6 +2257,88 @@ def _fetch_all(
                 "gap_class": "operational",
             })
 
+    # ── 资金规模归一接入 (D-03-2 / C-09-3) ──────────────────────────
+    prov = _registry.get("cn_akshare")
+    basic_row: Optional[Dict[str, Any]] = None
+    basic_err: Optional[str] = None
+    basic_cat: Optional[str] = None
+    if prov is not None and hasattr(prov, "_fetch_tushare_daily_basic"):
+        try:
+            basic_row, basic_err, basic_cat = prov._fetch_tushare_daily_basic(
+                symbol=ticker,
+                trade_date=norm_trade_date,
+                as_of=norm_trade_date,
+            )
+        except TypeError:
+            try:
+                basic_row, basic_err, basic_cat = prov._fetch_tushare_daily_basic(
+                    ticker,
+                    norm_trade_date,
+                    norm_trade_date,
+                )
+            except Exception as exc:
+                basic_row = None
+                basic_err = f"daily_basic 调用异常: {type(exc).__name__}: {exc}"
+                basic_cat = "exception"
+        except Exception as exc:
+            basic_row = None
+            basic_err = f"daily_basic 调用异常: {type(exc).__name__}: {exc}"
+            basic_cat = "exception"
+    else:
+        basic_err = "cn_akshare provider 不可用或缺少 _fetch_tushare_daily_basic"
+        basic_cat = "provider_unavailable"
+
+    net_val = None
+    if isinstance(fund_flow_context, Mapping):
+        for k in ("selected_value", "net_amount", "value", "r0_net", "netamount"):
+            if fund_flow_context.get(k) is not None:
+                net_val = fund_flow_context[k]
+                break
+
+    net_unit = None
+    if isinstance(fund_flow_context, Mapping):
+        for k in ("selected_unit", "net_amount_unit", "unit", "raw_unit"):
+            val = fund_flow_context.get(k)
+            if val is not None and str(val).strip():
+                net_unit = str(val).strip()
+                break
+
+    evidence_trade_date = None
+    if isinstance(fund_flow_context, Mapping):
+        for k in ("selected_as_of", "as_of", "trade_date", "date", "measurement_date"):
+            val = fund_flow_context.get(k)
+            if val is not None and str(val).strip():
+                evidence_trade_date = str(val).strip()
+                break
+
+    evidence_symbol = None
+    if isinstance(fund_flow_context, Mapping):
+        for k in ("ts_code", "symbol", "code"):
+            val = fund_flow_context.get(k)
+            if val is not None and str(val).strip():
+                evidence_symbol = str(val).strip()
+                break
+
+    scale_metrics = calculate_fund_flow_scale_metrics(
+        ts_code=evidence_symbol or ticker,
+        trade_date=evidence_trade_date or norm_trade_date,
+        net_amount=net_val,
+        net_amount_unit=net_unit,
+        daily_basic=basic_row,
+        circ_mv_unit="万元" if basic_row else None,
+        amount_unit=basic_row.get("amount_unit") if isinstance(basic_row, Mapping) else None,
+        denominator_source="tushare.daily_basic",
+    )
+    if basic_err:
+        gap_msg = f"daily_basic分母数据获取失败: {basic_err}"
+        if gap_msg not in scale_metrics["gaps"]:
+            scale_metrics["gaps"].append(gap_msg)
+        scale_metrics["error"] = basic_err
+        scale_metrics["error_category"] = basic_cat
+
+    fund_flow_context["scale_metrics"] = scale_metrics
+    results["scale_metrics"] = scale_metrics
+
     # ── Parse CSV once, reuse for indicators and VPA ──────────────────
     raw_csv = results.get("stock_data", "")
     df = _parse_csv_to_dataframe(raw_csv)
@@ -2389,6 +2480,7 @@ def _fetch_all(
     results["market_data_context"] = {
         "analysis_baseline_date": trade_date,
         "fund_flow_evidence": fund_flow_context,
+        "scale_metrics": scale_metrics,
         "dividend_evidence": results.get("dividend_evidence"),
         "event_coverage": event_cov,
         "daily": daily_context,
