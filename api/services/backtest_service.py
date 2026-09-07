@@ -34,9 +34,12 @@ MAX_RETAINED_BACKTEST_JOBS = max(1, int(os.getenv("BACKTEST_MAX_RETAINED_JOBS", 
 MIN_SAMPLE_INTERVAL = 1
 MAX_SAMPLE_INTERVAL = 365
 
-# Price basis semantics (DAV-606)
+# Price basis semantics (DAV-606, DAV-705)
 PRICE_BASIS_VENDOR_QFQ: str = "vendor_qfq"
 PRICE_BASIS_UNSPECIFIED: str = "unspecified"
+PRICE_BASIS_RAW: str = "raw"
+PRICE_BASIS_PIT_RAW: str = "pit_raw"
+PRICE_BASIS_PIT_ADJUSTED: str = "pit_adjusted"
 
 
 class BacktestQueueFullError(RuntimeError):

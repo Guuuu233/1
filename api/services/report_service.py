@@ -54,10 +54,15 @@ REPORT_SUMMARY_COLUMNS = (
 ACTIVE_REPORT_STATUSES = ("pending", "running")
 STALE_REPORT_ERROR_MESSAGE = "分析任务已中断，请重新发起分析"
 
-# DAV-604: H1b cohort metadata constants
+# DAV-604 / DAV-705: H1b cohort metadata constants
 DECISION_MODEL_V1: str = "decision_model.v1"
 EVIDENCE_CONTRACT_V1: str = "evidence_contract.v1"
 PRICE_BASIS_UNSPECIFIED: str = "price_basis.unspecified"
+PRICE_BASIS_VERSION_VENDOR_QFQ: str = "price_basis.vendor_qfq"
+PRICE_BASIS_VERSION_UNSPECIFIED: str = "price_basis.unspecified"
+PRICE_BASIS_VERSION_RAW: str = "price_basis.raw"
+PRICE_BASIS_VERSION_PIT_RAW: str = "price_basis.pit_raw"
+PRICE_BASIS_VERSION_PIT_ADJUSTED: str = "price_basis.pit_adjusted"
 
 
 # ─── Structured extraction schemas ───────────────────────────────────────────

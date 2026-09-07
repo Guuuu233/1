@@ -406,6 +406,9 @@ class TestPriceBasisSemantics:
         """Named constants must be defined and match allowed values."""
         assert getattr(bt, "PRICE_BASIS_VENDOR_QFQ", None) == "vendor_qfq"
         assert getattr(bt, "PRICE_BASIS_UNSPECIFIED", None) == "unspecified"
+        assert getattr(bt, "PRICE_BASIS_RAW", None) == "raw"
+        assert getattr(bt, "PRICE_BASIS_PIT_RAW", None) == "pit_raw"
+        assert getattr(bt, "PRICE_BASIS_PIT_ADJUSTED", None) == "pit_adjusted"
         assert getattr(cal, "PRICE_BASIS_VENDOR_QFQ", None) == "vendor_qfq"
 
     def test_single_analysis_defaults_to_vendor_qfq_and_never_raw(self):
