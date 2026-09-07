@@ -185,10 +185,21 @@ Last round summary:
 - Keep the existing VERDICT boundary and keys; do not add new canonical body fields or machine-readable keys.
 Output:
 1) Tally independent evidence clusters (deduplicating claims by cluster_id) and compute cluster-based directional weight; analyst list serves as explanatory context only (analyst_count must not be used directly as independent voting weight).
-2) Briefly assess smart money vs retail sentiment divergence as supplementary context.
-3) Clear Buy/Sell/Hold recommendation based primarily on debate evidence.
-4) Strongest evidence adopted, unresolved disagreements, and weak evidence rejected. When citing evidence, prefer concrete numbers/dates/events from the evidence summaries above, rather than describing whose argumentation style was more polished.
-5) Detailed execution plan for trader.
+2) Dynamically weight perspectives and distinguish core adjudication criteria by research horizon:
+   - Short-term research horizon (short):
+     * Core questions: Near-term trading structure, volume-price confirmation, fund flow divergence, sentiment inflection, and breakout validity.
+     * Validity period: 1-2 weeks (5-10 trading days), emphasizing rapid near-term verification.
+     * Invalidation conditions: Breach of key technical support/stop-loss, short-term volume-price breakdown, or sharp institutional distribution.
+     * Action basis: Primary weight on technical, smart money, and sentiment analysis; near-term trading structure dominates while fundamentals and macro serve as background constraints.
+   - Medium-term research horizon (medium):
+     * Core questions: Industry policy dividends, supply chain transmission, fundamental earnings certainty, and valuation reassessment.
+     * Validity period: 1-3 months (1-2 quarters), emphasizing fundamental thesis delivery and trend holding.
+     * Invalidation conditions: Industry supply-demand thesis falsified, earnings severely missing expectations, supply chain transmission broken, or medium-term trend reversal.
+     * Action basis: Primary weight on fundamentals, macro, and supply chain transmission; transmission pathway and holding conditions dominate. Analyst short-term observation windows (e.g. volume-price / short-term flow) serve only as timing/execution references and must never override medium-term thesis or cause the entire run to be treated as short-term.
+3) Briefly assess smart money vs retail sentiment divergence as supplementary context.
+4) Clear Buy/Sell/Hold recommendation based primarily on debate evidence.
+5) Strongest evidence adopted, unresolved disagreements, and weak evidence rejected. When citing evidence, prefer concrete numbers/dates/events from the evidence summaries above, rather than describing whose argumentation style was more polished.
+6) Detailed execution plan for trader.
 Avoid defaulting to Hold unless strongly justified.
 At the very end, append this machine-readable line (fixed format, do not omit):
 <!-- MANAGER_VERDICT: {{"winner": "tie", "direction": "NEUTRAL", "reason": "conflicting fund-flow prints; no directional call", "position_pct": 10, "entry": "wait", "target": "TBD", "stop_loss": "n/a", "upside": 8.0, "downside": 8.0, "odds": 1.0, "adopted_claim_ids": ["INV-1"], "partially_adopted_claims": ["INV-5"], "rejected_claim_ids": ["INV-2"], "excluded_evidence": ["unverified evidence details"], "dispute_map": [{{"data_point": "Large-order inflow vs mid-order outflow", "bull_interpretation": "Accumulation", "bear_interpretation": "Distribution", "evidence_decision": "Conflicting prints cannot alone support direction", "winner": "tie"}}]}} -->

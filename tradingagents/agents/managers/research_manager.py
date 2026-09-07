@@ -42,8 +42,40 @@ from tradingagents.agents.utils.run_integrity import (
     evaluate_state_integrity,
     fund_flow_guard_abstain_status,
 )
+from tradingagents.graph.intent_parser import (
+    build_horizon_context,
+    get_bound_research_horizon,
+)
 
 _logger = logging.getLogger(__name__)
+
+
+def _resolve_research_horizon(state: dict | None) -> str:
+    """Resolve the active research horizon for the current run.
+
+    Priority:
+    1. state["horizon"] if present and truthy
+    2. state["horizon_run_metadata"]["resolved"][0] if present
+    3. state["horizon_run_metadata"]["requested"][0] if present
+    4. get_bound_research_horizon() from H-04a thread binding
+    5. fallback to "short"
+    """
+    if state:
+        val = state.get("horizon")
+        if val and isinstance(val, str) and val.strip():
+            return val.strip()
+        metadata = state.get("horizon_run_metadata")
+        if isinstance(metadata, dict):
+            resolved = metadata.get("resolved")
+            if resolved and isinstance(resolved, list) and len(resolved) > 0 and resolved[0]:
+                return str(resolved[0]).strip()
+            requested = metadata.get("requested")
+            if requested and isinstance(requested, list) and len(requested) > 0 and requested[0]:
+                return str(requested[0]).strip()
+    bound = get_bound_research_horizon()
+    if bound and isinstance(bound, str) and bound.strip():
+        return bound.strip()
+    return "short"
 
 
 def _blocked_manager_payload(
@@ -60,6 +92,7 @@ def _blocked_manager_payload(
     failed_checks: list | None = None,
     evidence_verification: list | None = None,
     claim_cluster_metrics: dict | None = None,
+    research_horizon: str = "short",
 ) -> dict:
     """Shared early-return shape for INVALID/ABSTAIN manager short-circuits."""
     if claim_cluster_metrics is None:
@@ -89,6 +122,8 @@ def _blocked_manager_payload(
         "trade_action": decision_status.get("trade_action", ACTION_NO_TRADE),
         "risk_status": decision_status.get("risk_status"),
         "confirmation_state": decision_status.get("confirmation_state", "UNRESOLVED"),
+        "horizon": research_horizon,
+        "research_horizon": research_horizon,
     }
     payload = {
         "fund_flow_consensus_guard": fund_flow_guard,
@@ -122,6 +157,11 @@ def _blocked_manager_payload(
 
 def create_research_manager(llm, memory, custom_prompt: str = "", placement: Placement = DEFAULT_PLACEMENT):
     async def research_manager_node(state) -> dict:
+        research_horizon = _resolve_research_horizon(state)
+        user_intent = state.get("user_intent") or {}
+        focus_areas = user_intent.get("focus_areas", [])
+        specific_questions = user_intent.get("specific_questions", [])
+
         history = state["investment_debate_state"].get("history", "")
         macro_report = state.get("macro_report", "")
         market_research_report = state.get("market_report", "")
@@ -222,6 +262,7 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
                 run_integrity=run_integrity.to_dict(),
                 consistency_check_passed=False,
                 failed_checks=list(run_integrity.reason_codes),
+                research_horizon=research_horizon,
             )
 
         # ── Provenance & Data Failure Context ──────────────────────────────
@@ -298,6 +339,7 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
                 manager_reason="资金流来源选择 guard 已阻断",
                 run_integrity=run_integrity.to_dict(),
                 consistency_check_passed=True,
+                research_horizon=research_horizon,
             )
 
         # ── 辩论前置硬闸检查 (Debate Pre-Gate Hard Gate - fail-closed before LLM) ──
@@ -346,6 +388,7 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
                 consistency_check_passed=False,
                 failed_checks=[f"辩论前置硬闸未通过: {err}" for err in gate_errors],
                 evidence_verification=claims_verification,
+                research_horizon=research_horizon,
             )
             # Preserve pre-gate debate bookkeeping fields
             debate_state = payload["investment_debate_state"]
@@ -461,8 +504,17 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
         )
         battlefield_coverage_text = format_battlefield_coverage(claims)
 
+        config = get_config()
+        horizon_ctx = build_horizon_context(
+            research_horizon,
+            focus_areas,
+            specific_questions,
+            agent_type="research_manager",
+            research_horizon=research_horizon,
+        )
+
         injection_slots = build_injection_slots(custom_prompt, placement, role_key="research_manager")
-        prompt = get_prompt("research_manager_prompt", config=get_config()).format(
+        base_prompt = get_prompt("research_manager_prompt", config=config).format(
             past_memory_str=past_memory_str,
             provenance_context=provenance_context,
             history=history,
@@ -484,6 +536,7 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             battlefield_coverage_text=battlefield_coverage_text,
             **injection_slots,
         )
+        prompt = f"{horizon_ctx}\n\n{base_prompt}"
 
         _logger.info(
             "[research_manager] prompt size: total=%d chars | "
@@ -577,6 +630,8 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             challenges_verification=challenges_verification,
             market_data_context=market_data_context if isinstance(market_data_context, dict) else None,
         )
+        manager_verdict["horizon"] = research_horizon
+        manager_verdict["research_horizon"] = research_horizon
 
         if not manager_verdict["consistency_check_passed"]:
             failed_reasons = "; ".join(manager_verdict["failed_checks"])
@@ -695,6 +750,8 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             "trade_action": status_dict["trade_action"],
             "risk_status": status_dict["risk_status"],
             "confirmation_state": status_dict["confirmation_state"],
+            "horizon": research_horizon,
+            "research_horizon": research_horizon,
         }
         new_investment_debate_state["manager_verdict"] = manager_verdict
 
