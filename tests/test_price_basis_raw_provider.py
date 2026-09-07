@@ -34,7 +34,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from api.services.price_basis_labels import (
+from tradingagents.dataflows.providers.cn_akshare_provider import (
     PRICE_BASIS_PIT_ADJUSTED,
     PRICE_BASIS_PIT_RAW,
     PRICE_BASIS_RAW,
@@ -42,13 +42,11 @@ from api.services.price_basis_labels import (
     PRICE_BASIS_VENDOR_QFQ,
     PriceBasisError,
     UnknownPriceBasisError,
-)
-from tradingagents.dataflows.providers.cn_akshare_provider import (
-    _TUSHARE_DAILY_REQUIRED_FIELDS,
-    CnAkshareProvider,
+    UnsupportedPriceBasisError,
     RawDailyFetchError,
     StockDataText,
-    UnsupportedPriceBasisError,
+    CnAkshareProvider,
+    _TUSHARE_DAILY_REQUIRED_FIELDS,
 )
 
 

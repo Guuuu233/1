@@ -77,18 +77,43 @@ from ..cninfo_disclosure import (
     qualify_cninfo_content,
     query_cninfo_raw_announcements,
 )
-from api.services.price_basis_labels import (
+
+_provider_logger = logging.getLogger(__name__)
+
+# ── Price basis constants & provider-local exceptions ──
+PRICE_BASIS_VENDOR_QFQ: str = "vendor_qfq"
+PRICE_BASIS_RAW: str = "raw"
+PRICE_BASIS_PIT_RAW: str = "pit_raw"
+PRICE_BASIS_PIT_ADJUSTED: str = "pit_adjusted"
+PRICE_BASIS_UNSPECIFIED: str = "unspecified"
+
+_KNOWN_PRICE_BASIS_SHORT_LABELS: set[str] = {
     PRICE_BASIS_VENDOR_QFQ,
     PRICE_BASIS_RAW,
     PRICE_BASIS_PIT_RAW,
     PRICE_BASIS_PIT_ADJUSTED,
     PRICE_BASIS_UNSPECIFIED,
-    PriceBasisError,
-    UnknownPriceBasisError,
-    validate_price_basis_short_label,
-)
+}
 
-_provider_logger = logging.getLogger(__name__)
+
+class PriceBasisError(ValueError):
+    """Base exception for price basis errors in provider."""
+    pass
+
+
+class UnknownPriceBasisError(PriceBasisError):
+    """Raised when an unknown, invalid, or empty price basis label is supplied."""
+    pass
+
+
+def validate_price_basis_short_label(label: Any) -> str:
+    """Validate that label is a known price_basis short label and return it."""
+    if not isinstance(label, str) or label not in _KNOWN_PRICE_BASIS_SHORT_LABELS:
+        raise UnknownPriceBasisError(
+            f"Invalid price basis short label: {label!r}. "
+            f"Allowed labels: {sorted(list(_KNOWN_PRICE_BASIS_SHORT_LABELS))}"
+        )
+    return label
 
 
 class RawDailyFetchError(RuntimeError, PriceBasisError):
