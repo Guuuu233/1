@@ -168,7 +168,7 @@ def resolve_horizon_calendar_window(
     horizon: str,
     trading_days: Sequence[str],
     as_of: str,
-    as_of_market_closed: bool = True,
+    as_of_market_closed: bool,
 ) -> HorizonCalendarWindow:
     """Resolve a multi-horizon trading calendar window based strictly on an explicit trading days sequence.
 

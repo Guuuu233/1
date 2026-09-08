@@ -278,6 +278,7 @@ class TestDateFormatAndRealCalendarDateValidation:
                 horizon="short",
                 trading_days=FIXTURE_JAN_2024,
                 as_of="2024-01-20",
+                as_of_market_closed=True,
             )
 
     @pytest.mark.parametrize(
@@ -298,6 +299,7 @@ class TestDateFormatAndRealCalendarDateValidation:
                 horizon="short",
                 trading_days=FIXTURE_JAN_2024,
                 as_of="2024-01-20",
+                as_of_market_closed=True,
             )
 
 
@@ -311,6 +313,7 @@ class TestTradingDaysPseudoSequenceValidation:
                 horizon="short",
                 trading_days="2024-01-02",  # type: ignore
                 as_of="2024-01-20",
+                as_of_market_closed=True,
             )
 
     def test_trading_days_bytes_rejected(self):
@@ -320,6 +323,7 @@ class TestTradingDaysPseudoSequenceValidation:
                 horizon="short",
                 trading_days=b"2024-01-02",  # type: ignore
                 as_of="2024-01-20",
+                as_of_market_closed=True,
             )
 
     def test_trading_days_non_sequence_rejected(self):
@@ -329,6 +333,7 @@ class TestTradingDaysPseudoSequenceValidation:
                 horizon="short",
                 trading_days=12345,  # type: ignore
                 as_of="2024-01-20",
+                as_of_market_closed=True,
             )
 
     def test_trading_days_empty_sequence_rejected(self):
@@ -338,6 +343,7 @@ class TestTradingDaysPseudoSequenceValidation:
                 horizon="short",
                 trading_days=[],
                 as_of="2024-01-20",
+                as_of_market_closed=True,
             )
 
 
@@ -362,6 +368,7 @@ class TestTradingDaysNonStringElementsValidation:
                 horizon="short",
                 trading_days=days,  # type: ignore
                 as_of="2024-01-20",
+                as_of_market_closed=True,
             )
 
 
@@ -381,6 +388,7 @@ class TestTradingDaysUnsortedRejected:
                 horizon="short",
                 trading_days=unsorted_days,
                 as_of="2024-01-20",
+                as_of_market_closed=True,
             )
 
 
@@ -400,6 +408,7 @@ class TestTradingDaysDuplicateRejected:
                 horizon="short",
                 trading_days=dup_days,
                 as_of="2024-01-20",
+                as_of_market_closed=True,
             )
 
 
@@ -414,6 +423,7 @@ class TestSignalDatePresenceInCalendar:
                 horizon="short",
                 trading_days=FIXTURE_JAN_2024,
                 as_of="2024-01-20",
+                as_of_market_closed=True,
             )
 
     def test_signal_date_outside_calendar_range_rejected(self):
@@ -423,6 +433,7 @@ class TestSignalDatePresenceInCalendar:
                 horizon="short",
                 trading_days=FIXTURE_JAN_2024,
                 as_of="2024-01-20",
+                as_of_market_closed=True,
             )
 
 
@@ -465,6 +476,7 @@ class TestHorizonValidation:
                 horizon=bad_horizon,  # type: ignore
                 trading_days=FIXTURE_JAN_2024,
                 as_of="2024-01-20",
+                as_of_market_closed=True,
             )
 
     def test_external_str_enum_and_stringifiable_rejected(self):
@@ -480,6 +492,7 @@ class TestHorizonValidation:
                     horizon=bad,  # type: ignore
                     trading_days=FIXTURE_JAN_2024,
                     as_of="2024-01-20",
+                    as_of_market_closed=True,
                 )
 
 
@@ -594,6 +607,7 @@ class TestInsufficientCalendarCoverageFailClosed:
                 horizon="short",
                 trading_days=truncated,
                 as_of="2024-02-23",
+                as_of_market_closed=True,
             )
 
     def test_calendar_ending_at_target_date_missing_roll_raises_error(self):
@@ -609,6 +623,7 @@ class TestInsufficientCalendarCoverageFailClosed:
                 horizon="short",
                 trading_days=truncated,
                 as_of="2024-02-23",
+                as_of_market_closed=True,
             )
 
     def test_calendar_with_partial_roll_days_raises_error(self):
@@ -623,6 +638,7 @@ class TestInsufficientCalendarCoverageFailClosed:
                 horizon="short",
                 trading_days=truncated,
                 as_of="2024-02-23",
+                as_of_market_closed=True,
             )
 
 
@@ -700,6 +716,7 @@ class TestAsOfValidation:
                 horizon="short",
                 trading_days=FIXTURE_SPRING_FESTIVAL_2024,
                 as_of=bad_as_of,  # type: ignore
+                as_of_market_closed=True,
             )
 
     @pytest.mark.parametrize(
@@ -718,11 +735,21 @@ class TestAsOfValidation:
                 horizon="short",
                 trading_days=FIXTURE_SPRING_FESTIVAL_2024,
                 as_of=unreal_as_of,
+                as_of_market_closed=True,
             )
 
 
 class TestAsOfMarketClosedStrictBoolValidation:
-    """17. Verify as_of_market_closed must be a strict bool."""
+    """17. Verify as_of_market_closed must be a strict bool and is required."""
+
+    def test_as_of_market_closed_missing_raises_type_error(self):
+        with pytest.raises(TypeError, match="missing 1 required keyword-only argument: 'as_of_market_closed'"):
+            rl.resolve_horizon_calendar_window(
+                signal_date="2024-02-01",
+                horizon="short",
+                trading_days=FIXTURE_SPRING_FESTIVAL_2024,
+                as_of="2024-02-23",
+            )  # type: ignore[call-arg]
 
     @pytest.mark.parametrize(
         "non_bool_value",
