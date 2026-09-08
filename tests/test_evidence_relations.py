@@ -851,3 +851,45 @@ def test_deep_thaw_mapping_still_rejects_nan_inf_and_unserializable(bad_nested_m
     """NaN/Inf、非字符串 key、真正不可序列化对象在 list/tuple 嵌套中仍被严格拒绝。"""
     with pytest.raises(expected_exc):
         EvidenceRelation("a", RelationType.SUPPORTS, "b", metadata=bad_nested_meta)
+
+
+# ============================================================================
+# Knife 5: build_canonical_source_repetition 严格字符串 ID 校验
+# ============================================================================
+
+@pytest.mark.parametrize("malformed_id", [
+    {"key": "dict_id"},
+    ["list_id"],
+    True,
+    False,
+    12345,
+    3.14159,
+])
+def test_build_canonical_source_repetition_rejects_non_string_ids(malformed_id):
+    """dict/list/bool/number 四类畸形 ID 不得被字符串化或建边，必须返回 None。"""
+    valid_ev = {"canonical_event_id": "cninfo:valid", "evidence_id": "ev_valid"}
+
+    # 1. canonical_event_id 畸形
+    bad_cid_1 = {"canonical_event_id": malformed_id, "evidence_id": "ev_1"}
+    bad_cid_2 = {"canonical_event_id": malformed_id, "evidence_id": "ev_2"}
+    assert build_canonical_source_repetition(bad_cid_1, valid_ev) is None
+    assert build_canonical_source_repetition(valid_ev, bad_cid_1) is None
+    assert build_canonical_source_repetition(bad_cid_1, bad_cid_2) is None
+
+    # 2. evidence_id 畸形
+    bad_eid_1 = {"canonical_event_id": "cninfo:valid", "evidence_id": malformed_id}
+    bad_eid_2 = {"canonical_event_id": "cninfo:valid", "evidence_id": malformed_id}
+    assert build_canonical_source_repetition(bad_eid_1, valid_ev) is None
+    assert build_canonical_source_repetition(valid_ev, bad_eid_1) is None
+    assert build_canonical_source_repetition(bad_eid_1, bad_eid_2) is None
+
+
+def test_build_canonical_source_repetition_valid_strings_behavior_preserved():
+    """合法非空字符串 ID trim 后仍保留既有正常建边行为。"""
+    ev1 = {"canonical_event_id": "  cninfo:000001  ", "evidence_id": "  ev_1  "}
+    ev2 = {"canonical_event_id": "cninfo:000001", "evidence_id": "ev_2"}
+    rel = build_canonical_source_repetition(ev1, ev2)
+    assert rel is not None
+    assert rel.source_id == "ev_1"
+    assert rel.target_id == "ev_2"
+    assert rel.metadata["canonical_event_id"] == "cninfo:000001"

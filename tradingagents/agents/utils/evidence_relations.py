@@ -452,8 +452,11 @@ def build_canonical_source_repetition(ev1: Any, ev2: Any) -> EvidenceRelation | 
     if id1 is None or id2 is None:
         return None
 
-    c_id1 = str(id1).strip()
-    c_id2 = str(id2).strip()
+    if not isinstance(id1, str) or not isinstance(id2, str):
+        return None
+
+    c_id1 = id1.strip()
+    c_id2 = id2.strip()
     if not c_id1 or not c_id2 or c_id1 != c_id2:
         return None
 
@@ -468,8 +471,11 @@ def build_canonical_source_repetition(ev1: Any, ev2: Any) -> EvidenceRelation | 
     if e1 is None or e2 is None:
         return None
 
-    s_e1 = str(e1).strip()
-    s_e2 = str(e2).strip()
+    if not isinstance(e1, str) or not isinstance(e2, str):
+        return None
+
+    s_e1 = e1.strip()
+    s_e2 = e2.strip()
     if not s_e1 or not s_e2 or s_e1 == s_e2:
         return None
 
