@@ -17,6 +17,7 @@ Covers all 18 test cases from DAV-742, plus comprehensive edge-case tests mandat
 from __future__ import annotations
 
 from decimal import Decimal
+from enum import Enum
 import json
 import math
 from typing import Any
@@ -810,3 +811,160 @@ def test_dead_error_codes_removed_from_spec():
         assert not hasattr(cs.ClaimSpecErrorCode, code), f"{code} must be removed from ClaimSpecErrorCode"
         assert not hasattr(cs, code), f"{code} must be removed from module constants"
     assert not hasattr(cs, "NON_NUMERIC_THRESHOLD"), "NON_NUMERIC_THRESHOLD must be removed"
+
+
+# Helper foreign enums with matching string values for negative testing
+class ForeignHorizon(str, Enum):
+    SHORT = "short"
+    MEDIUM = "medium"
+
+
+class ForeignMetricBasis(str, Enum):
+    VENDOR_QFQ = "vendor_qfq"
+
+
+class ForeignOperator(str, Enum):
+    LT = "<"
+    LE = "<="
+
+
+class ForeignUnit(str, Enum):
+    CNY = "cny"
+    PCT = "pct"
+
+
+class ForeignPeriod(str, Enum):
+    CLOSE_1D = "1d_close"
+
+
+class ForeignSource(str, Enum):
+    DAILY_PRICE = "daily_price"
+
+
+@pytest.mark.parametrize(
+    "horizon_val",
+    [
+        "short",  # raw valid string
+        "medium",  # raw valid string
+        ForeignHorizon.SHORT,  # foreign enum with identical value
+        ForeignHorizon.MEDIUM,
+        True,  # bool
+        123,  # number
+        None,
+        {"value": "short"},  # dict
+    ],
+)
+def test_claim_applicability_direct_instantiation_horizon_type_gate(horizon_val: Any):
+    """34. Direct ClaimApplicability instantiation rejects non-ApplicabilityHorizon values with ValueError."""
+    with pytest.raises(ValueError):
+        ClaimApplicability(
+            symbol="600519",
+            horizon=horizon_val,  # type: ignore
+            metric_basis=MetricBasis.VENDOR_QFQ,
+            pit_date="2026-09-08",
+        )
+
+
+@pytest.mark.parametrize(
+    "mb_val",
+    [
+        "vendor_qfq",  # raw valid string
+        "raw",  # raw valid string
+        ForeignMetricBasis.VENDOR_QFQ,  # foreign enum with identical value
+        True,  # bool
+        456,  # number
+        None,
+        ["vendor_qfq"],  # list
+    ],
+)
+def test_claim_applicability_direct_instantiation_metric_basis_type_gate(mb_val: Any):
+    """35. Direct ClaimApplicability instantiation rejects non-MetricBasis values with ValueError."""
+    with pytest.raises(ValueError):
+        ClaimApplicability(
+            symbol="600519",
+            horizon=ApplicabilityHorizon.SHORT,
+            metric_basis=mb_val,  # type: ignore
+            pit_date="2026-09-08",
+        )
+
+
+@pytest.mark.parametrize(
+    ("operator_val", "unit_val", "period_val", "source_val"),
+    [
+        ("<", ConditionUnit.CNY, ConditionPeriod.CLOSE_1D, ConditionSource.DAILY_PRICE),
+        (ForeignOperator.LT, ConditionUnit.CNY, ConditionPeriod.CLOSE_1D, ConditionSource.DAILY_PRICE),
+        (True, ConditionUnit.CNY, ConditionPeriod.CLOSE_1D, ConditionSource.DAILY_PRICE),
+        (123, ConditionUnit.CNY, ConditionPeriod.CLOSE_1D, ConditionSource.DAILY_PRICE),
+        (ConditionOperator.LT, "cny", ConditionPeriod.CLOSE_1D, ConditionSource.DAILY_PRICE),
+        (ConditionOperator.LT, ForeignUnit.CNY, ConditionPeriod.CLOSE_1D, ConditionSource.DAILY_PRICE),
+        (ConditionOperator.LT, False, ConditionPeriod.CLOSE_1D, ConditionSource.DAILY_PRICE),
+        (ConditionOperator.LT, ConditionUnit.CNY, "1d_close", ConditionSource.DAILY_PRICE),
+        (ConditionOperator.LT, ConditionUnit.CNY, ForeignPeriod.CLOSE_1D, ConditionSource.DAILY_PRICE),
+        (ConditionOperator.LT, ConditionUnit.CNY, 999, ConditionSource.DAILY_PRICE),
+        (ConditionOperator.LT, ConditionUnit.CNY, ConditionPeriod.CLOSE_1D, "daily_price"),
+        (ConditionOperator.LT, ConditionUnit.CNY, ConditionPeriod.CLOSE_1D, ForeignSource.DAILY_PRICE),
+        (ConditionOperator.LT, ConditionUnit.CNY, ConditionPeriod.CLOSE_1D, None),
+    ],
+)
+def test_claim_invalidation_condition_direct_instantiation_enum_type_gates(
+    operator_val: Any, unit_val: Any, period_val: Any, source_val: Any
+):
+    """36. Direct ClaimInvalidationCondition instantiation rejects non-exact Enum instances with ValueError."""
+    with pytest.raises(ValueError):
+        ClaimInvalidationCondition(
+            condition_id="inv-1",
+            metric="close_price",
+            operator=operator_val,  # type: ignore
+            threshold=1600.0,
+            unit=unit_val,  # type: ignore
+            period=period_val,  # type: ignore
+            source=source_val,  # type: ignore
+            pit_date="2026-09-08",
+        )
+
+
+def test_dataclass_from_dict_and_roundtrip_with_canonical_strings():
+    """37. from_dict still accepts canonical strings and creates strong typed objects with JSON roundtrip intact."""
+    app_data = {
+        "symbol": "600519",
+        "horizon": "short",
+        "metric_basis": "vendor_qfq",
+        "pit_date": "2026-09-08",
+        "preconditions": ["market_open"],
+    }
+    app = ClaimApplicability.from_dict(app_data)
+    assert isinstance(app.horizon, ApplicabilityHorizon)
+    assert app.horizon is ApplicabilityHorizon.SHORT
+    assert isinstance(app.metric_basis, MetricBasis)
+    assert app.metric_basis is MetricBasis.VENDOR_QFQ
+    assert app.to_dict() == app_data
+
+    cond_data = {
+        "condition_id": "inv-1",
+        "metric": "close_price",
+        "operator": "<",
+        "threshold": 1600.0,
+        "unit": "cny",
+        "period": "1d_close",
+        "source": "daily_price",
+        "pit_date": "2026-09-08",
+    }
+    cond = ClaimInvalidationCondition.from_dict(cond_data)
+    assert isinstance(cond.operator, ConditionOperator)
+    assert cond.operator is ConditionOperator.LT
+    assert isinstance(cond.unit, ConditionUnit)
+    assert cond.unit is ConditionUnit.CNY
+    assert isinstance(cond.period, ConditionPeriod)
+    assert cond.period is ConditionPeriod.CLOSE_1D
+    assert isinstance(cond.source, ConditionSource)
+    assert cond.source is ConditionSource.DAILY_PRICE
+    assert cond.to_dict() == cond_data
+
+    contract_data = {
+        "applicability": app_data,
+        "invalidation_conditions": [cond_data],
+    }
+    contract = ClaimReviewContract.from_dict(contract_data)
+    assert contract.applicability == app
+    assert contract.invalidation_conditions == (cond,)
+    assert contract.to_dict() == contract_data

@@ -209,6 +209,14 @@ class ClaimApplicability:
     preconditions: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.horizon, ApplicabilityHorizon):
+            raise ValueError(
+                f"horizon must be an instance of ApplicabilityHorizon, got {type(self.horizon).__name__}"
+            )
+        if not isinstance(self.metric_basis, MetricBasis):
+            raise ValueError(
+                f"metric_basis must be an instance of MetricBasis, got {type(self.metric_basis).__name__}"
+            )
         ok, err, norm = validate_applicability(self.to_dict())
         if not ok:
             raise ValueError(f"Invalid applicability dataclass: {err}")
@@ -259,6 +267,22 @@ class ClaimInvalidationCondition:
     pit_date: str
 
     def __post_init__(self) -> None:
+        if not isinstance(self.operator, ConditionOperator):
+            raise ValueError(
+                f"operator must be an instance of ConditionOperator, got {type(self.operator).__name__}"
+            )
+        if not isinstance(self.unit, ConditionUnit):
+            raise ValueError(
+                f"unit must be an instance of ConditionUnit, got {type(self.unit).__name__}"
+            )
+        if not isinstance(self.period, ConditionPeriod):
+            raise ValueError(
+                f"period must be an instance of ConditionPeriod, got {type(self.period).__name__}"
+            )
+        if not isinstance(self.source, ConditionSource):
+            raise ValueError(
+                f"source must be an instance of ConditionSource, got {type(self.source).__name__}"
+            )
         ok, err, norm = validate_invalidation_condition(self.to_dict())
         if not ok:
             raise ValueError(f"Invalid condition dataclass: {err}")
