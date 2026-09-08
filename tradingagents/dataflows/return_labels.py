@@ -179,8 +179,8 @@ def resolve_horizon_calendar_window(
     5. Fails closed with ValueError (or InsufficientTradingCalendarError) if calendar coverage is less than T+N+max_roll.
     6. Does not compute prices or returns; does not output OutcomeStatus.EVALUATED_OK.
     """
-    # 1. Validate horizon
-    if not isinstance(horizon, str) or horizon not in SUPPORTED_HORIZONS:
+    # 1. Validate horizon: must be native str (reject str Enum, plain Enum, stringifiable objects)
+    if type(horizon) is not str or horizon not in SUPPORTED_HORIZONS:
         raise ValueError(
             f"Unsupported horizon {horizon!r}. Supported horizons: {list(SUPPORTED_HORIZONS)}"
         )

@@ -27,6 +27,7 @@ from __future__ import annotations
 import copy
 import socket
 from dataclasses import FrozenInstanceError, is_dataclass
+from enum import Enum
 from typing import List
 
 import pytest
@@ -411,6 +412,18 @@ class TestSignalDatePresenceInCalendar:
 class TestHorizonValidation:
     """10. Verify horizon parameter validation."""
 
+    class ExternalStrEnum(str, Enum):
+        SHORT = "short"
+        MEDIUM = "medium"
+
+    class ExternalPlainEnum(Enum):
+        SHORT = "short"
+        MEDIUM = "medium"
+
+    class Stringifiable:
+        def __str__(self):
+            return "short"
+
     @pytest.mark.parametrize(
         "bad_horizon",
         [
@@ -421,6 +434,11 @@ class TestHorizonValidation:
             "",
             None,
             10,
+            3.14,
+            True,
+            False,
+            ["short"],
+            {"horizon": "short"},
         ],
     )
     def test_unsupported_horizon_rejected(self, bad_horizon):
@@ -431,6 +449,21 @@ class TestHorizonValidation:
                 trading_days=FIXTURE_JAN_2024,
                 as_of="2024-01-20",
             )
+
+    def test_external_str_enum_and_stringifiable_rejected(self):
+        for bad in (
+            self.ExternalStrEnum.SHORT,
+            self.ExternalStrEnum.MEDIUM,
+            self.ExternalPlainEnum.SHORT,
+            self.Stringifiable(),
+        ):
+            with pytest.raises(ValueError, match="Unsupported horizon"):
+                rl.resolve_horizon_calendar_window(
+                    signal_date="2024-01-02",
+                    horizon=bad,  # type: ignore
+                    trading_days=FIXTURE_JAN_2024,
+                    as_of="2024-01-20",
+                )
 
 
 class TestStandardShortAndMediumResolution:
@@ -446,6 +479,7 @@ class TestStandardShortAndMediumResolution:
         )
         assert window.signal_date == "2024-01-02"
         assert window.horizon == "short"
+        assert type(window.horizon) is str
         assert window.eval_offset == 10
         assert window.max_roll_days == 2
         assert window.executable_entry_date == "2024-01-03"  # T+1
@@ -466,6 +500,7 @@ class TestStandardShortAndMediumResolution:
         )
         assert window.signal_date == "2024-01-02"
         assert window.horizon == "medium"
+        assert type(window.horizon) is str
         assert window.eval_offset == 40
         assert window.max_roll_days == 5
         assert window.executable_entry_date == "2024-01-03"  # T+1
