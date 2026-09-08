@@ -275,8 +275,25 @@ def validate_relation(
 
         for ctx, name in [(source_ctx, "source"), (target_ctx, "target")]:
             if ctx is not None:
-                ts = ctx.get("published_at") or ctx.get("ann_date") or ctx.get("timestamp") or ctx.get("trade_date")
-                if not ts:
+                # 键存在即表示该 ctx 已声明这一种时间语义。present-but-falsy 是畸形数据
+                # 而非缺失，不得靠 `or` 静默换用下一个键——那会让交易日冒充发布时间，
+                # 属 D-008 禁止的时间语义互换，也是 DAV-719 判过的 or 吃掉合法假值模式。
+                ts = None
+                ts_field = None
+                for _key in ("published_at", "ann_date", "timestamp", "trade_date"):
+                    if _key not in ctx:
+                        continue
+                    _raw = ctx[_key]
+                    if _raw is None or (isinstance(_raw, str) and not _raw.strip()):
+                        return ValidationResult(
+                            valid=False,
+                            reason=FailClosedReason.MALFORMED_TIMESTAMP,
+                            message=f"{name} context field '{_key}' is present but empty",
+                        )
+                    ts = _raw
+                    ts_field = _key
+                    break
+                if ts is None:
                     return ValidationResult(
                         valid=False,
                         reason=FailClosedReason.MISSING_TIMESTAMP,
@@ -307,7 +324,7 @@ def validate_relation(
                     return ValidationResult(
                         valid=False,
                         reason=FailClosedReason.LOOKAHEAD_VIOLATION,
-                        message=f"{name} date {dt} is after baseline date {b_dt}",
+                        message=f"{name} date {dt} (from '{ts_field}') is after baseline date {b_dt}",
                     )
 
     # 4. 检查规范源内容哈希有效性

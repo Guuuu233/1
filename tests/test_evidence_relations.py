@@ -613,3 +613,56 @@ def test_datetime_baseline_fails_closed_not_raises():
         baseline_date=date(2026, 9, 8),
     )
     assert res3.reason == res2.reason
+
+
+def test_present_but_empty_timestamp_fails_closed_not_substituted():
+    """时间字段「存在但为空」是畸形数据，不得静默换用下一个字段。
+
+    原实现用 `or` 链取时间戳，published_at="" 会静默回落到 trade_date，
+    让交易日冒充发布时间并通过校验。这属 D-008 禁止的时间语义互换，
+    与 DAV-719 判过的 or 吃掉合法假值是同一模式。
+    """
+    rel = EvidenceRelation("a", RelationType.SUPPORTS, "b")
+    ids = {"a", "b"}
+
+    for empty in ("", "   ", None):
+        res = validate_relation(
+            rel, ids,
+            {"published_at": empty, "trade_date": "2026-09-01"},
+            {"published_at": "2026-09-01"},
+            baseline_date="2026-09-08",
+        )
+        assert res.valid is False, f"published_at={empty!r} 不得被 trade_date 顶替"
+        assert res.reason == FailClosedReason.MALFORMED_TIMESTAMP
+        assert "published_at" in res.message
+
+
+def test_timestamp_field_priority_and_semantics_are_explicit():
+    """字段优先级按声明顺序，且实际采用的时间语义须出现在前视消息中。"""
+    rel = EvidenceRelation("a", RelationType.SUPPORTS, "b")
+    ids = {"a", "b"}
+
+    # 只声明 trade_date 时才用 trade_date，且前视消息标明来源字段
+    res = validate_relation(
+        rel, ids, {"trade_date": "2026-09-09"}, {"trade_date": "2026-09-01"},
+        baseline_date="2026-09-08",
+    )
+    assert res.reason == FailClosedReason.LOOKAHEAD_VIOLATION
+    assert "trade_date" in res.message
+
+    # published_at 存在且合法时优先于 trade_date
+    res2 = validate_relation(
+        rel, ids,
+        {"published_at": "2026-09-09", "trade_date": "2026-09-01"},
+        {"published_at": "2026-09-01"},
+        baseline_date="2026-09-08",
+    )
+    assert res2.reason == FailClosedReason.LOOKAHEAD_VIOLATION
+    assert "published_at" in res2.message
+
+    # 一个时间字段都没有仍是 MISSING_TIMESTAMP
+    res3 = validate_relation(
+        rel, ids, {"other": "x"}, {"published_at": "2026-09-01"},
+        baseline_date="2026-09-08",
+    )
+    assert res3.reason == FailClosedReason.MISSING_TIMESTAMP
