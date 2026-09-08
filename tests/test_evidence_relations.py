@@ -808,3 +808,46 @@ def test_detect_relation_cycles_empty_target_types_detects_zero_cycles(empty_tar
 
     # 2. 显式空容器必须检测 0 种关系，返回空列表 []
     assert detect_relation_cycles(relations, target_types=empty_target_types) == []
+
+
+# ============================================================================
+# Knife 4: _deep_thaw_mapping 递归 thaw list 与 tuple 嵌套 metadata
+# ============================================================================
+
+@pytest.mark.parametrize("container_builder", [
+    lambda proxy: [proxy],
+    lambda proxy: (proxy,),
+    lambda proxy: [{"nested_proxy": proxy}],
+    lambda proxy: ({"nested_proxy": proxy},),
+    lambda proxy: [[proxy]],
+    lambda proxy: [(proxy,)],
+])
+def test_deep_thaw_mapping_supports_list_and_tuple_nested_mappingproxy(container_builder):
+    """对 list 与 tuple 均递归 thaw，确保任意 JSON-safe list/tuple 中嵌套既有 frozen metadata 可再次构造并无损 roundtrip。"""
+    src = EvidenceRelation("src", RelationType.SUPPORTS, "tgt", metadata={"k": "v", "num": 42})
+    assert isinstance(src.metadata, MappingProxyType)
+
+    nested_meta = {"items": container_builder(src.metadata)}
+    rel = EvidenceRelation("a", RelationType.SUPPORTS, "b", metadata=nested_meta)
+
+    # 验证能无损 to_dict 并进行标准 JSON 序列化和反序列化往返
+    d = rel.to_dict()
+    json_bytes = json.dumps(d, allow_nan=False)
+    parsed = json.loads(json_bytes)
+    restored = EvidenceRelation.from_dict(parsed)
+    assert restored.to_dict() == d
+
+
+@pytest.mark.parametrize("bad_nested_meta,expected_exc", [
+    ({"items": [float("nan")]}, ValueError),
+    ({"items": [float("inf")]}, ValueError),
+    ({"items": [float("-inf")]}, ValueError),
+    ({"items": (float("nan"),)}, ValueError),
+    ({"items": [{123: "non_str_key"}]}, TypeError),
+    ({"items": [object()]}, TypeError),
+    ({"items": ([object()],)}, TypeError),
+])
+def test_deep_thaw_mapping_still_rejects_nan_inf_and_unserializable(bad_nested_meta, expected_exc):
+    """NaN/Inf、非字符串 key、真正不可序列化对象在 list/tuple 嵌套中仍被严格拒绝。"""
+    with pytest.raises(expected_exc):
+        EvidenceRelation("a", RelationType.SUPPORTS, "b", metadata=bad_nested_meta)

@@ -61,10 +61,10 @@ def _deep_freeze_mapping(val: Any) -> Any:
 
 
 def _deep_thaw_mapping(val: Any) -> Any:
-    """Recursively thaw MappingProxyType to dict and tuple to list for JSON export."""
+    """Recursively thaw MappingProxyType to dict and list/tuple to list for JSON export."""
     if isinstance(val, (Mapping, MappingProxyType)):
         return {k: _deep_thaw_mapping(v) for k, v in val.items()}
-    elif isinstance(val, tuple):
+    elif isinstance(val, (list, tuple)):
         return [_deep_thaw_mapping(item) for item in val]
     return val
 
