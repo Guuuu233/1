@@ -370,12 +370,11 @@ def test_algorithm_group_and_reference_only_read_only_from_selection():
 
     human_prompt = llm.messages[1].content
 
-    # 检查相对规模证据节：真实算法组来自 selection，伪字段不得被信任
-    scale_section = human_prompt.split("【资金流相对规模证据（同标的同日相对参考）】")[1].split("【龙虎榜数据】")[0]
-    assert "real_selection_algo_group" in scale_section
-    assert "fake_scale_algo_group" not in scale_section
-    assert "reference_only=True" in scale_section
-    assert "reference_only=False" not in scale_section
+    # 检查整个 HumanMessage：真实算法组来自 selection，伪字段与伪 reference_only 绝不存在
+    assert "real_selection_algo_group" in human_prompt
+    assert "fake_scale_algo_group" not in human_prompt
+    assert "reference_only=True" in human_prompt
+    assert "reference_only=False" not in human_prompt
 
     # 直接验证纯函数 format_fund_flow_scale_metrics_prompt 的契约行为
     from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
@@ -545,25 +544,33 @@ def test_compliance_negative_sentences_not_blocked():
 
 
 def test_immutability_and_json_serializability():
-    """10. 输入对象不被原地修改，JSON 可序列化。"""
+    """10. 输入对象不被原地修改，严格 JSON 序列化（无 default=str）。"""
     scale_metrics = {
         "ts_code": "600519.SH",
         "trade_date": "2026-08-14",
-        "net_amount": Decimal("15000.0"),
+        "net_amount": "15000.0",
         "net_amount_raw": "15000.0",
         "net_amount_unit": "万元",
         "unit": "万元",
-        "net_to_circ_mv": Decimal("0.006755"),
+        "net_to_circ_mv": "0.006755",
         "net_to_circ_mv_text": "0.006755",
-        "net_to_amount": Decimal("0.027273"),
+        "net_to_amount": "0.027273",
         "net_to_amount_text": "0.027273",
-        "circ_mv": Decimal("2220600.0"),
+        "circ_mv": "2220600.0",
         "circ_mv_unit": "万元",
         "circ_mv_source": "tushare.daily_basic",
-        "amount": Decimal("550000.0"),
+        "amount": "550000.0",
         "amount_unit": "万元",
         "amount_source": "tushare.daily_basic",
         "denominator_source": "tushare.daily_basic",
+        "denominator_sources": {
+            "circ_mv": "tushare.daily_basic",
+            "amount": "tushare.daily_basic",
+        },
+        "denominator_units": {
+            "circ_mv": "万元",
+            "amount": "万元",
+        },
         "status": "available",
         "gaps": ["无缺口"],
         "gap_list": ["无缺口"],
@@ -599,13 +606,439 @@ def test_immutability_and_json_serializability():
     # 验证输入对象未被原地修改
     assert scale_metrics == scale_metrics_snapshot
     assert selection == selection_snapshot
-    assert state["trade_date"] == state_snapshot["trade_date"]
-    assert state["company_of_interest"] == state_snapshot["company_of_interest"]
+    assert state == state_snapshot
 
-    # 验证 node 返回结果可 JSON 序列化
-    serialized = json.dumps(result, ensure_ascii=False, default=str)
+    # 验证 node 返回结果可严格 JSON 序列化（不得使用 default=str 掩盖）
+    serialized = json.dumps(result, ensure_ascii=False)
     assert isinstance(serialized, str)
     deserialized = json.loads(serialized)
     assert "smart_money_report" in deserialized
     assert "fund_flow_consensus_guard" in deserialized
     assert "analyst_traces" in deserialized
+
+
+def test_reference_only_strict_boolean_and_missing_selection():
+    """11. reference_only 仅在 selection 中存在严格布尔值时展示 True/False；缺失、非 Mapping、缺键或非 bool 时显式处理。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    valid_scale = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": "0.006755",
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": "0.027273",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+    }
+    unknown_marker = "reference_only=未知/缺少 selection，按 reference_only 纪律处理"
+
+    # 缺少 selection (None)
+    out_none = format_fund_flow_scale_metrics_prompt(valid_scale, None)
+    assert unknown_marker in out_none
+    assert "reference_only=False" not in out_none
+    assert "reference_only=True" not in out_none
+
+    # selection 为空 dict (缺键)
+    out_empty = format_fund_flow_scale_metrics_prompt(valid_scale, {})
+    assert unknown_marker in out_empty
+    assert "reference_only=False" not in out_empty
+
+    # selection 中 reference_only 为字符串 "false" (非 bool，禁止 bool("false")==True 强转)
+    out_str_false = format_fund_flow_scale_metrics_prompt(valid_scale, {"reference_only": "false"})
+    assert unknown_marker in out_str_false
+    assert "reference_only=False" not in out_str_false
+    assert "reference_only=True" not in out_str_false
+
+    # selection 中 reference_only 为字符串 "true" (非 bool)
+    out_str_true = format_fund_flow_scale_metrics_prompt(valid_scale, {"reference_only": "true"})
+    assert unknown_marker in out_str_true
+
+    # selection 中 reference_only 为整型 0 / 1 (非 bool)
+    out_int_0 = format_fund_flow_scale_metrics_prompt(valid_scale, {"reference_only": 0})
+    assert unknown_marker in out_int_0
+    out_int_1 = format_fund_flow_scale_metrics_prompt(valid_scale, {"reference_only": 1})
+    assert unknown_marker in out_int_1
+
+    # 严格布尔值 True / False
+    out_bool_false = format_fund_flow_scale_metrics_prompt(valid_scale, {"reference_only": False})
+    assert "reference_only=False" in out_bool_false
+    assert unknown_marker not in out_bool_false
+
+    out_bool_true = format_fund_flow_scale_metrics_prompt(valid_scale, {"reference_only": True})
+    assert "reference_only=True" in out_bool_true
+    assert unknown_marker not in out_bool_true
+
+    # 端到端 node 运行验证非 bool 时整个 HumanMessage 均无 reference_only=False
+    fund_flow_evidence = {
+        "scale_metrics": valid_scale,
+        "selection": {"reference_only": "false", "selected_source": "ths"},
+        "records": [],
+    }
+    llm = _RecordingLLM()
+    collector = _MockCollector(fund_flow_evidence=fund_flow_evidence)
+    _run_analyst_node(llm, collector)
+    human_msg = llm.messages[1].content
+    assert unknown_marker in human_msg
+    assert "reference_only=False" not in human_msg
+
+
+def test_available_status_downgrade_when_single_ratio():
+    """12. 声明 available 但仅一个比率完整可用，必须降级为 partial，并增加契约矛盾 gap。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    scale_metrics = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",  # 声明为 available
+        "net_to_circ_mv": "0.006755",
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": None,  # 但缺失另一个比率
+        "amount_source": None,
+        "amount_unit": None,
+        "gaps": [],
+    }
+    selection = {"reference_only": True, "selected_source": "tushare"}
+
+    out = format_fund_flow_scale_metrics_prompt(scale_metrics, selection)
+    assert "- 状态: partial (部分可用)" in out
+    assert "0.006755" in out
+    assert "- 净额占成交额比 (net_to_amount): 缺失/不可用" in out
+    assert "契约矛盾: status 声明为 available，但仅有一个比率完整可用，降级为 partial" in out
+
+
+def test_unknown_and_missing_status_fail_closed():
+    """13. 未知或缺失状态直接 fail-closed 为 unavailable，并保留原始异常说明。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    base_scale = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "net_to_circ_mv": "0.006755",
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": "0.027273",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+    }
+
+    # 1. 缺失 status 键
+    scale_no_status = dict(base_scale)
+    out_no_status = format_fund_flow_scale_metrics_prompt(scale_no_status, {"reference_only": True})
+    assert "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)" in out_no_status
+    assert "缺少 status 状态字段" in out_no_status
+
+    # 2. status 为 unknown
+    scale_unknown = dict(base_scale, status="unknown")
+    out_unknown = format_fund_flow_scale_metrics_prompt(scale_unknown, {"reference_only": True})
+    assert "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)" in out_unknown
+    assert "未知状态 'unknown'" in out_unknown
+
+    # 3. status 为 error / invalid
+    scale_err = dict(base_scale, status="calc_error")
+    out_err = format_fund_flow_scale_metrics_prompt(scale_err, {"reference_only": True})
+    assert "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)" in out_err
+    assert "未知状态 'calc_error'" in out_err
+
+    # 4. status 为非字符串类型
+    scale_num = dict(base_scale, status=500)
+    out_num = format_fund_flow_scale_metrics_prompt(scale_num, {"reference_only": True})
+    assert "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)" in out_num
+    assert "状态字段为未知类型" in out_num
+
+
+def test_unavailable_status_with_ratios_never_presented_as_available():
+    """14. unavailable 无论携带何值都不得呈现为可用。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    scale_metrics = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "unavailable",
+        "net_to_circ_mv": "0.006755",
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": "0.027273",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": ["上游强制判定不可用"],
+    }
+    selection = {"reference_only": True}
+
+    out = format_fund_flow_scale_metrics_prompt(scale_metrics, selection)
+    assert "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)" in out
+    # 虽携带数值，但绝不得作为可用比率呈现
+    assert "0.006755" not in out
+    assert "0.027273" not in out
+    assert "上游强制判定不可用" in out
+    assert "契约矛盾: status 声明为 unavailable 但携带比率数值，按 unavailable 纪律不予呈现" in out
+
+
+def test_gaps_as_string_and_malformed_types():
+    """15. gaps/gap_list 为字符串时保留为单项；为 list/tuple 时逐项保留；其他畸形类型增加显式契约 gap。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    base_scale = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "partial",
+        "net_to_circ_mv": "0.006755",
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": None,
+    }
+
+    # 字符串形式的 gap
+    scale_str = dict(base_scale, gaps="成交额数据缺失无法计算占比")
+    out_str = format_fund_flow_scale_metrics_prompt(scale_str, {"reference_only": True})
+    assert "* 成交额数据缺失无法计算占比" in out_str
+
+    # 列表形式的 gaps
+    scale_list = dict(base_scale, gaps=["缺口一", "缺口二"])
+    out_list = format_fund_flow_scale_metrics_prompt(scale_list, {"reference_only": True})
+    assert "* 缺口一" in out_list
+    assert "* 缺口二" in out_list
+
+    # 畸形对象：int
+    scale_int = dict(base_scale, gaps=9999)
+    out_int = format_fund_flow_scale_metrics_prompt(scale_int, {"reference_only": True})
+    assert "契约异常: gaps 包含畸形类型 (int: 9999)" in out_int
+
+    # 畸形对象：dict
+    scale_dict = dict(base_scale, gaps={"invalid": "data"})
+    out_dict = format_fund_flow_scale_metrics_prompt(scale_dict, {"reference_only": True})
+    assert "契约异常: gaps 包含畸形类型 (dict:" in out_dict
+
+
+def test_missing_ts_code_or_trade_date_fails_closed():
+    """16. ts_code 或 trade_date 缺失时整体相对规模 unavailable；不得输出空标的/空日期却称完整可用。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    base_scale = {
+        "status": "available",
+        "net_to_circ_mv": "0.006755",
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": "0.027273",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+    }
+
+    # 缺失 ts_code
+    scale_no_code = dict(base_scale, ts_code="", trade_date="2026-08-14")
+    out_no_code = format_fund_flow_scale_metrics_prompt(scale_no_code, {"reference_only": True})
+    assert "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)" in out_no_code
+    assert "标的代码 (ts_code) 缺失" in out_no_code
+
+    # 缺失 trade_date
+    scale_no_date = dict(base_scale, ts_code="600519.SH", trade_date="")
+    out_no_date = format_fund_flow_scale_metrics_prompt(scale_no_date, {"reference_only": True})
+    assert "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)" in out_no_date
+    assert "交易日期 (trade_date) 缺失" in out_no_date
+
+
+def test_missing_denominator_source_or_unit_makes_ratio_unusable():
+    """17. 对应分母来源或单位缺失时该比率不可用，不得用“未指定”维持 available。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    # 1. net_to_circ_mv 缺单位
+    scale_no_unit = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": "0.006755",
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": None,  # 缺单位
+        "net_to_amount": "0.027273",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+    }
+    out_no_unit = format_fund_flow_scale_metrics_prompt(scale_no_unit, {"reference_only": True})
+    assert "- 状态: partial (部分可用)" in out_no_unit
+    assert "- 净额占流通市值比 (net_to_circ_mv): 缺失/不可用" in out_no_unit
+    assert "- 净额占成交额比 (net_to_amount): 0.027273" in out_no_unit
+    assert "分母单位缺失" in out_no_unit
+
+    # 2. net_to_amount 缺来源
+    scale_no_src = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": "0.006755",
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": "0.027273",
+        "amount_source": None,  # 缺来源
+        "amount_unit": "万元",
+    }
+    out_no_src = format_fund_flow_scale_metrics_prompt(scale_no_src, {"reference_only": True})
+    assert "- 状态: partial (部分可用)" in out_no_src
+    assert "- 净额占成交额比 (net_to_amount): 缺失/不可用" in out_no_src
+    assert "分母来源缺失" in out_no_src
+
+    # 3. 两者分母均缺来源/单位 -> unavailable
+    scale_no_both = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": "0.006755",
+        "circ_mv_source": None,
+        "circ_mv_unit": None,
+        "net_to_amount": "0.027273",
+        "amount_source": None,
+        "amount_unit": None,
+    }
+    out_no_both = format_fund_flow_scale_metrics_prompt(scale_no_both, {"reference_only": True})
+    assert "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)" in out_no_both
+
+
+def test_denominator_mapping_fallback():
+    """18. 允许真实 denominator_sources / denominator_units Mapping 作为精确 fallback。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    scale_metrics = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": "0.006755",
+        "circ_mv_source": None,  # 顶层为空
+        "circ_mv_unit": None,
+        "net_to_amount": "0.027273",
+        "amount_source": None,
+        "amount_unit": None,
+        "denominator_sources": {
+            "circ_mv": "tushare.daily_basic",
+            "amount": "tushare.daily_basic",
+        },
+        "denominator_units": {
+            "circ_mv": "万元",
+            "amount": "万元",
+        },
+        "gaps": [],
+    }
+    selection = {"reference_only": True, "selected_source": "tushare"}
+
+    out = format_fund_flow_scale_metrics_prompt(scale_metrics, selection)
+    assert "- 状态: available (完整可用)" in out
+    assert "- 净额占流通市值比 (net_to_circ_mv): 0.006755 (分母来源: tushare.daily_basic, 分母单位: 万元)" in out
+    assert "- 净额占成交额比 (net_to_amount): 0.027273 (分母来源: tushare.daily_basic, 分母单位: 万元)" in out
+
+
+def test_scale_pseudo_fields_invisible_in_entire_human_message():
+    """19. 原始 scale 伪字段在整个 HumanMessage 中均不存在（封死 HIGH 级旁路）。"""
+    scale_metrics = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": "0.006755",
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": "0.027273",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        # 伪字段
+        "algorithm_group": "fake_scale_algo_group",
+        "selected_algorithm_group": "fake_scale_algo_group",
+        "reference_only": False,
+    }
+    selection = {
+        "selected_source": "ths",
+        "selected_algorithm_group": "real_selection_algo_group",
+        "reference_only": True,
+    }
+    fund_flow_evidence = {
+        "scale_metrics": scale_metrics,
+        "selection": selection,
+        "records": [],
+    }
+
+    llm = _RecordingLLM()
+    collector = _MockCollector(fund_flow_evidence=fund_flow_evidence)
+    _run_analyst_node(llm, collector)
+
+    # 检查整个 HumanMessage
+    human_msg = llm.messages[1].content
+    assert "fake_scale_algo_group" not in human_msg
+    assert "reference_only=False" not in human_msg
+    assert "real_selection_algo_group" in human_msg
+    assert "reference_only=True" in human_msg
+
+
+def test_top_level_scale_bypass_rejected_and_nested_state_only_consumed():
+    """20. 顶层错误路径 scale 不被消费，嵌套 state-only 正确消费。"""
+    valid_scale = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": "0.006755",
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": "0.027273",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+    }
+    valid_sel = {
+        "selected_source": "tushare",
+        "selected_algorithm_group": "new_algorithm_group",
+        "reference_only": True,
+    }
+
+    # 1. 顶层错误路径：market_data_context["scale_metrics"] 旁路不被消费
+    llm1 = _RecordingLLM()
+    pool_data = {
+        "fund_flow_individual": "无数据",
+        "market_data_context": {
+            "scale_metrics": valid_scale,  # 顶层旁路
+            # 没有 fund_flow_evidence
+        },
+        "lhb": "无数据",
+        "indicators": {"vwma": "无数据"},
+    }
+    class _TopLevelCollector:
+        def get(self, ticker, curr_date):
+            return pool_data
+
+    _run_analyst_node(llm1, _TopLevelCollector())
+    human_msg1 = llm1.messages[1].content
+    # 顶层旁路不得被消费，fail-closed 输出缺少 scale_metrics
+    assert "缺少 scale_metrics 相对规模对象" in human_msg1
+    assert "0.006755" not in human_msg1
+
+    # 2. 嵌套 state-only 正常消费，无 UnboundLocalError
+    llm2 = _RecordingLLM()
+    state = {
+        "trade_date": "2026-08-14",
+        "company_of_interest": "600519",
+        "user_intent": {"focus_areas": [], "specific_questions": []},
+        "market_data_context": {
+            "fund_flow_evidence": {
+                "scale_metrics": valid_scale,
+                "selection": valid_sel,
+                "records": [],
+            },
+        },
+    }
+    # data_collector 为 None 触发 fallback 分支（state-only 路径）
+    _run_analyst_node(llm2, None, state=state)
+    human_msg2 = llm2.messages[1].content
+    assert "- 状态: available (完整可用)" in human_msg2
+    assert "0.006755" in human_msg2
+    assert "0.027273" in human_msg2
+
+
+def test_unserializable_evidence_raises_type_error():
+    """21. 未知不可序列化 evidence 对象严格抛 TypeError。"""
+    class _DummyUnknown:
+        pass
+
+    fund_flow_evidence = {
+        "records": [],
+        "unknown_obj": _DummyUnknown(),
+    }
+    llm = _RecordingLLM()
+    collector = _MockCollector(fund_flow_evidence=fund_flow_evidence)
+
+    with pytest.raises(TypeError):
+        _run_analyst_node(llm, collector)

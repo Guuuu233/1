@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Mapping
+from decimal import Decimal
 from typing import Any
 from tradingagents.agents.utils.context_utils import get_cn_stock_name, format_phase1_reports
 import asyncio
@@ -60,15 +61,19 @@ def format_fund_flow_scale_metrics_prompt(
     Contracts:
     1. Read real fields only from scale_metrics.
     2. Read selected_algorithm_group and reference_only ONLY from selection (never from scale_metrics).
-    3. Ratio 0 is a valid value, not missing.
-    4. When status is 'available', present both ratios, text, date, ticker, denominator source and units.
-       Never recalculate or change precision.
-    5. When status is 'partial', present available ratio only, do not manufacture the other, preserve gaps.
-    6. When status is 'unavailable' or scale_metrics is missing/empty, explicitly state
-       '相对规模不可用/不得据绝对净额替代', fail-closed, never silently omit.
-    7. Append node-local discipline constraints: statistical reference only, no account identity inference,
-       no cross-stock ranking, no new scores/weights/probabilities/signals.
-    8. Input objects are not modified in place.
+    3. reference_only displays True/False ONLY when selection contains a strict boolean;
+       if missing, non-Mapping, missing key, or non-bool, display
+       '未知/缺少 selection，按 reference_only 纪律处理', never default to False or coerce.
+    4. Only accept known status (available/partial/unavailable). Unknown/missing status fails closed to unavailable.
+       Cross-check status with usable ratios:
+       - available requires both ratios with required denominator source & unit, otherwise downgrade to partial or unavailable with contract contradiction gap.
+       - partial only presents structurally complete usable ratio; if neither is usable, downgrade to unavailable.
+       - unavailable is never presented as usable, regardless of values carried.
+    5. ts_code or trade_date missing fails closed to unavailable.
+    6. Denominator source/unit read from corresponding fields, allowing denominator_sources / denominator_units
+       Mapping as exact fallback; if still missing, ratio is unusable (no '未指定' to keep available).
+    7. gaps/gap_list as str kept as single item; list/tuple preserved per item; malformed types add explicit contract gap.
+    8. Discipline constraints appended. Input objects not modified in place.
     """
     discipline_text = (
         "【纪律约束】相对规模比率仅作为同标的、同交易日的统计参考证据；"
@@ -78,11 +83,14 @@ def format_fund_flow_scale_metrics_prompt(
 
     # 1. Read metadata strictly and ONLY from selection
     selected_algorithm_group = None
-    reference_only = False
+    ref_only_repr = "未知/缺少 selection，按 reference_only 纪律处理"
     selected_source = None
     if isinstance(selection, Mapping):
         selected_algorithm_group = selection.get("selected_algorithm_group")
-        reference_only = bool(selection.get("reference_only"))
+        if "reference_only" in selection:
+            raw_ref = selection["reference_only"]
+            if isinstance(raw_ref, bool):
+                ref_only_repr = str(raw_ref)
         selected_source = selection.get("selected_source")
 
     # 2. Handle missing or empty scale_metrics -> fail closed
@@ -94,76 +102,209 @@ def format_fund_flow_scale_metrics_prompt(
             f"- {discipline_text}"
         )
 
-    # 3. Read real fields from scale_metrics
-    ts_code = scale_metrics.get("ts_code") or ""
-    trade_date = scale_metrics.get("trade_date") or ""
-    status = str(scale_metrics.get("status") or "").strip().lower()
+    # 3. Parse gaps / gap_list
+    raw_gaps = scale_metrics.get("gaps")
+    if raw_gaps is None and "gap_list" in scale_metrics:
+        raw_gaps = scale_metrics.get("gap_list")
+
+    gaps: list[str] = []
+    if raw_gaps is not None:
+        if isinstance(raw_gaps, str):
+            if raw_gaps.strip():
+                gaps.append(raw_gaps.strip())
+        elif isinstance(raw_gaps, (list, tuple)):
+            for g in raw_gaps:
+                if g is not None and str(g).strip():
+                    gaps.append(str(g).strip())
+        else:
+            gaps.append(f"契约异常: gaps 包含畸形类型 ({type(raw_gaps).__name__}: {raw_gaps})")
+
+    # 4. Read real identification fields
+    raw_ts_code = scale_metrics.get("ts_code")
+    raw_trade_date = scale_metrics.get("trade_date")
+    ts_code = str(raw_ts_code).strip() if raw_ts_code is not None else ""
+    trade_date = str(raw_trade_date).strip() if raw_trade_date is not None else ""
+
+    missing_id_gaps: list[str] = []
+    if not ts_code:
+        missing_id_gaps.append("契约异常: 标的代码 (ts_code) 缺失，整体相对规模不可用")
+    if not trade_date:
+        missing_id_gaps.append("契约异常: 交易日期 (trade_date) 缺失，整体相对规模不可用")
+
+    # 5. Read status strictly
+    raw_status = scale_metrics.get("status")
+    if raw_status is None:
+        gaps.append("契约异常: 缺少 status 状态字段 (fail-closed 置为 unavailable)")
+        status = "unavailable"
+    elif not isinstance(raw_status, str):
+        gaps.append(f"契约异常: 状态字段为未知类型 ({type(raw_status).__name__}: {raw_status}) (fail-closed 置为 unavailable)")
+        status = "unavailable"
+    else:
+        norm_status = raw_status.strip().lower()
+        if norm_status in {"available", "partial", "unavailable"}:
+            status = norm_status
+        else:
+            gaps.append(f"契约异常: 未知状态 '{raw_status}' (fail-closed 置为 unavailable)")
+            status = "unavailable"
+
+    # 6. Read ratio values and sources/units with fallback
+    denominator_sources = scale_metrics.get("denominator_sources")
+    denominator_units = scale_metrics.get("denominator_units")
+    denominator_source = scale_metrics.get("denominator_source")
 
     net_to_circ_mv = scale_metrics.get("net_to_circ_mv")
     net_to_circ_mv_text = scale_metrics.get("net_to_circ_mv_text")
-    circ_mv_source = scale_metrics.get("circ_mv_source") or scale_metrics.get("denominator_source") or "未指定"
-    circ_mv_unit = scale_metrics.get("circ_mv_unit") or "未指定"
-
     net_to_amount = scale_metrics.get("net_to_amount")
     net_to_amount_text = scale_metrics.get("net_to_amount_text")
-    amount_source = scale_metrics.get("amount_source") or scale_metrics.get("denominator_source") or "未指定"
-    amount_unit = scale_metrics.get("amount_unit") or "未指定"
 
-    denominator_source = scale_metrics.get("denominator_source") or "未指定"
-    raw_gaps = scale_metrics.get("gaps") or scale_metrics.get("gap_list") or []
-    gaps = [str(g) for g in raw_gaps] if isinstance(raw_gaps, (list, tuple)) else []
+    # circ_mv source & unit resolution
+    circ_mv_source = scale_metrics.get("circ_mv_source")
+    if not (circ_mv_source and str(circ_mv_source).strip()):
+        if isinstance(denominator_sources, Mapping):
+            fb_src = denominator_sources.get("circ_mv")
+            circ_mv_source = str(fb_src).strip() if fb_src and str(fb_src).strip() else None
+        else:
+            circ_mv_source = None
+    else:
+        circ_mv_source = str(circ_mv_source).strip()
 
-    # Valid ratio check: 0 is valid, not missing!
-    has_circ = net_to_circ_mv is not None
-    has_amt = net_to_amount is not None
+    circ_mv_unit = scale_metrics.get("circ_mv_unit")
+    if not (circ_mv_unit and str(circ_mv_unit).strip()):
+        if isinstance(denominator_units, Mapping):
+            fb_unit = denominator_units.get("circ_mv")
+            circ_mv_unit = str(fb_unit).strip() if fb_unit and str(fb_unit).strip() else None
+        else:
+            circ_mv_unit = None
+    else:
+        circ_mv_unit = str(circ_mv_unit).strip()
 
+    # amount source & unit resolution
+    amount_source = scale_metrics.get("amount_source")
+    if not (amount_source and str(amount_source).strip()):
+        if isinstance(denominator_sources, Mapping):
+            fb_src = denominator_sources.get("amount")
+            amount_source = str(fb_src).strip() if fb_src and str(fb_src).strip() else None
+        else:
+            amount_source = None
+    else:
+        amount_source = str(amount_source).strip()
+
+    amount_unit = scale_metrics.get("amount_unit")
+    if not (amount_unit and str(amount_unit).strip()):
+        if isinstance(denominator_units, Mapping):
+            fb_unit = denominator_units.get("amount")
+            amount_unit = str(fb_unit).strip() if fb_unit and str(fb_unit).strip() else None
+        else:
+            amount_unit = None
+    else:
+        amount_unit = str(amount_unit).strip()
+
+    # Validate ratios
+    def _is_valid_num(v: Any) -> bool:
+        if v is None or isinstance(v, bool):
+            return False
+        if isinstance(v, str):
+            s = v.strip()
+            if not s or s.lower() in {"none", "null", "nan"}:
+                return False
+            try:
+                float(s)
+                return True
+            except ValueError:
+                return False
+        if isinstance(v, (int, float, Decimal)):
+            import math
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                return False
+            return True
+        return False
+
+    has_circ_val = _is_valid_num(net_to_circ_mv)
+    has_amt_val = _is_valid_num(net_to_amount)
+
+    # String representations
     if net_to_circ_mv_text is not None and str(net_to_circ_mv_text).strip():
-        circ_str = str(net_to_circ_mv_text)
-    elif has_circ:
-        circ_str = str(net_to_circ_mv)
+        circ_str = str(net_to_circ_mv_text).strip()
+    elif has_circ_val:
+        circ_str = "0" if net_to_circ_mv == 0 else str(net_to_circ_mv).strip()
     else:
         circ_str = None
 
     if net_to_amount_text is not None and str(net_to_amount_text).strip():
-        amt_str = str(net_to_amount_text)
-    elif has_amt:
-        amt_str = str(net_to_amount)
+        amt_str = str(net_to_amount_text).strip()
+    elif has_amt_val:
+        amt_str = "0" if net_to_amount == 0 else str(net_to_amount).strip()
     else:
         amt_str = None
 
-    # Determine status if not explicitly set
-    if not status:
-        if has_circ and has_amt:
-            status = "available"
-        elif has_circ or has_amt:
+    # Check structural completeness of each ratio
+    circ_usable = has_circ_val and bool(circ_mv_source) and bool(circ_mv_unit)
+    amt_usable = has_amt_val and bool(amount_source) and bool(amount_unit)
+
+    if has_circ_val and not circ_usable:
+        if not circ_mv_source and not circ_mv_unit:
+            gaps.append("契约异常: net_to_circ_mv 存在但分母来源与单位均缺失，该比率不可用")
+        elif not circ_mv_source:
+            gaps.append("契约异常: net_to_circ_mv 存在但分母来源缺失，该比率不可用")
+        else:
+            gaps.append("契约异常: net_to_circ_mv 存在但分母单位缺失，该比率不可用")
+
+    if has_amt_val and not amt_usable:
+        if not amount_source and not amount_unit:
+            gaps.append("契约异常: net_to_amount 存在但分母来源与单位均缺失，该比率不可用")
+        elif not amount_source:
+            gaps.append("契约异常: net_to_amount 存在但分母来源缺失，该比率不可用")
+        else:
+            gaps.append("契约异常: net_to_amount 存在但分母单位缺失，该比率不可用")
+
+    # 7. Check ts_code and trade_date
+    if missing_id_gaps:
+        status = "unavailable"
+        gaps.extend(missing_id_gaps)
+
+    # 8. Cross-check status with usable ratios
+    if status == "available":
+        if circ_usable and amt_usable:
+            pass
+        elif circ_usable or amt_usable:
             status = "partial"
+            gaps.append("契约矛盾: status 声明为 available，但仅有一个比率完整可用，降级为 partial")
         else:
             status = "unavailable"
+            gaps.append("契约矛盾: status 声明为 available，但两个比率均不可用，降级为 unavailable")
+    elif status == "partial":
+        if not circ_usable and not amt_usable:
+            status = "unavailable"
+            gaps.append("契约矛盾: status 声明为 partial，但无任何可用比率，降级为 unavailable")
+    elif status == "unavailable":
+        if has_circ_val or has_amt_val:
+            gaps.append("契约矛盾: status 声明为 unavailable 但携带比率数值，按 unavailable 纪律不予呈现")
 
-    # Scenario: unavailable
-    if status == "unavailable" or (not has_circ and not has_amt):
-        gap_lines = "\n".join(f"  * {g}" for g in gaps) if gaps else "  * 分母缺失或不可用"
+    # 9. Handle unavailable scenario
+    if status == "unavailable":
+        gap_lines = "\n".join(f"  * {g}" for g in gaps) if gaps else "  * 相对规模不可用或分母缺失"
         return (
             "【资金流相对规模证据（同标的同日相对参考）】\n"
             "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)\n"
-            f"- 标的代码: {ts_code}\n"
-            f"- 交易日期: {trade_date}\n"
+            f"- 标的代码: {ts_code if ts_code else '缺失'}\n"
+            f"- 交易日期: {trade_date if trade_date else '缺失'}\n"
             f"- 缺口说明:\n{gap_lines}\n"
             f"- {discipline_text}"
         )
 
-    # Common lines for available and partial
+    # 10. Available and partial output
+    source_display = selected_source or denominator_source or "未指定"
     lines = [
         "【资金流相对规模证据（同标的同日相对参考）】",
         f"- 状态: {status} ({'完整可用' if status == 'available' else '部分可用'})",
         f"- 标的代码: {ts_code}",
         f"- 交易日期: {trade_date}",
-        f"- 资金来源: {selected_source or denominator_source}",
+        f"- 资金来源: {source_display}",
         f"- 算法组: {selected_algorithm_group or '未指定'}",
-        f"- 参考属性: reference_only={reference_only}",
+        f"- 参考属性: reference_only={ref_only_repr}",
     ]
 
-    if has_circ:
+    if circ_usable:
         lines.append(
             f"- 净额占流通市值比 (net_to_circ_mv): {circ_str} "
             f"(分母来源: {circ_mv_source}, 分母单位: {circ_mv_unit})"
@@ -171,7 +312,7 @@ def format_fund_flow_scale_metrics_prompt(
     else:
         lines.append("- 净额占流通市值比 (net_to_circ_mv): 缺失/不可用")
 
-    if has_amt:
+    if amt_usable:
         lines.append(
             f"- 净额占成交额比 (net_to_amount): {amt_str} "
             f"(分母来源: {amount_source}, 分母单位: {amount_unit})"
@@ -268,16 +409,17 @@ def create_smart_money_analyst(llm, data_collector=None):
             )
             if isinstance(fund_flow_evidence, dict):
                 fund_flow_evidence["selection"] = selection
-        evidence_text = json.dumps(fund_flow_evidence, ensure_ascii=False, sort_keys=True, default=str)
+        if isinstance(fund_flow_evidence, Mapping):
+            evidence_for_display = dict(fund_flow_evidence)
+            evidence_for_display.pop("scale_metrics", None)
+        else:
+            evidence_for_display = fund_flow_evidence
+        evidence_text = json.dumps(evidence_for_display, ensure_ascii=False, sort_keys=True)
         consensus_instruction = consensus_prompt_instruction(selection)
 
         scale_metrics = None
-        if isinstance(fund_flow_evidence, dict):
+        if isinstance(fund_flow_evidence, Mapping):
             scale_metrics = fund_flow_evidence.get("scale_metrics")
-        if scale_metrics is None and isinstance(pool_context, dict):
-            scale_metrics = pool_context.get("scale_metrics")
-        if scale_metrics is None and isinstance(state_market_data_context, dict):
-            scale_metrics = state_market_data_context.get("scale_metrics")
 
         scale_metrics_prompt = format_fund_flow_scale_metrics_prompt(scale_metrics, selection)
         validation = (
