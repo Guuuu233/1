@@ -28,6 +28,7 @@ import copy
 import socket
 from dataclasses import FrozenInstanceError, is_dataclass
 from enum import Enum
+from types import MappingProxyType
 from typing import List
 
 import pytest
@@ -170,6 +171,22 @@ class TestHorizonProfileAlignment:
         assert rl.HORIZON_MAX_ROLL_DAYS[HORIZON_SHORT] == 2
         assert rl.HORIZON_MAX_ROLL_DAYS[HORIZON_MEDIUM] == 5
         assert set(rl.HORIZON_MAX_ROLL_DAYS.keys()) == set(SUPPORTED_HORIZONS)
+        assert isinstance(rl.HORIZON_MAX_ROLL_DAYS, MappingProxyType)
+
+        # Mutation attempts must raise TypeError at runtime
+        with pytest.raises(TypeError):
+            rl.HORIZON_MAX_ROLL_DAYS[HORIZON_SHORT] = 999  # type: ignore
+
+        with pytest.raises(TypeError):
+            rl.HORIZON_MAX_ROLL_DAYS["new_key"] = 10  # type: ignore
+
+        with pytest.raises(TypeError):
+            del rl.HORIZON_MAX_ROLL_DAYS[HORIZON_SHORT]  # type: ignore
+
+        # MappingProxyType has no update, pop, or clear methods
+        assert not hasattr(rl.HORIZON_MAX_ROLL_DAYS, "update")
+        assert not hasattr(rl.HORIZON_MAX_ROLL_DAYS, "pop")
+        assert not hasattr(rl.HORIZON_MAX_ROLL_DAYS, "clear")
 
     def test_horizon_return_result_typeddict_contract(self):
         # Assert type annotation keys match V-01 contract specifications

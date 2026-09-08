@@ -16,6 +16,7 @@ import re
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence, Tuple, TypedDict
 
 from tradingagents.graph.horizon_profile import (
@@ -62,11 +63,11 @@ HORIZON_PROFILE_ID_V1: str = "horizon_profile_v1"
 PRIMARY_EVAL_OFFSET_SHORT: int = int(HORIZON_PROFILE_V1[HORIZON_SHORT]["primary_eval_offset"])
 PRIMARY_EVAL_OFFSET_MEDIUM: int = int(HORIZON_PROFILE_V1[HORIZON_MEDIUM]["primary_eval_offset"])
 
-# Immutable max-roll mapping (short: 2 days, medium: 5 days)
-HORIZON_MAX_ROLL_DAYS: Mapping[str, int] = {
+# Immutable max-roll mapping (short: 2 days, medium: 5 days) wrapped in MappingProxyType
+HORIZON_MAX_ROLL_DAYS: Mapping[str, int] = MappingProxyType({
     HORIZON_SHORT: 2,
     HORIZON_MEDIUM: 5,
-}
+})
 
 # Module-level consistency assertions against canonical HORIZON_PROFILE_V1
 assert PRIMARY_EVAL_OFFSET_SHORT == 10, "HORIZON_PROFILE_V1 short offset drift detected"
