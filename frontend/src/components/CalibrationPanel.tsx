@@ -113,7 +113,8 @@ export default function CalibrationPanel({ compact = false, initialData = null }
 
     const isSufficient = data?.sample_sufficient ?? false
     const minSamples = data?.min_sample_size ?? 30
-    const evaluated = data?.sample_size ?? 0
+    const probSamples = data?.probability_sample_size ?? 0
+    const totalSamples = data?.sample_size ?? 0
     const skipped = data?.skipped_no_outcome ?? 0
     const excludedCounts = data?.excluded_counts
     const excludedTotal = excludedCounts?.total ?? (data?.skipped_no_outcome ?? 0)
@@ -229,9 +230,9 @@ export default function CalibrationPanel({ compact = false, initialData = null }
                         />
                         <StatTile
                             icon={BarChart3}
-                            label="已评估样本 (n)"
-                            value={String(evaluated)}
-                            hint={isSufficient ? `已达统计门槛 (≥${minSamples})` : `门槛需 ≥${minSamples} 份（缺 ${Math.max(0, minSamples - evaluated)} 份）`}
+                            label="概率校准样本 (n)"
+                            value={String(probSamples)}
+                            hint={isSufficient ? `已达统计门槛 (≥${minSamples})${totalSamples > probSamples ? ` · 全部可评估样本 ${totalSamples}` : ''}` : `门槛需 ≥${minSamples} 份（缺 ${Math.max(0, minSamples - probSamples)} 份）${totalSamples > probSamples ? ` · 全部可评估样本 ${totalSamples}` : ''}`}
                         />
                         <StatTile
                             icon={Ban}
@@ -242,13 +243,13 @@ export default function CalibrationPanel({ compact = false, initialData = null }
                         <StatTile
                             icon={isSufficient ? Activity : AlertTriangle}
                             label="校准有效性"
-                            value={isSufficient ? '有效校准' : (evaluated === 0 ? '无样本' : '样本不足 (熔断)')}
-                            hint={isSufficient ? `含样本分桶 ${chartData.filter(d => d.count > 0).length}/${chartData.length}` : (evaluated === 0 ? '暂无有效评估报告' : '样本极小，不具统计学效力')}
+                            value={isSufficient ? '有效校准' : (probSamples === 0 && totalSamples === 0 ? '无样本' : '样本不足 (熔断)')}
+                            hint={isSufficient ? `含样本分桶 ${chartData.filter(d => d.count > 0).length}/${chartData.length}` : (probSamples === 0 && totalSamples === 0 ? '暂无有效评估报告' : (probSamples === 0 ? '无有效概率样本，不具统计学效力' : '样本极小，不具统计学效力'))}
                         />
                     </div>
 
                     {/* Small sample warning alert */}
-                    {data.sample_size > 0 && !isSufficient && (
+                    {(probSamples > 0 || totalSamples > 0) && !isSufficient && (
                         <div
                             className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/40 dark:text-amber-200"
                             data-testid="small-sample-warning"
@@ -257,10 +258,10 @@ export default function CalibrationPanel({ compact = false, initialData = null }
                                 <AlertTriangle className="h-5 w-5 flex-shrink-0 text-amber-600 dark:text-amber-400 mt-0.5" />
                                 <div className="space-y-1">
                                     <h4 className="font-semibold text-sm">
-                                        样本量不足以支撑校准结论（当前样本 n={data.sample_size}，最小阈值 {minSamples}）
+                                        样本量不足以支撑校准结论（当前概率样本 n={probSamples}，最小阈值 {minSamples}）
                                     </h4>
                                     <p className="text-xs leading-relaxed opacity-90">
-                                        为防止小样本下的偶然涨跌制造虚假校准曲线（L3 自欺），在样本量达到统计显著性下限前，系统拒绝呈现 Brier Score 与可靠性曲线柱体。
+                                        为防止小样本下的偶然涨跌制造虚假校准曲线（L3 自欺），在样本量达到统计显著性下限前，系统拒绝呈现 Brier Score 与可靠性曲线柱体。{totalSamples > probSamples ? `（当前全部可评估样本共 ${totalSamples} 份，其中方向命中等非概率样本不计入校准分母）` : ''}
                                     </p>
                                 </div>
                             </div>
@@ -300,14 +301,14 @@ export default function CalibrationPanel({ compact = false, initialData = null }
                         >
                             <AlertTriangle className="mb-2 h-7 w-7 text-amber-500 opacity-80" />
                             <p className="text-sm font-medium text-slate-700 dark:text-slate-300">
-                                {evaluated === 0 ? '暂无可评估样本，未绘制可靠性曲线' : '样本量不足，可靠性曲线已熔断隐藏'}
+                                {probSamples === 0 && totalSamples === 0 ? '暂无可评估样本，未绘制可靠性曲线' : '样本量不足，可靠性曲线已熔断隐藏'}
                             </p>
                             <p className="mt-1 max-w-md text-xs text-slate-400 dark:text-slate-500">
-                                {evaluated === 0
+                                {probSamples === 0 && totalSamples === 0
                                     ? (skipped > 0
                                         ? '最近报告持有期尚未结束，或缺少价格数据，暂无可评估样本。'
                                         : '当前筛选条件下暂无带概率的历史报告，调整日期范围或过滤条件后重试。')
-                                    : `样本量低于统计显著性阈值（当前 n=${evaluated}，阈值 ${minSamples}），拒绝呈现可靠性曲线。`}
+                                    : `概率样本量低于统计显著性阈值（当前概率 n=${probSamples}，阈值 ${minSamples}，缺 ${Math.max(0, minSamples - probSamples)} 份），拒绝呈现可靠性曲线。${totalSamples > probSamples ? ` 全部可评估样本 ${totalSamples} 份。` : ''}`}
                             </p>
                         </div>
                     )}

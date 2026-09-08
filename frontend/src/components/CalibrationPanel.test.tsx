@@ -110,8 +110,9 @@ describe('CalibrationPanel small sample guard (DAV-758)', () => {
         expect(html).toContain('Brier Score')
 
         // 4. Must display both sample_size and excluded_counts in top metric tiles with equal prominence
-        expect(html).toContain('已评估样本 (n)')
+        expect(html).toContain('概率校准样本 (n)')
         expect(html).toContain('>1<')
+        expect(html).toContain('缺 29 份')
         expect(html).toContain('排除样本 (Excluded)')
         expect(html).toContain('>6<')
         expect(html).toContain('校准有效性')
@@ -119,6 +120,71 @@ describe('CalibrationPanel small sample guard (DAV-758)', () => {
 
         // 5. Table must not display exact rise rate percentages
         expect(html).not.toContain('100.0%')
+    })
+
+    it('withholds curve and displays correct prob n and gap for mixed samples (sample_size=35 >= 30, probability_sample_size=10 < 30)', () => {
+        const mockData = makeMockResponse({
+            sample_size: 35,
+            probability_sample_size: 10,
+            sample_sufficient: false,
+            min_sample_size: 30,
+            insufficient_reason: '样本量不足以支撑校准结论 (当前有效样本 10 份，低于最小阈值 30 份)',
+            brier_score: null,
+        })
+
+        const html = renderToStaticMarkup(<CalibrationPanel initialData={mockData} />)
+
+        // 1. Metric tile must use probability_sample_size (10), not total sample_size (35)
+        expect(html).toContain('概率校准样本 (n)')
+        expect(html).toContain('>10<')
+        expect(html).toContain('缺 20 份')
+        expect(html).not.toContain('缺 0 份')
+        expect(html).not.toContain('已达统计门槛')
+        expect(html).toContain('全部可评估样本 35')
+
+        // 2. Small sample warning alert must reflect probability n=10
+        expect(html).toContain('data-testid="small-sample-warning"')
+        expect(html).toContain('当前概率样本 n=10')
+        expect(html).not.toContain('当前样本 n=35')
+        expect(html).not.toContain('当前概率样本 n=35')
+
+        // 3. Curve withheld placeholder must reflect probability n=10 and gap 20
+        expect(html).not.toContain('data-testid="reliability-chart"')
+        expect(html).toContain('data-testid="curve-withheld-placeholder"')
+        expect(html).toContain('当前概率 n=10')
+        expect(html).not.toContain('当前 n=35')
+    })
+
+    it('withholds curve and displays correct prob n=0 and gap=30 for pure winner-only samples (sample_size=30, probability_sample_size=0)', () => {
+        const mockData = makeMockResponse({
+            sample_size: 30,
+            probability_sample_size: 0,
+            sample_sufficient: false,
+            min_sample_size: 30,
+            insufficient_reason: '样本量不足以支撑校准结论 (当前有效样本 0 份，低于最小阈值 30 份)',
+            brier_score: null,
+        })
+
+        const html = renderToStaticMarkup(<CalibrationPanel initialData={mockData} />)
+
+        // 1. Metric tile must show probability n=0, gap 30, and clearly distinguish total sample_size 30
+        expect(html).toContain('概率校准样本 (n)')
+        expect(html).toContain('>0<')
+        expect(html).toContain('缺 30 份')
+        expect(html).not.toContain('缺 0 份')
+        expect(html).not.toContain('已达统计门槛')
+        expect(html).toContain('全部可评估样本 30')
+
+        // 2. Small sample warning alert must show probability n=0
+        expect(html).toContain('data-testid="small-sample-warning"')
+        expect(html).toContain('当前概率样本 n=0')
+        expect(html).not.toContain('当前样本 n=30')
+
+        // 3. Curve placeholder must withhold curve and show probability n=0, gap 30
+        expect(html).not.toContain('data-testid="reliability-chart"')
+        expect(html).toContain('data-testid="curve-withheld-placeholder"')
+        expect(html).toContain('当前概率 n=0')
+        expect(html).not.toContain('当前 n=30')
     })
 
     it('renders reliability curve and suppresses warning alert when sample size meets threshold (n=30)', () => {
@@ -192,9 +258,82 @@ describe('CalibrationPanel small sample guard (DAV-758)', () => {
 
         // 4. Must display active calibration status
         expect(html).toContain('有效校准')
+        expect(html).toContain('概率校准样本 (n)')
+        expect(html).toContain('>30<')
 
         // 5. Table must display calculated rates
         expect(html).toContain('62.5%')
+    })
+
+    it('renders reliability curve and displays probability n when threshold is met in mixed data (sample_size=45, probability_sample_size=30)', () => {
+        const mockData = makeMockResponse({
+            sample_size: 45,
+            probability_sample_size: 30,
+            sample_sufficient: true,
+            min_sample_size: 30,
+            insufficient_reason: null,
+            brier_score: 0.1852,
+            buckets: [
+                {
+                    bucket: '0-50%',
+                    probability_min: 0.0,
+                    probability_max: 0.5,
+                    count: 5,
+                    rise_count: 2,
+                    rise_rate: 40.0,
+                    avg_probability: 0.42,
+                },
+                {
+                    bucket: '50-60%',
+                    probability_min: 0.5,
+                    probability_max: 0.6,
+                    count: 5,
+                    rise_count: 3,
+                    rise_rate: 60.0,
+                    avg_probability: 0.55,
+                },
+                {
+                    bucket: '60-70%',
+                    probability_min: 0.6,
+                    probability_max: 0.7,
+                    count: 8,
+                    rise_count: 5,
+                    rise_rate: 62.5,
+                    avg_probability: 0.65,
+                },
+                {
+                    bucket: '70-80%',
+                    probability_min: 0.7,
+                    probability_max: 0.8,
+                    count: 6,
+                    rise_count: 4,
+                    rise_rate: 66.7,
+                    avg_probability: 0.75,
+                },
+                {
+                    bucket: '80+%',
+                    probability_min: 0.8,
+                    probability_max: 1.0,
+                    count: 6,
+                    rise_count: 5,
+                    rise_rate: 83.3,
+                    avg_probability: 0.88,
+                },
+            ],
+        })
+
+        const html = renderToStaticMarkup(<CalibrationPanel initialData={mockData} />)
+
+        // 1. Must render reliability curve chart and suppress warnings
+        expect(html).toContain('data-testid="reliability-chart"')
+        expect(html).not.toContain('data-testid="small-sample-warning"')
+        expect(html).not.toContain('data-testid="curve-withheld-placeholder"')
+
+        // 2. Must show probability n=30, threshold met, and distinct total sample_size 45
+        expect(html).toContain('概率校准样本 (n)')
+        expect(html).toContain('>30<')
+        expect(html).toContain('已达统计门槛 (≥30)')
+        expect(html).toContain('全部可评估样本 45')
     })
 
     it('renders clean zero-sample state when sample_size is 0', () => {

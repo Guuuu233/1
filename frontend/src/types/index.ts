@@ -700,7 +700,7 @@ export interface CalibrationExcludedCounts {
 export interface CalibrationResponse {
     brier_score: number | null
     sample_size: number
-    probability_sample_size?: number
+    probability_sample_size: number
     sample_sufficient?: boolean
     min_sample_size?: number
     insufficient_reason?: string | null
