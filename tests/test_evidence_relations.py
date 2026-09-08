@@ -544,3 +544,38 @@ def test_relation_is_unhashable_and_cannot_be_in_set():
     s = set()
     with pytest.raises(TypeError, match="unhashable type: 'EvidenceRelation'"):
         s.add(rel)
+
+
+def test_frozen_metadata_can_be_reused_to_construct_new_relation():
+    """已冻结的 metadata 必须能再次用于构造 relation。
+
+    __post_init__ 深冻结后 metadata 是 MappingProxyType/tuple，本身不是 json
+    可序列化类型。若 JSON 安全校验直接作用于入参，则任何以既有 relation 的
+    metadata 组合新 relation 的路径都会被误判为「非 JSON 安全」而失败。
+    """
+    src = EvidenceRelation("a", RelationType.SUPPORTS, "b", {"k": {"n": 1}, "lst": [1, 2]})
+
+    reused = EvidenceRelation("c", RelationType.SUPPORTS, "d", src.metadata)
+    assert reused.metadata["k"]["n"] == 1
+    assert reused.metadata["lst"] == (1, 2)
+    assert isinstance(reused.metadata, MappingProxyType)
+
+    # from_dict 收到冻结 metadata 同样不得报错
+    via_dict = EvidenceRelation.from_dict(
+        {"source_id": "e", "relation_type": "SUPPORTS", "target_id": "f", "metadata": src.metadata}
+    )
+    assert via_dict.to_dict()["metadata"] == {"k": {"n": 1}, "lst": [1, 2]}
+
+
+def test_json_safety_rejections_survive_thaw_normalization():
+    """解冻归一不得放宽 JSON 安全校验：NaN/Inf 与不可序列化对象仍须拒绝。"""
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            EvidenceRelation("a", RelationType.SUPPORTS, "b", {"x": bad})
+
+    with pytest.raises(TypeError):
+        EvidenceRelation("a", RelationType.SUPPORTS, "b", {"x": object()})
+
+    # 嵌套层同样拒绝
+    with pytest.raises(ValueError):
+        EvidenceRelation("a", RelationType.SUPPORTS, "b", {"outer": {"inner": float("nan")}})

@@ -94,16 +94,20 @@ class EvidenceRelation:
             raise TypeError(f"metadata must be a Mapping, got {type(self.metadata).__name__}")
         _check_string_keys(self.metadata)
 
-        # 4. 严格校验 JSON 安全性并使用 allow_nan=False 拒绝 NaN/Infinity
+        # 4. 先解冻成纯 dict/list 再校验 JSON 安全性（allow_nan=False 拒绝 NaN/Infinity）。
+        #    冻结产物 MappingProxyType/tuple 不是 json 可序列化类型，若直接对入参 dumps，
+        #    会把「已冻结的合法 metadata」误判为「非 JSON 安全」，使 relation 无法由既有
+        #    relation 的 metadata 组合，from_dict 收到冻结映射时同样报错。
+        thawed = _deep_thaw_mapping(self.metadata)
         try:
-            json.dumps(self.metadata, allow_nan=False)
+            json.dumps(thawed, allow_nan=False)
         except (TypeError, ValueError, OverflowError) as e:
             if isinstance(e, TypeError):
                 raise TypeError(f"EvidenceRelation.metadata must be JSON-safe: {e}") from e
             raise ValueError(f"EvidenceRelation.metadata must be JSON-safe and cannot contain NaN/Infinity: {e}") from e
 
         # 5. 递归深度冻结包装
-        object.__setattr__(self, "metadata", _deep_freeze_mapping(dict(self.metadata)))
+        object.__setattr__(self, "metadata", _deep_freeze_mapping(thawed))
 
     @property
     def dedupe_key(self) -> tuple[str, str, str]:
