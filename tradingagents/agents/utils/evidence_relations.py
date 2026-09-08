@@ -200,9 +200,13 @@ class EvidenceRelationGraph:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> EvidenceRelationGraph:
+    def from_dict(cls, data: Mapping[str, Any] | None) -> EvidenceRelationGraph:
         """Robust deserialization with safe fallback for None/empty inputs."""
-        if not data or not isinstance(data, Mapping):
+        if data is None:
+            return cls()
+        if not isinstance(data, Mapping):
+            raise TypeError(f"EvidenceRelationGraph.from_dict requires a mapping or None, got {type(data).__name__}")
+        if not data:
             return cls()
         version = str(data.get("version") or "v1")
         raw_relations = data.get("relations")

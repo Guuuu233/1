@@ -666,3 +666,35 @@ def test_timestamp_field_priority_and_semantics_are_explicit():
         baseline_date="2026-09-08",
     )
     assert res3.reason == FailClosedReason.MISSING_TIMESTAMP
+
+
+# ============================================================================
+# Knife 1: EvidenceRelationGraph.from_dict 顶层类型严格校验
+# ============================================================================
+
+@pytest.mark.parametrize("bad_input", [
+    [],
+    "bad",
+    123,
+    True,
+    False,
+    [{"source_id": "a", "relation_type": "SUPPORTS", "target_id": "b"}],
+    ("a", "b"),
+])
+def test_from_dict_non_mapping_top_level_raises_type_error(bad_input):
+    """任何非 Mapping 顶层输入抛 TypeError，不得静默变空图。"""
+    with pytest.raises(TypeError, match="EvidenceRelationGraph.from_dict requires a mapping or None"):
+        EvidenceRelationGraph.from_dict(bad_input)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("empty_mapping", [
+    None,
+    {},
+    {"relations": None},
+    MappingProxyType({}),
+    MappingProxyType({"relations": None}),
+])
+def test_from_dict_empty_or_none_mapping_preserves_empty_graph(empty_mapping):
+    """保留 None / 空 Mapping / relations=None 的既有空图语义。"""
+    graph = EvidenceRelationGraph.from_dict(empty_mapping)
+    assert graph.relations == ()
