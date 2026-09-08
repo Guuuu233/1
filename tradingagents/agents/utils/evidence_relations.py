@@ -372,7 +372,7 @@ def detect_relation_cycles(
     target_types: Container[RelationType] | None = None,
 ) -> list[list[str]]:
     """Detect cycles within hierarchical/derivation relation subgraphs using DFS 3-color."""
-    types = target_types or {RelationType.DERIVED_OBSERVATION, RelationType.REVISES}
+    types: Container[RelationType] = {RelationType.DERIVED_OBSERVATION, RelationType.REVISES} if target_types is None else target_types
     adj: dict[str, list[str]] = {}
     for r in relations:
         if r.relation_type in types:

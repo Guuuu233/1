@@ -785,3 +785,26 @@ def test_valid_iso_date_and_datetime_strings_accepted_symmetrically(valid_iso_st
     )
     assert res_lookahead.valid is False
     assert res_lookahead.reason == FailClosedReason.LOOKAHEAD_VIOLATION
+
+
+# ============================================================================
+# Knife 3: detect_relation_cycles 显式空容器检测零种关系
+# ============================================================================
+
+@pytest.mark.parametrize("empty_target_types", [
+    set(),
+    [],
+    (),
+    frozenset(),
+])
+def test_detect_relation_cycles_empty_target_types_detects_zero_cycles(empty_target_types):
+    """只有 target_types is None 使用默认；显式空容器必须检测零种关系并返回空列表。"""
+    r1 = EvidenceRelation("node_x", RelationType.DERIVED_OBSERVATION, "node_y")
+    r2 = EvidenceRelation("node_y", RelationType.DERIVED_OBSERVATION, "node_x")
+    relations = [r1, r2]
+
+    # 1. 默认 target_types=None 检测出衍生时序环路
+    assert len(detect_relation_cycles(relations, target_types=None)) > 0
+
+    # 2. 显式空容器必须检测 0 种关系，返回空列表 []
+    assert detect_relation_cycles(relations, target_types=empty_target_types) == []
