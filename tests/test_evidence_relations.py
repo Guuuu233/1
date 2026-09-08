@@ -698,3 +698,90 @@ def test_from_dict_empty_or_none_mapping_preserves_empty_graph(empty_mapping):
     """保留 None / 空 Mapping / relations=None 的既有空图语义。"""
     graph = EvidenceRelationGraph.from_dict(empty_mapping)
     assert graph.relations == ()
+
+
+# ============================================================================
+# Knife 2: 完整时间字符串验证与对称 fail-closed
+# ============================================================================
+
+@pytest.mark.parametrize("malformed_ts", [
+    "2026-09-08junk",
+    "2026-09-08T99:99:99",
+    "2026-99-99",
+    "2026-09-08 99:99:99",
+    "2026-09-08T",
+    "2026-09-08-extra",
+    "invalid",
+    "",
+    "   ",
+])
+def test_malformed_timestamp_strings_fail_closed_symmetrically(malformed_ts):
+    """非法时间、任意 junk 尾缀、空白均返回 MALFORMED_TIMESTAMP，baseline 与 ctx 行为对称。"""
+    rel = EvidenceRelation("a", RelationType.SUPPORTS, "b")
+    ids = {"a", "b"}
+
+    # 1. baseline_date 侧拦截
+    res_base = validate_relation(
+        rel, ids,
+        source_ctx={"published_at": "2026-09-01"},
+        target_ctx={"published_at": "2026-09-01"},
+        baseline_date=malformed_ts,
+    )
+    assert res_base.valid is False
+    assert res_base.reason == FailClosedReason.MALFORMED_TIMESTAMP
+
+    # 2. source_ctx 侧拦截
+    res_src = validate_relation(
+        rel, ids,
+        source_ctx={"published_at": malformed_ts},
+        target_ctx={"published_at": "2026-09-01"},
+        baseline_date="2026-09-08",
+    )
+    assert res_src.valid is False
+    assert res_src.reason == FailClosedReason.MALFORMED_TIMESTAMP
+
+    # 3. target_ctx 侧拦截
+    res_tgt = validate_relation(
+        rel, ids,
+        source_ctx={"published_at": "2026-09-01"},
+        target_ctx={"published_at": malformed_ts},
+        baseline_date="2026-09-08",
+    )
+    assert res_tgt.valid is False
+    assert res_tgt.reason == FailClosedReason.MALFORMED_TIMESTAMP
+
+
+@pytest.mark.parametrize("valid_iso_str,expected_date", [
+    ("2026-09-08", date(2026, 9, 8)),
+    ("2026-09-08T12:34:56", date(2026, 9, 8)),
+    ("2026-09-08T12:34:56Z", date(2026, 9, 8)),
+    ("2026-09-08T12:34:56+00:00", date(2026, 9, 8)),
+    ("2026-09-08T12:34:56+08:00", date(2026, 9, 8)),
+    ("2026-09-08 12:34:56", date(2026, 9, 8)),
+    ("2026-09-08 12:34:56.123456", date(2026, 9, 8)),
+    ("2026-09-08T12:34:56.123456Z", date(2026, 9, 8)),
+])
+def test_valid_iso_date_and_datetime_strings_accepted_symmetrically(valid_iso_str, expected_date):
+    """明确接受完整 ISO date 和合法 ISO datetime，对称支持 baseline 与 ctx。"""
+    rel = EvidenceRelation("a", RelationType.SUPPORTS, "b")
+    ids = {"a", "b"}
+
+    # 当证据与基准日同一天（均为 valid_iso_str），应当验证通过
+    res = validate_relation(
+        rel, ids,
+        source_ctx={"published_at": valid_iso_str},
+        target_ctx={"trade_date": valid_iso_str},
+        baseline_date=valid_iso_str,
+    )
+    assert res.valid is True
+    assert res.reason is None
+
+    # baseline 设为前一天，证据设为 valid_iso_str，必须判定为前视穿透 LOOKAHEAD_VIOLATION
+    res_lookahead = validate_relation(
+        rel, ids,
+        source_ctx={"published_at": valid_iso_str},
+        target_ctx={"trade_date": "2026-09-07"},
+        baseline_date="2026-09-07",
+    )
+    assert res_lookahead.valid is False
+    assert res_lookahead.reason == FailClosedReason.LOOKAHEAD_VIOLATION

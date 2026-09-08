@@ -221,6 +221,41 @@ class EvidenceRelationGraph:
         )
 
 
+def _parse_timestamp_to_date(val: Any) -> date:
+    """Parse date/datetime object or ISO date/datetime string to date.
+
+    Accepts:
+    - datetime instances (normalized to .date())
+    - date instances
+    - full ISO date strings (e.g. '2026-09-08')
+    - valid ISO datetime strings (e.g. '2026-09-08T12:00:00', with optional timezone/microseconds)
+
+    Rejects:
+    - non-date/str types (TypeError)
+    - empty/whitespace strings (ValueError)
+    - strings with trailing junk characters (ValueError)
+    - strings with invalid date or time components (ValueError)
+    """
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    if not isinstance(val, str):
+        raise TypeError(f"Expected date, datetime, or str, got {type(val).__name__}")
+    s = val.strip()
+    if not s:
+        raise ValueError("Empty timestamp string")
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        pass
+    s_iso = (s[:-1] + "+00:00") if (s.endswith("Z") or s.endswith("z")) and len(s) > 10 else s
+    try:
+        return datetime.fromisoformat(s_iso).date()
+    except ValueError as e:
+        raise ValueError(f"Malformed ISO timestamp: {val!r}") from e
+
+
 def validate_relation(
     relation: EvidenceRelation,
     known_node_ids: Container[str],
@@ -253,28 +288,13 @@ def validate_relation(
     # 3. 检查时间前视穿透与畸形日期 fail-closed
     if baseline_date is not None:
         b_dt: date
-        if isinstance(baseline_date, datetime):
-            # datetime 是 date 的子类。若不先归一到 date，b_dt 会保持 datetime，
-            # 而 ctx 侧时间戳已归一为 date，末尾 `dt > b_dt` 就变成 date 与 datetime
-            # 相比并抛 TypeError——护栏由 fail-closed 退化成异常穿透调用方。
-            # 判型顺序须与下方 ctx 时间戳分支保持一致。
-            b_dt = baseline_date.date()
-        elif isinstance(baseline_date, date):
-            b_dt = baseline_date
-        elif isinstance(baseline_date, str):
-            try:
-                b_dt = datetime.strptime(baseline_date.strip()[:10], "%Y-%m-%d").date()
-            except (ValueError, TypeError):
-                return ValidationResult(
-                    valid=False,
-                    reason=FailClosedReason.MALFORMED_TIMESTAMP,
-                    message=f"Malformed baseline_date: {baseline_date!r}",
-                )
-        else:
+        try:
+            b_dt = _parse_timestamp_to_date(baseline_date)
+        except (ValueError, TypeError):
             return ValidationResult(
                 valid=False,
                 reason=FailClosedReason.MALFORMED_TIMESTAMP,
-                message=f"baseline_date must be date or str, got {type(baseline_date).__name__}",
+                message=f"Malformed baseline_date: {baseline_date!r}",
             )
 
         for ctx, name in [(source_ctx, "source"), (target_ctx, "target")]:
@@ -304,24 +324,13 @@ def validate_relation(
                         message=f"{name} context is missing timestamp",
                     )
                 dt: date
-                if isinstance(ts, datetime):
-                    dt = ts.date()
-                elif isinstance(ts, date):
-                    dt = ts
-                elif isinstance(ts, str):
-                    try:
-                        dt = datetime.strptime(ts.strip()[:10], "%Y-%m-%d").date()
-                    except (ValueError, TypeError):
-                        return ValidationResult(
-                            valid=False,
-                            reason=FailClosedReason.MALFORMED_TIMESTAMP,
-                            message=f"{name} context contains malformed timestamp: {ts!r}",
-                        )
-                else:
+                try:
+                    dt = _parse_timestamp_to_date(ts)
+                except (ValueError, TypeError):
                     return ValidationResult(
                         valid=False,
                         reason=FailClosedReason.MALFORMED_TIMESTAMP,
-                        message=f"{name} context timestamp has invalid type: {type(ts).__name__}",
+                        message=f"{name} context contains malformed timestamp: {ts!r}",
                     )
 
                 if dt > b_dt:
