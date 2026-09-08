@@ -92,7 +92,44 @@ DEFAULT_HOLD_DAYS = 5
 #    and self-deception ("已校准" on random noise).
 # 3. Decision Consensus:
 #    Confirmed in DAV-755 diagnosis (H3) and scheduled as a hard gate in DAV-758.
-DEFAULT_MIN_CALIBRATION_SAMPLE_SIZE = max(1, int(os.getenv("CALIBRATION_MIN_SAMPLE_SIZE", "30")))
+DEFAULT_CALIBRATION_MIN_SAMPLE_SIZE_CONSTANT = 30
+
+
+def _parse_min_sample_size_env(env_val: Optional[str] = None) -> int:
+    """Safely parse CALIBRATION_MIN_SAMPLE_SIZE from environment.
+
+    Accepts only reasonable positive integers in [1, 10000].
+    Malformed or out-of-range values (empty string, non-digit, float,
+    negative, zero, excessive magnitude) fail-closed to the named safe default 30
+    and log a warning, completely preventing unhandled import exceptions.
+    """
+    if env_val is None:
+        env_val = os.getenv("CALIBRATION_MIN_SAMPLE_SIZE")
+    if env_val is None:
+        return DEFAULT_CALIBRATION_MIN_SAMPLE_SIZE_CONSTANT
+    raw = env_val.strip()
+    if not raw:
+        return DEFAULT_CALIBRATION_MIN_SAMPLE_SIZE_CONSTANT
+    try:
+        val = int(raw)
+        if 1 <= val <= 10_000:
+            return val
+        logger.warning(
+            "CALIBRATION_MIN_SAMPLE_SIZE=%r out of valid range [1, 10000]; falling back to safe default %d",
+            env_val,
+            DEFAULT_CALIBRATION_MIN_SAMPLE_SIZE_CONSTANT,
+        )
+        return DEFAULT_CALIBRATION_MIN_SAMPLE_SIZE_CONSTANT
+    except (ValueError, TypeError):
+        logger.warning(
+            "Invalid CALIBRATION_MIN_SAMPLE_SIZE=%r (expected integer); falling back to safe default %d",
+            env_val,
+            DEFAULT_CALIBRATION_MIN_SAMPLE_SIZE_CONSTANT,
+        )
+        return DEFAULT_CALIBRATION_MIN_SAMPLE_SIZE_CONSTANT
+
+
+DEFAULT_MIN_CALIBRATION_SAMPLE_SIZE = _parse_min_sample_size_env()
 MIN_CALIBRATION_SAMPLE_SIZE = DEFAULT_MIN_CALIBRATION_SAMPLE_SIZE
 
 

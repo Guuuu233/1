@@ -12,6 +12,9 @@ Verifies:
 """
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -293,3 +296,42 @@ class TestCalibrationEndpointGuard:
         assert payload["insufficient_reason"] is not None
         assert payload["brier_score"] is None
         assert all(b["rise_rate"] is None for b in payload["buckets"])
+
+
+class TestCalibrationThresholdConfigSafety:
+    """Verify CALIBRATION_MIN_SAMPLE_SIZE safe parsing and robust import under malformed env vars (DAV-765)."""
+
+    @pytest.mark.parametrize(
+        ("env_val", "expected_val"),
+        [
+            ("abc", 30),
+            ("", 30),
+            ("   ", 30),
+            ("3.14", 30),
+            ("-5", 30),
+            ("0", 30),
+            ("999999999", 30),
+            ("50", 50),
+            ("1", 1),
+            ("30", 30),
+        ],
+    )
+    def test_subprocess_import_with_env_values(self, env_val: str, expected_val: int):
+        cmd = [
+            sys.executable,
+            "-c",
+            "import api.services.calibration_service as cal; print(cal.DEFAULT_MIN_CALIBRATION_SAMPLE_SIZE)",
+        ]
+        env = dict(os.environ)
+        env["CALIBRATION_MIN_SAMPLE_SIZE"] = env_val
+        env.pop("PYTHONPATH", None)
+        proc = subprocess.run(
+            cmd,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, f"Import failed with stderr:\n{proc.stderr}"
+        output = proc.stdout.strip().splitlines()[-1]
+        assert int(output) == expected_val
