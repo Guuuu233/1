@@ -1042,3 +1042,138 @@ def test_unserializable_evidence_raises_type_error():
 
     with pytest.raises(TypeError):
         _run_analyst_node(llm, collector)
+
+
+@pytest.mark.parametrize(
+    "invalid_val",
+    [
+        "inf",
+        "-inf",
+        "+inf",
+        "Infinity",
+        "-Infinity",
+        "+Infinity",
+        "INFINITY",
+        "NaN",
+        "nan",
+        "1e999999",
+        "-1e999999",
+        "+1e999999",
+        Decimal("NaN"),
+        Decimal("-NaN"),
+        Decimal("Infinity"),
+        Decimal("-Infinity"),
+        Decimal("1e999999"),
+        Decimal("-1e999999"),
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        None,
+        True,
+        False,
+        "",
+        "   ",
+        [],
+        {},
+        (),
+        "abc",
+        "none",
+        "null",
+    ],
+)
+def test_non_finite_values_fail_closed_and_downgrade(invalid_val):
+    """22. 验证非有限数值/溢出值/非法对象全部被拒绝并使状态按既有契约降级，绝不显示 available。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    selection = {
+        "selected_source": "tushare_eastmoney_moneyflow_dc",
+        "selected_algorithm_group": "new_algorithm_group",
+        "reference_only": True,
+    }
+
+    # 1. 两个比率均为非法/非有限值：降级为 unavailable
+    scale_both_invalid = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": invalid_val,
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": invalid_val,
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": [],
+    }
+    out_both = format_fund_flow_scale_metrics_prompt(scale_both_invalid, selection)
+    assert "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)" in out_both
+    assert "- 状态: available" not in out_both
+    assert "完整可用" not in out_both
+    assert "契约矛盾: status 声明为 available，但两个比率均不可用，降级为 unavailable" in out_both
+
+    # 2. 单个比率为非法/非有限值，另一个为有效有限值：降级为 partial，非法比率显示为缺失/不可用
+    scale_single_invalid = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": invalid_val,
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": Decimal("0.027273"),
+        "net_to_amount_text": "0.027273",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": [],
+    }
+    out_single = format_fund_flow_scale_metrics_prompt(scale_single_invalid, selection)
+    assert "- 状态: partial (部分可用)" in out_single
+    assert "- 状态: available" not in out_single
+    assert "- 状态: available (完整可用)" not in out_single
+    assert "- 净额占流通市值比 (net_to_circ_mv): 缺失/不可用" in out_single
+    assert "- 净额占成交额比 (net_to_amount): 0.027273 (分母来源: tushare.daily_basic, 分母单位: 万元)" in out_single
+    assert "契约矛盾: status 声明为 available，但仅有一个比率完整可用，降级为 partial" in out_single
+
+
+@pytest.mark.parametrize(
+    "circ_val, amt_val, circ_expected, amt_expected",
+    [
+        (0, 0, "0", "0"),
+        (0.0, 0.0, "0", "0"),
+        ("0", "0", "0", "0"),
+        ("0.0", "0.0", "0.0", "0.0"),
+        (Decimal("0"), Decimal("0"), "0", "0"),
+        (-1, -2, "-1", "-2"),
+        (-0.05, -0.10, "-0.05", "-0.1"),
+        ("-0.05", "-0.10", "-0.05", "-0.10"),
+        (Decimal("-0.05"), Decimal("-0.10"), "-0.05", "-0.10"),
+        (Decimal("0.006755"), Decimal("0.027273"), "0.006755", "0.027273"),
+        ("0.006755", "0.027273", "0.006755", "0.027273"),
+        ("  0.006755  ", "  0.027273  ", "0.006755", "0.027273"),
+        ("1e-5", "1e5", "1e-5", "1e5"),
+        (Decimal("1e-5"), Decimal("1e5"), "0.00001", "1E+5"),
+    ],
+)
+def test_finite_values_accepted_as_available(circ_val, amt_val, circ_expected, amt_expected):
+    """23. 验证有限零/负数/Decimal/数值字符串均被正确识别并保持 available。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    scale_metrics = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": circ_val,
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": amt_val,
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": [],
+    }
+    selection = {
+        "selected_source": "tushare_eastmoney_moneyflow_dc",
+        "selected_algorithm_group": "new_algorithm_group",
+        "reference_only": True,
+    }
+    out = format_fund_flow_scale_metrics_prompt(scale_metrics, selection)
+    assert "- 状态: available (完整可用)" in out
+    assert f"- 净额占流通市值比 (net_to_circ_mv): {circ_expected} (分母来源: tushare.daily_basic, 分母单位: 万元)" in out
+    assert f"- 净额占成交额比 (net_to_amount): {amt_expected} (分母来源: tushare.daily_basic, 分母单位: 万元)" in out
