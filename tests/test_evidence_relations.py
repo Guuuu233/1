@@ -28,7 +28,7 @@ Covers:
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 import json
 from types import MappingProxyType
 import pytest
@@ -579,3 +579,37 @@ def test_json_safety_rejections_survive_thaw_normalization():
     # 嵌套层同样拒绝
     with pytest.raises(ValueError):
         EvidenceRelation("a", RelationType.SUPPORTS, "b", {"outer": {"inner": float("nan")}})
+
+
+def test_datetime_baseline_fails_closed_not_raises():
+    """baseline_date 传 datetime 必须走 fail-closed，不得抛异常穿透调用方。
+
+    datetime 是 date 的子类；若判型顺序把 datetime 归入 date 分支而不归一，
+    末尾 `dt > b_dt` 会拿 date 与 datetime 相比并抛 TypeError，使护栏在
+    调用方看来是崩溃而非 ValidationResult。
+    """
+    rel = EvidenceRelation("a", RelationType.SUPPORTS, "b")
+    ids = {"a", "b"}
+
+    # 同日：不算前视，必须返回 valid 的 ValidationResult
+    res = validate_relation(
+        rel, ids, {"published_at": "2026-09-08"}, {"published_at": "2026-09-08"},
+        baseline_date=datetime(2026, 9, 8, 23, 59, 59),
+    )
+    assert isinstance(res, ValidationResult)
+    assert res.valid is True
+
+    # 证据日期晚于 baseline：必须 fail-closed 为 LOOKAHEAD_VIOLATION，而不是抛错
+    res2 = validate_relation(
+        rel, ids, {"published_at": "2026-09-09"}, {"published_at": "2026-09-08"},
+        baseline_date=datetime(2026, 9, 8, 10, 0, 0),
+    )
+    assert res2.valid is False
+    assert res2.reason == FailClosedReason.LOOKAHEAD_VIOLATION
+
+    # datetime 与等价 date 的判定必须一致
+    res3 = validate_relation(
+        rel, ids, {"published_at": "2026-09-09"}, {"published_at": "2026-09-08"},
+        baseline_date=date(2026, 9, 8),
+    )
+    assert res3.reason == res2.reason

@@ -249,7 +249,13 @@ def validate_relation(
     # 3. 检查时间前视穿透与畸形日期 fail-closed
     if baseline_date is not None:
         b_dt: date
-        if isinstance(baseline_date, date):
+        if isinstance(baseline_date, datetime):
+            # datetime 是 date 的子类。若不先归一到 date，b_dt 会保持 datetime，
+            # 而 ctx 侧时间戳已归一为 date，末尾 `dt > b_dt` 就变成 date 与 datetime
+            # 相比并抛 TypeError——护栏由 fail-closed 退化成异常穿透调用方。
+            # 判型顺序须与下方 ctx 时间戳分支保持一致。
+            b_dt = baseline_date.date()
+        elif isinstance(baseline_date, date):
             b_dt = baseline_date
         elif isinstance(baseline_date, str):
             try:
