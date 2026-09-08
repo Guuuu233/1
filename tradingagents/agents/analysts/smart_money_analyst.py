@@ -1,4 +1,6 @@
 import logging
+from collections.abc import Mapping
+from typing import Any
 from tradingagents.agents.utils.context_utils import get_cn_stock_name, format_phase1_reports
 import asyncio
 import json
@@ -49,6 +51,143 @@ def _resolve_research_horizon(state: dict | None) -> str:
     return "short"
 
 
+def format_fund_flow_scale_metrics_prompt(
+    scale_metrics: Mapping[str, Any] | None,
+    selection: Mapping[str, Any] | None,
+) -> str:
+    """Format deterministic scale_metrics evidence snippet for LLM prompt.
+
+    Contracts:
+    1. Read real fields only from scale_metrics.
+    2. Read selected_algorithm_group and reference_only ONLY from selection (never from scale_metrics).
+    3. Ratio 0 is a valid value, not missing.
+    4. When status is 'available', present both ratios, text, date, ticker, denominator source and units.
+       Never recalculate or change precision.
+    5. When status is 'partial', present available ratio only, do not manufacture the other, preserve gaps.
+    6. When status is 'unavailable' or scale_metrics is missing/empty, explicitly state
+       '相对规模不可用/不得据绝对净额替代', fail-closed, never silently omit.
+    7. Append node-local discipline constraints: statistical reference only, no account identity inference,
+       no cross-stock ranking, no new scores/weights/probabilities/signals.
+    8. Input objects are not modified in place.
+    """
+    discipline_text = (
+        "【纪律约束】相对规模比率仅作为同标的、同交易日的统计参考证据；"
+        "严禁据此识别机构或散户账户身份，严禁进行跨股票横向排名，严禁据此生成新评分、权重、概率或交易执行信号。"
+        "不得在分母缺失时退回绝对净额作规模结论。"
+    )
+
+    # 1. Read metadata strictly and ONLY from selection
+    selected_algorithm_group = None
+    reference_only = False
+    selected_source = None
+    if isinstance(selection, Mapping):
+        selected_algorithm_group = selection.get("selected_algorithm_group")
+        reference_only = bool(selection.get("reference_only"))
+        selected_source = selection.get("selected_source")
+
+    # 2. Handle missing or empty scale_metrics -> fail closed
+    if not isinstance(scale_metrics, Mapping) or not scale_metrics:
+        return (
+            "【资金流相对规模证据（同标的同日相对参考）】\n"
+            "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)\n"
+            "- 缺口说明: 缺少 scale_metrics 相对规模对象\n"
+            f"- {discipline_text}"
+        )
+
+    # 3. Read real fields from scale_metrics
+    ts_code = scale_metrics.get("ts_code") or ""
+    trade_date = scale_metrics.get("trade_date") or ""
+    status = str(scale_metrics.get("status") or "").strip().lower()
+
+    net_to_circ_mv = scale_metrics.get("net_to_circ_mv")
+    net_to_circ_mv_text = scale_metrics.get("net_to_circ_mv_text")
+    circ_mv_source = scale_metrics.get("circ_mv_source") or scale_metrics.get("denominator_source") or "未指定"
+    circ_mv_unit = scale_metrics.get("circ_mv_unit") or "未指定"
+
+    net_to_amount = scale_metrics.get("net_to_amount")
+    net_to_amount_text = scale_metrics.get("net_to_amount_text")
+    amount_source = scale_metrics.get("amount_source") or scale_metrics.get("denominator_source") or "未指定"
+    amount_unit = scale_metrics.get("amount_unit") or "未指定"
+
+    denominator_source = scale_metrics.get("denominator_source") or "未指定"
+    raw_gaps = scale_metrics.get("gaps") or scale_metrics.get("gap_list") or []
+    gaps = [str(g) for g in raw_gaps] if isinstance(raw_gaps, (list, tuple)) else []
+
+    # Valid ratio check: 0 is valid, not missing!
+    has_circ = net_to_circ_mv is not None
+    has_amt = net_to_amount is not None
+
+    if net_to_circ_mv_text is not None and str(net_to_circ_mv_text).strip():
+        circ_str = str(net_to_circ_mv_text)
+    elif has_circ:
+        circ_str = str(net_to_circ_mv)
+    else:
+        circ_str = None
+
+    if net_to_amount_text is not None and str(net_to_amount_text).strip():
+        amt_str = str(net_to_amount_text)
+    elif has_amt:
+        amt_str = str(net_to_amount)
+    else:
+        amt_str = None
+
+    # Determine status if not explicitly set
+    if not status:
+        if has_circ and has_amt:
+            status = "available"
+        elif has_circ or has_amt:
+            status = "partial"
+        else:
+            status = "unavailable"
+
+    # Scenario: unavailable
+    if status == "unavailable" or (not has_circ and not has_amt):
+        gap_lines = "\n".join(f"  * {g}" for g in gaps) if gaps else "  * 分母缺失或不可用"
+        return (
+            "【资金流相对规模证据（同标的同日相对参考）】\n"
+            "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)\n"
+            f"- 标的代码: {ts_code}\n"
+            f"- 交易日期: {trade_date}\n"
+            f"- 缺口说明:\n{gap_lines}\n"
+            f"- {discipline_text}"
+        )
+
+    # Common lines for available and partial
+    lines = [
+        "【资金流相对规模证据（同标的同日相对参考）】",
+        f"- 状态: {status} ({'完整可用' if status == 'available' else '部分可用'})",
+        f"- 标的代码: {ts_code}",
+        f"- 交易日期: {trade_date}",
+        f"- 资金来源: {selected_source or denominator_source}",
+        f"- 算法组: {selected_algorithm_group or '未指定'}",
+        f"- 参考属性: reference_only={reference_only}",
+    ]
+
+    if has_circ:
+        lines.append(
+            f"- 净额占流通市值比 (net_to_circ_mv): {circ_str} "
+            f"(分母来源: {circ_mv_source}, 分母单位: {circ_mv_unit})"
+        )
+    else:
+        lines.append("- 净额占流通市值比 (net_to_circ_mv): 缺失/不可用")
+
+    if has_amt:
+        lines.append(
+            f"- 净额占成交额比 (net_to_amount): {amt_str} "
+            f"(分母来源: {amount_source}, 分母单位: {amount_unit})"
+        )
+    else:
+        lines.append("- 净额占成交额比 (net_to_amount): 缺失/不可用")
+
+    if gaps:
+        lines.append("- 缺口说明:")
+        for g in gaps:
+            lines.append(f"  * {g}")
+
+    lines.append(f"- {discipline_text}")
+    return "\n".join(lines)
+
+
 def create_smart_money_analyst(llm, data_collector=None):
     async def _safe(tool, payload):
         try:
@@ -83,9 +222,12 @@ def create_smart_money_analyst(llm, data_collector=None):
         pool = data_collector.get(ticker, current_date) if data_collector else None
         state_market_data_context = state.get("market_data_context")
 
+        pool_context = None
         if pool is not None:
             fund_flow = pool.get("fund_flow_individual", "无数据")
             pool_context = pool.get("market_data_context")
+            if not isinstance(pool_context, dict) and isinstance(state_market_data_context, dict):
+                pool_context = state_market_data_context
             fund_flow_evidence = (
                 pool_context.get("fund_flow_evidence", {})
                 if isinstance(pool_context, dict)
@@ -97,7 +239,7 @@ def create_smart_money_analyst(llm, data_collector=None):
             from tradingagents.agents.utils.agent_utils import (
                 get_individual_fund_flow, get_lhb_detail, get_indicators,
             )
-            
+
             # Parallelize fallback fetches
             results = await asyncio.gather(
                 _safe(get_individual_fund_flow, {"symbol": ticker, "curr_date": current_date}),
@@ -108,7 +250,11 @@ def create_smart_money_analyst(llm, data_collector=None):
                 })
             )
             fund_flow, lhb, volume = results
-            fund_flow_evidence = {}
+            fund_flow_evidence = (
+                state_market_data_context.get("fund_flow_evidence", {})
+                if isinstance(state_market_data_context, dict)
+                else {}
+            )
 
         selection: dict = {}
         if isinstance(fund_flow_evidence, dict):
@@ -122,8 +268,18 @@ def create_smart_money_analyst(llm, data_collector=None):
             )
             if isinstance(fund_flow_evidence, dict):
                 fund_flow_evidence["selection"] = selection
-        evidence_text = json.dumps(fund_flow_evidence, ensure_ascii=False, sort_keys=True)
+        evidence_text = json.dumps(fund_flow_evidence, ensure_ascii=False, sort_keys=True, default=str)
         consensus_instruction = consensus_prompt_instruction(selection)
+
+        scale_metrics = None
+        if isinstance(fund_flow_evidence, dict):
+            scale_metrics = fund_flow_evidence.get("scale_metrics")
+        if scale_metrics is None and isinstance(pool_context, dict):
+            scale_metrics = pool_context.get("scale_metrics")
+        if scale_metrics is None and isinstance(state_market_data_context, dict):
+            scale_metrics = state_market_data_context.get("scale_metrics")
+
+        scale_metrics_prompt = format_fund_flow_scale_metrics_prompt(scale_metrics, selection)
         validation = (
             fund_flow_evidence.get("validation", {})
             if isinstance(fund_flow_evidence, dict)
@@ -167,6 +323,7 @@ def create_smart_money_analyst(llm, data_collector=None):
                 f"【资金流数据（来源、日期与口径见数据）】\n{fund_flow}\n\n"
                 f"【资金流结构化 evidence（仅用于精确累计，不得从展示文本反推）】\n{evidence_text}\n\n"
                 f"【资金流来源选择与方向规则】\n{consensus_instruction}\n\n"
+                f"{scale_metrics_prompt}\n\n"
                 f"【龙虎榜数据】\n{lhb}\n\n"
                 f"【成交量指标(vwma)】\n{volume}"
             )),
