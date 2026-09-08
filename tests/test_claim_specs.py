@@ -648,3 +648,138 @@ def test_run_horizon_isolation_invariant():
     assert run_state["horizon"] == "medium"
     assert FUTURE_RESERVED_FOR_E03B_E03C is True
     assert "Run horizon" in FUTURE_RESERVED_DISCLAIMER
+
+
+def test_dataclass_direct_instantiation_validation_negative():
+    """32. Direct instantiation of dataclasses enforces __post_init__ gates with ValueError."""
+    # 1. ClaimApplicability
+    with pytest.raises(ValueError):
+        ClaimApplicability(
+            symbol="invalid_sym",
+            horizon=ApplicabilityHorizon.SHORT,
+            metric_basis=MetricBasis.VENDOR_QFQ,
+            pit_date="2026-09-08",
+        )
+    with pytest.raises(ValueError):
+        ClaimApplicability(
+            symbol="600519",
+            horizon="invalid_horizon",  # type: ignore
+            metric_basis=MetricBasis.VENDOR_QFQ,
+            pit_date="2026-09-08",
+        )
+    with pytest.raises(ValueError):
+        ClaimApplicability(
+            symbol="600519",
+            horizon=ApplicabilityHorizon.SHORT,
+            metric_basis=MetricBasis.VENDOR_QFQ,
+            pit_date="2026-02-29",  # non-leap year
+        )
+    with pytest.raises(ValueError):
+        ClaimApplicability(
+            symbol="600519",
+            horizon=ApplicabilityHorizon.SHORT,
+            metric_basis=MetricBasis.VENDOR_QFQ,
+            pit_date="2026-09-08",
+            preconditions="string_not_seq",  # type: ignore
+        )
+
+    # 2. ClaimInvalidationCondition
+    with pytest.raises(ValueError):
+        ClaimInvalidationCondition(
+            condition_id="",
+            metric="close_price",
+            operator=ConditionOperator.LT,
+            threshold=1600.0,
+            unit=ConditionUnit.CNY,
+            period=ConditionPeriod.CLOSE_1D,
+            source=ConditionSource.DAILY_PRICE,
+            pit_date="2026-09-08",
+        )
+    with pytest.raises(ValueError):
+        ClaimInvalidationCondition(
+            condition_id="inv-1",
+            metric="",
+            operator=ConditionOperator.LT,
+            threshold=1600.0,
+            unit=ConditionUnit.CNY,
+            period=ConditionPeriod.CLOSE_1D,
+            source=ConditionSource.DAILY_PRICE,
+            pit_date="2026-09-08",
+        )
+    with pytest.raises(ValueError):
+        ClaimInvalidationCondition(
+            condition_id="inv-1",
+            metric="close_price",
+            operator="bad_op",  # type: ignore
+            threshold=1600.0,
+            unit=ConditionUnit.CNY,
+            period=ConditionPeriod.CLOSE_1D,
+            source=ConditionSource.DAILY_PRICE,
+            pit_date="2026-09-08",
+        )
+    with pytest.raises(ValueError):
+        ClaimInvalidationCondition(
+            condition_id="inv-1",
+            metric="close_price",
+            operator=ConditionOperator.LT,
+            threshold=float("nan"),
+            unit=ConditionUnit.CNY,
+            period=ConditionPeriod.CLOSE_1D,
+            source=ConditionSource.DAILY_PRICE,
+            pit_date="2026-09-08",
+        )
+    with pytest.raises(ValueError):
+        ClaimInvalidationCondition(
+            condition_id="inv-1",
+            metric="close_price",
+            operator=ConditionOperator.LT,
+            threshold=Decimal("1e1000"),
+            unit=ConditionUnit.CNY,
+            period=ConditionPeriod.CLOSE_1D,
+            source=ConditionSource.DAILY_PRICE,
+            pit_date="2026-09-08",
+        )
+    with pytest.raises(ValueError):
+        ClaimInvalidationCondition(
+            condition_id="inv-1",
+            metric="close_price",
+            operator=ConditionOperator.LT,
+            threshold=1600.0,
+            unit=ConditionUnit.CNY,
+            period=ConditionPeriod.CLOSE_1D,
+            source=ConditionSource.DAILY_PRICE,
+            pit_date="2026-02-29",
+        )
+
+    # 3. ClaimReviewContract
+    valid_app = ClaimApplicability(
+        symbol="600519",
+        horizon=ApplicabilityHorizon.SHORT,
+        metric_basis=MetricBasis.VENDOR_QFQ,
+        pit_date="2026-09-08",
+    )
+    valid_cond = ClaimInvalidationCondition(
+        condition_id="inv-1",
+        metric="close_price",
+        operator=ConditionOperator.LT,
+        threshold=1600.0,
+        unit=ConditionUnit.CNY,
+        period=ConditionPeriod.CLOSE_1D,
+        source=ConditionSource.DAILY_PRICE,
+        pit_date="2026-09-08",
+    )
+    with pytest.raises(ValueError):
+        ClaimReviewContract(
+            applicability=valid_app,
+            invalidation_conditions=(),  # empty conditions
+        )
+    with pytest.raises(ValueError):
+        ClaimReviewContract(
+            applicability=valid_app,
+            invalidation_conditions=(valid_cond, valid_cond),  # duplicate condition_id
+        )
+    with pytest.raises(ValueError):
+        ClaimReviewContract(
+            applicability="not_an_applicability",  # type: ignore
+            invalidation_conditions=(valid_cond,),
+        )

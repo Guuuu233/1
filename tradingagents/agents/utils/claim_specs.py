@@ -217,13 +217,28 @@ class ClaimApplicability:
     pit_date: str
     preconditions: tuple[str, ...] = field(default_factory=tuple)
 
+    def __post_init__(self) -> None:
+        ok, err, norm = validate_applicability(self.to_dict())
+        if not ok:
+            raise ValueError(f"Invalid applicability dataclass: {err}")
+        object.__setattr__(self, "symbol", norm["symbol"])
+        object.__setattr__(self, "horizon", ApplicabilityHorizon(norm["horizon"]))
+        object.__setattr__(self, "metric_basis", MetricBasis(norm["metric_basis"]))
+        object.__setattr__(self, "pit_date", norm["pit_date"])
+        object.__setattr__(self, "preconditions", tuple(norm["preconditions"]))
+
     def to_dict(self) -> dict[str, Any]:
+        preconds: Any
+        if isinstance(self.preconditions, (list, tuple)):
+            preconds = list(self.preconditions)
+        else:
+            preconds = self.preconditions
         return {
             "symbol": self.symbol,
             "horizon": self.horizon.value if isinstance(self.horizon, Enum) else self.horizon,
             "metric_basis": self.metric_basis.value if isinstance(self.metric_basis, Enum) else self.metric_basis,
             "pit_date": self.pit_date,
-            "preconditions": list(self.preconditions),
+            "preconditions": preconds,
         }
 
     @classmethod
@@ -251,6 +266,19 @@ class ClaimInvalidationCondition:
     period: ConditionPeriod
     source: ConditionSource
     pit_date: str
+
+    def __post_init__(self) -> None:
+        ok, err, norm = validate_invalidation_condition(self.to_dict())
+        if not ok:
+            raise ValueError(f"Invalid condition dataclass: {err}")
+        object.__setattr__(self, "condition_id", norm["condition_id"])
+        object.__setattr__(self, "metric", norm["metric"])
+        object.__setattr__(self, "operator", ConditionOperator(norm["operator"]))
+        object.__setattr__(self, "threshold", norm["threshold"])
+        object.__setattr__(self, "unit", ConditionUnit(norm["unit"]))
+        object.__setattr__(self, "period", ConditionPeriod(norm["period"]))
+        object.__setattr__(self, "source", ConditionSource(norm["source"]))
+        object.__setattr__(self, "pit_date", norm["pit_date"])
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -288,10 +316,41 @@ class ClaimReviewContract:
     invalidation_conditions: tuple[ClaimInvalidationCondition, ...]
     claim_id: str | None = None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.applicability, ClaimApplicability):
+            raise ValueError(f"applicability must be an instance of ClaimApplicability, got {type(self.applicability).__name__}")
+        if not isinstance(self.invalidation_conditions, (list, tuple)):
+            raise ValueError(f"invalidation_conditions must be a tuple or list, got {type(self.invalidation_conditions).__name__}")
+        for idx, cond in enumerate(self.invalidation_conditions):
+            if not isinstance(cond, ClaimInvalidationCondition):
+                raise ValueError(f"invalidation_conditions item at index {idx} must be a ClaimInvalidationCondition, got {type(cond).__name__}")
+        object.__setattr__(self, "invalidation_conditions", tuple(self.invalidation_conditions))
+        if self.claim_id is not None:
+            if not isinstance(self.claim_id, str) or not self.claim_id.strip():
+                raise ValueError("claim_id must be a non-empty string when provided")
+            object.__setattr__(self, "claim_id", self.claim_id.strip())
+        ok, errors, _ = validate_claim_review_contract(self.to_dict())
+        if not ok:
+            raise ValueError(f"Invalid claim review contract: {errors}")
+
     def to_dict(self) -> dict[str, Any]:
+        app_dict = (
+            self.applicability.to_dict()
+            if hasattr(self.applicability, "to_dict")
+            else self.applicability
+        )
+        cond_dicts: Any
+        if isinstance(self.invalidation_conditions, (list, tuple)):
+            cond_dicts = [
+                c.to_dict() if hasattr(c, "to_dict") else c
+                for c in self.invalidation_conditions
+            ]
+        else:
+            cond_dicts = self.invalidation_conditions
+
         res: dict[str, Any] = {
-            "applicability": self.applicability.to_dict(),
-            "invalidation_conditions": [c.to_dict() for c in self.invalidation_conditions],
+            "applicability": app_dict,
+            "invalidation_conditions": cond_dicts,
         }
         if self.claim_id is not None:
             res["claim_id"] = self.claim_id
