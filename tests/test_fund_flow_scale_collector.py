@@ -820,4 +820,3 @@ class TestFundFlowScaleCollectorJsonSerialization:
 
         with pytest.raises(TypeError, match="not JSON serializable"):
             _serialize_scale_metrics_for_json({"unknown": DummyUnknown()})
-
