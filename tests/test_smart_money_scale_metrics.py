@@ -1267,3 +1267,432 @@ def test_fund_flow_source_isolation_end_to_end_node():
     assert "- 资金来源: daily_basic" not in human_prompt
     assert "- 资金来源: tushare.daily_basic" not in human_prompt
     assert "(分母来源: tushare.daily_basic, 分母单位: 万元)" in human_prompt
+
+
+@pytest.mark.parametrize(
+    "ratio_key, text_key, raw_val, invalid_text, expected_raw_str",
+    [
+        # circ_mv with NaN / Inf / 1e999999
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "NaN", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "nan", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "-NaN", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "Infinity", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "-Infinity", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "+Infinity", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "INFINITY", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "inf", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "-inf", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "+inf", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "1e999999", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "-1e999999", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "+1e999999", "0.006755"),
+        # circ_mv with non-numeric strings
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "abc", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "none", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "null", "0.006755"),
+        # circ_mv with blanks
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "   ", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "\t\n", "0.006755"),
+        # circ_mv with malformed objects (non-strings)
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), None, "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), 123, "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), True, "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), False, "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), Decimal("0.006755"), "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), float("nan"), "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), float("inf"), "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), [], "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), {}, "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), (), "0.006755"),
+        # amount with NaN / Inf / 1e999999
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "NaN", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "nan", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "-NaN", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "Infinity", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "-Infinity", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "+Infinity", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "INFINITY", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "inf", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "-inf", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "+inf", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "1e999999", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "-1e999999", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "+1e999999", "0.027273"),
+        # amount with non-numeric strings
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "invalid", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "none", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "null", "0.027273"),
+        # amount with blanks
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "   ", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "\t\n", "0.027273"),
+        # amount with malformed objects
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), None, "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), 9999, "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), True, "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), False, "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), Decimal("0.027273"), "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), float("nan"), "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), float("inf"), "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), [], "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), {}, "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), (), "0.027273"),
+    ],
+)
+def test_invalid_or_malformed_ratio_text_fallback_and_gap(
+    ratio_key, text_key, raw_val, invalid_text, expected_raw_str
+):
+    """26. text 为 NaN/Inf/Infinity/1e999999、畸形对象、空白、非数值时回退原始比率并追加非法 gap。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    scale_metrics = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": Decimal("0.006755"),
+        "net_to_circ_mv_text": "0.006755",
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": Decimal("0.027273"),
+        "net_to_amount_text": "0.027273",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": [],
+    }
+    # 覆盖对应比率的 raw 和 text
+    scale_metrics[ratio_key] = raw_val
+    scale_metrics[text_key] = invalid_text
+
+    selection = {
+        "selected_source": "tushare_eastmoney_moneyflow_dc",
+        "selected_algorithm_group": "new_algorithm_group",
+        "reference_only": True,
+    }
+
+    out = format_fund_flow_scale_metrics_prompt(scale_metrics, selection)
+
+    # 1. 绝不能在比率行直接展示非有限/非法文本（如 NaN, Infinity 等）
+    if isinstance(invalid_text, str) and invalid_text.strip():
+        inv_str = invalid_text.strip()
+        # 确保比率展示行不含非法文本
+        ratio_line_prefix = (
+            "- 净额占流通市值比 (net_to_circ_mv):"
+            if ratio_key == "net_to_circ_mv"
+            else "- 净额占成交额比 (net_to_amount):"
+        )
+        for line in out.splitlines():
+            if line.startswith(ratio_line_prefix):
+                assert inv_str not in line
+
+    # 2. 比率展示行必须回退为已验证的原始比率数值字符串
+    assert f": {expected_raw_str} (分母来源:" in out
+
+    # 3. 必须追加明确契约 gap，指出对应 text 非法
+    assert f"契约异常: {text_key} 非法" in out
+
+
+@pytest.mark.parametrize(
+    "ratio_key, text_key, raw_val, inconsistent_text, expected_raw_str",
+    [
+        # circ_mv inconsistent
+        ("net_to_circ_mv", "net_to_circ_mv_text", 0.1, "999", "0.1"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "999", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "0.006756", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", 0, "1", "0"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", 0.0, "-0.5", "0"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", "0.006755", "0.05", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("-0.05"), "0.05", "-0.05"),
+        # amount inconsistent
+        ("net_to_amount", "net_to_amount_text", 0.1, "999", "0.1"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "999", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "0.05", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", 0, "0.01", "0"),
+        ("net_to_amount", "net_to_amount_text", 0.0, "100", "0"),
+        ("net_to_amount", "net_to_amount_text", Decimal("1e-5"), "0.01", "0.00001"),
+    ],
+)
+def test_inconsistent_ratio_text_fallback_and_gap(
+    ratio_key, text_key, raw_val, inconsistent_text, expected_raw_str
+):
+    """27. text 为有限但与原始值不一致时回退原始比率并追加不一致 gap。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    scale_metrics = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": Decimal("0.006755"),
+        "net_to_circ_mv_text": "0.006755",
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": Decimal("0.027273"),
+        "net_to_amount_text": "0.027273",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": [],
+    }
+    scale_metrics[ratio_key] = raw_val
+    scale_metrics[text_key] = inconsistent_text
+
+    selection = {
+        "selected_source": "tushare_eastmoney_moneyflow_dc",
+        "selected_algorithm_group": "new_algorithm_group",
+        "reference_only": True,
+    }
+
+    out = format_fund_flow_scale_metrics_prompt(scale_metrics, selection)
+
+    # 1. 绝不能在比率行展示不一致的文本（核对数值展示部分）
+    ratio_line_prefix = (
+        "- 净额占流通市值比 (net_to_circ_mv):"
+        if ratio_key == "net_to_circ_mv"
+        else "- 净额占成交额比 (net_to_amount):"
+    )
+    for line in out.splitlines():
+        if line.startswith(ratio_line_prefix):
+            assert f": {inconsistent_text} (" not in line
+
+    # 2. 比率展示行必须回退为已验证的原始比率数值字符串
+    assert f": {expected_raw_str} (分母来源:" in out
+
+    # 3. 必须追加明确契约 gap，指出对应 text 与原始比率不一致
+    assert f"契约异常: {text_key} 与原始比率不一致" in out
+
+
+@pytest.mark.parametrize(
+    "ratio_key, text_key, raw_val, valid_text, expected_display",
+    [
+        # circ_mv valid consistent
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "0.006755", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", 0, "0", "0"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", 0.0, "0", "0"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0"), "0", "0"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.0"), "0", "0"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "  0.006755  ", "0.006755"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", Decimal("0.006755"), "0.0067550", "0.0067550"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", 0.1, "0.1", "0.1"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", -0.05, "-0.05", "-0.05"),
+        ("net_to_circ_mv", "net_to_circ_mv_text", "0.006755", "0.006755", "0.006755"),
+        # amount valid consistent
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "0.027273", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", 0, "0", "0"),
+        ("net_to_amount", "net_to_amount_text", 0.0, "0", "0"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0"), "0", "0"),
+        ("net_to_amount", "net_to_amount_text", 0.027273, "0.027273", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", "0.027273", "0.027273", "0.027273"),
+        ("net_to_amount", "net_to_amount_text", Decimal("0.027273"), "  0.027273  ", "0.027273"),
+    ],
+)
+def test_valid_consistent_ratio_text_accepted(
+    ratio_key, text_key, raw_val, valid_text, expected_display
+):
+    """28. text 为合法且与原始比率一致时用于展示，不追加异常 gap。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    scale_metrics = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": Decimal("0.006755"),
+        "net_to_circ_mv_text": "0.006755",
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": Decimal("0.027273"),
+        "net_to_amount_text": "0.027273",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": [],
+    }
+    scale_metrics[ratio_key] = raw_val
+    scale_metrics[text_key] = valid_text
+
+    selection = {
+        "selected_source": "tushare_eastmoney_moneyflow_dc",
+        "selected_algorithm_group": "new_algorithm_group",
+        "reference_only": True,
+    }
+
+    out = format_fund_flow_scale_metrics_prompt(scale_metrics, selection)
+
+    # 1. 正确展示合法文本
+    assert f": {expected_display} (分母来源:" in out
+    # 2. 状态保持完整可用
+    assert "- 状态: available (完整可用)" in out
+    # 3. 绝不追加对应比率的异常 gap
+    assert f"契约异常: {text_key}" not in out
+
+
+@pytest.mark.parametrize(
+    "invalid_raw",
+    [
+        "NaN",
+        "nan",
+        "-NaN",
+        "Infinity",
+        "-Infinity",
+        "+Infinity",
+        "INFINITY",
+        "inf",
+        "-inf",
+        "1e999999",
+        "-1e999999",
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        Decimal("-Infinity"),
+        Decimal("1e999999"),
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        None,
+        True,
+        False,
+        "",
+        "   ",
+        "abc",
+        "none",
+        "null",
+        [],
+        {},
+        (),
+    ],
+)
+def test_raw_non_finite_with_finite_text_remains_unavailable(invalid_raw):
+    """29. raw 非有限 + text 有限时绝不能救活，状态保持 unavailable，不得显示 available。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    selection = {
+        "selected_source": "tushare_eastmoney_moneyflow_dc",
+        "selected_algorithm_group": "new_algorithm_group",
+        "reference_only": True,
+    }
+
+    # 1. 两个比率 raw 均为非法/非有限，但 text 均伪造为看似有效的有限数值
+    scale_both_invalid_raw = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",  # 上游声明为 available
+        "net_to_circ_mv": invalid_raw,
+        "net_to_circ_mv_text": "0.006755",  # 看似有限有效
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": invalid_raw,
+        "net_to_amount_text": "0.027273",  # 看似有限有效
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": [],
+    }
+
+    out_both = format_fund_flow_scale_metrics_prompt(scale_both_invalid_raw, selection)
+
+    # 必须降级为 unavailable，绝不能被 text 救活
+    assert "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)" in out_both
+    assert "- 状态: available" not in out_both
+    assert "完整可用" not in out_both
+    # 有限 text 绝不得作为可用比率呈现
+    assert "0.006755 (分母来源:" not in out_both
+    assert "0.027273 (分母来源:" not in out_both
+
+    # 2. 单个比率 raw 非有限 + text 有限，另一个比率完全合法：降级为 partial，非有限比率不可用
+    scale_single_invalid_raw = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": invalid_raw,
+        "net_to_circ_mv_text": "0.006755",  # 非有限 raw + 有限 text
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": Decimal("0.027273"),
+        "net_to_amount_text": "0.027273",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": [],
+    }
+
+    out_single = format_fund_flow_scale_metrics_prompt(scale_single_invalid_raw, selection)
+
+    assert "- 状态: partial (部分可用)" in out_single
+    assert "- 状态: available" not in out_single
+    assert "- 状态: available (完整可用)" not in out_single
+    assert "- 净额占流通市值比 (net_to_circ_mv): 缺失/不可用" in out_single
+    assert "0.006755 (分母来源:" not in out_single
+    assert "- 净额占成交额比 (net_to_amount): 0.027273" in out_single
+
+
+def test_end_to_end_node_codex_reproduction_prevented():
+    """30. 端到端 analyst node 验证 Codex 实测复现场景：raw 有限但 text 为 NaN/Infinity 时回退 raw 并报警。"""
+    # 场景 1：Codex 复现案例，raw 有限，text 为 NaN / Infinity
+    scale_metrics_codex = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": Decimal("0.006755"),
+        "net_to_circ_mv_text": "NaN",  # 非有限文本
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": Decimal("0.027273"),
+        "net_to_amount_text": "Infinity",  # 非有限文本
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": [],
+    }
+    selection = {
+        "selected_source": "tushare_eastmoney_moneyflow_dc",
+        "selected_algorithm_group": "new_algorithm_group",
+        "reference_only": True,
+    }
+    fund_flow_evidence = {
+        "scale_metrics": scale_metrics_codex,
+        "selection": selection,
+        "records": [],
+    }
+
+    llm = _RecordingLLM()
+    collector = _MockCollector(fund_flow_evidence=fund_flow_evidence)
+    result = _run_analyst_node(llm, collector)
+
+    assert "smart_money_report" in result
+    human_prompt = llm.messages[1].content
+
+    # 1. 绝不呈现非有限文本 NaN / Infinity 作为比率数值
+    assert "(net_to_circ_mv): NaN" not in human_prompt
+    assert "(net_to_amount): Infinity" not in human_prompt
+    # 2. 回退到已验证的原始比率数值字符串
+    assert "- 净额占流通市值比 (net_to_circ_mv): 0.006755" in human_prompt
+    assert "- 净额占成交额比 (net_to_amount): 0.027273" in human_prompt
+    # 3. 必须追加缺口说明，指出 text 非法
+    assert "契约异常: net_to_circ_mv_text 非法" in human_prompt
+    assert "契约异常: net_to_amount_text 非法" in human_prompt
+
+    # 场景 2：不一致文本示例 raw 0.1 + text '999'
+    scale_metrics_inconsistent = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": 0.1,
+        "net_to_circ_mv_text": "999",  # 与 raw 不一致
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": Decimal("0.027273"),
+        "net_to_amount_text": "0.027273",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": [],
+    }
+    collector2 = _MockCollector(
+        fund_flow_evidence={
+            "scale_metrics": scale_metrics_inconsistent,
+            "selection": selection,
+            "records": [],
+        }
+    )
+    llm2 = _RecordingLLM()
+    _run_analyst_node(llm2, collector2)
+    human_prompt2 = llm2.messages[1].content
+
+    # 绝不展示 999 作为比率数值
+    assert "(net_to_circ_mv): 999" not in human_prompt2
+    # 回退到原始比率 0.1
+    assert "- 净额占流通市值比 (net_to_circ_mv): 0.1" in human_prompt2
+    # 追加不一致缺口说明
+    assert "契约异常: net_to_circ_mv_text 与原始比率不一致" in human_prompt2

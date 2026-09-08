@@ -226,22 +226,68 @@ def format_fund_flow_scale_metrics_prompt(
     has_circ_val = _is_valid_num(net_to_circ_mv)
     has_amt_val = _is_valid_num(net_to_amount)
 
-    # String representations
-    if has_circ_val:
-        if net_to_circ_mv_text is not None and str(net_to_circ_mv_text).strip():
-            circ_str = str(net_to_circ_mv_text).strip()
-        else:
-            circ_str = "0" if net_to_circ_mv == 0 else str(net_to_circ_mv).strip()
-    else:
-        circ_str = None
+    # String representations and text consistency verification
+    def _resolve_ratio_display(
+        raw_val: Any,
+        text_val: Any,
+        has_val: bool,
+        field_name: str,
+    ) -> str | None:
+        if not has_val:
+            return None
 
-    if has_amt_val:
-        if net_to_amount_text is not None and str(net_to_amount_text).strip():
-            amt_str = str(net_to_amount_text).strip()
-        else:
-            amt_str = "0" if net_to_amount == 0 else str(net_to_amount).strip()
-    else:
-        amt_str = None
+        raw_str = "0" if raw_val == 0 else str(raw_val).strip()
+        try:
+            d_raw = Decimal(str(raw_val).strip())
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            return None
+
+        if not isinstance(text_val, str):
+            gaps.append(
+                f"契约异常: {field_name} 非法（非字符串类型: {type(text_val).__name__}），回退到原始比率数值展示"
+            )
+            return raw_str
+
+        stripped_text = text_val.strip()
+        if not stripped_text:
+            gaps.append(
+                f"契约异常: {field_name} 非法（空白字符串），回退到原始比率数值展示"
+            )
+            return raw_str
+
+        try:
+            d_text = Decimal(stripped_text)
+            if not d_text.is_finite():
+                gaps.append(
+                    f"契约异常: {field_name} 非法（非有限数值: {stripped_text}），回退到原始比率数值展示"
+                )
+                return raw_str
+            fv_text = float(d_text)
+            if not math.isfinite(fv_text):
+                gaps.append(
+                    f"契约异常: {field_name} 非法（非有限数值/溢出: {stripped_text}），回退到原始比率数值展示"
+                )
+                return raw_str
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            gaps.append(
+                f"契约异常: {field_name} 非法（非有限数值或非数值: {stripped_text}），回退到原始比率数值展示"
+            )
+            return raw_str
+
+        if d_text != d_raw:
+            gaps.append(
+                f"契约异常: {field_name} 与原始比率不一致 (text: '{stripped_text}' vs raw: {d_raw})，回退到原始比率数值展示"
+            )
+            return raw_str
+
+        return stripped_text
+
+    circ_str = _resolve_ratio_display(
+        net_to_circ_mv, net_to_circ_mv_text, has_circ_val, "net_to_circ_mv_text"
+    )
+    amt_str = _resolve_ratio_display(
+        net_to_amount, net_to_amount_text, has_amt_val, "net_to_amount_text"
+    )
 
     # Check structural completeness of each ratio
     circ_usable = has_circ_val and bool(circ_mv_source) and bool(circ_mv_unit)
