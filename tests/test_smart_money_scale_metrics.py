@@ -1696,3 +1696,303 @@ def test_end_to_end_node_codex_reproduction_prevented():
     assert "- 净额占流通市值比 (net_to_circ_mv): 0.1" in human_prompt2
     # 追加不一致缺口说明
     assert "契约异常: net_to_circ_mv_text 与原始比率不一致" in human_prompt2
+
+
+_MALFORMED_LABEL_VALUES = [
+    {"bad": "val"},
+    ["bad"],
+    ("bad",),
+    True,
+    False,
+    123,
+    0,
+    3.14,
+    0.0,
+    Decimal("100"),
+    "",
+    "   ",
+    "\t\n",
+]
+
+
+@pytest.mark.parametrize("field_name", ["ts_code", "trade_date"])
+@pytest.mark.parametrize("invalid_val", _MALFORMED_LABEL_VALUES)
+def test_identity_fields_malformed_types_fail_closed_to_unavailable(field_name, invalid_val):
+    """31. ts_code / trade_date 为 dict/list/tuple/bool/number/空白字符串时，整体 fail-closed 为 unavailable，断言畸形 repr 不以有效标的/日期进入提示。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    scale_metrics = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": Decimal("0.006755"),
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": Decimal("0.027273"),
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": [],
+    }
+    scale_metrics[field_name] = invalid_val
+    selection = {
+        "selected_source": "tushare_eastmoney_moneyflow_dc",
+        "selected_algorithm_group": "new_algorithm_group",
+        "reference_only": True,
+    }
+
+    out = format_fund_flow_scale_metrics_prompt(scale_metrics, selection)
+
+    # 1. 整体必须 fail closed 为 unavailable
+    assert "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)" in out
+    assert "- 状态: available" not in out
+    assert "- 状态: available (完整可用)" not in out
+    assert "- 状态: partial" not in out
+
+    # 2. 两个比率均不得作为可用比率呈现
+    assert "0.006755 (分母来源:" not in out
+    assert "0.027273 (分母来源:" not in out
+
+    # 3. 畸形对象的 repr / str 绝不得作为有效标的或日期展示
+    if field_name == "ts_code":
+        assert "- 标的代码: 缺失" in out
+        if isinstance(invalid_val, str) and not invalid_val.strip():
+            assert "契约异常: 标的代码 (ts_code) 缺失" in out
+        else:
+            assert f"契约异常: 标的代码 (ts_code) 畸形（非字符串类型: {type(invalid_val).__name__}）" in out
+        if str(invalid_val).strip():
+            assert f"- 标的代码: {invalid_val}" not in out
+    else:
+        assert "- 交易日期: 缺失" in out
+        if isinstance(invalid_val, str) and not invalid_val.strip():
+            assert "契约异常: 交易日期 (trade_date) 缺失" in out
+        else:
+            assert f"契约异常: 交易日期 (trade_date) 畸形（非字符串类型: {type(invalid_val).__name__}）" in out
+        if str(invalid_val).strip():
+            assert f"- 交易日期: {invalid_val}" not in out
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["circ_mv_source", "circ_mv_unit", "amount_source", "amount_unit"],
+)
+@pytest.mark.parametrize("invalid_val", _MALFORMED_LABEL_VALUES)
+def test_denominator_fields_malformed_types_downgrade_and_exclude_repr(field_name, invalid_val):
+    """32. 分母 source/unit 为 dict/list/tuple/bool/number/空白字符串时，只使对应比率不可用，降级为 partial，断言畸形 repr 不以有效来源/单位进入提示。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    scale_metrics = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": Decimal("0.006755"),
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": Decimal("0.027273"),
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": [],
+    }
+    scale_metrics[field_name] = invalid_val
+    selection = {
+        "selected_source": "tushare_eastmoney_moneyflow_dc",
+        "selected_algorithm_group": "new_algorithm_group",
+        "reference_only": True,
+    }
+
+    out = format_fund_flow_scale_metrics_prompt(scale_metrics, selection)
+
+    # 1. 状态必须从 available 降级为 partial
+    assert "- 状态: partial (部分可用)" in out
+    assert "- 状态: available" not in out
+    assert "- 状态: available (完整可用)" not in out
+
+    # 2. 对应受影响比率不可用，另一合法比率正常展示且不被破坏
+    if field_name in ("circ_mv_source", "circ_mv_unit"):
+        assert "- 净额占流通市值比 (net_to_circ_mv): 缺失/不可用" in out
+        assert "- 净额占成交额比 (net_to_amount): 0.027273 (分母来源: tushare.daily_basic, 分母单位: 万元)" in out
+    else:
+        assert "- 净额占成交额比 (net_to_amount): 缺失/不可用" in out
+        assert "- 净额占流通市值比 (net_to_circ_mv): 0.006755 (分母来源: tushare.daily_basic, 分母单位: 万元)" in out
+
+    # 3. 畸形对象的 repr/str 绝不作为有效来源或单位进入提示
+    if str(invalid_val).strip():
+        assert f"分母来源: {invalid_val}" not in out
+        assert f"分母单位: {invalid_val}" not in out
+
+    # 4. 必须记录字段名与真实类型
+    if isinstance(invalid_val, str) and not invalid_val.strip():
+        assert f"契约异常: {field_name} 缺失（空白字符串）" in out
+    else:
+        assert f"契约异常: {field_name} 畸形（非字符串类型: {type(invalid_val).__name__}）" in out
+
+
+@pytest.mark.parametrize(
+    "fallback_kind, fallback_key, top_level_field, affected_ratio_prefix, intact_ratio_prefix",
+    [
+        ("denominator_sources", "circ_mv", "circ_mv_source", "- 净额占流通市值比 (net_to_circ_mv):", "- 净额占成交额比 (net_to_amount):"),
+        ("denominator_sources", "amount", "amount_source", "- 净额占成交额比 (net_to_amount):", "- 净额占流通市值比 (net_to_circ_mv):"),
+        ("denominator_units", "circ_mv", "circ_mv_unit", "- 净额占流通市值比 (net_to_circ_mv):", "- 净额占成交额比 (net_to_amount):"),
+        ("denominator_units", "amount", "amount_unit", "- 净额占成交额比 (net_to_amount):", "- 净额占流通市值比 (net_to_circ_mv):"),
+    ],
+)
+@pytest.mark.parametrize("invalid_val", _MALFORMED_LABEL_VALUES)
+def test_fallback_denominator_fields_malformed_types_downgrade_and_exclude_repr(
+    fallback_kind, fallback_key, top_level_field, affected_ratio_prefix, intact_ratio_prefix, invalid_val
+):
+    """33. denominator_sources / denominator_units 中的 fallback 对应值为 dict/list/tuple/bool/number/空白字符串时，只使对应比率不可用，降级为 partial，断言畸形 repr 不以有效来源/单位进入提示。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    scale_metrics = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": Decimal("0.006755"),
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": Decimal("0.027273"),
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "denominator_sources": {
+            "circ_mv": "tushare.daily_basic",
+            "amount": "tushare.daily_basic",
+        },
+        "denominator_units": {
+            "circ_mv": "万元",
+            "amount": "万元",
+        },
+        "gaps": [],
+    }
+    # 顶层置为 None 以触发对应 fallback
+    scale_metrics[top_level_field] = None
+    # 注入畸形 fallback 值
+    scale_metrics[fallback_kind][fallback_key] = invalid_val
+
+    selection = {
+        "selected_source": "tushare_eastmoney_moneyflow_dc",
+        "selected_algorithm_group": "new_algorithm_group",
+        "reference_only": True,
+    }
+
+    out = format_fund_flow_scale_metrics_prompt(scale_metrics, selection)
+
+    # 1. 状态降级为 partial
+    assert "- 状态: partial (部分可用)" in out
+    assert "- 状态: available" not in out
+
+    # 2. 受影响比率不可用，另一合法比率正常展示
+    assert f"{affected_ratio_prefix} 缺失/不可用" in out
+    assert f"{intact_ratio_prefix} 0." in out
+
+    # 3. 畸形对象的 repr/str 绝不作为有效来源或单位进入提示
+    if str(invalid_val).strip():
+        assert f"分母来源: {invalid_val}" not in out
+        assert f"分母单位: {invalid_val}" not in out
+
+    # 4. 必须记录字段名与真实类型
+    if isinstance(invalid_val, str) and not invalid_val.strip():
+        assert f"契约异常: {fallback_kind}['{fallback_key}'] 缺失（空白字符串）" in out
+    else:
+        assert f"契约异常: {fallback_kind}['{fallback_key}'] 畸形（非字符串类型: {type(invalid_val).__name__}）" in out
+
+
+@pytest.mark.parametrize(
+    "field_name, fallback_kind, fallback_key",
+    [
+        ("circ_mv_source", "denominator_sources", "circ_mv"),
+        ("circ_mv_unit", "denominator_units", "circ_mv"),
+        ("amount_source", "denominator_sources", "amount"),
+        ("amount_unit", "denominator_units", "amount"),
+    ],
+)
+@pytest.mark.parametrize("invalid_val", [{"bad": "source"}, ["bad"], ("bad",), True, False, 123, 0, 0.0, Decimal("100"), "", "   "])
+def test_top_level_malformed_not_rescued_by_valid_fallback(field_name, fallback_kind, fallback_key, invalid_val):
+    """34. 顶层分母标签畸形时，即使存在合法的 fallback 也绝不能被救活；只使对应比率不可用并降级。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    scale_metrics = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": Decimal("0.006755"),
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": Decimal("0.027273"),
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "denominator_sources": {
+            "circ_mv": "tushare.daily_basic",
+            "amount": "tushare.daily_basic",
+        },
+        "denominator_units": {
+            "circ_mv": "万元",
+            "amount": "万元",
+        },
+        "gaps": [],
+    }
+    scale_metrics[field_name] = invalid_val
+    selection = {
+        "selected_source": "tushare_eastmoney_moneyflow_dc",
+        "selected_algorithm_group": "new_algorithm_group",
+        "reference_only": True,
+    }
+
+    out = format_fund_flow_scale_metrics_prompt(scale_metrics, selection)
+    assert "- 状态: partial (部分可用)" in out
+    assert "- 状态: available" not in out
+    if field_name in ("circ_mv_source", "circ_mv_unit"):
+        assert "- 净额占流通市值比 (net_to_circ_mv): 缺失/不可用" in out
+    else:
+        assert "- 净额占成交额比 (net_to_amount): 缺失/不可用" in out
+
+
+def test_end_to_end_node_malformed_identity_and_denominator_labels():
+    """35. 端到端 node 验证畸形 ts_code / trade_date / circ_mv_source / amount_unit 被拦截且不进入提示。"""
+    # 场景 A: ts_code = {} 触发 unavailable
+    scale_metrics_a = {
+        "ts_code": {"bad": "code"},
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": Decimal("0.006755"),
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "net_to_amount": Decimal("0.027273"),
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": [],
+    }
+    selection = {
+        "selected_source": "tushare_eastmoney_moneyflow_dc",
+        "selected_algorithm_group": "new_algorithm_group",
+        "reference_only": True,
+    }
+    llm = _RecordingLLM()
+    collector = _MockCollector(fund_flow_evidence={"scale_metrics": scale_metrics_a, "selection": selection, "records": []})
+    _run_analyst_node(llm, collector)
+    prompt_a = llm.messages[1].content
+    assert "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)" in prompt_a
+    assert "- 标的代码: 缺失" in prompt_a
+    assert "- 标的代码: {'bad': 'code'}" not in prompt_a
+    assert "契约异常: 标的代码 (ts_code) 畸形（非字符串类型: dict）" in prompt_a
+
+    # 场景 B: circ_mv_source = {"bad": "source"} 触发 partial
+    scale_metrics_b = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": Decimal("0.006755"),
+        "circ_mv_source": {"bad": "source"},
+        "circ_mv_unit": "万元",
+        "net_to_amount": Decimal("0.027273"),
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "gaps": [],
+    }
+    llm_b = _RecordingLLM()
+    collector_b = _MockCollector(fund_flow_evidence={"scale_metrics": scale_metrics_b, "selection": selection, "records": []})
+    _run_analyst_node(llm_b, collector_b)
+    prompt_b = llm_b.messages[1].content
+    assert "- 状态: partial (部分可用)" in prompt_b
+    assert "- 净额占流通市值比 (net_to_circ_mv): 缺失/不可用" in prompt_b
+    assert "分母来源: {'bad': 'source'}" not in prompt_b
+    assert "- 净额占成交额比 (net_to_amount): 0.027273" in prompt_b
+    assert "契约异常: circ_mv_source 畸形（非字符串类型: dict）" in prompt_b

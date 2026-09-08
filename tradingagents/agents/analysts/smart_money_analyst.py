@@ -125,14 +125,35 @@ def format_fund_flow_scale_metrics_prompt(
     # 4. Read real identification fields
     raw_ts_code = scale_metrics.get("ts_code")
     raw_trade_date = scale_metrics.get("trade_date")
-    ts_code = str(raw_ts_code).strip() if raw_ts_code is not None else ""
-    trade_date = str(raw_trade_date).strip() if raw_trade_date is not None else ""
 
+    ts_code = ""
     missing_id_gaps: list[str] = []
-    if not ts_code:
+    if raw_ts_code is None:
         missing_id_gaps.append("契约异常: 标的代码 (ts_code) 缺失，整体相对规模不可用")
-    if not trade_date:
+    elif isinstance(raw_ts_code, str):
+        stripped_code = raw_ts_code.strip()
+        if stripped_code:
+            ts_code = stripped_code
+        else:
+            missing_id_gaps.append("契约异常: 标的代码 (ts_code) 缺失（空白字符串），整体相对规模不可用")
+    else:
+        missing_id_gaps.append(
+            f"契约异常: 标的代码 (ts_code) 畸形（非字符串类型: {type(raw_ts_code).__name__}），整体相对规模不可用"
+        )
+
+    trade_date = ""
+    if raw_trade_date is None:
         missing_id_gaps.append("契约异常: 交易日期 (trade_date) 缺失，整体相对规模不可用")
+    elif isinstance(raw_trade_date, str):
+        stripped_date = raw_trade_date.strip()
+        if stripped_date:
+            trade_date = stripped_date
+        else:
+            missing_id_gaps.append("契约异常: 交易日期 (trade_date) 缺失（空白字符串），整体相对规模不可用")
+    else:
+        missing_id_gaps.append(
+            f"契约异常: 交易日期 (trade_date) 畸形（非字符串类型: {type(raw_trade_date).__name__}），整体相对规模不可用"
+        )
 
     # 5. Read status strictly
     raw_status = scale_metrics.get("status")
@@ -154,52 +175,84 @@ def format_fund_flow_scale_metrics_prompt(
     denominator_sources = scale_metrics.get("denominator_sources")
     denominator_units = scale_metrics.get("denominator_units")
 
+    if denominator_sources is not None and not isinstance(denominator_sources, Mapping):
+        gaps.append(
+            f"契约异常: denominator_sources 畸形（非 Mapping 类型: {type(denominator_sources).__name__}），无法读取 fallback"
+        )
+    if denominator_units is not None and not isinstance(denominator_units, Mapping):
+        gaps.append(
+            f"契约异常: denominator_units 畸形（非 Mapping 类型: {type(denominator_units).__name__}），无法读取 fallback"
+        )
+
     net_to_circ_mv = scale_metrics.get("net_to_circ_mv")
     net_to_circ_mv_text = scale_metrics.get("net_to_circ_mv_text")
     net_to_amount = scale_metrics.get("net_to_amount")
     net_to_amount_text = scale_metrics.get("net_to_amount_text")
 
-    # circ_mv source & unit resolution
-    circ_mv_source = scale_metrics.get("circ_mv_source")
-    if not (circ_mv_source and str(circ_mv_source).strip()):
-        if isinstance(denominator_sources, Mapping):
-            fb_src = denominator_sources.get("circ_mv")
-            circ_mv_source = str(fb_src).strip() if fb_src and str(fb_src).strip() else None
-        else:
-            circ_mv_source = None
-    else:
-        circ_mv_source = str(circ_mv_source).strip()
+    def _resolve_denominator_label(
+        field_name: str,
+        raw_val: Any,
+        fallback_container: Any,
+        fallback_key: str,
+        fallback_name: str,
+    ) -> str | None:
+        if raw_val is not None:
+            if isinstance(raw_val, str):
+                s = raw_val.strip()
+                if s:
+                    return s
+                gaps.append(f"契约异常: {field_name} 缺失（空白字符串），该分母标签不可用")
+                return None
+            gaps.append(
+                f"契约异常: {field_name} 畸形（非字符串类型: {type(raw_val).__name__}），该分母标签不可用"
+            )
+            return None
 
-    circ_mv_unit = scale_metrics.get("circ_mv_unit")
-    if not (circ_mv_unit and str(circ_mv_unit).strip()):
-        if isinstance(denominator_units, Mapping):
-            fb_unit = denominator_units.get("circ_mv")
-            circ_mv_unit = str(fb_unit).strip() if fb_unit and str(fb_unit).strip() else None
-        else:
-            circ_mv_unit = None
-    else:
-        circ_mv_unit = str(circ_mv_unit).strip()
+        if isinstance(fallback_container, Mapping):
+            fb_val = fallback_container.get(fallback_key)
+            if fb_val is not None:
+                if isinstance(fb_val, str):
+                    s = fb_val.strip()
+                    if s:
+                        return s
+                    gaps.append(
+                        f"契约异常: {fallback_name}['{fallback_key}'] 缺失（空白字符串），该分母标签不可用"
+                    )
+                    return None
+                gaps.append(
+                    f"契约异常: {fallback_name}['{fallback_key}'] 畸形（非字符串类型: {type(fb_val).__name__}），该分母标签不可用"
+                )
+                return None
+        return None
 
-    # amount source & unit resolution
-    amount_source = scale_metrics.get("amount_source")
-    if not (amount_source and str(amount_source).strip()):
-        if isinstance(denominator_sources, Mapping):
-            fb_src = denominator_sources.get("amount")
-            amount_source = str(fb_src).strip() if fb_src and str(fb_src).strip() else None
-        else:
-            amount_source = None
-    else:
-        amount_source = str(amount_source).strip()
-
-    amount_unit = scale_metrics.get("amount_unit")
-    if not (amount_unit and str(amount_unit).strip()):
-        if isinstance(denominator_units, Mapping):
-            fb_unit = denominator_units.get("amount")
-            amount_unit = str(fb_unit).strip() if fb_unit and str(fb_unit).strip() else None
-        else:
-            amount_unit = None
-    else:
-        amount_unit = str(amount_unit).strip()
+    circ_mv_source = _resolve_denominator_label(
+        "circ_mv_source",
+        scale_metrics.get("circ_mv_source"),
+        denominator_sources,
+        "circ_mv",
+        "denominator_sources",
+    )
+    circ_mv_unit = _resolve_denominator_label(
+        "circ_mv_unit",
+        scale_metrics.get("circ_mv_unit"),
+        denominator_units,
+        "circ_mv",
+        "denominator_units",
+    )
+    amount_source = _resolve_denominator_label(
+        "amount_source",
+        scale_metrics.get("amount_source"),
+        denominator_sources,
+        "amount",
+        "denominator_sources",
+    )
+    amount_unit = _resolve_denominator_label(
+        "amount_unit",
+        scale_metrics.get("amount_unit"),
+        denominator_units,
+        "amount",
+        "denominator_units",
+    )
 
     # Validate ratios
     def _is_valid_num(v: Any) -> bool:
