@@ -1,4 +1,4 @@
-import { Activity, BarChart3, Loader2, RefreshCw } from 'lucide-react'
+import { Activity, AlertTriangle, Ban, BarChart3, Loader2, RefreshCw } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import {
     Bar,
@@ -16,6 +16,7 @@ import type { CalibrationBucket, CalibrationResponse } from '@/types'
 
 interface CalibrationPanelProps {
     compact?: boolean
+    initialData?: CalibrationResponse | null
 }
 
 type ChartDatum = {
@@ -50,8 +51,8 @@ const tooltipFormatter = (value: TooltipValue | undefined, name: string | number
     return [`${display}%`, label === 'predicted' ? '预测概率(中值)' : '实际上涨率']
 }
 
-export default function CalibrationPanel({ compact = false }: CalibrationPanelProps) {
-    const [data, setData] = useState<CalibrationResponse | null>(null)
+export default function CalibrationPanel({ compact = false, initialData = null }: CalibrationPanelProps) {
+    const [data, setData] = useState<CalibrationResponse | null>(initialData)
     const [loading, setLoading] = useState(false)
     const [error, setError] = useState<string | null>(null)
 
@@ -80,6 +81,7 @@ export default function CalibrationPanel({ compact = false }: CalibrationPanelPr
     )
 
     useEffect(() => {
+        if (initialData) return
         let cancelled = false
         fetchCalibration()
             .then(res => {
@@ -94,7 +96,7 @@ export default function CalibrationPanel({ compact = false }: CalibrationPanelPr
         return () => {
             cancelled = true
         }
-    }, [fetchCalibration])
+    }, [fetchCalibration, initialData])
 
     const handleRefresh = useCallback(() => {
         setLoading(true)
@@ -109,9 +111,13 @@ export default function CalibrationPanel({ compact = false }: CalibrationPanelPr
             .finally(() => setLoading(false))
     }, [fetchCalibration])
 
-    const chartData = data ? toChartData(data.buckets) : []
+    const isSufficient = data?.sample_sufficient ?? false
+    const minSamples = data?.min_sample_size ?? 30
     const evaluated = data?.sample_size ?? 0
     const skipped = data?.skipped_no_outcome ?? 0
+    const excludedCounts = data?.excluded_counts
+    const excludedTotal = excludedCounts?.total ?? (data?.skipped_no_outcome ?? 0)
+    const chartData = data && isSufficient ? toChartData(data.buckets) : []
 
     return (
         <div className="card space-y-4">
@@ -213,53 +219,98 @@ export default function CalibrationPanel({ compact = false }: CalibrationPanelPr
 
             {data && (
                 <>
-                    {/* Summary stats */}
-                    <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+                    {/* Summary stats with equal prominence */}
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
                         <StatTile
                             icon={Activity}
                             label="Brier Score"
-                            value={data.brier_score != null ? data.brier_score.toFixed(4) : '—'}
-                            hint="越低越准（0 完美 / 1 最差）"
+                            value={isSufficient && data.brier_score != null ? data.brier_score.toFixed(4) : '—'}
+                            hint={isSufficient ? '越低越准（0 完美 / 1 最差）' : (data.insufficient_reason ?? '样本不足，指标熔断')}
                         />
                         <StatTile
                             icon={BarChart3}
-                            label="已评估样本"
+                            label="已评估样本 (n)"
                             value={String(evaluated)}
-                            hint={`跳过 ${skipped} 份持有期未到/无价格数据报告`}
+                            hint={isSufficient ? `已达统计门槛 (≥${minSamples})` : `门槛需 ≥${minSamples} 份（缺 ${Math.max(0, minSamples - evaluated)} 份）`}
                         />
                         <StatTile
-                            icon={Activity}
-                            label="覆盖分桶"
-                            value={`${chartData.filter(d => d.count > 0).length}/${chartData.length}`}
-                            hint="含样本的概率分桶"
+                            icon={Ban}
+                            label="排除样本 (Excluded)"
+                            value={String(excludedTotal)}
+                            hint={`无效 ${excludedCounts?.invalid ?? 0} · 弃权 ${excludedCounts?.abstain ?? 0} · 观望/未交易 ${excludedCounts?.no_trade ?? 0} · 未到期 ${excludedCounts?.incomplete ?? skipped}`}
+                        />
+                        <StatTile
+                            icon={isSufficient ? Activity : AlertTriangle}
+                            label="校准有效性"
+                            value={isSufficient ? '有效校准' : (evaluated === 0 ? '无样本' : '样本不足 (熔断)')}
+                            hint={isSufficient ? `含样本分桶 ${chartData.filter(d => d.count > 0).length}/${chartData.length}` : (evaluated === 0 ? '暂无有效评估报告' : '样本极小，不具统计学效力')}
                         />
                     </div>
 
+                    {/* Small sample warning alert */}
+                    {data.sample_size > 0 && !isSufficient && (
+                        <div
+                            className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/40 dark:text-amber-200"
+                            data-testid="small-sample-warning"
+                        >
+                            <div className="flex items-start gap-3">
+                                <AlertTriangle className="h-5 w-5 flex-shrink-0 text-amber-600 dark:text-amber-400 mt-0.5" />
+                                <div className="space-y-1">
+                                    <h4 className="font-semibold text-sm">
+                                        样本量不足以支撑校准结论（当前样本 n={data.sample_size}，最小阈值 {minSamples}）
+                                    </h4>
+                                    <p className="text-xs leading-relaxed opacity-90">
+                                        为防止小样本下的偶然涨跌制造虚假校准曲线（L3 自欺），在样本量达到统计显著性下限前，系统拒绝呈现 Brier Score 与可靠性曲线柱体。
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
                     {/* Reliability curve */}
-                    <div className="h-72 w-full">
-                        <ResponsiveContainer width="100%" height="100%">
-                            <ComposedChart data={chartData} margin={{ top: 8, right: 16, bottom: 8, left: -12 }}>
-                                <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.12} />
-                                <XAxis
-                                    dataKey="bucket"
-                                    tick={{ fill: 'currentColor', opacity: 0.6, fontSize: 12 }}
-                                    axisLine={false}
-                                    tickLine={false}
-                                />
-                                <YAxis
-                                    domain={[0, 100]}
-                                    tickFormatter={value => `${value}%`}
-                                    tick={{ fill: 'currentColor', opacity: 0.6, fontSize: 12 }}
-                                    axisLine={false}
-                                    tickLine={false}
-                                />
-                                <Tooltip formatter={tooltipFormatter} />
-                                <Legend wrapperStyle={{ fontSize: 12 }} />
-                                <Bar dataKey="predicted" name="预测概率(中值)" fill="#6366f1" radius={[4, 4, 0, 0]} />
-                                <Bar dataKey="actual" name="实际上涨率" fill="#f59e0b" radius={[4, 4, 0, 0]} />
-                            </ComposedChart>
-                        </ResponsiveContainer>
-                    </div>
+                    {isSufficient ? (
+                        <div className="h-72 w-full" data-testid="reliability-chart">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <ComposedChart data={chartData} margin={{ top: 8, right: 16, bottom: 8, left: -12 }}>
+                                    <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.12} />
+                                    <XAxis
+                                        dataKey="bucket"
+                                        tick={{ fill: 'currentColor', opacity: 0.6, fontSize: 12 }}
+                                        axisLine={false}
+                                        tickLine={false}
+                                    />
+                                    <YAxis
+                                        domain={[0, 100]}
+                                        tickFormatter={value => `${value}%`}
+                                        tick={{ fill: 'currentColor', opacity: 0.6, fontSize: 12 }}
+                                        axisLine={false}
+                                        tickLine={false}
+                                    />
+                                    <Tooltip formatter={tooltipFormatter} />
+                                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                                    <Bar dataKey="predicted" name="预测概率(中值)" fill="#6366f1" radius={[4, 4, 0, 0]} />
+                                    <Bar dataKey="actual" name="实际上涨率" fill="#f59e0b" radius={[4, 4, 0, 0]} />
+                                </ComposedChart>
+                            </ResponsiveContainer>
+                        </div>
+                    ) : (
+                        <div
+                            className="flex h-48 w-full flex-col items-center justify-center rounded-xl border border-dashed border-amber-200 bg-amber-50/40 p-6 text-center dark:border-amber-900/40 dark:bg-amber-950/20"
+                            data-testid="curve-withheld-placeholder"
+                        >
+                            <AlertTriangle className="mb-2 h-7 w-7 text-amber-500 opacity-80" />
+                            <p className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                                {evaluated === 0 ? '暂无可评估样本，未绘制可靠性曲线' : '样本量不足，可靠性曲线已熔断隐藏'}
+                            </p>
+                            <p className="mt-1 max-w-md text-xs text-slate-400 dark:text-slate-500">
+                                {evaluated === 0
+                                    ? (skipped > 0
+                                        ? '最近报告持有期尚未结束，或缺少价格数据，暂无可评估样本。'
+                                        : '当前筛选条件下暂无带概率的历史报告，调整日期范围或过滤条件后重试。')
+                                    : `样本量低于统计显著性阈值（当前 n=${evaluated}，阈值 ${minSamples}），拒绝呈现可靠性曲线。`}
+                            </p>
+                        </div>
+                    )}
 
                     {!compact && (
                         <div className="overflow-x-auto">
@@ -278,12 +329,12 @@ export default function CalibrationPanel({ compact = false }: CalibrationPanelPr
                                         <tr key={bucket.bucket} className="text-slate-600 dark:text-slate-300">
                                             <td className="py-2 pr-4 font-medium text-slate-900 dark:text-slate-100">{bucket.bucket}</td>
                                             <td className="py-2 pr-4 tabular-nums">{bucket.count}</td>
-                                            <td className="py-2 pr-4 tabular-nums">{bucket.rise_count}</td>
+                                            <td className="py-2 pr-4 tabular-nums">{isSufficient ? bucket.rise_count : '—'}</td>
                                             <td className="py-2 pr-4 tabular-nums">
-                                                {bucket.rise_rate != null ? `${bucket.rise_rate}%` : '—'}
+                                                {isSufficient && bucket.rise_rate != null ? `${bucket.rise_rate}%` : '—'}
                                             </td>
                                             <td className="py-2 pr-4 tabular-nums">
-                                                {bucket.avg_probability != null ? `${(bucket.avg_probability * 100).toFixed(1)}%` : '—'}
+                                                {isSufficient && bucket.avg_probability != null ? `${(bucket.avg_probability * 100).toFixed(1)}%` : '—'}
                                             </td>
                                         </tr>
                                     ))}

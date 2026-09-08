@@ -76,6 +76,25 @@ _BUCKETS: List[Tuple[str, float, float]] = [
 
 DEFAULT_HOLD_DAYS = 5
 
+# Minimum evaluated sample size required before calibration metrics
+# (Brier score and per-bucket rise rates) are presented to callers.
+#
+# Rationale (AGENTS.md §5 - no magic values, explicit basis):
+# 1. Statistical Validity (Central Limit Theorem & Binomial Estimation):
+#    Evaluating calibration divides reports into 5 probability buckets
+#    (0-50%, 50-60%, 60-70%, 70-80%, 80+%). With N=30, each bucket expects
+#    ~6 samples on average. In binomial proportion estimation, N >= 30 is the
+#    classic rule-of-thumb lower bound required for the sampling distribution of
+#    proportions to approximate normality and yield meaningful confidence intervals.
+# 2. Fail-Closed Discipline (L1 fail-closed in L3 calibration, DAV-755 / DAV-758):
+#    With N < 30 (e.g. N=1, 2, or 3), a single binary outcome shifts an entire
+#    bucket's observed rate between 0% and 100%, creating an illusion of precision
+#    and self-deception ("已校准" on random noise).
+# 3. Decision Consensus:
+#    Confirmed in DAV-755 diagnosis (H3) and scheduled as a hard gate in DAV-758.
+DEFAULT_MIN_CALIBRATION_SAMPLE_SIZE = max(1, int(os.getenv("CALIBRATION_MIN_SAMPLE_SIZE", "30")))
+MIN_CALIBRATION_SAMPLE_SIZE = DEFAULT_MIN_CALIBRATION_SAMPLE_SIZE
+
 
 class CalibrationBusyError(RuntimeError):
     """Raised when the calibration concurrency cap is already reached."""
@@ -100,6 +119,7 @@ def _cache_key(
     model: Optional[str],
     hold_days: int,
     limit: int,
+    min_sample_size: Optional[int] = None,
 ) -> str:
     return "|".join(
         str(part) if part is not None else ""
@@ -112,6 +132,7 @@ def _cache_key(
             model,
             hold_days,
             limit,
+            min_sample_size,
         )
     )
 
@@ -619,6 +640,7 @@ def _compute_calibration_unlocked(
     hold_days: int,
     limit: int,
     outcome_resolver: Optional[Callable[[ReportDB], Optional[bool]]],
+    min_sample_size: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Compute the reliability curve + Brier score for historical reports.
 
@@ -718,11 +740,38 @@ def _compute_calibration_unlocked(
     )
 
     total_sample_size = len(prob_samples) + winner_only_admitted
+    prob_sample_size = len(prob_samples)
+
+    effective_min_sample_size = (
+        min_sample_size
+        if min_sample_size is not None and min_sample_size >= 0
+        else DEFAULT_MIN_CALIBRATION_SAMPLE_SIZE
+    )
+
+    sample_sufficient = prob_sample_size >= effective_min_sample_size and prob_sample_size > 0
+
+    if sample_sufficient:
+        brier = _brier_score(prob_samples)
+        insufficient_reason = None
+    else:
+        brier = None
+        if total_sample_size == 0:
+            insufficient_reason = "当前筛选条件下暂无带概率的历史报告，调整日期范围或过滤条件后重试。"
+        else:
+            insufficient_reason = (
+                f"样本量不足以支撑校准结论 (当前有效样本 {prob_sample_size} 份，低于最小阈值 {effective_min_sample_size} 份)"
+            )
+        # 契约 3: 样本不足时：brier_score 与各分桶的 rise_rate 必须为 null，前端不得绘制柱体，不得显示任何精确数值。
+        for entry in buckets:
+            entry["rise_rate"] = None
 
     return {
-        "brier_score": _brier_score(prob_samples),
+        "brier_score": brier,
         "sample_size": total_sample_size,
-        "probability_sample_size": len(prob_samples),
+        "probability_sample_size": prob_sample_size,
+        "sample_sufficient": sample_sufficient,
+        "min_sample_size": effective_min_sample_size,
+        "insufficient_reason": insufficient_reason,
         "winner_only_admitted": winner_only_admitted,
         "winner_only_hits": winner_only_hits,
         "winner_only_hit_rate": winner_only_hit_rate,
@@ -778,6 +827,7 @@ def compute_calibration(
     hold_days: int = DEFAULT_HOLD_DAYS,
     limit: Optional[int] = None,
     outcome_resolver: Optional[Callable[[ReportDB], Optional[bool]]] = None,
+    min_sample_size: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Compute the reliability curve + Brier score, guarded by cache + concurrency.
 
@@ -796,6 +846,7 @@ def compute_calibration(
         model,
         hold_days,
         effective_limit,
+        min_sample_size,
     )
     if outcome_resolver is None:
         cached = _cache_get(key)
@@ -817,6 +868,7 @@ def compute_calibration(
             hold_days=hold_days,
             limit=effective_limit,
             outcome_resolver=outcome_resolver,
+            min_sample_size=min_sample_size,
         )
     finally:
         _release_slot()
