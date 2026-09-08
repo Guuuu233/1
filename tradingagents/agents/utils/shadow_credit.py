@@ -21,6 +21,7 @@ from tradingagents.dataflows.trade_calendar import (
     calculate_t_plus_5_date,
     cn_market_phase,
     now_cn,
+    trading_days_forward,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,21 @@ DECISION_MODEL_LEGACY: str = "decision_model.legacy_unversioned"
 DECISION_MODEL_V1: str = "decision_model.v1"
 EVIDENCE_CONTRACT_V0: str = "evidence_contract.v0"
 PRICE_BASIS_UNSPECIFIED: str = "price_basis.unspecified"
+
+# ── T+5 Status Constants (AGENTS.md §5 / DAV-779) ──────────────────────────────
+T_PLUS_5_STATUS_DUE_AND_EVALUATED: str = "due_and_evaluated"
+T_PLUS_5_STATUS_PENDING_DUE: str = "pending_due"
+T_PLUS_5_STATUS_DATA_MISSING: str = "data_missing"
+T_PLUS_5_STATUS_SUSPENSION: str = "suspension"
+T_PLUS_5_STATUS_NOT_APPLICABLE: str = "not_applicable"
+
+VALID_T_PLUS_5_STATUSES: frozenset[str] = frozenset({
+    T_PLUS_5_STATUS_DUE_AND_EVALUATED,
+    T_PLUS_5_STATUS_PENDING_DUE,
+    T_PLUS_5_STATUS_DATA_MISSING,
+    T_PLUS_5_STATUS_SUSPENSION,
+    T_PLUS_5_STATUS_NOT_APPLICABLE,
+})
 
 
 # Mapping from report key to canonical role slug
@@ -1087,7 +1103,7 @@ def evaluate_h1b_system_gates(
         st = s.get("t_plus_5_status") or metrics.get("t_plus_5_status") or res_data.get("t_plus_5_status")
         # Exclude suspension from due denominator
         if (
-            st == "suspension"
+            st == T_PLUS_5_STATUS_SUSPENSION
             or s.get("is_suspended") is True
             or s.get("suspension") is True
             or res_data.get("is_suspended") is True
@@ -1096,7 +1112,7 @@ def evaluate_h1b_system_gates(
             continue
         # Exclude pending / in-flight samples from due denominator
         if (
-            st == "pending_due"
+            st == T_PLUS_5_STATUS_PENDING_DUE
             or s.get("is_in_flight") is True
             or s.get("is_t_plus_5_due") is False
             or res_data.get("is_in_flight") is True
@@ -1113,7 +1129,7 @@ def evaluate_h1b_system_gates(
                 (hit is not None)
                 or bool(s.get("t_plus_5_evaluated", False))
                 or bool(res_data.get("t_plus_5_evaluated", False))
-                or (st in ("due_and_evaluated", "data_missing"))
+                or (st in (T_PLUS_5_STATUS_DUE_AND_EVALUATED, T_PLUS_5_STATUS_DATA_MISSING))
             ):
                 is_due = True
             else:
@@ -1631,7 +1647,7 @@ def apply_credit_weighting_to_debate(
     }
 
 
-# ── T+5 Shadow Backfill Module (Track A5) ───────────────────────────────────
+# ── T+5 Shadow Backfill Module (Track A5 / DAV-779) ──────────────────────────
 
 def fetch_close_prices_safe(
     symbol: str,
@@ -1661,13 +1677,86 @@ def fetch_close_prices_safe(
             if d_val and c_val:
                 try:
                     d_clean = str(d_val)[:10]
-                    prices[d_clean] = float(c_val)
+                    if len(d_clean) == 8 and d_clean.isdigit():
+                        d_clean = f"{d_clean[:4]}-{d_clean[4:6]}-{d_clean[6:]}"
+                    c_float = float(c_val)
+                    if c_float > 0:
+                        prices[d_clean] = c_float
                 except (ValueError, TypeError):
                     pass
         return prices
     except Exception as exc:
         logger.debug("fetch_close_prices_safe failed for %s (%s -> %s): %s", symbol, start_date, end_date, exc)
         return {}
+
+
+def detect_tplus5_suspension(
+    symbol: str,
+    trade_date_str: str,
+    t5_date: str,
+    quotes_map: Optional[Mapping[str, float]],
+    *,
+    trading_calendar: Optional[Sequence[Union[str, date]]] = None,
+) -> bool:
+    """Detect whether a stock was objectively suspended on T+5 based on quote series.
+
+    Contracts (DAV-779 / Bilateral Evidence Requirement):
+    1. True suspension is an internal hole within a sequence, not an end-of-series truncation.
+       Bilateral evidence required: T+5 has no valid price, BUT both adjacent trading days
+       T+4 (preceding) AND T+6 (subsequent) exist in quotes_map with valid positive prices.
+    2. Fail-closed: if quotes_map is truncated at T+4 (no T+6), or sequence is missing,
+       or T+6 has not arrived, returns False (preserving status as data_missing).
+    3. Zero extra network roundtrips: operates purely on already-obtained quotes_map.
+    """
+    if not quotes_map or not isinstance(quotes_map, Mapping):
+        return False
+    if not trade_date_str or not t5_date:
+        return False
+
+    # If T+5 price exists and is valid (> 0), not suspended
+    t5_val = quotes_map.get(t5_date)
+    if t5_val is not None:
+        try:
+            if float(t5_val) > 0:
+                return False
+        except (ValueError, TypeError):
+            pass
+
+    # Determine forward trading days from T0 up to T+6 (6 trading days)
+    try:
+        fwd_days = trading_days_forward(trade_date_str, 6, calendar_dates=trading_calendar)
+    except Exception as exc:
+        logger.debug("detect_tplus5_suspension: trading_days_forward failed for %s: %s", trade_date_str, exc)
+        return False
+
+    if not fwd_days or len(fwd_days) < 6:
+        return False
+
+    # fwd_days: [T+1, T+2, T+3, T+4, T+5, T+6]
+    # Verify index 4 is indeed t5_date
+    if fwd_days[4] != t5_date:
+        return False
+
+    t4_date = fwd_days[3]  # T+4 (preceding trading day)
+    t6_date = fwd_days[5]  # T+6 (subsequent trading day)
+
+    t4_val = quotes_map.get(t4_date)
+    t6_val = quotes_map.get(t6_date)
+
+    if t4_val is None or t6_val is None:
+        # If either T+4 or T+6 is missing, cannot exclude vendor truncation -> fail-closed
+        return False
+
+    try:
+        p4 = float(t4_val)
+        p6 = float(t6_val)
+        if p4 > 0 and p6 > 0:
+            # Both sides exist with valid prices, T+5 is missing -> true suspension gap
+            return True
+    except (ValueError, TypeError):
+        pass
+
+    return False
 
 
 def backfill_tplus5_shadow_for_report(
@@ -1739,7 +1828,7 @@ def backfill_tplus5_shadow_for_report(
             t5_date = None
 
     if not trade_date_str or not t5_date:
-        t_plus_5_status = "data_missing"
+        t_plus_5_status = T_PLUS_5_STATUS_DATA_MISSING
         is_t_plus_5_due = False
         t_plus_5_evaluated = False
         t_plus_5_direction_hit = None
@@ -1774,7 +1863,7 @@ def backfill_tplus5_shadow_for_report(
 
     if t5_date > as_of_str or (is_live_today and cn_market_phase() != "post_close"):
         # T+5 window not yet arrived
-        t_plus_5_status = "pending_due"
+        t_plus_5_status = T_PLUS_5_STATUS_PENDING_DUE
         is_t_plus_5_due = False
         t_plus_5_evaluated = False
         t_plus_5_direction_hit = None
@@ -1812,10 +1901,10 @@ def backfill_tplus5_shadow_for_report(
         is_suspended
         or target.get("is_suspended") is True
         or target.get("suspension") is True
-        or target.get("t_plus_5_status") == "suspension"
+        or target.get("t_plus_5_status") == T_PLUS_5_STATUS_SUSPENSION
         or res.get("is_suspended") is True
         or res.get("suspension") is True
-        or res.get("t_plus_5_status") == "suspension"
+        or res.get("t_plus_5_status") == T_PLUS_5_STATUS_SUSPENSION
     )
 
     # Check raw_gaps for suspension mention if any
@@ -1827,8 +1916,100 @@ def backfill_tplus5_shadow_for_report(
                 suspended = True
                 break
 
+    # 5. Price Resolution & Suspension Detection
+    manager_verdict = (
+        target.get("manager_verdict")
+        or inv_state.get("manager_verdict")
+        or res.get("manager_verdict")
+        or {}
+    )
+    if not isinstance(manager_verdict, Mapping):
+        manager_verdict = {}
+
+    entry_val: Optional[float] = None
+    raw_entry = (
+        manager_verdict.get("entry")
+        or target.get("entry_price")
+        or target.get("target_price")
+        or inv_state.get("entry_price")
+        or inv_state.get("target_price")
+        or res.get("entry_price")
+        or res.get("target_price")
+    )
+    if raw_entry:
+        try:
+            entry_val = float(str(raw_entry).split("-")[0].replace("元", "").strip())
+        except (ValueError, TypeError):
+            entry_val = None
+
+    t5_price_val: Optional[float] = None
+    quote_series: Optional[Mapping[str, float]] = None
+
+    if not suspended:
+        # Check custom price_series or get_price_fn or pre-set t_plus_5_price
+        if price_series is not None and isinstance(price_series, Mapping):
+            quote_series = price_series
+            if t5_date in price_series:
+                try:
+                    t5_price_val = float(price_series[t5_date])
+                except (ValueError, TypeError):
+                    t5_price_val = None
+            if entry_val is None and trade_date_str in price_series:
+                try:
+                    entry_val = float(price_series[trade_date_str])
+                except (ValueError, TypeError):
+                    entry_val = None
+        elif get_price_fn and callable(get_price_fn):
+            try:
+                fn_res = get_price_fn(symbol, trade_date_str, t5_date)
+                if fn_res is not None:
+                    t5_price_val = float(fn_res)
+            except Exception as exc:
+                logger.debug("get_price_fn failed for %s: %s", symbol, exc)
+        elif target.get("t_plus_5_price") is not None:
+            try:
+                t5_price_val = float(target["t_plus_5_price"])
+            except (ValueError, TypeError):
+                t5_price_val = None
+        elif res.get("t_plus_5_price") is not None:
+            try:
+                t5_price_val = float(res["t_plus_5_price"])
+            except (ValueError, TypeError):
+                t5_price_val = None
+        else:
+            # Try fetching from vendor
+            # Query up to T+6 if available to enable bilateral suspension detection
+            end_query_date = t5_date
+            try:
+                fwd6 = trading_days_forward(trade_date_str, 6, calendar_dates=trading_calendar)
+                if fwd6 and len(fwd6) >= 6:
+                    t6_candidate = fwd6[-1]
+                    if as_of_str is None or t6_candidate <= as_of_str:
+                        end_query_date = t6_candidate
+            except Exception:
+                end_query_date = t5_date
+
+            fetched = fetch_close_prices_safe(symbol, trade_date_str, end_query_date)
+            quote_series = fetched
+            if fetched:
+                if t5_date in fetched:
+                    t5_price_val = fetched[t5_date]
+                if entry_val is None and trade_date_str in fetched:
+                    entry_val = fetched[trade_date_str]
+
+        # If T+5 price was not found or non-positive, detect suspension from quote sequence
+        if t5_price_val is None or t5_price_val <= 0:
+            if detect_tplus5_suspension(
+                symbol=symbol,
+                trade_date_str=trade_date_str,
+                t5_date=t5_date,
+                quotes_map=quote_series,
+                trading_calendar=trading_calendar,
+            ):
+                suspended = True
+
     if suspended:
-        t_plus_5_status = "suspension"
+        t_plus_5_status = T_PLUS_5_STATUS_SUSPENSION
         is_t_plus_5_due = False
         t_plus_5_evaluated = False
         t_plus_5_direction_hit = None
@@ -1864,72 +2045,6 @@ def backfill_tplus5_shadow_for_report(
         res["_backfill_status"] = "suspension"
         return res
 
-    # 5. Price Resolution
-    manager_verdict = (
-        target.get("manager_verdict")
-        or inv_state.get("manager_verdict")
-        or res.get("manager_verdict")
-        or {}
-    )
-    if not isinstance(manager_verdict, Mapping):
-        manager_verdict = {}
-
-    entry_val: Optional[float] = None
-    raw_entry = (
-        manager_verdict.get("entry")
-        or target.get("entry_price")
-        or target.get("target_price")
-        or inv_state.get("entry_price")
-        or inv_state.get("target_price")
-        or res.get("entry_price")
-        or res.get("target_price")
-    )
-    if raw_entry:
-        try:
-            entry_val = float(str(raw_entry).split("-")[0].replace("元", "").strip())
-        except (ValueError, TypeError):
-            entry_val = None
-
-    t5_price_val: Optional[float] = None
-
-    # Check custom price_series or get_price_fn or pre-set t_plus_5_price
-    if price_series and isinstance(price_series, Mapping):
-        if t5_date in price_series:
-            try:
-                t5_price_val = float(price_series[t5_date])
-            except (ValueError, TypeError):
-                t5_price_val = None
-        if entry_val is None and trade_date_str in price_series:
-            try:
-                entry_val = float(price_series[trade_date_str])
-            except (ValueError, TypeError):
-                entry_val = None
-    elif get_price_fn and callable(get_price_fn):
-        try:
-            fn_res = get_price_fn(symbol, trade_date_str, t5_date)
-            if fn_res is not None:
-                t5_price_val = float(fn_res)
-        except Exception as exc:
-            logger.debug("get_price_fn failed for %s: %s", symbol, exc)
-    elif target.get("t_plus_5_price") is not None:
-        try:
-            t5_price_val = float(target["t_plus_5_price"])
-        except (ValueError, TypeError):
-            t5_price_val = None
-    elif res.get("t_plus_5_price") is not None:
-        try:
-            t5_price_val = float(res["t_plus_5_price"])
-        except (ValueError, TypeError):
-            t5_price_val = None
-    else:
-        # Try fetching from vendor
-        fetched = fetch_close_prices_safe(symbol, trade_date_str, t5_date)
-        if fetched:
-            if t5_date in fetched:
-                t5_price_val = fetched[t5_date]
-            if entry_val is None and trade_date_str in fetched:
-                entry_val = fetched[trade_date_str]
-
     # 6. Evaluation based on winner
     winner = str(
         manager_verdict.get("winner")
@@ -1940,8 +2055,8 @@ def backfill_tplus5_shadow_for_report(
 
     t_plus_5_return_pct: Optional[float] = None
 
-    if t5_price_val is None or entry_val is None or entry_val <= 0:
-        t_plus_5_status = "data_missing"
+    if t5_price_val is None or t5_price_val <= 0 or entry_val is None or entry_val <= 0:
+        t_plus_5_status = T_PLUS_5_STATUS_DATA_MISSING
         is_t_plus_5_due = True
         t_plus_5_evaluated = True
         t_plus_5_direction_hit = None
@@ -1972,7 +2087,7 @@ def backfill_tplus5_shadow_for_report(
             else:
                 t_plus_5_direction_hit = bool(price_change > 0)
 
-        t_plus_5_status = "due_and_evaluated"
+        t_plus_5_status = T_PLUS_5_STATUS_DUE_AND_EVALUATED
         is_t_plus_5_due = True
         t_plus_5_evaluated = True
         t_plus_5_price = round(t5_price_val, 4)
@@ -2061,7 +2176,11 @@ def backfill_tplus5_shadow_for_reports(
         stats["qualifying_v2_count"] += 1
         sym = r.get("symbol") or (r.get("result_data", {}).get("symbol") if isinstance(r.get("result_data"), Mapping) else "")
         sym_clean = str(sym).strip()
-        series = prices_map.get(sym_clean) or prices_map.get(sym_clean.split(".")[0])
+        series: Optional[Mapping[str, float]] = None
+        if sym_clean in prices_map:
+            series = prices_map[sym_clean]
+        elif sym_clean.split(".")[0] in prices_map:
+            series = prices_map[sym_clean.split(".")[0]]
 
         updated = backfill_tplus5_shadow_for_report(
             r,
@@ -2077,14 +2196,14 @@ def backfill_tplus5_shadow_for_reports(
         if hit is None and isinstance(updated.get("result_data"), Mapping):
             hit = updated["result_data"].get("t_plus_5_direction_hit")
 
-        if st == "suspension":
+        if st == T_PLUS_5_STATUS_SUSPENSION:
             stats["suspension_count"] += 1
-        elif st == "pending_due":
+        elif st == T_PLUS_5_STATUS_PENDING_DUE:
             stats["pending_due_count"] += 1
-        elif st == "data_missing":
+        elif st == T_PLUS_5_STATUS_DATA_MISSING:
             stats["due_count"] += 1
             stats["data_missing_count"] += 1
-        elif st == "due_and_evaluated":
+        elif st == T_PLUS_5_STATUS_DUE_AND_EVALUATED:
             stats["due_count"] += 1
             stats["evaluated_count"] += 1
             if hit is True:
