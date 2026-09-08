@@ -538,61 +538,154 @@ def extract_report_industry(sample: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def extract_report_analysis_status_and_action(report: Mapping[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    """Extract canonical (analysis_status, trade_action) from report dictionary."""
+    if not isinstance(report, Mapping):
+        return None, None
+
+    res_data = report.get("result_data") if isinstance(report.get("result_data"), Mapping) else {}
+    inv_state = report.get("investment_debate_state") if isinstance(report.get("investment_debate_state"), Mapping) else (
+        res_data.get("investment_debate_state") if isinstance(res_data.get("investment_debate_state"), Mapping) else {}
+    )
+    dec_status = report.get("decision_status") if isinstance(report.get("decision_status"), Mapping) else (
+        res_data.get("decision_status") if isinstance(res_data.get("decision_status"), Mapping) else (
+            inv_state.get("decision_status") if isinstance(inv_state.get("decision_status"), Mapping) else {}
+        )
+    )
+
+    # 1. analysis_status
+    raw_status = (
+        report.get("analysis_status")
+        or res_data.get("analysis_status")
+        or dec_status.get("analysis_status")
+        or inv_state.get("analysis_status")
+    )
+    analysis_status = str(raw_status).strip().upper() if raw_status is not None and str(raw_status).strip() else None
+
+    # 2. trade_action
+    raw_action = (
+        report.get("trade_action")
+        or res_data.get("trade_action")
+        or dec_status.get("trade_action")
+        or inv_state.get("trade_action")
+        or report.get("decision")
+        or res_data.get("decision")
+        or report.get("action")
+        or res_data.get("action")
+    )
+    trade_action = str(raw_action).strip().upper() if raw_action is not None and str(raw_action).strip() else None
+
+    return analysis_status, trade_action
+
+
+def classify_report_exclusion_category(report: Mapping[str, Any]) -> Optional[str]:
+    """Classify why a report is excluded under D-009 §5.
+
+    Returns None if report qualifies:
+    - analysis_status == 'VALID'
+    - trade_action in {'BUY', 'SELL', 'HOLD'}
+    - completed lifecycle status (if status present)
+    - valid v2 structured debate protocol
+    - valid winner in ('bull', 'bear', 'tie')
+
+    Returns one of the categorized exclusion reasons otherwise:
+    - 'legacy_null': analysis_status IS NULL (pre-D-009 sample)
+    - 'abstain': analysis_status == 'ABSTAIN'
+    - 'invalid_run': analysis_status == 'INVALID_RUN' (or non-completed)
+    - 'data_error': analysis_status in ('DATA_ERROR', 'PARTIAL') or data/winner missing
+    - 'no_trade': analysis_status == 'VALID' but trade_action == 'NO_TRADE' (or empty)
+    - 'wait': analysis_status == 'VALID' but trade_action == 'WAIT'
+    """
+    if not isinstance(report, Mapping):
+        return "invalid_run"
+
+    # Status check: if status is specified and not completed
+    status = report.get("status")
+    if status is not None and str(status).strip().lower() != "completed":
+        st_val, _ = extract_report_analysis_status_and_action(report)
+        if st_val == "INVALID_RUN":
+            return "invalid_run"
+        if st_val in ("DATA_ERROR", "PARTIAL"):
+            return "data_error"
+        if st_val == "ABSTAIN":
+            return "abstain"
+        if st_val is None:
+            return "legacy_null"
+        return "invalid_run"
+
+    # Extract D-009 §5 status and action
+    st_val, act_val = extract_report_analysis_status_and_action(report)
+
+    if st_val is None:
+        return "legacy_null"
+    if st_val == "ABSTAIN":
+        return "abstain"
+    if st_val == "INVALID_RUN":
+        return "invalid_run"
+    if st_val in ("DATA_ERROR", "PARTIAL"):
+        return "data_error"
+
+    if st_val == "VALID":
+        if act_val == "WAIT":
+            return "wait"
+        if act_val == "NO_TRADE":
+            return "no_trade"
+        if act_val not in {"BUY", "SELL", "HOLD"}:
+            return "no_trade"
+
+        # Check v2 and winner requirements for VALID reports
+        res_data = report.get("result_data")
+        target = {**res_data, **report} if isinstance(res_data, Mapping) else report
+        inv_state = target.get("investment_debate_state")
+        if not isinstance(inv_state, Mapping):
+            inv_state = target
+
+        meta = get_protocol_metadata(target)
+        proto_ver = meta.get("protocol_version") or target.get("protocol_version") or inv_state.get("protocol_version")
+        is_v2 = (
+            proto_ver == PROTOCOL_VERSION_V2_STRUCTURED
+            or is_v2_debate_enabled(target)
+        )
+        verdict = (
+            target.get("manager_verdict")
+            or inv_state.get("manager_verdict")
+            or {}
+        )
+        if not isinstance(verdict, Mapping):
+            verdict = {}
+
+        raw_winner = verdict.get("winner") or target.get("debate_winner")
+        winner_str = str(raw_winner or "").strip().lower()
+        has_valid_winner = winner_str in ("bull", "bear", "tie")
+
+        if not (is_v2 and has_valid_winner):
+            if not (has_valid_winner and (
+                bool(verdict.get("claim_evidence_summary"))
+                or verdict.get("consistency_check_passed") is not None
+                or bool(inv_state.get("claims"))
+            )):
+                return "data_error"
+
+        # All checks passed: report qualifies!
+        return None
+
+    # Any other unrecognized analysis_status
+    return "invalid_run"
+
+
 def is_qualifying_v2_report(report: Mapping[str, Any]) -> bool:
-    """Return True if report is a completed v2 structured debate report with a valid v2 manager verdict winner.
+    """Return True if report is a completed v2 structured debate report with analysis_status=VALID,
+    clear action semantics (trade_action in {BUY, SELL, HOLD}), and a valid v2 manager verdict winner (D-009 §5).
 
     Excludes:
     - Non-completed reports (if status is present and != 'completed')
+    - Reports with analysis_status IS NULL (legacy_null)
+    - Reports with analysis_status in ('ABSTAIN', 'INVALID_RUN', 'DATA_ERROR', 'PARTIAL')
+    - Reports with trade_action in ('NO_TRADE', 'WAIT') or non-directional action
     - Legacy v1 reports without v2 structured disagreement / without v2 manager_verdict.winner
     - Reports without winner in manager_verdict
     """
-    if not isinstance(report, Mapping):
-        return False
-
-    # 1. Status check: if status is specified, must be 'completed'
-    status = report.get("status")
-    if status is not None and str(status).strip().lower() != "completed":
-        return False
-
-    # Unpack nested result_data if present
-    res_data = report.get("result_data")
-    target = {**res_data, **report} if isinstance(res_data, Mapping) else report
-
-    inv_state = target.get("investment_debate_state")
-    if not isinstance(inv_state, Mapping):
-        inv_state = target
-
-    # 2. Protocol version check:
-    meta = get_protocol_metadata(target)
-    proto_ver = meta.get("protocol_version") or target.get("protocol_version") or inv_state.get("protocol_version")
-    is_v2 = (
-        proto_ver == PROTOCOL_VERSION_V2_STRUCTURED
-        or is_v2_debate_enabled(target)
-    )
-
-    # 3. Manager verdict & winner check:
-    verdict = (
-        target.get("manager_verdict")
-        or inv_state.get("manager_verdict")
-        or {}
-    )
-    if not isinstance(verdict, Mapping):
-        verdict = {}
-
-    raw_winner = verdict.get("winner") or target.get("debate_winner")
-    winner_str = str(raw_winner or "").strip().lower()
-    has_valid_winner = winner_str in ("bull", "bear", "tie")
-
-    if is_v2 and has_valid_winner:
-        return True
-    if has_valid_winner and (
-        bool(verdict.get("claim_evidence_summary"))
-        or verdict.get("consistency_check_passed") is not None
-        or bool(inv_state.get("claims"))
-    ):
-        return True
-
-    return False
+    return classify_report_exclusion_category(report) is None
 
 
 def normalize_report_for_evaluation(sample: Mapping[str, Any]) -> dict[str, Any]:
@@ -626,13 +719,42 @@ def normalize_report_for_evaluation(sample: Mapping[str, Any]) -> dict[str, Any]
 
 def filter_v2_completed_reports(
     reports: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Filter and normalize reports, returning only qualifying completed v2 reports with a valid winner."""
+    *,
+    return_excluded_counts: bool = False,
+) -> Union[list[dict[str, Any]], tuple[list[dict[str, Any]], dict[str, int]]]:
+    """Filter and normalize reports, returning only qualifying completed v2 reports with VALID analysis_status and winner.
+
+    When return_excluded_counts=True, returns (qualifying_reports, excluded_counts) tuple where excluded_counts contains:
+    - 'legacy_null': count of reports where analysis_status IS NULL
+    - 'abstain': count of reports where analysis_status == 'ABSTAIN'
+    - 'invalid_run': count of reports where analysis_status == 'INVALID_RUN' (or failed lifecycle)
+    - 'data_error': count of reports where analysis_status in ('DATA_ERROR', 'PARTIAL') or data error
+    - 'no_trade': count of reports where analysis_status == 'VALID' but trade_action == 'NO_TRADE'
+    - 'wait': count of reports where analysis_status == 'VALID' but trade_action == 'WAIT'
+    """
     qualifying: list[dict[str, Any]] = []
+    excluded_counts: dict[str, int] = {
+        "legacy_null": 0,
+        "abstain": 0,
+        "invalid_run": 0,
+        "data_error": 0,
+        "no_trade": 0,
+        "wait": 0,
+    }
+
     for r in reports:
-        if is_qualifying_v2_report(r):
+        cat = classify_report_exclusion_category(r)
+        if cat is None:
             normalized = normalize_report_for_evaluation(r)
             qualifying.append(normalized)
+        else:
+            if cat in excluded_counts:
+                excluded_counts[cat] += 1
+            else:
+                excluded_counts[cat] = excluded_counts.get(cat, 0) + 1
+
+    if return_excluded_counts:
+        return qualifying, excluded_counts
     return qualifying
 
 
@@ -868,6 +990,7 @@ def evaluate_h1b_system_gates(
     as_of: Optional[Union[str, date, datetime]] = None,
     trading_calendar: Optional[Sequence[Union[str, date]]] = None,
     calendar_dates: Optional[Sequence[Union[str, date]]] = None,
+    excluded_counts: Optional[Mapping[str, int]] = None,
 ) -> dict[str, Any]:
     """Evaluate 7-dimension gate thresholds for credit weighting activation.
 
@@ -902,15 +1025,36 @@ def evaluate_h1b_system_gates(
     else:
         as_of_date = now_cn().date()
 
+    initial_excluded: dict[str, int] = {
+        "legacy_null": 0,
+        "abstain": 0,
+        "invalid_run": 0,
+        "data_error": 0,
+        "no_trade": 0,
+        "wait": 0,
+    }
+    if excluded_counts:
+        initial_excluded.update(excluded_counts)
+
+    # Ensure input samples are filtered for D-009 §5 qualification (if raw reports passed)
+    sanitized_input: list[dict[str, Any]] = []
+    for s in samples_or_reports or []:
+        cat = classify_report_exclusion_category(s)
+        if cat is None:
+            sanitized_input.append(dict(s))
+        else:
+            if not excluded_counts:
+                initial_excluded[cat] = initial_excluded.get(cat, 0) + 1
+
     cohort_meta: dict[str, Any] = {}
     homogeneity_passed = True
     homogeneity_reason = None
 
     if cohort is not None and str(cohort).strip():
-        filtered_samples, cohort_meta = filter_reports_by_cohort(samples_or_reports, cohort=cohort)
+        filtered_samples, cohort_meta = filter_reports_by_cohort(sanitized_input, cohort=cohort)
         samples = filtered_samples
     else:
-        samples = list(samples_or_reports or [])
+        samples = list(sanitized_input)
         is_homo, c_key = is_cohort_homogeneous(samples)
         if not is_homo:
             homogeneity_passed = False
@@ -1320,7 +1464,9 @@ def evaluate_h1b_system_gates(
             "recommendation": recommendation,
             "cohort": cohort_meta.get("canonical_key"),
             "commit_shas": cohort_meta.get("commit_shas", []),
+            "excluded_counts": dict(initial_excluded),
         },
+        "excluded_counts": dict(initial_excluded),
         "recommendation": recommendation,
         "cohort": cohort_meta.get("canonical_key"),
         "cohort_info": cohort_meta,

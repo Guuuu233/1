@@ -1,7 +1,24 @@
 {
-  "generated_at": "2026-08-25T17:02:37.413456+00:00",
+  "generated_at": "2026-09-08T16:29:35.461556+00:00",
   "task_id": "P3-H1b",
-  "sample_count": 3,
+  "cohort": "legacy_unversioned",
+  "cohort_info": {
+    "cohort_type": "legacy_unversioned",
+    "canonical_key": "legacy_unversioned",
+    "decision_model_version": "decision_model.legacy_unversioned",
+    "evidence_contract_version": null,
+    "price_basis_version": null,
+    "commit_shas": []
+  },
+  "sample_count": 7,
+  "excluded_counts": {
+    "legacy_null": 731,
+    "abstain": 35,
+    "invalid_run": 2,
+    "data_error": 0,
+    "no_trade": 0,
+    "wait": 15
+  },
   "gate_evaluation": {
     "schema_version": "h1b_json_v1",
     "passed": false,
@@ -9,64 +26,64 @@
       "dimension_n": {
         "passed": false,
         "details": {
-          "sample_count": 3,
+          "sample_count": 7,
           "min_required": 60,
-          "unique_symbols": 3,
+          "unique_symbols": 7,
           "min_unique_symbols": 20,
-          "unique_industries": 0,
+          "unique_industries": 6,
           "min_industries": 5,
-          "max_symbol_share": 0.3333,
+          "max_symbol_share": 0.1429,
           "max_allowed_share": 0.15
         }
       },
       "dimension_side": {
         "passed": false,
         "details": {
-          "bull_samples": 0,
-          "bear_samples": 0,
+          "bull_samples": 1,
+          "bear_samples": 5,
           "min_side_samples": 25,
-          "bull_verified_claims": 0,
-          "bear_verified_claims": 0,
+          "bull_verified_claims": 33,
+          "bear_verified_claims": 36,
           "min_verified_claims": 100
         }
       },
       "dimension_time": {
         "passed": false,
         "details": {
-          "calendar_days": 1,
+          "calendar_days": 21,
           "min_calendar_days": 45,
-          "trading_days": 1,
+          "trading_days": 3,
           "min_trading_days": 30,
           "market_regimes_covered": []
         }
       },
       "dimension_t5": {
-        "passed": false,
+        "passed": true,
         "details": {
-          "due_count": 0,
-          "completed_count": 0,
-          "completeness_rate": 0.0,
+          "due_count": 6,
+          "completed_count": 6,
+          "completeness_rate": 1.0,
           "min_required_rate": 0.95
         }
       },
       "dimension_balance": {
         "passed": false,
         "details": {
-          "bull_ratio": 0.0,
+          "bull_ratio": 0.1667,
           "allowed_range": [
             0.4,
             0.6
           ],
-          "side_diff": 0,
+          "side_diff": 4,
           "max_allowed_diff": 10
         }
       },
       "dimension_bias": {
         "passed": false,
         "details": {
-          "avg_bull_verified_rate": 0.0,
-          "avg_bear_verified_rate": 0.0,
-          "delta_verified_rate": 0.0,
+          "avg_bull_verified_rate": 0.7857,
+          "avg_bear_verified_rate": 0.8571,
+          "delta_verified_rate": 0.0714,
           "max_allowed_delta_v": 0.18,
           "avg_bull_challenge_adoption_rate": 0.0,
           "avg_bear_challenge_adoption_rate": 0.0,
@@ -91,25 +108,48 @@
       }
     },
     "summary": {
-      "sample_count": 3,
+      "sample_count": 7,
       "system_gate_status": "FAIL",
-      "recommendation": "KEEP_FALSE"
+      "recommendation": "KEEP_FALSE",
+      "cohort": "legacy_unversioned",
+      "commit_shas": [],
+      "excluded_counts": {
+        "legacy_null": 731,
+        "abstain": 35,
+        "invalid_run": 2,
+        "data_error": 0,
+        "no_trade": 0,
+        "wait": 15
+      }
     },
-    "recommendation": "KEEP_FALSE"
+    "excluded_counts": {
+      "legacy_null": 731,
+      "abstain": 35,
+      "invalid_run": 2,
+      "data_error": 0,
+      "no_trade": 0,
+      "wait": 15
+    },
+    "recommendation": "KEEP_FALSE",
+    "cohort": "legacy_unversioned",
+    "cohort_info": {
+      "cohort_type": "legacy_unversioned",
+      "canonical_key": "legacy_unversioned",
+      "decision_model_version": "decision_model.legacy_unversioned",
+      "evidence_contract_version": null,
+      "price_basis_version": null,
+      "commit_shas": []
+    }
   },
   "model_isolation": {
     "credit_weighting_active": false,
     "global_fallback_shadow": true,
     "system_gate_status": "FAIL",
     "model_weights": {
-      "gpt-4o": 1.0,
-      "qwen-max": 1.0,
-      "deepseek-r1": 1.0
+      "gemini-3.8-flash-high": 1.0
     },
     "bias_freeze_reasons": {
-      "gpt-4o": "System-level activation gates not passed",
-      "qwen-max": "System-level activation gates not passed",
-      "deepseek-r1": "System-level activation gates not passed"
+      "gemini-3.8-flash-high": "System-level activation gates not passed"
     },
     "abnormal_model_ratio": 1.0
   },
