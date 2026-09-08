@@ -71,7 +71,6 @@ from tradingagents.agents.utils.claim_specs import (
     MISSING_SYMBOL,
     MISSING_UNIT,
     MetricBasis,
-    NON_NUMERIC_THRESHOLD,
     SYMBOL_MISMATCH,
     validate_applicability,
     validate_claim_review_contract,
@@ -390,16 +389,28 @@ def test_missing_metric_or_source_negative():
     del cond_no_metric["metric"]
     ok1, err1, norm1 = validate_invalidation_condition(cond_no_metric)
     assert ok1 is False
-    assert err1 == ERR_SPEC_MISSING_CONDITION_FIELDS
+    assert err1 == "ERR_SPEC_MISSING_CONDITION_FIELDS"
     assert norm1 == {}
+
+    claim_no_metric = make_valid_claim_dict(invalidation_conditions=[cond_no_metric])
+    ok_c1, errs_c1, norm_c1 = validate_claim_review_contract(claim_no_metric)
+    assert ok_c1 is False
+    assert "ERR_SPEC_MISSING_CONDITION_FIELDS" in errs_c1
+    assert norm_c1 == {}
 
     # Missing source
     cond_no_source = make_valid_condition_dict()
     del cond_no_source["source"]
     ok2, err2, norm2 = validate_invalidation_condition(cond_no_source)
     assert ok2 is False
-    assert err2 == ERR_SPEC_MISSING_CONDITION_FIELDS
+    assert err2 == "ERR_SPEC_MISSING_CONDITION_FIELDS"
     assert norm2 == {}
+
+    claim_no_source = make_valid_claim_dict(invalidation_conditions=[cond_no_source])
+    ok_c2, errs_c2, norm_c2 = validate_claim_review_contract(claim_no_source)
+    assert ok_c2 is False
+    assert "ERR_SPEC_MISSING_CONDITION_FIELDS" in errs_c2
+    assert norm_c2 == {}
 
 
 def test_unknown_condition_preserves_none_no_prob_imputation():
@@ -783,3 +794,19 @@ def test_dataclass_direct_instantiation_validation_negative():
             applicability="not_an_applicability",  # type: ignore
             invalidation_conditions=(valid_cond,),
         )
+
+
+def test_dead_error_codes_removed_from_spec():
+    """33. Dead error codes and aliases cited in DAV-754 are purged according to AGENTS.md rule 3."""
+    import tradingagents.agents.utils.claim_specs as cs
+
+    dead_codes = [
+        "ERR_SPEC_UNFALSIFIABLE",
+        "ERR_SPEC_MISSING_METRIC",
+        "ERR_SPEC_NON_NUMERIC_THRESHOLD",
+        "ERR_SPEC_MISSING_SOURCE",
+    ]
+    for code in dead_codes:
+        assert not hasattr(cs.ClaimSpecErrorCode, code), f"{code} must be removed from ClaimSpecErrorCode"
+        assert not hasattr(cs, code), f"{code} must be removed from module constants"
+    assert not hasattr(cs, "NON_NUMERIC_THRESHOLD"), "NON_NUMERIC_THRESHOLD must be removed"
