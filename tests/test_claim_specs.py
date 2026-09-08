@@ -481,6 +481,16 @@ def test_decimal_non_finite_threshold_negative():
         assert norm == {}
 
 
+def test_decimal_overflow_to_inf_threshold_negative():
+    """Decimal values that exceed float range overflow to inf and must be rejected."""
+    for huge_dec in [Decimal("1e1000"), Decimal("-1e1000"), Decimal("1e309"), Decimal("-1e309")]:
+        cond = make_valid_condition_dict(threshold=huge_dec)
+        ok, err, norm = validate_invalidation_condition(cond)
+        assert ok is False
+        assert err == ERR_SPEC_INVALID_THRESHOLD
+        assert norm == {}
+
+
 def test_invalid_calendar_date_negative():
     """23. Non-existent calendar dates (e.g. 2026-02-29 non-leap) are rejected."""
     invalid_dates = [

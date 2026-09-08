@@ -519,7 +519,12 @@ def validate_invalidation_condition(
     if isinstance(raw_th, Decimal):
         if not raw_th.is_finite():
             return False, ERR_SPEC_INVALID_THRESHOLD, {}
-        norm_th: float | int = float(raw_th)
+        try:
+            norm_th: float | int = float(raw_th)
+        except (OverflowError, ValueError):
+            return False, ERR_SPEC_INVALID_THRESHOLD, {}
+        if not math.isfinite(norm_th):
+            return False, ERR_SPEC_INVALID_THRESHOLD, {}
     elif isinstance(raw_th, float):
         if not math.isfinite(raw_th):
             return False, ERR_SPEC_INVALID_THRESHOLD, {}
