@@ -61,7 +61,7 @@ def format_fund_flow_scale_metrics_prompt(
 
     Contracts:
     1. Read real fields only from scale_metrics.
-    2. Read selected_algorithm_group and reference_only ONLY from selection (never from scale_metrics).
+    2. Read selected_algorithm_group, selected_source, and reference_only ONLY from selection (never from scale_metrics).
     3. reference_only displays True/False ONLY when selection contains a strict boolean;
        if missing, non-Mapping, missing key, or non-bool, display
        '未知/缺少 selection，按 reference_only 纪律处理', never default to False or coerce.
@@ -92,7 +92,9 @@ def format_fund_flow_scale_metrics_prompt(
             raw_ref = selection["reference_only"]
             if isinstance(raw_ref, bool):
                 ref_only_repr = str(raw_ref)
-        selected_source = selection.get("selected_source")
+        raw_source = selection.get("selected_source")
+        if isinstance(raw_source, str) and raw_source.strip():
+            selected_source = raw_source.strip()
 
     # 2. Handle missing or empty scale_metrics -> fail closed
     if not isinstance(scale_metrics, Mapping) or not scale_metrics:
@@ -151,7 +153,6 @@ def format_fund_flow_scale_metrics_prompt(
     # 6. Read ratio values and sources/units with fallback
     denominator_sources = scale_metrics.get("denominator_sources")
     denominator_units = scale_metrics.get("denominator_units")
-    denominator_source = scale_metrics.get("denominator_source")
 
     net_to_circ_mv = scale_metrics.get("net_to_circ_mv")
     net_to_circ_mv_text = scale_metrics.get("net_to_circ_mv_text")
@@ -298,7 +299,7 @@ def format_fund_flow_scale_metrics_prompt(
         )
 
     # 10. Available and partial output
-    source_display = selected_source or denominator_source or "未指定"
+    source_display = selected_source if selected_source else "未知/缺少资金流来源"
     lines = [
         "【资金流相对规模证据（同标的同日相对参考）】",
         f"- 状态: {status} ({'完整可用' if status == 'available' else '部分可用'})",

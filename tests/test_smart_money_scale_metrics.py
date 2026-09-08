@@ -1177,3 +1177,93 @@ def test_finite_values_accepted_as_available(circ_val, amt_val, circ_expected, a
     assert "- 状态: available (完整可用)" in out
     assert f"- 净额占流通市值比 (net_to_circ_mv): {circ_expected} (分母来源: tushare.daily_basic, 分母单位: 万元)" in out
     assert f"- 净额占成交额比 (net_to_amount): {amt_expected} (分母来源: tushare.daily_basic, 分母单位: 万元)" in out
+
+
+@pytest.mark.parametrize(
+    "selection_input, expected_source_display",
+    [
+        (None, "未知/缺少资金流来源"),
+        ({}, "未知/缺少资金流来源"),
+        ({"selected_source": None}, "未知/缺少资金流来源"),
+        ({"selected_source": ""}, "未知/缺少资金流来源"),
+        ({"selected_source": "   "}, "未知/缺少资金流来源"),
+        ({"selected_source": 123}, "未知/缺少资金流来源"),
+        ({"selected_source": ["tushare"]}, "未知/缺少资金流来源"),
+        ({"selected_source": {"source": "ths"}}, "未知/缺少资金流来源"),
+        ({"selected_source": "tushare_eastmoney_moneyflow_dc"}, "tushare_eastmoney_moneyflow_dc"),
+        ({"selected_source": "ths"}, "ths"),
+    ],
+)
+def test_fund_flow_source_isolation_from_denominator_source(selection_input, expected_source_display):
+    """24. 验证资金来源只能来自 selection.selected_source，绝不回退为 denominator_source 或各比率分母来源。"""
+    from tradingagents.agents.analysts.smart_money_analyst import format_fund_flow_scale_metrics_prompt
+
+    scale_metrics = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": Decimal("0.006755"),
+        "net_to_amount": Decimal("0.027273"),
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "denominator_source": "daily_basic",
+        "denominator_sources": {
+            "circ_mv": "tushare.daily_basic",
+            "amount": "tushare.daily_basic",
+        },
+        "denominator_units": {
+            "circ_mv": "万元",
+            "amount": "万元",
+        },
+        "gaps": [],
+    }
+
+    out = format_fund_flow_scale_metrics_prompt(scale_metrics, selection_input)
+    assert f"- 资金来源: {expected_source_display}" in out
+
+    # 当 selected_source 缺失或畸形时，绝不能将分母来源 daily_basic / tushare.daily_basic 冒充为资金来源
+    if expected_source_display == "未知/缺少资金流来源":
+        assert "- 资金来源: daily_basic" not in out
+        assert "- 资金来源: tushare.daily_basic" not in out
+        assert "- 资金来源: 未指定" not in out
+
+    # 分母来源依然严格保留在各比率自己的分母标签中
+    assert "(分母来源: tushare.daily_basic, 分母单位: 万元)" in out
+
+
+def test_fund_flow_source_isolation_end_to_end_node():
+    """25. 端到端验证 selection 缺 selected_source 时 LLM 提示词中资金来源不冒充分母来源。"""
+    scale_metrics = {
+        "ts_code": "600519.SH",
+        "trade_date": "2026-08-14",
+        "status": "available",
+        "net_to_circ_mv": Decimal("0.006755"),
+        "net_to_amount": Decimal("0.027273"),
+        "circ_mv_source": "tushare.daily_basic",
+        "circ_mv_unit": "万元",
+        "amount_source": "tushare.daily_basic",
+        "amount_unit": "万元",
+        "denominator_source": "daily_basic",
+        "gaps": [],
+    }
+    selection = {
+        "reference_only": True,
+        "selected_algorithm_group": "new_algorithm_group",
+        "selected_source": "",  # 空字符串
+    }
+    fund_flow_evidence = {
+        "scale_metrics": scale_metrics,
+        "selection": selection,
+        "records": [],
+    }
+    llm = _RecordingLLM()
+    collector = _MockCollector(fund_flow_evidence=fund_flow_evidence)
+    _run_analyst_node(llm, collector)
+
+    human_prompt = llm.messages[1].content
+    assert "- 资金来源: 未知/缺少资金流来源" in human_prompt
+    assert "- 资金来源: daily_basic" not in human_prompt
+    assert "- 资金来源: tushare.daily_basic" not in human_prompt
+    assert "(分母来源: tushare.daily_basic, 分母单位: 万元)" in human_prompt
