@@ -968,3 +968,87 @@ def test_dataclass_from_dict_and_roundtrip_with_canonical_strings():
     assert contract.applicability == app
     assert contract.invalidation_conditions == (cond,)
     assert contract.to_dict() == contract_data
+
+
+def test_claim_id_validation_and_from_dict_consistency_valid():
+    """38. Valid and trimmed claim_id, or missing claim_id, are consistent between validator and from_dict."""
+    # 1. Missing claim_id
+    payload_missing = make_valid_claim_dict()
+    del payload_missing["claim_id"]
+    ok, errors, norm = validate_claim_review_contract(payload_missing)
+    assert ok is True
+    assert errors == []
+    assert norm.get("claim_id") is None
+    contract_missing = ClaimReviewContract.from_dict(payload_missing)
+    assert contract_missing.claim_id is None
+
+    # 2. Legal non-empty string claim_id
+    payload_legal = make_valid_claim_dict(claim_id="CLM-LEGAL-1")
+    ok, errors, norm = validate_claim_review_contract(payload_legal)
+    assert ok is True
+    assert errors == []
+    assert norm["claim_id"] == "CLM-LEGAL-1"
+    contract_legal = ClaimReviewContract.from_dict(payload_legal)
+    assert contract_legal.claim_id == "CLM-LEGAL-1"
+
+    # 3. Trimmed claim_id
+    payload_trim = make_valid_claim_dict(claim_id="   CLM-TRIM-1  \t\n")
+    ok, errors, norm = validate_claim_review_contract(payload_trim)
+    assert ok is True
+    assert errors == []
+    assert norm["claim_id"] == "CLM-TRIM-1"
+    contract_trim = ClaimReviewContract.from_dict(payload_trim)
+    assert contract_trim.claim_id == "CLM-TRIM-1"
+
+
+@pytest.mark.parametrize(
+    "invalid_cid",
+    [
+        "",  # empty string
+        "   ",  # whitespace string
+        "\t\n",  # tab / newline only
+        None,  # explicit None
+        True,  # bool True
+        False,  # bool False
+        123,  # int
+        45.67,  # float
+        {"id": "CLM-1"},  # dict
+        ["CLM-1"],  # list
+    ],
+)
+def test_claim_id_fail_closed_consistency_parameterized(invalid_cid: Any):
+    """39. Malformed/empty/None/bool/number/dict/list claim_id fail closed identically in validator and from_dict."""
+    import tradingagents.agents.utils.claim_specs as cs
+
+    expected_err = getattr(cs, "ERR_SPEC_INVALID_CLAIM_ID", "ERR_SPEC_INVALID_CLAIM_ID")
+    payload = make_valid_claim_dict(claim_id=invalid_cid)
+
+    # 1. validate_claim_review_contract with strict_fail_closed=True
+    ok, errors, norm = validate_claim_review_contract(payload, strict_fail_closed=True)
+    assert ok is False
+    assert expected_err in errors
+    assert norm == {}
+
+    # 2. validate_claim_review_contract with strict_fail_closed=False (aggregation mode)
+    ok_agg, errors_agg, norm_agg = validate_claim_review_contract(payload, strict_fail_closed=False)
+    assert ok_agg is False
+    assert expected_err in errors_agg
+    assert norm_agg == {}
+
+    # 3. ClaimReviewContract.from_dict fails closed with ValueError containing the stable error code
+    with pytest.raises(ValueError) as exc_info:
+        ClaimReviewContract.from_dict(payload)
+    assert expected_err in str(exc_info.value)
+
+
+def test_claim_id_error_code_defined_without_aliases():
+    """40. ERR_SPEC_INVALID_CLAIM_ID is defined and stable, without dead aliases."""
+    import tradingagents.agents.utils.claim_specs as cs
+
+    assert hasattr(cs.ClaimSpecErrorCode, "ERR_SPEC_INVALID_CLAIM_ID")
+    assert cs.ClaimSpecErrorCode.ERR_SPEC_INVALID_CLAIM_ID.value == "ERR_SPEC_INVALID_CLAIM_ID"
+    assert hasattr(cs, "ERR_SPEC_INVALID_CLAIM_ID")
+    assert cs.ERR_SPEC_INVALID_CLAIM_ID == "ERR_SPEC_INVALID_CLAIM_ID"
+    # Rule: no dead alias / alias creation
+    assert not hasattr(cs, "INVALID_CLAIM_ID")
+    assert not hasattr(cs.ClaimSpecErrorCode, "INVALID_CLAIM_ID")

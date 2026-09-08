@@ -145,6 +145,9 @@ class ClaimSpecErrorCode(str, Enum):
     ERR_SPEC_INVALID_PERIOD = "ERR_SPEC_INVALID_PERIOD"
     ERR_SPEC_INVALID_SOURCE = "ERR_SPEC_INVALID_SOURCE"
 
+    # Contract level errors
+    ERR_SPEC_INVALID_CLAIM_ID = "ERR_SPEC_INVALID_CLAIM_ID"
+
 
 # Module-level string constants for direct equality / membership
 ERR_SPEC_MISSING_CLAIM: str = ClaimSpecErrorCode.ERR_SPEC_MISSING_CLAIM.value
@@ -178,6 +181,7 @@ ERR_SPEC_INVALID_UNIT: str = ClaimSpecErrorCode.ERR_SPEC_INVALID_UNIT.value
 ERR_SPEC_MISSING_PERIOD: str = ClaimSpecErrorCode.ERR_SPEC_MISSING_PERIOD.value
 ERR_SPEC_INVALID_PERIOD: str = ClaimSpecErrorCode.ERR_SPEC_INVALID_PERIOD.value
 ERR_SPEC_INVALID_SOURCE: str = ClaimSpecErrorCode.ERR_SPEC_INVALID_SOURCE.value
+ERR_SPEC_INVALID_CLAIM_ID: str = ClaimSpecErrorCode.ERR_SPEC_INVALID_CLAIM_ID.value
 
 # Backward-compatible short aliases matching DAV-736 text
 MISSING_SYMBOL: str = ERR_SPEC_MISSING_SYMBOL
@@ -753,6 +757,17 @@ def validate_claim_review_contract(
                     seen_condition_ids.add(cid)
                     norm_conditions.append(norm_c)
 
+    # C. Validate claim_id (if explicitly provided)
+    norm_claim_id: str | None = None
+    if "claim_id" in claim_dict:
+        raw_cid = claim_dict["claim_id"]
+        if isinstance(raw_cid, str) and not isinstance(raw_cid, bool) and raw_cid.strip():
+            norm_claim_id = raw_cid.strip()
+        else:
+            errors.append(ERR_SPEC_INVALID_CLAIM_ID)
+            if strict_fail_closed:
+                return False, errors, {}
+
     if errors:
         return False, errors, {}
 
@@ -760,7 +775,7 @@ def validate_claim_review_contract(
         "applicability": norm_applicability,
         "invalidation_conditions": norm_conditions,
     }
-    if "claim_id" in claim_dict and isinstance(claim_dict["claim_id"], str):
-        normalized_contract["claim_id"] = claim_dict["claim_id"].strip()
+    if norm_claim_id is not None:
+        normalized_contract["claim_id"] = norm_claim_id
 
     return True, [], normalized_contract
