@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import Enum
 import hashlib
+import json
 import logging
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, Tuple, Union
 
 from tradingagents.agents.utils.debate_utils import normalize_text
+from tradingagents.agents.utils.evidence_relations import (
+    EvidenceRelation,
+    EvidenceRelationGraph,
+    FailClosedReason,
+    RelationType,
+    ValidationResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -499,3 +509,299 @@ def format_claim_cluster_summary_for_prompt(
             votes = cl.get("direction_votes") or {}
             lines.append(f"  * 【{c_id}】 类型={c_type} | 关联 claim=[{claims_str}] | 发言分析师=[{speakers_str}] | 方向投票={votes}")
     return "\n".join(lines)
+
+
+# ==============================================================================
+# E-02: 证据关系 Reducer 折叠与贡献上限（纯函数）
+# 冻结契约 v4 (DAV-772 第四版微修订)：
+# 1. SOURCE_REPETITION 作为无向等价关系做连通分量折叠；规范化键为 (min(u,v), rep, max(u,v))；不报 cycle。
+# 2. DERIVED_OBSERVATION 保持 source_id(derived) -> target_id(base)，仅此子图参与 cycle 与 terminal 分析。
+# 3. 纯 repetition 组件 derived_terminal_ids=() 并标注“不适用派生终点”。
+# 4. component_id 采用无歧义 Canonical JSON 编码防碰撞后 SHA-256 计算。
+# 5. 错误分类 100% 复用 E-01 FailClosedReason 与 ValidationResult；专有异常仅新增 MALFORMED_CLAIM_SEQUENCE / AMBIGUOUS_DERIVED_TERMINAL。
+# 6. 未连接声明严禁称作独立声明；independence_status 恒为 UNKNOWN，global_contribution_cap 恒为 1（0 声明为 0）。
+# 7. 严格输入置换不变性。
+# ==============================================================================
+
+
+class IndependenceStatus(str, Enum):
+    """全局独立性证明状态（路径 A 下多节点间独立性无法证明）。"""
+    UNKNOWN = "UNKNOWN"
+
+
+class ReducerFailReason(str, Enum):
+    """Reducer 专用防御异常原因（不重名新增，共享图错误直接复用 FailClosedReason）。"""
+    MALFORMED_CLAIM_SEQUENCE = "MALFORMED_CLAIM_SEQUENCE"      # claim_ids 非序列、含非字符串、空白字符或 None/dict/list 等畸形元素
+    AMBIGUOUS_DERIVED_TERMINAL = "AMBIGUOUS_DERIVED_TERMINAL"  # 要求严格单派生终点但存在多终点或纯 repetition 无派生终点
+
+
+class EvidenceReductionError(ValueError):
+    """非法输入整图拒绝异常容器（复用 E-01 FailClosedReason 与 ReducerFailReason）。"""
+
+    def __init__(
+        self,
+        error_reason: Union[FailClosedReason, ReducerFailReason],
+        message: str,
+        affected_nodes: Tuple[str, ...] = (),
+        affected_edges: Tuple[Tuple[str, str], ...] = (),
+    ) -> None:
+        reason_val = error_reason.value if hasattr(error_reason, "value") else str(error_reason)
+        super().__init__(f"[{reason_val}] {message}")
+        self.error_reason = error_reason
+        self.message = message
+        self.affected_nodes = tuple(affected_nodes)
+        self.affected_edges = tuple(affected_edges)
+
+
+@dataclass(frozen=True)
+class FoldedComponent:
+    """已证明折叠组件纯数据结构。"""
+    component_id: str                              # 基于严格排序成员无歧义 Canonical JSON 编码经 SHA-256 截断生成的确定性 ID
+    member_claim_ids: Tuple[str, ...]              # 组件内全部成员声明 ID（ASCII 严格升序）
+    derived_terminal_ids: Tuple[str, ...]          # 仅基于 DERIVED_OBSERVATION 出边计算的终点元组（ASCII 严格升序；纯 repetition 组件恒为 ()，标注不适用派生终点）
+    audit_edges: Tuple[EvidenceRelation, ...]      # 组件内包含的规范化审计边（去重并稳定排序）
+
+    @property
+    def is_ambiguous_derived_terminal(self) -> bool:
+        """是否存在多终点或缺失派生终点的语义歧义。"""
+        return len(self.derived_terminal_ids) != 1
+
+    def get_single_derived_terminal(self) -> str:
+        """严格单派生终点提取器：多终点或纯 repetition 无派生终点时立即 Fail-Closed 抛出 AMBIGUOUS_DERIVED_TERMINAL。"""
+        if len(self.derived_terminal_ids) != 1:
+            raise EvidenceReductionError(
+                error_reason=ReducerFailReason.AMBIGUOUS_DERIVED_TERMINAL,
+                message=f"Component {self.component_id} has ambiguous or empty derived terminals: {self.derived_terminal_ids}",
+                affected_nodes=self.derived_terminal_ids,
+                affected_edges=tuple((e.source_id, e.target_id) for e in self.audit_edges),
+            )
+        return self.derived_terminal_ids[0]
+
+
+@dataclass(frozen=True)
+class EvidenceReductionResult:
+    """纯函数最终输出契约：只报告可证明折叠事实，不推断独立性，不输出独立投票。"""
+    folded_components: Tuple[FoldedComponent, ...]  # 已证明折叠组件列表（按 component_id 升序排列）
+    unconnected_claim_ids: Tuple[str, ...]          # 未被折叠边连接的声明列表（ASCII 严格升序，严禁称作独立声明）
+    audit_edges: Tuple[EvidenceRelation, ...]       # 全图参与折叠的规范化审计边（全量去重排序）
+    independence_status: IndependenceStatus         # 恒为 IndependenceStatus.UNKNOWN
+    global_contribution_cap: int                    # 全局下游贡献上限（0 个声明为 0；>=1 个声明恒为 1）
+
+
+def reduce_evidence_claims(
+    claim_ids: Sequence[str],
+    relations: Sequence[EvidenceRelation] | EvidenceRelationGraph,
+) -> EvidenceReductionResult:
+    """纯函数：基于显式可证明证据关系执行确定性同源等价折叠与派生 DAG 分流分析。
+
+    核心约束：
+    1. SOURCE_REPETITION 作为无向等价关系处理，反向重复与三角同源幂等合并，不参与有向环检测；
+    2. DERIVED_OBSERVATION 保持 source_id(derived) -> target_id(base)，仅此子图进行有向环检测与派生终点分析；
+    3. 组件由 repetition 与 derived 的无向投影共同形成；纯 repetition 组件 derived_terminal_ids=()；
+    4. component_id 使用 Canonical JSON 编码防碰撞后哈希；
+    5. unconnected_claim_ids 严禁称作独立声明，全图独立性恒为 UNKNOWN，全局下游贡献上限 global_contribution_cap 恒为 1（0 声明为 0）；
+    6. 共享图错误直接复用 E-01 FailClosedReason (SELF_LOOP, DANGLING_REFERENCE, CYCLE_DETECTED)；
+    7. 输入排列不影响输出结果（严格置换不变性）。
+    """
+    # Phase 1: Input Validation & Fail-Closed Defense
+    if claim_ids is None or not isinstance(claim_ids, (list, tuple)):
+        raise EvidenceReductionError(
+            error_reason=ReducerFailReason.MALFORMED_CLAIM_SEQUENCE,
+            message="claim_ids must be a sequence (list or tuple)",
+        )
+    for idx, item in enumerate(claim_ids):
+        if not isinstance(item, str) or not item.strip():
+            raise EvidenceReductionError(
+                error_reason=ReducerFailReason.MALFORMED_CLAIM_SEQUENCE,
+                message=f"Invalid claim ID at index {idx}: {item!r}. Must be a non-empty string.",
+            )
+
+    if relations is None:
+        raise TypeError("relations must be Sequence[EvidenceRelation] or EvidenceRelationGraph, got None")
+    if isinstance(relations, EvidenceRelationGraph):
+        rel_seq = relations.relations
+    elif isinstance(relations, (list, tuple)):
+        rel_seq = relations
+    else:
+        raise TypeError(
+            f"relations must be Sequence[EvidenceRelation] or EvidenceRelationGraph, got {type(relations).__name__}"
+        )
+
+    for idx, rel in enumerate(rel_seq):
+        if not isinstance(rel, EvidenceRelation):
+            raise TypeError(f"relations element at index {idx} must be EvidenceRelation, got {type(rel).__name__}")
+
+    unique_claim_ids = sorted(set(claim_ids))
+    if len(unique_claim_ids) == 0:
+        if len(rel_seq) == 0:
+            return EvidenceReductionResult(
+                folded_components=(),
+                unconnected_claim_ids=(),
+                audit_edges=(),
+                independence_status=IndependenceStatus.UNKNOWN,
+                global_contribution_cap=0,
+            )
+
+    # Sort relations for deterministic, permutation-invariant evaluation
+    sorted_rel_seq = sorted(
+        rel_seq,
+        key=lambda r: (
+            r.relation_type.value,
+            r.source_id,
+            r.target_id,
+            json.dumps(r.to_dict(), sort_keys=True, ensure_ascii=False),
+        ),
+    )
+
+    # Phase 2: Edge Categorization & Endpoint Normalization (Fail-Closed)
+    repetition_edges_map: dict[tuple[str, str, str], EvidenceRelation] = {}
+    derived_edges_map: dict[tuple[str, str, str], EvidenceRelation] = {}
+
+    for rel in sorted_rel_seq:
+        # Dangling reference check (E-01 FailClosedReason.DANGLING_REFERENCE)
+        if rel.source_id not in unique_claim_ids or rel.target_id not in unique_claim_ids:
+            missing = tuple(sorted([n for n in (rel.source_id, rel.target_id) if n not in unique_claim_ids]))
+            raise EvidenceReductionError(
+                error_reason=FailClosedReason.DANGLING_REFERENCE,
+                message=f"Dangling edge: {rel.source_id}->{rel.target_id} references unknown node(s): {missing}",
+                affected_nodes=missing,
+                affected_edges=((rel.source_id, rel.target_id),),
+            )
+
+        # Self-loop check (E-01 FailClosedReason.SELF_LOOP)
+        if rel.source_id == rel.target_id:
+            raise EvidenceReductionError(
+                error_reason=FailClosedReason.SELF_LOOP,
+                message=f"Self-loop: {rel.source_id}",
+                affected_nodes=(rel.source_id,),
+                affected_edges=((rel.source_id, rel.target_id),),
+            )
+
+        if rel.relation_type == RelationType.SOURCE_REPETITION:
+            u, v = sorted([rel.source_id, rel.target_id])
+            rep_key = (u, RelationType.SOURCE_REPETITION.value, v)
+            if rep_key not in repetition_edges_map:
+                norm_rel = EvidenceRelation(
+                    source_id=u,
+                    relation_type=RelationType.SOURCE_REPETITION,
+                    target_id=v,
+                    metadata=dict(rel.to_dict()["metadata"]),
+                )
+                repetition_edges_map[rep_key] = norm_rel
+        elif rel.relation_type == RelationType.DERIVED_OBSERVATION:
+            derived_key = (rel.source_id, RelationType.DERIVED_OBSERVATION.value, rel.target_id)
+            if derived_key not in derived_edges_map:
+                derived_edges_map[derived_key] = rel
+
+    # Phase 3: Directed Cycle Detection on DERIVED_OBSERVATION Subgraph Only (Fail-Closed)
+    adj_derived: dict[str, list[str]] = {u: [] for u in unique_claim_ids}
+    for rel in derived_edges_map.values():
+        adj_derived[rel.source_id].append(rel.target_id)
+    for u in unique_claim_ids:
+        adj_derived[u].sort()
+
+    color: dict[str, int] = {u: 0 for u in unique_claim_ids}
+    path: list[str] = []
+
+    def dfs(node: str) -> None:
+        color[node] = 1
+        path.append(node)
+        for nbr in adj_derived[node]:
+            if color[nbr] == 1:
+                idx = path.index(nbr)
+                cycle_nodes = path[idx:] + [nbr]
+                cycle_edges = tuple((cycle_nodes[i], cycle_nodes[i + 1]) for i in range(len(cycle_nodes) - 1))
+                raise EvidenceReductionError(
+                    error_reason=FailClosedReason.CYCLE_DETECTED,
+                    message=f"Cycle in derived subgraph: {'->'.join(cycle_nodes)}",
+                    affected_nodes=tuple(cycle_nodes),
+                    affected_edges=cycle_edges,
+                )
+            elif color[nbr] == 0:
+                dfs(nbr)
+        path.pop()
+        color[node] = 2
+
+    for u in unique_claim_ids:
+        if color[u] == 0:
+            dfs(u)
+
+    # Phase 4: Connected Component Partitioning (Joint Undirected Projection)
+    undirected_adj: dict[str, set[str]] = {u: set() for u in unique_claim_ids}
+    for (u, _, v) in repetition_edges_map.keys():
+        undirected_adj[u].add(v)
+        undirected_adj[v].add(u)
+    for rel in derived_edges_map.values():
+        undirected_adj[rel.source_id].add(rel.target_id)
+        undirected_adj[rel.target_id].add(rel.source_id)
+
+    visited: set[str] = set()
+    raw_components: list[list[str]] = []
+    for u in unique_claim_ids:
+        if u not in visited:
+            comp: list[str] = []
+            queue: list[str] = [u]
+            visited.add(u)
+            while queue:
+                curr = queue.pop(0)
+                comp.append(curr)
+                for nbr in sorted(undirected_adj[curr]):
+                    if nbr not in visited:
+                        visited.add(nbr)
+                        queue.append(nbr)
+            raw_components.append(sorted(comp))
+
+    # Phase 5: Component Assembly & Canonical JSON ID Generation
+    folded_components: list[FoldedComponent] = []
+    unconnected_claims: list[str] = []
+
+    for comp in raw_components:
+        comp_set = set(comp)
+        if len(comp) == 1 and len(undirected_adj[comp[0]]) == 0:
+            unconnected_claims.append(comp[0])
+            continue
+
+        comp_derived = [
+            rel for rel in derived_edges_map.values()
+            if rel.source_id in comp_set and rel.target_id in comp_set
+        ]
+        if len(comp_derived) == 0:
+            terminals: Tuple[str, ...] = ()
+        else:
+            cand_nodes = set(rel.source_id for rel in comp_derived) | set(rel.target_id for rel in comp_derived)
+            terminals = tuple(sorted([
+                n for n in cand_nodes
+                if len([rel for rel in comp_derived if rel.source_id == n]) == 0
+            ]))
+
+        comp_audit = sorted(
+            [rel for rel in repetition_edges_map.values() if rel.source_id in comp_set and rel.target_id in comp_set]
+            + comp_derived,
+            key=lambda r: (r.relation_type.value, r.source_id, r.target_id),
+        )
+
+        canonical_payload = json.dumps(comp, ensure_ascii=False, separators=(',', ':'))
+        comp_hash = hashlib.sha256(canonical_payload.encode('utf-8')).hexdigest()[:12]
+        comp_id = f"comp_{comp[0]}_{comp_hash}"
+
+        folded_components.append(FoldedComponent(
+            component_id=comp_id,
+            member_claim_ids=tuple(comp),
+            derived_terminal_ids=terminals,
+            audit_edges=tuple(comp_audit),
+        ))
+
+    # Phase 6: Output Assembly (Strict Invariants)
+    folded_components.sort(key=lambda c: c.component_id)
+    unconnected_claims.sort()
+    all_audit_edges = sorted(
+        list(repetition_edges_map.values()) + list(derived_edges_map.values()),
+        key=lambda r: (r.relation_type.value, r.source_id, r.target_id),
+    )
+    return EvidenceReductionResult(
+        folded_components=tuple(folded_components),
+        unconnected_claim_ids=tuple(unconnected_claims),
+        audit_edges=tuple(all_audit_edges),
+        independence_status=IndependenceStatus.UNKNOWN,
+        global_contribution_cap=1,
+    )

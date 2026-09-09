@@ -482,3 +482,37 @@ class TestIntegrationDebateAndResearchManager:
         assert "independent_cluster_count" in prompt_text
         assert "verified_evidence_count" in prompt_text
 
+
+class TestEvidenceReducerExportsRegression:
+    """Regression assertions ensuring E-02 pure reducer types and API are exported and backwards-compatible."""
+
+    def test_e02_reducer_exports_and_contract_compatibility(self):
+        """claim_cluster module must export E-02 reducer types and pure function."""
+        from tradingagents.agents.utils.claim_cluster import (
+            EvidenceReductionError,
+            EvidenceReductionResult,
+            FoldedComponent,
+            IndependenceStatus,
+            ReducerFailReason,
+            reduce_evidence_claims,
+        )
+
+        assert issubclass(EvidenceReductionError, ValueError)
+        assert issubclass(IndependenceStatus, str)
+        assert issubclass(ReducerFailReason, str)
+        assert IndependenceStatus.UNKNOWN == "UNKNOWN"
+
+        # Baseline call: empty claims produce cap=0 and empty result
+        empty_res = reduce_evidence_claims([], [])
+        assert isinstance(empty_res, EvidenceReductionResult)
+        assert empty_res.global_contribution_cap == 0
+        assert empty_res.independence_status == IndependenceStatus.UNKNOWN
+        assert empty_res.folded_components == ()
+        assert empty_res.unconnected_claim_ids == ()
+        assert empty_res.audit_edges == ()
+
+        # Baseline call: single claim produces cap=1 and unconnected_claim_ids
+        single_res = reduce_evidence_claims(["INV-1"], [])
+        assert single_res.global_contribution_cap == 1
+        assert single_res.unconnected_claim_ids == ("INV-1",)
+        assert single_res.folded_components == ()
