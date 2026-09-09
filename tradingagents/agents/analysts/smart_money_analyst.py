@@ -1,4 +1,8 @@
 import logging
+from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
+import math
+from typing import Any
 from tradingagents.agents.utils.context_utils import get_cn_stock_name, format_phase1_reports
 import asyncio
 import json
@@ -49,6 +53,387 @@ def _resolve_research_horizon(state: dict | None) -> str:
     return "short"
 
 
+def format_fund_flow_scale_metrics_prompt(
+    scale_metrics: Mapping[str, Any] | None,
+    selection: Mapping[str, Any] | None,
+) -> str:
+    """Format deterministic scale_metrics evidence snippet for LLM prompt.
+
+    Contracts:
+    1. Read real fields only from scale_metrics.
+    2. Read selected_algorithm_group, selected_source, and reference_only ONLY from selection (never from scale_metrics).
+    3. reference_only displays True/False ONLY when selection contains a strict boolean;
+       if missing, non-Mapping, missing key, or non-bool, display
+       '未知/缺少 selection，按 reference_only 纪律处理', never default to False or coerce.
+    4. Only accept known status (available/partial/unavailable). Unknown/missing status fails closed to unavailable.
+       Cross-check status with usable ratios:
+       - available requires both ratios with required denominator source & unit, otherwise downgrade to partial or unavailable with contract contradiction gap.
+       - partial only presents structurally complete usable ratio; if neither is usable, downgrade to unavailable.
+       - unavailable is never presented as usable, regardless of values carried.
+    5. ts_code or trade_date missing fails closed to unavailable.
+    6. Denominator source/unit read from corresponding fields, allowing denominator_sources / denominator_units
+       Mapping as exact fallback; if still missing, ratio is unusable (no '未指定' to keep available).
+    7. gaps/gap_list as str kept as single item; list/tuple preserved per item; malformed types add explicit contract gap.
+    8. Discipline constraints appended. Input objects not modified in place.
+    """
+    discipline_text = (
+        "【纪律约束】相对规模比率仅作为同标的、同交易日的统计参考证据；"
+        "严禁据此识别机构或散户账户身份，严禁进行跨股票横向排名，严禁据此生成新评分、权重、概率或交易执行信号。"
+        "不得在分母缺失时退回绝对净额作规模结论。"
+    )
+
+    # 1. Read metadata strictly and ONLY from selection
+    selected_algorithm_group = None
+    ref_only_repr = "未知/缺少 selection，按 reference_only 纪律处理"
+    selected_source = None
+    if isinstance(selection, Mapping):
+        selected_algorithm_group = selection.get("selected_algorithm_group")
+        if "reference_only" in selection:
+            raw_ref = selection["reference_only"]
+            if isinstance(raw_ref, bool):
+                ref_only_repr = str(raw_ref)
+        raw_source = selection.get("selected_source")
+        if isinstance(raw_source, str) and raw_source.strip():
+            selected_source = raw_source.strip()
+
+    # 2. Handle missing or empty scale_metrics -> fail closed
+    if not isinstance(scale_metrics, Mapping) or not scale_metrics:
+        return (
+            "【资金流相对规模证据（同标的同日相对参考）】\n"
+            "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)\n"
+            "- 缺口说明: 缺少 scale_metrics 相对规模对象\n"
+            f"- {discipline_text}"
+        )
+
+    # 3. Parse gaps / gap_list
+    raw_gaps = scale_metrics.get("gaps")
+    if raw_gaps is None and "gap_list" in scale_metrics:
+        raw_gaps = scale_metrics.get("gap_list")
+
+    gaps: list[str] = []
+    if raw_gaps is not None:
+        if isinstance(raw_gaps, str):
+            if raw_gaps.strip():
+                gaps.append(raw_gaps.strip())
+        elif isinstance(raw_gaps, (list, tuple)):
+            for g in raw_gaps:
+                if g is not None and str(g).strip():
+                    gaps.append(str(g).strip())
+        else:
+            gaps.append(f"契约异常: gaps 包含畸形类型 ({type(raw_gaps).__name__}: {raw_gaps})")
+
+    # 4. Read real identification fields
+    raw_ts_code = scale_metrics.get("ts_code")
+    raw_trade_date = scale_metrics.get("trade_date")
+
+    ts_code = ""
+    missing_id_gaps: list[str] = []
+    if raw_ts_code is None:
+        missing_id_gaps.append("契约异常: 标的代码 (ts_code) 缺失，整体相对规模不可用")
+    elif isinstance(raw_ts_code, str):
+        stripped_code = raw_ts_code.strip()
+        if stripped_code:
+            ts_code = stripped_code
+        else:
+            missing_id_gaps.append("契约异常: 标的代码 (ts_code) 缺失（空白字符串），整体相对规模不可用")
+    else:
+        missing_id_gaps.append(
+            f"契约异常: 标的代码 (ts_code) 畸形（非字符串类型: {type(raw_ts_code).__name__}），整体相对规模不可用"
+        )
+
+    trade_date = ""
+    if raw_trade_date is None:
+        missing_id_gaps.append("契约异常: 交易日期 (trade_date) 缺失，整体相对规模不可用")
+    elif isinstance(raw_trade_date, str):
+        stripped_date = raw_trade_date.strip()
+        if stripped_date:
+            trade_date = stripped_date
+        else:
+            missing_id_gaps.append("契约异常: 交易日期 (trade_date) 缺失（空白字符串），整体相对规模不可用")
+    else:
+        missing_id_gaps.append(
+            f"契约异常: 交易日期 (trade_date) 畸形（非字符串类型: {type(raw_trade_date).__name__}），整体相对规模不可用"
+        )
+
+    # 5. Read status strictly
+    raw_status = scale_metrics.get("status")
+    if raw_status is None:
+        gaps.append("契约异常: 缺少 status 状态字段 (fail-closed 置为 unavailable)")
+        status = "unavailable"
+    elif not isinstance(raw_status, str):
+        gaps.append(f"契约异常: 状态字段为未知类型 ({type(raw_status).__name__}: {raw_status}) (fail-closed 置为 unavailable)")
+        status = "unavailable"
+    else:
+        norm_status = raw_status.strip().lower()
+        if norm_status in {"available", "partial", "unavailable"}:
+            status = norm_status
+        else:
+            gaps.append(f"契约异常: 未知状态 '{raw_status}' (fail-closed 置为 unavailable)")
+            status = "unavailable"
+
+    # 6. Read ratio values and sources/units with fallback
+    denominator_sources = scale_metrics.get("denominator_sources")
+    denominator_units = scale_metrics.get("denominator_units")
+
+    if denominator_sources is not None and not isinstance(denominator_sources, Mapping):
+        gaps.append(
+            f"契约异常: denominator_sources 畸形（非 Mapping 类型: {type(denominator_sources).__name__}），无法读取 fallback"
+        )
+    if denominator_units is not None and not isinstance(denominator_units, Mapping):
+        gaps.append(
+            f"契约异常: denominator_units 畸形（非 Mapping 类型: {type(denominator_units).__name__}），无法读取 fallback"
+        )
+
+    net_to_circ_mv = scale_metrics.get("net_to_circ_mv")
+    net_to_circ_mv_text = scale_metrics.get("net_to_circ_mv_text")
+    net_to_amount = scale_metrics.get("net_to_amount")
+    net_to_amount_text = scale_metrics.get("net_to_amount_text")
+
+    def _resolve_denominator_label(
+        field_name: str,
+        raw_val: Any,
+        fallback_container: Any,
+        fallback_key: str,
+        fallback_name: str,
+    ) -> str | None:
+        if raw_val is not None:
+            if isinstance(raw_val, str):
+                s = raw_val.strip()
+                if s:
+                    return s
+                gaps.append(f"契约异常: {field_name} 缺失（空白字符串），该分母标签不可用")
+                return None
+            gaps.append(
+                f"契约异常: {field_name} 畸形（非字符串类型: {type(raw_val).__name__}），该分母标签不可用"
+            )
+            return None
+
+        if isinstance(fallback_container, Mapping):
+            fb_val = fallback_container.get(fallback_key)
+            if fb_val is not None:
+                if isinstance(fb_val, str):
+                    s = fb_val.strip()
+                    if s:
+                        return s
+                    gaps.append(
+                        f"契约异常: {fallback_name}['{fallback_key}'] 缺失（空白字符串），该分母标签不可用"
+                    )
+                    return None
+                gaps.append(
+                    f"契约异常: {fallback_name}['{fallback_key}'] 畸形（非字符串类型: {type(fb_val).__name__}），该分母标签不可用"
+                )
+                return None
+        return None
+
+    circ_mv_source = _resolve_denominator_label(
+        "circ_mv_source",
+        scale_metrics.get("circ_mv_source"),
+        denominator_sources,
+        "circ_mv",
+        "denominator_sources",
+    )
+    circ_mv_unit = _resolve_denominator_label(
+        "circ_mv_unit",
+        scale_metrics.get("circ_mv_unit"),
+        denominator_units,
+        "circ_mv",
+        "denominator_units",
+    )
+    amount_source = _resolve_denominator_label(
+        "amount_source",
+        scale_metrics.get("amount_source"),
+        denominator_sources,
+        "amount",
+        "denominator_sources",
+    )
+    amount_unit = _resolve_denominator_label(
+        "amount_unit",
+        scale_metrics.get("amount_unit"),
+        denominator_units,
+        "amount",
+        "denominator_units",
+    )
+
+    # Validate ratios
+    def _is_valid_num(v: Any) -> bool:
+        if v is None or isinstance(v, bool):
+            return False
+        if not isinstance(v, (int, float, Decimal, str)):
+            return False
+        try:
+            if isinstance(v, float) and not math.isfinite(v):
+                return False
+            stripped_or_str = str(v).strip()
+            if not stripped_or_str:
+                return False
+            d = Decimal(stripped_or_str)
+            if not d.is_finite():
+                return False
+            fv = float(d)
+            if not math.isfinite(fv):
+                return False
+            return True
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            return False
+
+    has_circ_val = _is_valid_num(net_to_circ_mv)
+    has_amt_val = _is_valid_num(net_to_amount)
+
+    # String representations and text consistency verification
+    def _resolve_ratio_display(
+        raw_val: Any,
+        text_val: Any,
+        has_val: bool,
+        field_name: str,
+    ) -> str | None:
+        if not has_val:
+            return None
+
+        raw_str = "0" if raw_val == 0 else str(raw_val).strip()
+        try:
+            d_raw = Decimal(str(raw_val).strip())
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            return None
+
+        if not isinstance(text_val, str):
+            gaps.append(
+                f"契约异常: {field_name} 非法（非字符串类型: {type(text_val).__name__}），回退到原始比率数值展示"
+            )
+            return raw_str
+
+        stripped_text = text_val.strip()
+        if not stripped_text:
+            gaps.append(
+                f"契约异常: {field_name} 非法（空白字符串），回退到原始比率数值展示"
+            )
+            return raw_str
+
+        try:
+            d_text = Decimal(stripped_text)
+            if not d_text.is_finite():
+                gaps.append(
+                    f"契约异常: {field_name} 非法（非有限数值: {stripped_text}），回退到原始比率数值展示"
+                )
+                return raw_str
+            fv_text = float(d_text)
+            if not math.isfinite(fv_text):
+                gaps.append(
+                    f"契约异常: {field_name} 非法（非有限数值/溢出: {stripped_text}），回退到原始比率数值展示"
+                )
+                return raw_str
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            gaps.append(
+                f"契约异常: {field_name} 非法（非有限数值或非数值: {stripped_text}），回退到原始比率数值展示"
+            )
+            return raw_str
+
+        if d_text != d_raw:
+            gaps.append(
+                f"契约异常: {field_name} 与原始比率不一致 (text: '{stripped_text}' vs raw: {d_raw})，回退到原始比率数值展示"
+            )
+            return raw_str
+
+        return stripped_text
+
+    circ_str = _resolve_ratio_display(
+        net_to_circ_mv, net_to_circ_mv_text, has_circ_val, "net_to_circ_mv_text"
+    )
+    amt_str = _resolve_ratio_display(
+        net_to_amount, net_to_amount_text, has_amt_val, "net_to_amount_text"
+    )
+
+    # Check structural completeness of each ratio
+    circ_usable = has_circ_val and bool(circ_mv_source) and bool(circ_mv_unit)
+    amt_usable = has_amt_val and bool(amount_source) and bool(amount_unit)
+
+    if has_circ_val and not circ_usable:
+        if not circ_mv_source and not circ_mv_unit:
+            gaps.append("契约异常: net_to_circ_mv 存在但分母来源与单位均缺失，该比率不可用")
+        elif not circ_mv_source:
+            gaps.append("契约异常: net_to_circ_mv 存在但分母来源缺失，该比率不可用")
+        else:
+            gaps.append("契约异常: net_to_circ_mv 存在但分母单位缺失，该比率不可用")
+
+    if has_amt_val and not amt_usable:
+        if not amount_source and not amount_unit:
+            gaps.append("契约异常: net_to_amount 存在但分母来源与单位均缺失，该比率不可用")
+        elif not amount_source:
+            gaps.append("契约异常: net_to_amount 存在但分母来源缺失，该比率不可用")
+        else:
+            gaps.append("契约异常: net_to_amount 存在但分母单位缺失，该比率不可用")
+
+    # 7. Check ts_code and trade_date
+    if missing_id_gaps:
+        status = "unavailable"
+        gaps.extend(missing_id_gaps)
+
+    # 8. Cross-check status with usable ratios
+    if status == "available":
+        if circ_usable and amt_usable:
+            pass
+        elif circ_usable or amt_usable:
+            status = "partial"
+            gaps.append("契约矛盾: status 声明为 available，但仅有一个比率完整可用，降级为 partial")
+        else:
+            status = "unavailable"
+            gaps.append("契约矛盾: status 声明为 available，但两个比率均不可用，降级为 unavailable")
+    elif status == "partial":
+        if not circ_usable and not amt_usable:
+            status = "unavailable"
+            gaps.append("契约矛盾: status 声明为 partial，但无任何可用比率，降级为 unavailable")
+    elif status == "unavailable":
+        if has_circ_val or has_amt_val:
+            gaps.append("契约矛盾: status 声明为 unavailable 但携带比率数值，按 unavailable 纪律不予呈现")
+
+    # 9. Handle unavailable scenario
+    if status == "unavailable":
+        gap_lines = "\n".join(f"  * {g}" for g in gaps) if gaps else "  * 相对规模不可用或分母缺失"
+        return (
+            "【资金流相对规模证据（同标的同日相对参考）】\n"
+            "- 状态: unavailable (相对规模不可用/不得据绝对净额替代)\n"
+            f"- 标的代码: {ts_code if ts_code else '缺失'}\n"
+            f"- 交易日期: {trade_date if trade_date else '缺失'}\n"
+            f"- 缺口说明:\n{gap_lines}\n"
+            f"- {discipline_text}"
+        )
+
+    # 10. Available and partial output
+    source_display = selected_source if selected_source else "未知/缺少资金流来源"
+    lines = [
+        "【资金流相对规模证据（同标的同日相对参考）】",
+        f"- 状态: {status} ({'完整可用' if status == 'available' else '部分可用'})",
+        f"- 标的代码: {ts_code}",
+        f"- 交易日期: {trade_date}",
+        f"- 资金来源: {source_display}",
+        f"- 算法组: {selected_algorithm_group or '未指定'}",
+        f"- 参考属性: reference_only={ref_only_repr}",
+    ]
+
+    if circ_usable:
+        lines.append(
+            f"- 净额占流通市值比 (net_to_circ_mv): {circ_str} "
+            f"(分母来源: {circ_mv_source}, 分母单位: {circ_mv_unit})"
+        )
+    else:
+        lines.append("- 净额占流通市值比 (net_to_circ_mv): 缺失/不可用")
+
+    if amt_usable:
+        lines.append(
+            f"- 净额占成交额比 (net_to_amount): {amt_str} "
+            f"(分母来源: {amount_source}, 分母单位: {amount_unit})"
+        )
+    else:
+        lines.append("- 净额占成交额比 (net_to_amount): 缺失/不可用")
+
+    if gaps:
+        lines.append("- 缺口说明:")
+        for g in gaps:
+            lines.append(f"  * {g}")
+
+    lines.append(f"- {discipline_text}")
+    return "\n".join(lines)
+
+
 def create_smart_money_analyst(llm, data_collector=None):
     async def _safe(tool, payload):
         try:
@@ -83,9 +468,12 @@ def create_smart_money_analyst(llm, data_collector=None):
         pool = data_collector.get(ticker, current_date) if data_collector else None
         state_market_data_context = state.get("market_data_context")
 
+        pool_context = None
         if pool is not None:
             fund_flow = pool.get("fund_flow_individual", "无数据")
             pool_context = pool.get("market_data_context")
+            if not isinstance(pool_context, dict) and isinstance(state_market_data_context, dict):
+                pool_context = state_market_data_context
             fund_flow_evidence = (
                 pool_context.get("fund_flow_evidence", {})
                 if isinstance(pool_context, dict)
@@ -97,7 +485,7 @@ def create_smart_money_analyst(llm, data_collector=None):
             from tradingagents.agents.utils.agent_utils import (
                 get_individual_fund_flow, get_lhb_detail, get_indicators,
             )
-            
+
             # Parallelize fallback fetches
             results = await asyncio.gather(
                 _safe(get_individual_fund_flow, {"symbol": ticker, "curr_date": current_date}),
@@ -108,7 +496,11 @@ def create_smart_money_analyst(llm, data_collector=None):
                 })
             )
             fund_flow, lhb, volume = results
-            fund_flow_evidence = {}
+            fund_flow_evidence = (
+                state_market_data_context.get("fund_flow_evidence", {})
+                if isinstance(state_market_data_context, dict)
+                else {}
+            )
 
         selection: dict = {}
         if isinstance(fund_flow_evidence, dict):
@@ -122,8 +514,19 @@ def create_smart_money_analyst(llm, data_collector=None):
             )
             if isinstance(fund_flow_evidence, dict):
                 fund_flow_evidence["selection"] = selection
-        evidence_text = json.dumps(fund_flow_evidence, ensure_ascii=False, sort_keys=True)
+        if isinstance(fund_flow_evidence, Mapping):
+            evidence_for_display = dict(fund_flow_evidence)
+            evidence_for_display.pop("scale_metrics", None)
+        else:
+            evidence_for_display = fund_flow_evidence
+        evidence_text = json.dumps(evidence_for_display, ensure_ascii=False, sort_keys=True)
         consensus_instruction = consensus_prompt_instruction(selection)
+
+        scale_metrics = None
+        if isinstance(fund_flow_evidence, Mapping):
+            scale_metrics = fund_flow_evidence.get("scale_metrics")
+
+        scale_metrics_prompt = format_fund_flow_scale_metrics_prompt(scale_metrics, selection)
         validation = (
             fund_flow_evidence.get("validation", {})
             if isinstance(fund_flow_evidence, dict)
@@ -167,6 +570,7 @@ def create_smart_money_analyst(llm, data_collector=None):
                 f"【资金流数据（来源、日期与口径见数据）】\n{fund_flow}\n\n"
                 f"【资金流结构化 evidence（仅用于精确累计，不得从展示文本反推）】\n{evidence_text}\n\n"
                 f"【资金流来源选择与方向规则】\n{consensus_instruction}\n\n"
+                f"{scale_metrics_prompt}\n\n"
                 f"【龙虎榜数据】\n{lhb}\n\n"
                 f"【成交量指标(vwma)】\n{volume}"
             )),
