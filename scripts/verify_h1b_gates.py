@@ -15,7 +15,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 # Ensure project root in sys.path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,7 +47,13 @@ def load_reports_from_db(
     db_path: Optional[str] = None,
     input_file: Optional[str] = None,
     input_dir: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+    return_excluded_counts: bool = False,
+    return_ledger: bool = False,
+) -> Union[
+    List[Dict[str, Any]],
+    Tuple[List[Dict[str, Any]], Dict[str, int]],
+    Tuple[List[Dict[str, Any]], Dict[str, int], Dict[str, int]],
+]:
     """Load reports from SQLite database, input file/dir, or fallback paths, filtering strictly for completed v2 samples."""
     raw_reports: List[Dict[str, Any]] = []
 
@@ -90,13 +96,25 @@ def load_reports_from_db(
             raise RuntimeError(f"读取指定 SQLite 数据库 {db_path} 失败: {exc}") from exc
 
         # When explicit db_path is provided, strictly return filtered results from this db without fallback
-        v2_reports = filter_v2_completed_reports(raw_reports)
+        v2_reports, excluded_counts, ledger = filter_v2_completed_reports(raw_reports, return_ledger=True)
         logger.info(
-            "从指定数据库共检索到 %d 份原始样本，筛选出 %d 份合格 v2 结构化辩论样本 (排除 %d 份无 v2 winner/非 completed 样本)",
-            len(raw_reports),
-            len(v2_reports),
-            len(raw_reports) - len(v2_reports),
+            "【三段台账】从指定数据库共检索到 %d 份原始样本，筛选出 %d 份合格 v2 结构化辩论样本 (非v2排除 %d 份)；贯彻 D-009 §5 筛选出 %d 份合格样本 (排除 %d 份: legacy_null=%d, abstain=%d, invalid_run=%d, data_error=%d, no_trade=%d, wait=%d)",
+            ledger["raw_count"],
+            ledger["qualifying_v2_count"],
+            ledger["non_v2_excluded"],
+            ledger["eligible_count"],
+            ledger["d009_excluded"],
+            excluded_counts.get("legacy_null", 0),
+            excluded_counts.get("abstain", 0),
+            excluded_counts.get("invalid_run", 0),
+            excluded_counts.get("data_error", 0),
+            excluded_counts.get("no_trade", 0),
+            excluded_counts.get("wait", 0),
         )
+        if return_ledger:
+            return v2_reports, excluded_counts, ledger
+        if return_excluded_counts:
+            return v2_reports, excluded_counts
         return v2_reports
 
     # 2. Explicit input file
@@ -175,14 +193,26 @@ def load_reports_from_db(
                     except Exception as e:
                         logger.debug("读取 golden 报告 %s 失败: %s", fname, e)
 
-    # 6. Filter strictly for completed v2 reports with winner (and extract industry without fabrication)
-    v2_reports = filter_v2_completed_reports(raw_reports)
+    # 6. Filter strictly for completed v2 reports with winner and D-009 §5 analysis_status
+    v2_reports, excluded_counts, ledger = filter_v2_completed_reports(raw_reports, return_ledger=True)
     logger.info(
-        "共检索到 %d 份原始样本，筛选出 %d 份合格 v2 结构化辩论样本 (排除 %d 份无 v2 winner/非 completed 样本)",
-        len(raw_reports),
-        len(v2_reports),
-        len(raw_reports) - len(v2_reports),
+        "【三段台账】共检索到 %d 份原始样本，筛选出 %d 份合格 v2 结构化辩论样本 (非v2排除 %d 份)；贯彻 D-009 §5 筛选出 %d 份合格样本 (排除 %d 份: legacy_null=%d, abstain=%d, invalid_run=%d, data_error=%d, no_trade=%d, wait=%d)",
+        ledger["raw_count"],
+        ledger["qualifying_v2_count"],
+        ledger["non_v2_excluded"],
+        ledger["eligible_count"],
+        ledger["d009_excluded"],
+        excluded_counts.get("legacy_null", 0),
+        excluded_counts.get("abstain", 0),
+        excluded_counts.get("invalid_run", 0),
+        excluded_counts.get("data_error", 0),
+        excluded_counts.get("no_trade", 0),
+        excluded_counts.get("wait", 0),
     )
+    if return_ledger:
+        return v2_reports, excluded_counts, ledger
+    if return_excluded_counts:
+        return v2_reports, excluded_counts
     return v2_reports
 
 
@@ -275,6 +305,27 @@ def format_gates_matrix_text(evaluation: Dict[str, Any], cohort_info: Optional[D
         f"系数范围={det_mag.get('range', [0.85, 1.15])}"
     )
 
+    ex_counts = evaluation.get("excluded_counts") or summary.get("excluded_counts") or {}
+    total_excluded = sum(ex_counts.values()) if ex_counts else 0
+    ledger = evaluation.get("pipeline_ledger") or summary.get("pipeline_ledger")
+    lines.append("-" * 80)
+    if ledger:
+        lines.append(
+            f"【三段台账 (DAV-783)】: 原始样本={ledger.get('raw_count', 0)} -> "
+            f"v2候选={ledger.get('qualifying_v2_count', 0)} -> "
+            f"D-009合格={ledger.get('eligible_count', 0)} "
+            f"(非v2排除={ledger.get('non_v2_excluded', 0)})"
+        )
+    lines.append(f"【排除样本分类计数 (D-009 §5)】: 总排除={total_excluded}")
+    lines.append(
+        f"  legacy_null={ex_counts.get('legacy_null', 0)}, "
+        f"abstain={ex_counts.get('abstain', 0)}, "
+        f"invalid_run={ex_counts.get('invalid_run', 0)}, "
+        f"data_error={ex_counts.get('data_error', 0)}, "
+        f"no_trade={ex_counts.get('no_trade', 0)}, "
+        f"wait={ex_counts.get('wait', 0)}"
+    )
+
     lines.append("-" * 80)
     lines.append(f"【系统级门槛总状态】: {'PASS (全部通过)' if passed else 'FAIL (未达标)'}")
     lines.append(f"【Feature Flag 建议】: {'可开启 (ELIGIBLE_FOR_ACTIVATION)' if passed else '严禁开启，保持默认关闭 (KEEP_FALSE)'}")
@@ -292,11 +343,19 @@ def run_verify(
     cohort: Optional[Union[str, Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Execute gate verification and generate structured report under cohort isolation."""
-    reports = load_reports_from_db(
+    loaded_res = load_reports_from_db(
         db_path=db_path,
         input_file=input_file,
         input_dir=input_dir,
+        return_ledger=True,
     )
+    if isinstance(loaded_res, tuple) and len(loaded_res) == 3:
+        reports, initial_excluded, ledger = loaded_res
+    elif isinstance(loaded_res, tuple) and len(loaded_res) == 2:
+        reports, initial_excluded = loaded_res
+        ledger = {}
+    else:
+        reports, initial_excluded, ledger = loaded_res, {}, {}
 
     cohort_meta: Dict[str, Any] = {}
     if cohort is not None and str(cohort).strip():
@@ -316,7 +375,13 @@ def run_verify(
         }
 
     # 1. 7-dimension gate evaluation
-    gate_eval = evaluate_h1b_system_gates(reports, as_of=as_of, cohort=cohort)
+    gate_eval = evaluate_h1b_system_gates(
+        reports,
+        as_of=as_of,
+        cohort=cohort,
+        excluded_counts=initial_excluded,
+        pipeline_ledger=ledger,
+    )
 
     # 2. Model isolation evaluation
     isolation_eval = evaluate_model_bias_and_weights(
@@ -330,7 +395,11 @@ def run_verify(
         "task_id": "P3-H1b",
         "cohort": cohort_label,
         "cohort_info": cohort_meta,
+        "raw_sample_count": ledger.get("raw_count", len(reports)),
+        "qualifying_v2_count": ledger.get("qualifying_v2_count", len(reports)),
         "sample_count": len(reports),
+        "excluded_counts": gate_eval.get("excluded_counts", initial_excluded),
+        "pipeline_ledger": ledger,
         "gate_evaluation": gate_eval,
         "model_isolation": isolation_eval,
         "recommendation": gate_eval["recommendation"],
