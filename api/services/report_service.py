@@ -1241,10 +1241,15 @@ def resolve_report_fields(
             confidence = _coerce_confidence_value(result_data.get("confidence"))
 
     # 2. Probability extraction fallback chain:
-    # result_data.probability -> investment_debate_state.judge_decision regex -> result_data.judge_decision regex
+    # result_data.probability -> final_trade_decision regex -> trader_investment_plan regex ->
+    # investment_debate_state.judge_decision regex -> result_data.judge_decision regex
     probability = None
     if result_data and isinstance(result_data, dict) and result_data.get("probability") is not None:
         probability = _coerce_probability_value(result_data.get("probability"))
+    if probability is None:
+        probability = _extract_probability_regex(final_trade_decision)
+    if probability is None:
+        probability = _extract_probability_regex(trader_investment_plan)
     if probability is None and investment_debate_state and isinstance(investment_debate_state, dict):
         judge_decision = investment_debate_state.get("judge_decision")
         if judge_decision:
