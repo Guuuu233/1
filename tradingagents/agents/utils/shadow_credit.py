@@ -2164,6 +2164,22 @@ def backfill_tplus5_shadow_for_report(
                 if entry_val is None and trade_date_str in fetched:
                     entry_val = fetched[trade_date_str]
 
+        # Universal fallback: if price source (price_series / get_price_fn / vendor) did not yield
+        # a valid T+5 price, fall back to report's existing valid t_plus_5_price
+        if t5_price_val is None or t5_price_val <= 0:
+            existing_t5_price = (
+                target.get("t_plus_5_price")
+                if target.get("t_plus_5_price") is not None
+                else res.get("t_plus_5_price")
+            )
+            if existing_t5_price is not None:
+                try:
+                    parsed_existing = float(existing_t5_price)
+                    if parsed_existing > 0:
+                        t5_price_val = parsed_existing
+                except (ValueError, TypeError):
+                    pass
+
         # If T+5 price was not found or non-positive, detect suspension from quote sequence
         if t5_price_val is None or t5_price_val <= 0:
             if detect_tplus5_suspension(
@@ -2222,7 +2238,7 @@ def backfill_tplus5_shadow_for_report(
 
     t_plus_5_return_pct: Optional[float] = None
 
-    if t5_price_val is None or t5_price_val <= 0 or entry_val is None or entry_val <= 0:
+    if t5_price_val is None or t5_price_val <= 0:
         t_plus_5_status = T_PLUS_5_STATUS_DATA_MISSING
         is_t_plus_5_due = True
         t_plus_5_evaluated = True
@@ -2230,35 +2246,68 @@ def backfill_tplus5_shadow_for_report(
         t_plus_5_price = None
         backfill_status = "data_missing"
     else:
-        price_change = t5_price_val - entry_val
-        t_plus_5_return_pct = round((price_change / entry_val) * 100.0, 2)
-        if winner == "bull":
-            t_plus_5_direction_hit = bool(price_change > 0)
-        elif winner == "bear":
-            t_plus_5_direction_hit = bool(price_change < 0)
-        elif winner == "tie":
-            t_plus_5_direction_hit = bool(abs(price_change / entry_val) <= 0.03)
-        else:
-            direction_str = str(
-                manager_verdict.get("direction")
-                or target.get("decision")
-                or res.get("decision")
-                or ""
-            ).upper()
-            if any(w in direction_str for w in ("BUY", "BULLISH", "多", "买入", "增持")):
-                t_plus_5_direction_hit = bool(price_change > 0)
-            elif any(w in direction_str for w in ("SELL", "BEARISH", "空", "卖出", "减持")):
-                t_plus_5_direction_hit = bool(price_change < 0)
-            elif any(w in direction_str for w in ("HOLD", "NEUTRAL", "中性", "观望", "持有")):
-                t_plus_5_direction_hit = bool(abs(price_change / entry_val) <= 0.03)
-            else:
-                t_plus_5_direction_hit = bool(price_change > 0)
-
         t_plus_5_status = T_PLUS_5_STATUS_DUE_AND_EVALUATED
         is_t_plus_5_due = True
         t_plus_5_evaluated = True
         t_plus_5_price = round(t5_price_val, 4)
-        backfill_status = "hit" if t_plus_5_direction_hit else "miss"
+
+        if entry_val is not None and entry_val > 0:
+            price_change = t5_price_val - entry_val
+            t_plus_5_return_pct = round((price_change / entry_val) * 100.0, 2)
+            if winner == "bull":
+                t_plus_5_direction_hit = bool(price_change > 0)
+            elif winner == "bear":
+                t_plus_5_direction_hit = bool(price_change < 0)
+            elif winner == "tie":
+                t_plus_5_direction_hit = bool(abs(price_change / entry_val) <= 0.03)
+            else:
+                direction_str = str(
+                    manager_verdict.get("direction")
+                    or target.get("decision")
+                    or res.get("decision")
+                    or ""
+                ).upper()
+                if any(w in direction_str for w in ("BUY", "BULLISH", "多", "买入", "增持")):
+                    t_plus_5_direction_hit = bool(price_change > 0)
+                elif any(w in direction_str for w in ("SELL", "BEARISH", "空", "卖出", "减持")):
+                    t_plus_5_direction_hit = bool(price_change < 0)
+                elif any(w in direction_str for w in ("HOLD", "NEUTRAL", "中性", "观望", "持有")):
+                    t_plus_5_direction_hit = bool(abs(price_change / entry_val) <= 0.03)
+                else:
+                    t_plus_5_direction_hit = bool(price_change > 0)
+            backfill_status = "hit" if t_plus_5_direction_hit else "miss"
+        else:
+            # Preserving existing semantics for valid price with missing entry
+            existing_hit = (
+                target.get("t_plus_5_direction_hit")
+                if target.get("t_plus_5_direction_hit") is not None
+                else (
+                    res.get("t_plus_5_direction_hit")
+                    if res.get("t_plus_5_direction_hit") is not None
+                    else (
+                        target.get("shadow_credit_metrics", {}).get("t_plus_5_direction_hit")
+                        if isinstance(target.get("shadow_credit_metrics"), Mapping)
+                        else None
+                    )
+                )
+            )
+            if isinstance(existing_hit, bool):
+                t_plus_5_direction_hit = existing_hit
+                backfill_status = "hit" if t_plus_5_direction_hit else "miss"
+            else:
+                t_plus_5_direction_hit = None
+                backfill_status = "evaluated"
+
+            existing_return_pct = (
+                target.get("t_plus_5_return_pct")
+                if target.get("t_plus_5_return_pct") is not None
+                else res.get("t_plus_5_return_pct")
+            )
+            if existing_return_pct is not None:
+                try:
+                    t_plus_5_return_pct = float(existing_return_pct)
+                except (ValueError, TypeError):
+                    t_plus_5_return_pct = None
 
     target["t_plus_5_date"] = t5_date
     target["t_plus_5_price"] = t_plus_5_price
