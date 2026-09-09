@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
+from .proxy_guard import check_llm_proxy_guard
+
 
 class BaseLLMClient(ABC):
     """Abstract base class for LLM clients."""
@@ -9,6 +11,8 @@ class BaseLLMClient(ABC):
         self.model = model
         self.base_url = base_url
         self.kwargs = kwargs
+        if self.base_url:
+            check_llm_proxy_guard(self.base_url)
 
     @abstractmethod
     def get_llm(self) -> Any:
