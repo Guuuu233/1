@@ -34,12 +34,32 @@ from api.services.backtest_service import (
     PRICE_BASIS_VENDOR_QFQ,
     PRICE_BASIS_UNSPECIFIED,
 )
+from tradingagents.dataflows.return_labels import (
+    HORIZON_PROFILE_ID_V1,
+    OutcomeStatus,
+    PRIMARY_EVAL_OFFSET_MEDIUM,
+    PRIMARY_EVAL_OFFSET_SHORT,
+)
+from tradingagents.graph.horizon_profile import (
+    HORIZON_MEDIUM,
+    HORIZON_PROFILE_V1,
+    HORIZON_SHORT,
+    SUPPORTED_HORIZONS,
+    T_PLUS_10,
+    T_PLUS_40,
+)
 
 logger = logging.getLogger(__name__)
 
 # Price basis semantics (DAV-606)
 PRICE_BASIS_VENDOR_QFQ: str = PRICE_BASIS_VENDOR_QFQ
 PRICE_BASIS_UNSPECIFIED: str = PRICE_BASIS_UNSPECIFIED
+
+# Multi-horizon profile routing constants (V-02)
+SUPPORTED_HORIZON_PROFILES: frozenset[str] = frozenset({
+    HORIZON_PROFILE_ID_V1,
+    "horizon_profile_v1",
+})
 
 # Bounded evaluation: fetching hold-window prices is I/O-heavy, so cap how many
 # reports a single calibration run resolves.  Mirrors backtest_service's
@@ -157,6 +177,8 @@ def _cache_key(
     hold_days: int,
     limit: int,
     min_sample_size: Optional[int] = None,
+    horizon: Optional[str] = None,
+    profile_id: Optional[str] = None,
 ) -> str:
     return "|".join(
         str(part) if part is not None else ""
@@ -170,6 +192,8 @@ def _cache_key(
             hold_days,
             limit,
             min_sample_size,
+            horizon,
+            profile_id,
         )
     )
 
@@ -312,8 +336,38 @@ def _normalize_symbol(raw: str) -> str:
     return s
 
 
-def _extract_report_probability(report: ReportDB) -> Optional[float]:
-    """Extract explicit numerical probability (0–1) from report DB column or result_data."""
+def _extract_report_probability(
+    report: ReportDB,
+    target_horizon: Optional[str] = None,
+) -> Optional[float]:
+    """Extract explicit numerical probability (0–1) from report DB column or result_data.
+
+    Invariants (V-02 / AGENTS.md):
+    1. NEVER converts confidence to probability (zero confidence-to-probability leakage).
+    2. Respects target_horizon slice priority for dual-horizon reports.
+    """
+    rd = report.result_data if isinstance(report.result_data, dict) else {}
+
+    # Target-horizon slice priority
+    if target_horizon == HORIZON_SHORT and isinstance(rd.get("short_term"), dict):
+        prob = rd["short_term"].get("probability")
+        if prob is not None:
+            try:
+                p = float(prob)
+                if 0.0 <= p <= 1.0:
+                    return p
+            except (ValueError, TypeError):
+                pass
+    elif target_horizon == HORIZON_MEDIUM and isinstance(rd.get("medium_term"), dict):
+        prob = rd["medium_term"].get("probability")
+        if prob is not None:
+            try:
+                p = float(prob)
+                if 0.0 <= p <= 1.0:
+                    return p
+            except (ValueError, TypeError):
+                pass
+
     if report.probability is not None:
         try:
             p = float(report.probability)
@@ -321,7 +375,7 @@ def _extract_report_probability(report: ReportDB) -> Optional[float]:
                 return p
         except (ValueError, TypeError):
             pass
-    rd = report.result_data
+
     if isinstance(rd, dict):
         prob = rd.get("probability")
         if prob is not None:
@@ -344,19 +398,28 @@ def _extract_report_probability(report: ReportDB) -> Optional[float]:
     return None
 
 
-def _extract_report_winner(report: ReportDB) -> Optional[str]:
+def _extract_report_winner(
+    report: ReportDB,
+    target_horizon: Optional[str] = None,
+) -> Optional[str]:
     """Extract winner ('bull' or 'bear') from report."""
     rd = report.result_data
     if not isinstance(rd, dict):
         return None
 
-    containers = [
+    containers: List[Any] = []
+    if target_horizon == HORIZON_SHORT and isinstance(rd.get("short_term"), dict):
+        containers.append(rd["short_term"])
+    elif target_horizon == HORIZON_MEDIUM and isinstance(rd.get("medium_term"), dict):
+        containers.append(rd["medium_term"])
+
+    containers.extend([
         rd,
         rd.get("investment_debate_state"),
         rd.get("short_term"),
         rd.get("primary"),
         rd.get("medium_term"),
-    ]
+    ])
     for c in containers:
         if not isinstance(c, dict):
             continue
@@ -381,24 +444,118 @@ def _extract_report_winner(report: ReportDB) -> Optional[str]:
     return None
 
 
+def _extract_report_directional_lean(
+    report: ReportDB,
+    target_horizon: Optional[str] = None,
+) -> Optional[str]:
+    """Extract directional lean ('bull' or 'bear') for WAIT diagnostic analysis."""
+    winner = _extract_report_winner(report, target_horizon=target_horizon)
+    if winner in ("bull", "bear"):
+        return winner
+    prob = _extract_report_probability(report, target_horizon=target_horizon)
+    if prob is not None:
+        if prob > 0.5:
+            return "bull"
+        elif prob < 0.5:
+            return "bear"
+    d = str(report.direction or "").upper()
+    if any(k in d for k in ["BULL", "看多", "BUY"]):
+        return "bull"
+    if any(k in d for k in ["BEAR", "看空", "SELL"]):
+        return "bear"
+    rd = report.result_data if isinstance(report.result_data, dict) else {}
+    direct = str(rd.get("direction") or "").upper()
+    if any(k in direct for k in ["BULL", "看多"]):
+        return "bull"
+    if any(k in direct for k in ["BEAR", "看空"]):
+        return "bear"
+    return None
+
+
+def _extract_report_horizon_info(report: ReportDB) -> Dict[str, Any]:
+    """Extract horizon, profile_id, and profile validity from ReportDB."""
+    rd = report.result_data if isinstance(report.result_data, dict) else {}
+
+    raw_horizon = rd.get("horizon")
+    profile_id = rd.get("profile_id")
+    is_dual = bool(
+        rd.get("mode") == "dual_horizon"
+        or "short_term" in rd
+        or "medium_term" in rd
+    )
+
+    available_horizons: List[str] = []
+    resolution_source: Optional[str] = None
+    meta = rd.get("horizon_run_metadata")
+    if isinstance(meta, dict):
+        if not profile_id:
+            profile_id = meta.get("profile_id")
+        resolved = meta.get("resolved")
+        if isinstance(resolved, list):
+            available_horizons.extend(str(h).lower() for h in resolved if isinstance(h, str))
+        resolution_source = meta.get("resolution_source")
+
+    if not resolution_source:
+        resolution_source = rd.get("horizons_resolution_source")
+        if not resolution_source:
+            if rd.get("horizons_explicit"):
+                resolution_source = "explicit"
+            elif raw_horizon or meta:
+                resolution_source = "default"
+            else:
+                resolution_source = "legacy"
+
+    if not available_horizons:
+        if is_dual:
+            available_horizons = [HORIZON_SHORT, HORIZON_MEDIUM]
+        elif raw_horizon and isinstance(raw_horizon, str):
+            available_horizons = [raw_horizon.lower()]
+
+    horizon: Optional[str] = None
+    if raw_horizon and isinstance(raw_horizon, str):
+        horizon = raw_horizon.lower()
+    elif len(available_horizons) == 1:
+        horizon = available_horizons[0]
+
+    # Validate profile_id if explicitly specified
+    is_valid_profile = True
+    if profile_id is not None:
+        if not isinstance(profile_id, str) or profile_id not in SUPPORTED_HORIZON_PROFILES:
+            is_valid_profile = False
+
+    # Validate horizons if explicitly populated
+    for h in available_horizons:
+        if h not in SUPPORTED_HORIZONS:
+            is_valid_profile = False
+
+    if horizon is not None and horizon not in SUPPORTED_HORIZONS:
+        is_valid_profile = False
+
+    return {
+        "horizon": horizon if is_valid_profile and horizon in SUPPORTED_HORIZONS else horizon,
+        "profile_id": profile_id,
+        "is_valid_profile": is_valid_profile,
+        "is_dual_horizon": is_dual,
+        "available_horizons": available_horizons,
+        "resolution_source": resolution_source,
+    }
+
+
 def _is_admissible_calibration_report(
     report: ReportDB,
+    target_horizon: Optional[str] = None,
 ) -> Tuple[bool, bool, Optional[float], Optional[str]]:
     """Determine if report is eligible for calibration evaluation.
 
     Returns:
         (is_admissible, is_winner_only, probability, winner)
 
-    Two valid admission paths:
-    1. Probability Path:
-       - Explicit valid probability in [0, 1]
-       - Explicit VALID directional status (analysis_status == 'VALID', trade_action directional)
-    2. Winner-only Path:
-       - Completed status
-       - probability is None
-       - Qualifying v2 report (matching A6 is_qualifying_v2_report specification)
-       - winner in {'bull', 'bear'}
-       - Not explicitly marked INVALID/DATA_ERROR/ABSTAIN/PARTIAL or non-directional WAIT/NO_TRADE
+    Enforces V-02 pool isolation:
+    - Rejects invalid profiles and corrupted horizon records.
+    - Explicit target_horizon accepts only matching horizon records.
+    - Default legacy call (target_horizon is None) preserves legacy/default T+5 samples,
+      excluding explicit T+40 medium records or explicitly requested T+10 short records.
+    - Dual-horizon reports are admitted under their respective slices or default.
     """
     from tradingagents.agents.utils.decision_status import (
         NON_DIRECTIONAL_TRADE_ACTIONS,
@@ -410,8 +567,32 @@ def _is_admissible_calibration_report(
     if report.status != "completed":
         return False, False, None, None
 
+    h_info = _extract_report_horizon_info(report)
+    if not h_info["is_valid_profile"]:
+        return False, False, None, None
+
+    if target_horizon is not None:
+        if (
+            target_horizon not in h_info["available_horizons"]
+            and h_info["horizon"] != target_horizon
+        ):
+            return False, False, None, None
+    else:
+        # Default legacy call: no horizon requested (T+5 evaluation)
+        # "兼容旧样本，但默认不得混池"
+        # Explicit single-horizon medium reports must never mix into default T+5
+        if h_info["horizon"] == HORIZON_MEDIUM and not h_info["is_dual_horizon"]:
+            return False, False, None, None
+        # Explicitly requested single-horizon short (T+10) must also not mix into default T+5
+        if (
+            h_info["horizon"] == HORIZON_SHORT
+            and not h_info["is_dual_horizon"]
+            and h_info["resolution_source"] == "explicit"
+        ):
+            return False, False, None, None
+
     # Path 1: Explicit probability
-    prob = _extract_report_probability(report)
+    prob = _extract_report_probability(report, target_horizon=target_horizon)
     if prob is not None:
         if is_calibration_eligible(report):
             return True, False, prob, None
@@ -433,11 +614,43 @@ def _is_admissible_calibration_report(
     if not is_qualifying_v2_report(sample_dict):
         return False, False, None, None
 
-    winner = _extract_report_winner(report)
+    winner = _extract_report_winner(report, target_horizon=target_horizon)
     if winner in ("bull", "bear"):
         return True, True, None, winner
 
     return False, False, None, None
+
+
+def _is_admissible_wait_report(
+    report: ReportDB,
+    target_horizon: Optional[str] = None,
+) -> bool:
+    """Determine if a report is eligible for WAIT directional diagnostic."""
+    if report.status != "completed":
+        return False
+    if report.analysis_status != "VALID":
+        return False
+    if report.trade_action != "WAIT":
+        return False
+    h_info = _extract_report_horizon_info(report)
+    if not h_info["is_valid_profile"]:
+        return False
+    if target_horizon is not None:
+        if (
+            target_horizon not in h_info["available_horizons"]
+            and h_info["horizon"] != target_horizon
+        ):
+            return False
+    else:
+        if h_info["horizon"] == HORIZON_MEDIUM and not h_info["is_dual_horizon"]:
+            return False
+        if (
+            h_info["horizon"] == HORIZON_SHORT
+            and not h_info["is_dual_horizon"]
+            and h_info["resolution_source"] == "explicit"
+        ):
+            return False
+    return True
 
 
 def _query_reports(
@@ -451,7 +664,9 @@ def _query_reports(
     model: Optional[str],
     limit: int,
     hold_days: int,
-) -> Tuple[List[ReportDB], bool, int, Dict[str, int]]:
+    horizon: Optional[str] = None,
+    profile_id: Optional[str] = None,
+) -> Tuple[List[ReportDB], bool, int, Dict[str, int], List[ReportDB]]:
     """Load completed reports that carry a probability or qualifying v2 winner, applying filters.
 
     Date/symbol/user filters run in SQL.  Hold-window completeness also runs in
@@ -459,12 +674,10 @@ def _query_reports(
     window has not yet elapsed) are excluded from selection rather than being
     silently skipped after truncation; they are counted separately and reported
     as ``skipped_no_outcome`` so the UI can distinguish "hold window not over"
-    from "no report".  Prompt-version and model filters run in Python because
-    they inspect the snapshot JSON nested in ``result_data`` (SQLite JSON
-    queries are unreliable across backends); they are applied on a wide
-    candidate scan BEFORE the final ``limit`` truncation.
+    from "no report".  Prompt-version, model, and horizon filters run in Python because
+    they inspect the snapshot JSON and horizon metadata nested in ``result_data``.
 
-    Returns ``(rows, truncated_before_filter, skipped_incomplete_window, exclusion_stats)``.
+    Returns ``(rows, truncated_before_filter, skipped_incomplete_window, exclusion_stats, wait_rows)``.
     ``truncated_before_filter`` is True only when the pre-filter candidate scan
     actually hit its cap (checked by fetching one extra row).
     """
@@ -497,16 +710,10 @@ def _query_reports(
         ReportDB.analysis_status == ANALYSIS_VALID,
         ReportDB.trade_action.in_(list(NON_DIRECTIONAL_TRADE_ACTIONS)),
     ).count()
-    excluded_total = (
-        excluded_null + excluded_invalid + excluded_abstain + excluded_no_trade
-    )
-    exclusion_stats = {
-        "excluded_null": excluded_null,
-        "excluded_invalid": excluded_invalid,
-        "excluded_abstain": excluded_abstain,
-        "excluded_no_trade": excluded_no_trade,
-        "excluded_total": excluded_total,
-    }
+    excluded_wait = base_query.filter(
+        ReportDB.analysis_status == ANALYSIS_VALID,
+        ReportDB.trade_action == "WAIT",
+    ).count()
 
     # Only explicit VALID directional rows or candidate v2 rows are calibration-eligible
     query = base_query.filter(
@@ -530,23 +737,105 @@ def _query_reports(
         query = query.filter(ReportDB.trade_date <= cutoff)
 
     has_snapshot_filters = bool(prompt_version or model)
-    if has_snapshot_filters:
-        scan_cap = max(limit, MAX_CALIBRATION_FILTER_SCAN)
-        rows = query.order_by(ReportDB.created_at.desc()).limit(scan_cap + 1).all()
-        truncated_before_filter = len(rows) > scan_cap
-        rows = rows[:scan_cap]
-        rows = [
-            row
-            for row in rows
-            if _matches_filter(_report_prompt_versions(row), prompt_version)
-            and _matches_filter(_report_model_names(row), model)
-        ]
-        rows = rows[:limit]
+    has_horizon_filter = horizon is not None
+    scan_cap = max(limit, MAX_CALIBRATION_FILTER_SCAN) if (has_snapshot_filters or has_horizon_filter) else limit
+
+    candidate_rows = query.order_by(ReportDB.created_at.desc()).limit(scan_cap + 1).all()
+    truncated_before_filter = (len(candidate_rows) > scan_cap) if (has_snapshot_filters or has_horizon_filter) else False
+    candidate_rows = candidate_rows[:scan_cap]
+
+    excluded_invalid_profile = 0
+    excluded_mismatched_horizon = 0
+    admissible_rows: List[ReportDB] = []
+
+    for row in candidate_rows:
+        h_info = _extract_report_horizon_info(row)
+        if not h_info["is_valid_profile"]:
+            excluded_invalid_profile += 1
+            continue
+
+        if horizon is not None:
+            if (
+                horizon not in h_info["available_horizons"]
+                and h_info["horizon"] != horizon
+            ):
+                excluded_mismatched_horizon += 1
+                continue
+        else:
+            # Default legacy T+5 call: explicit single-horizon medium or explicitly requested short cannot enter legacy pool
+            if (
+                (h_info["horizon"] == HORIZON_MEDIUM and not h_info["is_dual_horizon"])
+                or (
+                    h_info["horizon"] == HORIZON_SHORT
+                    and not h_info["is_dual_horizon"]
+                    and h_info["resolution_source"] == "explicit"
+                )
+            ):
+                excluded_mismatched_horizon += 1
+                continue
+
+        if prompt_version and not _matches_filter(_report_prompt_versions(row), prompt_version):
+            continue
+        if model and not _matches_filter(_report_model_names(row), model):
+            continue
+
+        is_adm, _, _, _ = _is_admissible_calibration_report(row, target_horizon=horizon)
+        if is_adm:
+            admissible_rows.append(row)
+            if len(admissible_rows) >= limit:
+                break
+
+    # Separately query VALID WAIT reports within scope for directional diagnostics (V-02)
+    wait_query = base_query.filter(
+        ReportDB.analysis_status == ANALYSIS_VALID,
+        ReportDB.trade_action == "WAIT",
+    )
+    if cutoff:
+        wait_candidates = (
+            wait_query.filter(ReportDB.trade_date <= cutoff)
+            .order_by(ReportDB.created_at.desc())
+            .limit(scan_cap)
+            .all()
+        )
     else:
-        rows = query.order_by(ReportDB.created_at.desc()).limit(limit).all()
-        truncated_before_filter = False
-    rows = [row for row in rows if _is_admissible_calibration_report(row)[0]]
-    return rows, truncated_before_filter, skipped_incomplete, exclusion_stats
+        wait_candidates = (
+            wait_query.order_by(ReportDB.created_at.desc())
+            .limit(scan_cap)
+            .all()
+        )
+
+    wait_rows: List[ReportDB] = []
+    for w in wait_candidates:
+        if not _is_admissible_wait_report(w, target_horizon=horizon):
+            continue
+        if prompt_version and not _matches_filter(_report_prompt_versions(w), prompt_version):
+            continue
+        if model and not _matches_filter(_report_model_names(w), model):
+            continue
+        wait_rows.append(w)
+        if len(wait_rows) >= limit:
+            break
+
+    excluded_total = (
+        excluded_null
+        + excluded_invalid
+        + excluded_abstain
+        + excluded_no_trade
+        + excluded_invalid_profile
+        + excluded_mismatched_horizon
+    )
+    exclusion_stats = {
+        "excluded_null": excluded_null,
+        "excluded_invalid": excluded_invalid,
+        "excluded_abstain": excluded_abstain,
+        "excluded_no_trade": excluded_no_trade,
+        "excluded_wait": excluded_wait,
+        "excluded_invalid_profile": excluded_invalid_profile,
+        "excluded_mismatched_horizon": excluded_mismatched_horizon,
+        "excluded_total": excluded_total,
+    }
+
+    return admissible_rows, truncated_before_filter, skipped_incomplete, exclusion_stats, wait_rows
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -678,6 +967,8 @@ def _compute_calibration_unlocked(
     limit: int,
     outcome_resolver: Optional[Callable[[ReportDB], Optional[bool]]],
     min_sample_size: Optional[int] = None,
+    horizon: Optional[str] = None,
+    profile_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute the reliability curve + Brier score for historical reports.
 
@@ -693,7 +984,7 @@ def _compute_calibration_unlocked(
     probability reliability curve buckets and Brier score are strictly derived
     from reports with explicit probabilities.
     """
-    reports, truncated_before_filter, skipped_incomplete, exclusion_stats = _query_reports(
+    reports, truncated_before_filter, skipped_incomplete, exclusion_stats, wait_rows = _query_reports(
         db,
         user_id=user_id,
         start_date=start_date,
@@ -703,6 +994,8 @@ def _compute_calibration_unlocked(
         model=model,
         limit=limit,
         hold_days=hold_days,
+        horizon=horizon,
+        profile_id=profile_id,
     )
 
     prob_samples: List[Tuple[float, bool]] = []
@@ -713,13 +1006,18 @@ def _compute_calibration_unlocked(
     winner_bear_count = 0
     winner_bear_hits = 0
 
+    # V-02: Track samples for grouped statistics by (horizon, profile_id, model, prompt_version)
+    groups_map: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+
     # Too-recent reports (hold window not yet elapsed) are excluded at selection
     # time; they count as skipped alongside reports whose price is unavailable.
     skipped_no_outcome = skipped_incomplete
     resolve = outcome_resolver or (lambda row: _resolve_outcome(row, hold_days))
 
     for report in reports:
-        is_admissible, is_winner_only, probability, winner = _is_admissible_calibration_report(report)
+        is_admissible, is_winner_only, probability, winner = _is_admissible_calibration_report(
+            report, target_horizon=horizon
+        )
         if not is_admissible:
             continue
 
@@ -728,8 +1026,30 @@ def _compute_calibration_unlocked(
             skipped_no_outcome += 1
             continue
 
+        # Extract group metadata for grouped statistics (V-02)
+        h_info = _extract_report_horizon_info(report)
+        grp_horizon = h_info["horizon"] or (horizon or "legacy_t5")
+        grp_profile = h_info["profile_id"] or (profile_id or ("horizon_profile_v1" if horizon in SUPPORTED_HORIZONS else "legacy"))
+        m_names = _report_model_names(report)
+        grp_model = m_names[0] if m_names else "default"
+        p_vers = _report_prompt_versions(report)
+        grp_prompt = p_vers[0] if p_vers else "default"
+        grp_key = (grp_horizon, grp_profile, grp_model, grp_prompt)
+
+        if grp_key not in groups_map:
+            groups_map[grp_key] = {
+                "horizon": grp_horizon,
+                "profile_id": grp_profile,
+                "model": grp_model,
+                "prompt_version": grp_prompt,
+                "prob_samples": [],
+                "winner_only_admitted": 0,
+                "winner_only_hits": 0,
+            }
+
         if is_winner_only:
             winner_only_admitted += 1
+            hit = False
             # Direction hit evaluation:
             # - 'bull' expects rise (outcome is True -> hit)
             # - 'bear' expects fall (outcome is False -> hit)
@@ -745,9 +1065,14 @@ def _compute_calibration_unlocked(
                     winner_bear_hits += 1
             if hit:
                 winner_only_hits += 1
+
+            groups_map[grp_key]["winner_only_admitted"] += 1
+            if hit:
+                groups_map[grp_key]["winner_only_hits"] += 1
         else:
             if probability is not None:
                 prob_samples.append((probability, outcome))
+                groups_map[grp_key]["prob_samples"].append((probability, outcome))
 
     buckets = [_empty_bucket(label, low, high) for label, low, high in _BUCKETS]
     for probability, outcome in prob_samples:
@@ -802,6 +1127,106 @@ def _compute_calibration_unlocked(
         for entry in buckets:
             entry["rise_rate"] = None
 
+    # V-02: Compute grouped statistics per (horizon, profile_id, model, prompt_version)
+    grouped_stats = []
+    for g_key, g_val in groups_map.items():
+        g_prob_samples = g_val["prob_samples"]
+        g_w_admitted = g_val["winner_only_admitted"]
+        g_w_hits = g_val["winner_only_hits"]
+        g_prob_count = len(g_prob_samples)
+        g_total_count = g_prob_count + g_w_admitted
+        g_sufficient = g_prob_count >= effective_min_sample_size and g_prob_count > 0
+        g_brier = _brier_score(g_prob_samples) if g_sufficient else None
+
+        g_buckets = [_empty_bucket(label, low, high) for label, low, high in _BUCKETS]
+        for prob, out in g_prob_samples:
+            b = _bucket_for(prob)
+            if b is None:
+                continue
+            item = next(it for it in g_buckets if it["bucket"] == b[0])
+            item["count"] += 1
+            item["rise_count"] += 1 if out else 0
+            item["prob_sum"] += prob
+        for it in g_buckets:
+            c = it.pop("count", 0)
+            ps = it.pop("prob_sum", 0.0)
+            rc = it.pop("rise_count", 0)
+            it["count"] = c
+            it["rise_count"] = rc
+            it["rise_rate"] = round(rc / c * 100, 1) if (c and g_sufficient) else None
+            it["avg_probability"] = round(ps / c, 3) if c else None
+
+        grouped_stats.append({
+            "horizon": g_val["horizon"],
+            "profile_id": g_val["profile_id"],
+            "model": g_val["model"],
+            "prompt_version": g_val["prompt_version"],
+            "sample_size": g_total_count,
+            "probability_sample_size": g_prob_count,
+            "sample_sufficient": g_sufficient,
+            "brier_score": g_brier,
+            "winner_only_admitted": g_w_admitted,
+            "winner_only_hits": g_w_hits,
+            "winner_only_hit_rate": (
+                round(g_w_hits / g_w_admitted * 100, 1) if g_w_admitted > 0 else None
+            ),
+            "buckets": g_buckets,
+        })
+
+    # V-02: WAIT direction diagnostic (strictly separated from trading performance)
+    wait_evaluable = 0
+    wait_rise_count = 0
+    wait_fall_count = 0
+    wait_bull_lean = 0
+    wait_bull_hits = 0
+    wait_bear_lean = 0
+    wait_bear_hits = 0
+
+    for w_rep in wait_rows:
+        w_outcome = resolve(w_rep)
+        if w_outcome is None:
+            continue
+        wait_evaluable += 1
+        if w_outcome is True:
+            wait_rise_count += 1
+        else:
+            wait_fall_count += 1
+
+        lean = _extract_report_directional_lean(w_rep, target_horizon=horizon)
+        if lean == "bull":
+            wait_bull_lean += 1
+            if w_outcome is True:
+                wait_bull_hits += 1
+        elif lean == "bear":
+            wait_bear_lean += 1
+            if w_outcome is False:
+                wait_bear_hits += 1
+
+    total_wait_leans = wait_bull_lean + wait_bear_lean
+    total_wait_hits = wait_bull_hits + wait_bear_hits
+    wait_diagnostic = {
+        "total_wait_count": len(wait_rows),
+        "evaluable_wait_count": wait_evaluable,
+        "rise_count": wait_rise_count,
+        "fall_count": wait_fall_count,
+        "rise_rate": (
+            round(wait_rise_count / wait_evaluable * 100, 1)
+            if wait_evaluable > 0
+            else None
+        ),
+        "directional_lean_count": total_wait_leans,
+        "directional_hits": total_wait_hits,
+        "directional_hit_rate": (
+            round(total_wait_hits / total_wait_leans * 100, 1)
+            if total_wait_leans > 0
+            else None
+        ),
+        "bull_lean_count": wait_bull_lean,
+        "bull_hits": wait_bull_hits,
+        "bear_lean_count": wait_bear_lean,
+        "bear_hits": wait_bear_hits,
+    }
+
     return {
         "brier_score": brier,
         "sample_size": total_sample_size,
@@ -821,6 +1246,10 @@ def _compute_calibration_unlocked(
             "bear_count": winner_bear_count,
             "bear_hits": winner_bear_hits,
         },
+        "wait_diagnostic": wait_diagnostic,
+        "grouped_stats": grouped_stats,
+        "horizon": horizon,
+        "profile_id": profile_id,
         "skipped_no_outcome": skipped_no_outcome,
         "truncated_before_filter": truncated_before_filter,
         "buckets": buckets,
@@ -828,6 +1257,9 @@ def _compute_calibration_unlocked(
         "excluded_invalid": exclusion_stats["excluded_invalid"],
         "excluded_abstain": exclusion_stats["excluded_abstain"],
         "excluded_no_trade": exclusion_stats["excluded_no_trade"],
+        "excluded_wait": exclusion_stats["excluded_wait"],
+        "excluded_invalid_profile": exclusion_stats["excluded_invalid_profile"],
+        "excluded_mismatched_horizon": exclusion_stats["excluded_mismatched_horizon"],
         "excluded_incomplete_outcome": skipped_no_outcome,
         "excluded_total": exclusion_stats["excluded_total"] + skipped_no_outcome,
         "excluded_counts": {
@@ -835,8 +1267,11 @@ def _compute_calibration_unlocked(
             "invalid": exclusion_stats["excluded_invalid"],
             "abstain": exclusion_stats["excluded_abstain"],
             "no_trade": exclusion_stats["excluded_no_trade"],
+            "wait": exclusion_stats["excluded_wait"],
             "incomplete_outcome": skipped_no_outcome,
             "incomplete": skipped_no_outcome,
+            "invalid_profile": exclusion_stats["excluded_invalid_profile"],
+            "mismatched_horizon": exclusion_stats["excluded_mismatched_horizon"],
             "total": exclusion_stats["excluded_total"] + skipped_no_outcome,
         },
         "price_basis": PRICE_BASIS_VENDOR_QFQ,
@@ -848,6 +1283,8 @@ def _compute_calibration_unlocked(
             "model": model,
             "hold_days": hold_days,
             "limit": limit,
+            "horizon": horizon,
+            "profile_id": profile_id,
         },
     }
 
@@ -865,14 +1302,46 @@ def compute_calibration(
     limit: Optional[int] = None,
     outcome_resolver: Optional[Callable[[ReportDB], Optional[bool]]] = None,
     min_sample_size: Optional[int] = None,
+    horizon: Optional[str] = None,
+    profile_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute the reliability curve + Brier score, guarded by cache + concurrency.
 
     ``outcome_resolver`` bypasses the result cache (used by tests to inject
     deterministic outcomes); production callers leave it unset.
+
+    Multi-horizon routing (V-02):
+    - When horizon is omitted: defaults to legacy T+5 evaluation (hold_days=5).
+    - When horizon is 'short': routes to canonical T+10 (hold_days=10).
+    - When horizon is 'medium': routes to canonical T+40 (hold_days=40).
     """
     requested = limit or DEFAULT_CALIBRATION_LIMIT
     effective_limit = min(max(1, requested), MAX_CALIBRATION_LIMIT)
+
+    effective_horizon: Optional[str] = None
+    if horizon is not None:
+        if not isinstance(horizon, str) or horizon.lower() not in SUPPORTED_HORIZONS:
+            raise ValueError(
+                f"Unsupported horizon {horizon!r}. Supported horizons: {list(SUPPORTED_HORIZONS)}"
+            )
+        effective_horizon = horizon.lower()
+        if profile_id is not None and profile_id not in SUPPORTED_HORIZON_PROFILES:
+            raise ValueError(f"Unsupported profile_id {profile_id!r}")
+        effective_profile_id = profile_id or HORIZON_PROFILE_ID_V1
+        if hold_days == DEFAULT_HOLD_DAYS:
+            if effective_horizon == HORIZON_SHORT:
+                effective_hold_days = PRIMARY_EVAL_OFFSET_SHORT  # 10
+            elif effective_horizon == HORIZON_MEDIUM:
+                effective_hold_days = PRIMARY_EVAL_OFFSET_MEDIUM  # 40
+            else:
+                effective_hold_days = hold_days
+        else:
+            effective_hold_days = hold_days
+    else:
+        if profile_id is not None and profile_id not in SUPPORTED_HORIZON_PROFILES:
+            raise ValueError(f"Unsupported profile_id {profile_id!r}")
+        effective_profile_id = profile_id
+        effective_hold_days = hold_days
 
     key = _cache_key(
         user_id,
@@ -881,9 +1350,11 @@ def compute_calibration(
         symbol,
         prompt_version,
         model,
-        hold_days,
+        effective_hold_days,
         effective_limit,
         min_sample_size,
+        effective_horizon,
+        effective_profile_id,
     )
     if outcome_resolver is None:
         cached = _cache_get(key)
@@ -902,10 +1373,12 @@ def compute_calibration(
             symbol=symbol,
             prompt_version=prompt_version,
             model=model,
-            hold_days=hold_days,
+            hold_days=effective_hold_days,
             limit=effective_limit,
             outcome_resolver=outcome_resolver,
             min_sample_size=min_sample_size,
+            horizon=effective_horizon,
+            profile_id=effective_profile_id,
         )
     finally:
         _release_slot()

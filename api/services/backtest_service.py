@@ -41,6 +41,27 @@ PRICE_BASIS_RAW: str = "raw"
 PRICE_BASIS_PIT_RAW: str = "pit_raw"
 PRICE_BASIS_PIT_ADJUSTED: str = "pit_adjusted"
 
+# Multi-horizon profile routing constants (V-02)
+from tradingagents.dataflows.return_labels import (
+    HORIZON_PROFILE_ID_V1,
+    PRIMARY_EVAL_OFFSET_MEDIUM,
+    PRIMARY_EVAL_OFFSET_SHORT,
+)
+from tradingagents.graph.horizon_profile import (
+    HORIZON_MEDIUM,
+    HORIZON_PROFILE_V1,
+    HORIZON_SHORT,
+    SUPPORTED_HORIZONS,
+    T_PLUS_10,
+    T_PLUS_40,
+)
+
+DEFAULT_BACKTEST_HOLD_DAYS: int = 5
+SUPPORTED_HORIZON_PROFILES: frozenset[str] = frozenset({
+    HORIZON_PROFILE_ID_V1,
+    "horizon_profile_v1",
+})
+
 
 class BacktestQueueFullError(RuntimeError):
     """Raised when the bounded backtest submission queue is full."""
@@ -56,6 +77,8 @@ class _BacktestTask:
     hold_days: int
     sample_interval: int
     config: Dict[str, Any]
+    horizon: Optional[str] = None
+    profile_id: Optional[str] = None
 
 
 _job_queue: "queue.Queue[_BacktestTask]" = queue.Queue(maxsize=MAX_BACKTEST_QUEUE)
@@ -435,6 +458,7 @@ def _compute_stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     excluded_invalid = 0
     excluded_abstain = 0
     excluded_no_trade = 0
+    excluded_wait = 0
     excluded_incomplete = 0
     excluded_hold = 0
 
@@ -451,7 +475,10 @@ def _compute_stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             excluded_invalid += 1
         elif analysis_status in ("ABSTAIN", "PARTIAL"):
             excluded_abstain += 1
-        elif trade_action in ("WAIT", "NO_TRADE"):
+        elif trade_action == "WAIT":
+            excluded_no_trade += 1
+            excluded_wait += 1
+        elif trade_action == "NO_TRADE":
             excluded_no_trade += 1
         elif trade_action == "HOLD":
             excluded_hold += 1
@@ -473,11 +500,43 @@ def _compute_stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         + excluded_hold
     )
 
+    # V-02: WAIT direction diagnostic (strictly separated from trading performance)
+    wait_records = [
+        r for r in records
+        if (
+            str(r.get("trade_action") or r.get("action") or "").upper() == "WAIT"
+            and str(r.get("analysis_status") or "").upper() == "VALID"
+        )
+    ]
+    wait_with_returns = [
+        r for r in wait_records if r.get("wait_subsequent_return_pct") is not None
+    ]
+    wait_up = sum(1 for r in wait_with_returns if r["wait_subsequent_return_pct"] > 0)
+    wait_down = sum(1 for r in wait_with_returns if r["wait_subsequent_return_pct"] < 0)
+    wait_returns = [r["wait_subsequent_return_pct"] for r in wait_with_returns]
+
+    wait_diagnostic = {
+        "total_wait_signals": len(wait_records),
+        "evaluable_wait_signals": len(wait_with_returns),
+        "up_count": wait_up,
+        "down_count": wait_down,
+        "avg_subsequent_return_pct": (
+            round(sum(wait_returns) / len(wait_returns), 2) if wait_returns else None
+        ),
+        "up_rate": (
+            round(wait_up / len(wait_returns) * 100, 1) if wait_returns else None
+        ),
+    }
+
+    horizon = records[0].get("horizon") if records else None
+    profile_id = records[0].get("profile_id") if records else None
+
     base_stats = {
         "excluded_invalid": excluded_invalid,
         "excluded_abstain": excluded_abstain,
         "excluded_wait_or_no_trade": excluded_no_trade,
         "excluded_no_trade": excluded_no_trade,
+        "excluded_wait": excluded_wait,
         "excluded_incomplete": excluded_incomplete,
         "excluded_hold": excluded_hold,
         "excluded_total": excluded_total,
@@ -486,10 +545,14 @@ def _compute_stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             "abstain": excluded_abstain,
             "wait_or_no_trade": excluded_no_trade,
             "no_trade": excluded_no_trade,
+            "wait": excluded_wait,
             "incomplete": excluded_incomplete,
             "hold": excluded_hold,
             "total": excluded_total,
         },
+        "wait_diagnostic": wait_diagnostic,
+        "horizon": horizon,
+        "profile_id": profile_id,
     }
 
     if not valid_trades:
@@ -523,7 +586,8 @@ def _compute_stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def _run_backtest(job_id: str, symbol: str, start_date: str, end_date: str,
                   selected_analysts: List[str], hold_days: int, sample_interval: int,
-                  config: Dict[str, Any]) -> None:
+                  config: Dict[str, Any], *, horizon: Optional[str] = None,
+                  profile_id: Optional[str] = None) -> None:
     """Background thread: run backtest and store results."""
     _set(job_id, status="running", started_at=_utcnow_iso())
     try:
@@ -540,17 +604,25 @@ def _run_backtest(job_id: str, symbol: str, start_date: str, end_date: str,
                 "analysis_status": "INVALID_RUN",
                 "trade_action": "NO_TRADE",
                 "price_basis": "unknown",
+                "horizon": horizon,
+                "profile_id": profile_id,
                 "entry_price": None,
                 "entry_price_as_of": None,
                 "exit_price": None,
                 "exit_price_as_of": None,
                 "return_pct": None,
+                "wait_subsequent_return_pct": None,
                 "outcome_status": "excluded_invalid",
                 "decision_summary": "",
                 "error": None,
             }
             try:
-                analysis = _run_single_analysis(symbol, trade_date, selected_analysts, config)
+                run_config = dict(config or {})
+                if horizon:
+                    run_config["horizon"] = horizon
+                if profile_id:
+                    run_config["profile_id"] = profile_id
+                analysis = _run_single_analysis(symbol, trade_date, selected_analysts, run_config)
 
                 raw_decision = analysis.get("decision") or ""
                 final_decision_text = analysis.get("final_trade_decision") or ""
@@ -602,7 +674,32 @@ def _run_backtest(job_id: str, symbol: str, start_date: str, end_date: str,
                 elif analysis_status in ("ABSTAIN", "PARTIAL"):
                     record["outcome_status"] = "excluded_abstain"
                 elif trade_action in ("WAIT", "NO_TRADE"):
-                    record["outcome_status"] = "excluded_no_trade"
+                    if trade_action == "WAIT" and analysis_status == "VALID":
+                        entry_price = _get_price_on(symbol, trade_date, price_basis=price_basis)
+                        exit_price = _get_price_after(symbol, trade_date, hold_days, price_basis=price_basis)
+
+                        if entry_price is not None and entry_price > 0:
+                            record["entry_price"] = round(entry_price, 2)
+                            record["entry_price_as_of"] = trade_date
+
+                        if exit_price is not None and exit_price > 0:
+                            record["exit_price"] = round(exit_price, 2)
+                            record["exit_price_as_of"] = f"{trade_date}+T{hold_days}"
+
+                        if (
+                            entry_price is not None
+                            and exit_price is not None
+                            and entry_price > 0
+                            and exit_price > 0
+                        ):
+                            raw_return = (exit_price - entry_price) / entry_price * 100
+                            record["wait_subsequent_return_pct"] = round(raw_return, 2)
+                            record["outcome_status"] = "excluded_wait"
+                        else:
+                            record["wait_subsequent_return_pct"] = None
+                            record["outcome_status"] = "excluded_wait"
+                    else:
+                        record["outcome_status"] = "excluded_no_trade"
                 elif trade_action == "HOLD":
                     record["outcome_status"] = "excluded_hold"
                 elif trade_action in ("BUY", "SELL") and analysis_status == "VALID":
@@ -678,6 +775,8 @@ def _worker_loop() -> None:
                 task.hold_days,
                 task.sample_interval,
                 task.config,
+                horizon=task.horizon,
+                profile_id=task.profile_id,
             )
         except Exception as exc:
             logger.exception("Backtest worker task %s failed", task.job_id)
@@ -714,12 +813,46 @@ def submit(
     start_date: str,
     end_date: str,
     selected_analysts: List[str],
-    hold_days: int,
-    sample_interval: int,
-    config: Dict[str, Any],
+    hold_days: int = 5,
+    sample_interval: int = 7,
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    horizon: Optional[str] = None,
+    profile_id: Optional[str] = None,
 ) -> str:
-    """Submit a backtest job. Returns job_id."""
+    """Submit a backtest job. Returns job_id.
+
+    Multi-horizon profile routing (V-02):
+    - When horizon is omitted: defaults to legacy T+5 evaluation (hold_days=5).
+    - When horizon is 'short': routes to canonical T+10 (hold_days=10).
+    - When horizon is 'medium': routes to canonical T+40 (hold_days=40).
+    """
     validate_sample_interval(sample_interval)
+    effective_horizon: Optional[str] = None
+    if horizon is not None:
+        if not isinstance(horizon, str) or horizon.lower() not in SUPPORTED_HORIZONS:
+            raise ValueError(
+                f"Unsupported horizon {horizon!r}. Supported horizons: {list(SUPPORTED_HORIZONS)}"
+            )
+        effective_horizon = horizon.lower()
+        if profile_id is not None and profile_id not in SUPPORTED_HORIZON_PROFILES:
+            raise ValueError(f"Unsupported profile_id {profile_id!r}")
+        effective_profile_id = profile_id or HORIZON_PROFILE_ID_V1
+        if hold_days == 5 or hold_days is None:
+            if effective_horizon == HORIZON_SHORT:
+                effective_hold_days = PRIMARY_EVAL_OFFSET_SHORT  # 10
+            elif effective_horizon == HORIZON_MEDIUM:
+                effective_hold_days = PRIMARY_EVAL_OFFSET_MEDIUM  # 40
+            else:
+                effective_hold_days = hold_days
+        else:
+            effective_hold_days = hold_days
+    else:
+        if profile_id is not None and profile_id not in SUPPORTED_HORIZON_PROFILES:
+            raise ValueError(f"Unsupported profile_id {profile_id!r}")
+        effective_profile_id = profile_id
+        effective_hold_days = hold_days if hold_days is not None else 5
+
     job_id = uuid4().hex
     _create_job(
         job_id=job_id,
@@ -728,7 +861,7 @@ def submit(
         start_date=start_date,
         end_date=end_date,
         selected_analysts=selected_analysts,
-        hold_days=hold_days,
+        hold_days=effective_hold_days,
         sample_interval=sample_interval,
         status="pending",
         created_at=_utcnow_iso(),
@@ -737,6 +870,8 @@ def submit(
         records=[],
         stats=None,
         error=None,
+        horizon=effective_horizon,
+        profile_id=effective_profile_id,
     )
     _prune_old_jobs()
     task = _BacktestTask(
@@ -745,9 +880,11 @@ def submit(
         start_date=start_date,
         end_date=end_date,
         selected_analysts=selected_analysts,
-        hold_days=hold_days,
+        hold_days=effective_hold_days,
         sample_interval=sample_interval,
-        config=config,
+        config=config or {},
+        horizon=effective_horizon,
+        profile_id=effective_profile_id,
     )
     try:
         _job_queue.put_nowait(task)

@@ -997,3 +997,52 @@ class TestV2WinnerOnlyCalibration:
         assert "winner_only_stats" in payload
         assert payload["winner_only_stats"]["bull_count"] == 1
         assert payload["winner_only_stats"]["bear_count"] == 1
+
+
+class TestV02CalibrationGroupedStatsAndRouting:
+    """V-02 tests for grouped statistics and cache key isolation."""
+
+    def test_grouped_stats_segmented_by_model_prompt_and_horizon(self):
+        """V-02 requirement 1: calibration returns grouped_stats by horizon, model, prompt_version."""
+        user_id, _ = _user_token()
+        # Seed report with model A, prompt v1
+        _seed_report(
+            symbol="600519.SH", trade_date="2024-03-01", probability=0.8, user_id=user_id,
+            model_names=("model-a",), prompt_versions=("v1",),
+        )
+        # Seed report with model B, prompt v2
+        _seed_report(
+            symbol="600519.SH", trade_date="2024-03-02", probability=0.6, user_id=user_id,
+            model_names=("model-b",), prompt_versions=("v2",),
+        )
+
+        with get_db_ctx() as db:
+            result = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                hold_days=5,
+                outcome_resolver=lambda r: True,
+            )
+
+        assert "grouped_stats" in result
+        groups = result["grouped_stats"]
+        assert len(groups) >= 2
+        models = {g["model"] for g in groups}
+        assert "model-a" in models
+        assert "model-b" in models
+        prompts = {g["prompt_version"] for g in groups}
+        assert "v1" in prompts
+        assert "v2" in prompts
+
+    def test_cache_key_isolates_different_horizons_and_profiles(self):
+        """Cache key distinguishes short, medium, and default horizons."""
+        k_def = cal._cache_key("u1", "2024-01-01", "2024-02-01", "600519.SH", "v1", "m1", 5, 50, 30)
+        k_short = cal._cache_key("u1", "2024-01-01", "2024-02-01", "600519.SH", "v1", "m1", 10, 50, 30, horizon="short", profile_id="horizon_profile_v1")
+        k_med = cal._cache_key("u1", "2024-01-01", "2024-02-01", "600519.SH", "v1", "m1", 40, 50, 30, horizon="medium", profile_id="horizon_profile_v1")
+
+        assert k_def != k_short
+        assert k_short != k_med
+        assert k_def != k_med
+        assert "short" in k_short
+        assert "medium" in k_med
+        assert "horizon_profile_v1" in k_short

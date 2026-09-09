@@ -535,3 +535,560 @@ class TestPriceBasisSemantics:
 
         assert res["price_basis"] == "vendor_qfq"
         assert res["price_basis"] != "raw"
+
+
+class TestV02MultiHorizonReadonlyEvaluationAndIsolation:
+    """V-02 tests: multi-horizon readonly evaluation, profile routing, and isolation."""
+
+    def _seed_custom_report(self, user_id: str, **kwargs) -> ReportDB:
+        from api.database import get_db_ctx, init_db, ReportDB
+        init_db()
+        with get_db_ctx() as db:
+            rd = kwargs.get("result_data", {})
+            report_id = str(uuid4())
+            rep = ReportDB(
+                id=report_id,
+                user_id=user_id,
+                symbol=kwargs.get("symbol", "600519.SH"),
+                trade_date=kwargs.get("trade_date", "2024-01-02"),
+                status="completed",
+                decision=kwargs.get("trade_action", "BUY"),
+                direction=kwargs.get("direction", "BULL"),
+                probability=kwargs.get("probability", 0.8),
+                confidence=kwargs.get("confidence", 85),
+                analysis_status=kwargs.get("analysis_status", "VALID"),
+                trade_action=kwargs.get("trade_action", "BUY"),
+                result_data=rd,
+            )
+            db.add(rep)
+            db.commit()
+            db.refresh(rep)
+            return rep
+
+    def teardown_method(self):
+        from api.database import get_db_ctx, ReportDB, UserDB
+        with get_db_ctx() as db:
+            db.query(ReportDB).delete()
+            db.query(UserDB).delete()
+            db.commit()
+
+    def test_explicit_short_profile_routes_to_t10_and_isolates_pool(self):
+        """Specifying horizon='short' routes hold_days to 10 and excludes medium and legacy samples."""
+        from api.database import get_db_ctx, init_db, UserDB
+        init_db()
+        user_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+        with get_db_ctx() as db:
+            user = UserDB(id=user_id, email=f"v02-{uuid4().hex[:8]}@t.com", is_active=True, created_at=now, updated_at=now, last_login_at=now)
+            db.add(user)
+            db.commit()
+
+        # 1. Short report (T+10)
+        self._seed_custom_report(
+            user_id,
+            trade_date="2024-01-02",
+            probability=0.8,
+            analysis_status="VALID",
+            trade_action="BUY",
+            result_data={
+                "horizon": "short",
+                "horizon_run_metadata": {
+                    "resolved": ["short"],
+                    "profile_id": "horizon_profile_v1",
+                    "resolution_source": "explicit",
+                },
+            },
+        )
+        # 2. Medium report (T+40)
+        self._seed_custom_report(
+            user_id,
+            trade_date="2024-01-03",
+            probability=0.75,
+            analysis_status="VALID",
+            trade_action="BUY",
+            result_data={
+                "horizon": "medium",
+                "horizon_run_metadata": {
+                    "resolved": ["medium"],
+                    "profile_id": "horizon_profile_v1",
+                    "resolution_source": "explicit",
+                },
+            },
+        )
+        # 3. Legacy report (no horizon metadata)
+        self._seed_custom_report(
+            user_id,
+            trade_date="2024-01-04",
+            probability=0.7,
+            analysis_status="VALID",
+            trade_action="BUY",
+            result_data={},
+        )
+
+        with get_db_ctx() as db:
+            res = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                horizon="short",
+                outcome_resolver=lambda r: True,
+            )
+
+        assert res["sample_size"] == 1
+        assert res["filters"]["hold_days"] == 10
+        assert res["horizon"] == "short"
+        assert res["profile_id"] == "horizon_profile_v1"
+        assert res["excluded_counts"]["mismatched_horizon"] >= 2
+
+    def test_explicit_medium_profile_routes_to_t40_and_isolates_pool(self):
+        """Specifying horizon='medium' routes hold_days to 40 and excludes short and legacy samples."""
+        from api.database import get_db_ctx, init_db, UserDB
+        init_db()
+        user_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+        with get_db_ctx() as db:
+            user = UserDB(id=user_id, email=f"v02-{uuid4().hex[:8]}@t.com", is_active=True, created_at=now, updated_at=now, last_login_at=now)
+            db.add(user)
+            db.commit()
+
+        # 1. Short report (T+10)
+        self._seed_custom_report(
+            user_id,
+            trade_date="2024-01-02",
+            probability=0.8,
+            analysis_status="VALID",
+            trade_action="BUY",
+            result_data={
+                "horizon": "short",
+                "horizon_run_metadata": {
+                    "resolved": ["short"],
+                    "profile_id": "horizon_profile_v1",
+                    "resolution_source": "explicit",
+                },
+            },
+        )
+        # 2. Medium report (T+40)
+        self._seed_custom_report(
+            user_id,
+            trade_date="2024-01-03",
+            probability=0.75,
+            analysis_status="VALID",
+            trade_action="BUY",
+            result_data={
+                "horizon": "medium",
+                "horizon_run_metadata": {
+                    "resolved": ["medium"],
+                    "profile_id": "horizon_profile_v1",
+                    "resolution_source": "explicit",
+                },
+            },
+        )
+        # 3. Legacy report (no horizon metadata)
+        self._seed_custom_report(
+            user_id,
+            trade_date="2024-01-04",
+            probability=0.7,
+            analysis_status="VALID",
+            trade_action="BUY",
+            result_data={},
+        )
+
+        with get_db_ctx() as db:
+            res = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                horizon="medium",
+                outcome_resolver=lambda r: True,
+            )
+
+        assert res["sample_size"] == 1
+        assert res["filters"]["hold_days"] == 40
+        assert res["horizon"] == "medium"
+        assert res["profile_id"] == "horizon_profile_v1"
+        assert res["excluded_counts"]["mismatched_horizon"] >= 2
+
+    def test_default_legacy_preserves_t5_and_rejects_explicit_t10_t40_mix(self):
+        """Default call without horizon stays at T+5 and excludes explicit single-horizon medium/short."""
+        from api.database import get_db_ctx, init_db, UserDB
+        init_db()
+        user_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+        with get_db_ctx() as db:
+            user = UserDB(id=user_id, email=f"v02-{uuid4().hex[:8]}@t.com", is_active=True, created_at=now, updated_at=now, last_login_at=now)
+            db.add(user)
+            db.commit()
+
+        # 1. Explicit Medium report (T+40)
+        self._seed_custom_report(
+            user_id,
+            trade_date="2024-01-02",
+            probability=0.75,
+            analysis_status="VALID",
+            trade_action="BUY",
+            result_data={
+                "horizon": "medium",
+                "horizon_run_metadata": {
+                    "resolved": ["medium"],
+                    "profile_id": "horizon_profile_v1",
+                    "resolution_source": "explicit",
+                },
+            },
+        )
+        # 2. Legacy report (compatible with default T+5)
+        self._seed_custom_report(
+            user_id,
+            trade_date="2024-01-03",
+            probability=0.7,
+            analysis_status="VALID",
+            trade_action="BUY",
+            result_data={},
+        )
+
+        with get_db_ctx() as db:
+            res = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                outcome_resolver=lambda r: True,
+            )
+
+        assert res["sample_size"] == 1
+        assert res["filters"]["hold_days"] == 5
+        assert res["horizon"] is None
+        assert res["excluded_counts"]["mismatched_horizon"] >= 1
+
+    def test_dual_horizon_reports_admitted_to_respective_slices(self):
+        """Dual-horizon reports are admitted under both short and medium evaluations with correct slice probability."""
+        from api.database import get_db_ctx, init_db, UserDB
+        init_db()
+        user_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+        with get_db_ctx() as db:
+            user = UserDB(id=user_id, email=f"v02-{uuid4().hex[:8]}@t.com", is_active=True, created_at=now, updated_at=now, last_login_at=now)
+            db.add(user)
+            db.commit()
+
+        self._seed_custom_report(
+            user_id,
+            trade_date="2024-01-02",
+            probability=0.5,
+            analysis_status="VALID",
+            trade_action="BUY",
+            result_data={
+                "mode": "dual_horizon",
+                "short_term": {
+                    "horizon": "short",
+                    "status": "completed",
+                    "probability": 0.85,
+                    "analysis_status": "VALID",
+                    "trade_action": "BUY",
+                },
+                "medium_term": {
+                    "horizon": "medium",
+                    "status": "completed",
+                    "probability": 0.65,
+                    "analysis_status": "VALID",
+                    "trade_action": "BUY",
+                },
+                "horizon_run_metadata": {
+                    "resolved": ["short", "medium"],
+                    "profile_id": "horizon_profile_v1",
+                },
+            },
+        )
+
+        with get_db_ctx() as db:
+            res_short = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                horizon="short",
+                outcome_resolver=lambda r: True,
+            )
+            res_medium = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                horizon="medium",
+                outcome_resolver=lambda r: True,
+            )
+
+        assert res_short["sample_size"] == 1
+        assert res_short["filters"]["hold_days"] == 10
+        # 85% lands in 80+% bucket
+        b80_short = next(b for b in res_short["buckets"] if b["bucket"] == "80+%")
+        assert b80_short["count"] == 1
+
+        assert res_medium["sample_size"] == 1
+        assert res_medium["filters"]["hold_days"] == 40
+        # 65% lands in 60-70% bucket
+        b60_med = next(b for b in res_medium["buckets"] if b["bucket"] == "60-70%")
+        assert b60_med["count"] == 1
+
+    def test_invalid_profile_and_corrupted_horizon_excluded_with_counts(self):
+        """Corrupted horizon or profile are excluded and accounted for under invalid_profile."""
+        from api.database import get_db_ctx, init_db, UserDB
+        init_db()
+        user_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+        with get_db_ctx() as db:
+            user = UserDB(id=user_id, email=f"v02-{uuid4().hex[:8]}@t.com", is_active=True, created_at=now, updated_at=now, last_login_at=now)
+            db.add(user)
+            db.commit()
+
+        # Corrupted horizon
+        self._seed_custom_report(
+            user_id,
+            trade_date="2024-01-02",
+            probability=0.8,
+            analysis_status="VALID",
+            trade_action="BUY",
+            result_data={
+                "horizon": "unsupported_super_long",
+                "profile_id": "horizon_profile_v1",
+            },
+        )
+        # Corrupted profile
+        self._seed_custom_report(
+            user_id,
+            trade_date="2024-01-03",
+            probability=0.8,
+            analysis_status="VALID",
+            trade_action="BUY",
+            result_data={
+                "horizon": "short",
+                "profile_id": "unsupported_parallel_profile_v99",
+            },
+        )
+
+        with get_db_ctx() as db:
+            res = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                outcome_resolver=lambda r: True,
+            )
+
+        assert res["sample_size"] == 0
+        assert res["excluded_counts"]["invalid_profile"] >= 2
+        assert res["excluded_invalid_profile"] >= 2
+
+        # Direct caller validation check
+        with get_db_ctx() as db:
+            with pytest.raises(ValueError, match="Unsupported horizon 'invalid_param'"):
+                cal.compute_calibration(db, horizon="invalid_param")
+
+            with pytest.raises(ValueError, match="Unsupported profile_id 'invalid_profile'"):
+                cal.compute_calibration(db, horizon="short", profile_id="invalid_profile")
+
+    def test_wait_direction_diagnostic_separated_from_trading_performance(self):
+        """WAIT directional diagnostics are computed and presented separately from trading calibration."""
+        from api.database import get_db_ctx, init_db, UserDB
+        init_db()
+        user_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+        with get_db_ctx() as db:
+            user = UserDB(id=user_id, email=f"v02-{uuid4().hex[:8]}@t.com", is_active=True, created_at=now, updated_at=now, last_login_at=now)
+            db.add(user)
+            db.commit()
+
+        # 1. Traded BUY (price rose -> win)
+        self._seed_custom_report(
+            user_id, trade_date="2024-01-02", probability=0.8,
+            analysis_status="VALID", trade_action="BUY", symbol="600519.SH",
+        )
+        # 2. Traded SELL (price fell -> win)
+        self._seed_custom_report(
+            user_id, trade_date="2024-01-03", probability=0.2,
+            analysis_status="VALID", trade_action="SELL", symbol="600519.SH",
+        )
+        # 3. Non-traded WAIT with bullish lean (prob=0.75, price rose -> diagnostic hit)
+        self._seed_custom_report(
+            user_id, trade_date="2024-01-04", probability=0.75,
+            analysis_status="VALID", trade_action="WAIT", symbol="600519.SH",
+            result_data={"direction": "BULL"},
+        )
+        # 4. Non-traded WAIT with bearish lean (winner='bear', price fell -> diagnostic hit)
+        self._seed_custom_report(
+            user_id, trade_date="2024-01-05", probability=None,
+            analysis_status="VALID", trade_action="WAIT", symbol="600519.SH",
+            result_data={"investment_debate_state": {"winner": "bear"}},
+        )
+        # 5. Non-traded WAIT with bearish lean (winner='bear', price rose -> diagnostic miss)
+        self._seed_custom_report(
+            user_id, trade_date="2024-01-08", probability=None,
+            analysis_status="VALID", trade_action="WAIT", symbol="600519.SH",
+            result_data={"investment_debate_state": {"winner": "bear"}},
+        )
+
+        def mock_outcome(r: ReportDB) -> bool | None:
+            return r.trade_date in ("2024-01-02", "2024-01-04", "2024-01-08")
+
+        with get_db_ctx() as db:
+            res = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                outcome_resolver=mock_outcome,
+            )
+
+        # Traded calibration sample_size must ONLY count the 2 traded reports
+        assert res["sample_size"] == 2
+        assert res["probability_sample_size"] == 2
+
+        # WAIT diagnostic is reported separately
+        wait_diag = res["wait_diagnostic"]
+        assert wait_diag["total_wait_count"] == 3
+        assert wait_diag["evaluable_wait_count"] == 3
+        assert wait_diag["rise_count"] == 2  # Jan 4 and Jan 8 rose
+        assert wait_diag["fall_count"] == 1  # Jan 5 fell
+        assert wait_diag["rise_rate"] == 66.7
+        assert wait_diag["directional_lean_count"] == 3
+        assert wait_diag["directional_hits"] == 2  # Jan 4 (bull/rose) & Jan 5 (bear/fell)
+        assert wait_diag["directional_hit_rate"] == 66.7
+
+        # Exclusion accounting
+        assert res["excluded_wait"] == 3
+        assert res["excluded_counts"]["wait"] == 3
+
+    def test_zero_or_insufficient_samples_does_not_fabricate_metrics(self):
+        """Zero samples or N < min_sample_size never fabricates Brier score or bucket rise rates."""
+        from api.database import get_db_ctx, init_db, UserDB
+        init_db()
+        user_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+        with get_db_ctx() as db:
+            user = UserDB(id=user_id, email=f"v02-{uuid4().hex[:8]}@t.com", is_active=True, created_at=now, updated_at=now, last_login_at=now)
+            db.add(user)
+            db.commit()
+
+        # 0 samples
+        with get_db_ctx() as db:
+            res_zero = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                outcome_resolver=lambda r: True,
+            )
+        assert res_zero["sample_size"] == 0
+        assert res_zero["brier_score"] is None
+        assert res_zero["sample_sufficient"] is False
+        assert all(b["rise_rate"] is None for b in res_zero["buckets"])
+
+        # 2 samples (< 30)
+        self._seed_custom_report(user_id, trade_date="2024-01-02", probability=0.8, analysis_status="VALID", trade_action="BUY")
+        self._seed_custom_report(user_id, trade_date="2024-01-03", probability=0.6, analysis_status="VALID", trade_action="BUY")
+
+        with get_db_ctx() as db:
+            res_two = cal.compute_calibration(
+                db,
+                user_id=user_id,
+                outcome_resolver=lambda r: True,
+            )
+        assert res_two["sample_size"] == 2
+        assert res_two["brier_score"] is None
+        assert res_two["sample_sufficient"] is False
+        assert all(b["rise_rate"] is None for b in res_two["buckets"])
+        assert "低于最小阈值" in str(res_two["insufficient_reason"])
+
+    def test_backtest_service_routes_profile_and_preserves_hold_days(self):
+        """Backtest service routes short to T+10 and medium to T+40, preserving default T+5."""
+        job_short = bt.submit(
+            user_id="u-v02",
+            symbol="600519.SH",
+            start_date="2024-01-02",
+            end_date="2024-01-10",
+            selected_analysts=["market"],
+            horizon="short",
+        )
+        task_short = bt.get_job(job_short, "u-v02")
+        assert task_short is not None
+        assert task_short["hold_days"] == 10
+        assert task_short["horizon"] == "short"
+        assert task_short["profile_id"] == "horizon_profile_v1"
+
+        job_med = bt.submit(
+            user_id="u-v02",
+            symbol="600519.SH",
+            start_date="2024-01-02",
+            end_date="2024-01-10",
+            selected_analysts=["market"],
+            horizon="medium",
+        )
+        task_med = bt.get_job(job_med, "u-v02")
+        assert task_med is not None
+        assert task_med["hold_days"] == 40
+        assert task_med["horizon"] == "medium"
+
+        job_def = bt.submit(
+            user_id="u-v02",
+            symbol="600519.SH",
+            start_date="2024-01-02",
+            end_date="2024-01-10",
+            selected_analysts=["market"],
+        )
+        task_def = bt.get_job(job_def, "u-v02")
+        assert task_def is not None
+        assert task_def["hold_days"] == 5
+        assert task_def["horizon"] is None
+
+        with pytest.raises(ValueError, match="Unsupported horizon 'invalid_h'"):
+            bt.submit(
+                user_id="u-v02",
+                symbol="600519.SH",
+                start_date="2024-01-02",
+                end_date="2024-01-10",
+                selected_analysts=["market"],
+                horizon="invalid_h",
+            )
+
+    def test_backtest_service_wait_direction_diagnostic_separated_from_win_rate(self):
+        """Backtest compute_stats calculates wait_diagnostic without mixing into total_signals or win_rate."""
+        records = [
+            # 1. Winning BUY trade
+            {"action": "BUY", "trade_action": "BUY", "analysis_status": "VALID", "return_pct": 5.0, "outcome_status": "ok"},
+            # 2. Losing BUY trade
+            {"action": "BUY", "trade_action": "BUY", "analysis_status": "VALID", "return_pct": -2.0, "outcome_status": "ok"},
+            # 3. Non-traded WAIT with subsequent rise
+            {"action": "WAIT", "trade_action": "WAIT", "analysis_status": "VALID", "return_pct": None, "wait_subsequent_return_pct": 4.5, "outcome_status": "excluded_wait"},
+            # 4. Non-traded WAIT with subsequent fall
+            {"action": "WAIT", "trade_action": "WAIT", "analysis_status": "VALID", "return_pct": None, "wait_subsequent_return_pct": -1.5, "outcome_status": "excluded_wait"},
+        ]
+        stats = bt._compute_stats(records)
+        # Real trades count is strictly 2
+        assert stats["total_signals"] == 2
+        assert stats["win_rate"] == 50.0
+        assert stats["avg_return_pct"] == 1.5
+
+        # WAIT diagnostic is listed separately
+        wait_diag = stats["wait_diagnostic"]
+        assert wait_diag["total_wait_signals"] == 2
+        assert wait_diag["evaluable_wait_signals"] == 2
+        assert wait_diag["up_count"] == 1
+        assert wait_diag["down_count"] == 1
+        assert wait_diag["up_rate"] == 50.0
+        assert wait_diag["avg_subsequent_return_pct"] == 1.5
+
+        assert stats["excluded_wait"] == 2
+        assert stats["excluded_counts"]["wait"] == 2
+
+    def test_negative_constraints_invariance(self):
+        """V-02 negative constraints verification:
+        1. No portfolio Sharpe / drawdown metrics generated without portfolio rules.
+        2. Confidence is never converted into probability.
+        3. cal.DEFAULT_HOLD_DAYS remains 5.
+        4. shadow_credit T+5 semantics and constants remain unchanged.
+        """
+        # 1. No portfolio Sharpe / drawdown in calibration or backtest
+        stats = bt._compute_stats([])
+        for forbidden_key in ("sharpe", "sharpe_ratio", "max_drawdown", "drawdown", "portfolio_sharpe"):
+            assert forbidden_key not in stats, f"Forbidden key {forbidden_key!r} detected in backtest stats"
+
+        # 2. Confidence never converted to probability
+        from api.database import ReportDB
+        rep = ReportDB(confidence=90, probability=None, result_data={})
+        extracted_p = cal._extract_report_probability(rep)
+        assert extracted_p is None, "confidence must never be converted to probability"
+
+        # 3. DEFAULT_HOLD_DAYS invariance
+        assert cal.DEFAULT_HOLD_DAYS == 5
+
+        # 4. shadow_credit.py T+5 constants and invariants
+        from tradingagents.agents.utils import shadow_credit as sc
+        assert sc.T_PLUS_5_STATUS_DUE_AND_EVALUATED == "due_and_evaluated"
+        assert sc.T_PLUS_5_STATUS_PENDING_DUE == "pending_due"
+        assert hasattr(sc, "calculate_t_plus_5_date")
+        assert hasattr(sc, "H1B_THRESHOLDS")

@@ -823,3 +823,47 @@ class TestNoResolveHorizonReturnLabelPlaceholder:
             "resolve_horizon_return_label must NOT be implemented as a placeholder or "
             "NotImplementedError stub in V-01-1; deferred to V-01-2+."
         )
+
+
+class TestV02EvaluationRoutingBoundary:
+    """21. V-02 evaluation and routing boundary tests against V-01 shared contract."""
+
+    def test_eval_offsets_match_v01_and_v02_contracts(self):
+        """V-02 routing must match V-01 canonical offsets: short -> 10, medium -> 40."""
+        assert rl.PRIMARY_EVAL_OFFSET_SHORT == 10
+        assert rl.PRIMARY_EVAL_OFFSET_MEDIUM == 40
+        assert HORIZON_PROFILE_V1[HORIZON_SHORT]["primary_eval_offset"] == 10
+        assert HORIZON_PROFILE_V1[HORIZON_MEDIUM]["primary_eval_offset"] == 40
+        assert rl.HORIZON_PROFILE_ID_V1 == "horizon_profile_v1"
+        assert set(SUPPORTED_HORIZONS) == {"short", "medium"}
+
+    def test_unsupported_horizon_t5_rejected_by_calendar_resolution(self):
+        """Multi-horizon contract rejects unsupported horizons like legacy T+5."""
+        with pytest.raises(ValueError, match="Unsupported horizon 't5'"):
+            rl.resolve_horizon_calendar_window(
+                signal_date="2024-02-01",
+                horizon="t5",
+                trading_days=FIXTURE_SPRING_FESTIVAL_2024,
+                as_of="2024-02-23",
+                as_of_market_closed=True,
+            )
+
+    def test_calendar_window_due_boundary_governs_evaluation_eligibility(self):
+        """When target date > as_of, is_due is strictly False, preventing premature evaluation."""
+        window = rl.resolve_horizon_calendar_window(
+            signal_date="2024-02-01",
+            horizon="short",
+            trading_days=FIXTURE_SPRING_FESTIVAL_2024,
+            as_of="2024-02-19",
+            as_of_market_closed=True,
+        )
+        assert window.is_due is False
+        assert window.target_calendar_date == "2024-02-23"
+
+    def test_negative_constraints_no_fabricated_metrics(self):
+        """Contracts do not include probability fabrication or portfolio metrics."""
+        result_annotations = rl.HorizonReturnResult.__annotations__
+        assert "probability" not in result_annotations
+        assert "confidence" not in result_annotations
+        assert "sharpe" not in result_annotations
+        assert "max_drawdown" not in result_annotations
