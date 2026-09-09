@@ -1,0 +1,453 @@
+{
+  "metadata": {
+    "backup_db_path": "/Users/davidliu/multica_workspaces_desktop-api.multica.ai/davidsworks-d70c6ff76b54/dav-800-57ae433bc72d/workdir/tradingagents-ashare-fork/work/tradingagents_symbol_canonical_backup.db",
+    "total_reports": 1408,
+    "dry_run": false
+  },
+  "statistics": {
+    "total_count": 1408,
+    "already_canonical_count": 1370,
+    "mapped_updates_count": 4,
+    "bse_excluded_count": 0,
+    "unmappable_count": 34,
+    "unmappable_by_reason": {
+      "invalid_format": 2,
+      "empty": 32
+    }
+  },
+  "conservation_check": {
+    "sum_of_buckets": 1408,
+    "matches_total": true
+  },
+  "collisions_surfaced": {
+    "600519.SH": {
+      "canonical_symbol": "600519.SH",
+      "raw_symbols": [
+        "600519",
+        "600519.SH"
+      ],
+      "raw_counts": {
+        "600519.SH": 739,
+        "600519": 1
+      },
+      "total_occurrences": 740
+    },
+    "000001.SZ": {
+      "canonical_symbol": "000001.SZ",
+      "raw_symbols": [
+        "000001",
+        "000001.SZ"
+      ],
+      "raw_counts": {
+        "000001.SZ": 57,
+        "000001": 2
+      },
+      "total_occurrences": 59
+    },
+    "603259.SH": {
+      "canonical_symbol": "603259.SH",
+      "raw_symbols": [
+        "603259",
+        "603259.SH"
+      ],
+      "raw_counts": {
+        "603259.SH": 11,
+        "603259": 1
+      },
+      "total_occurrences": 12
+    }
+  },
+  "mapped_updates_sample": [
+    {
+      "id": "0045109b-1085-48cf-92d4-9ac8da945c7d",
+      "raw_symbol": "000001",
+      "trade_date": "2026-08-20",
+      "status": "completed",
+      "created_at": "2026-08-19 19:44:27.591917",
+      "canonical_symbol": "000001.SZ",
+      "canonical_status": "canonical",
+      "reason": null
+    },
+    {
+      "id": "034020a0-6170-4be9-9aa9-fe3c9c727f19",
+      "raw_symbol": "000001",
+      "trade_date": "2026-08-20",
+      "status": "completed",
+      "created_at": "2026-08-19 19:44:38.606244",
+      "canonical_symbol": "000001.SZ",
+      "canonical_status": "canonical",
+      "reason": null
+    },
+    {
+      "id": "b51ed1ab-be45-428b-a7ba-48c7b0ab11ab",
+      "raw_symbol": "600519",
+      "trade_date": "2026-08-20",
+      "status": "completed",
+      "created_at": "2026-08-19 19:44:55.691743",
+      "canonical_symbol": "600519.SH",
+      "canonical_status": "canonical",
+      "reason": null
+    },
+    {
+      "id": "3046f6af-d95b-4699-9f86-2dc1051dbcc9",
+      "raw_symbol": "603259",
+      "trade_date": "2026-08-20",
+      "status": "completed",
+      "created_at": "2026-08-19 19:45:59.234068",
+      "canonical_symbol": "603259.SH",
+      "canonical_status": "canonical",
+      "reason": null
+    }
+  ],
+  "quarantine_list": [
+    {
+      "id": "5f593affa6424bf19d8cd1f1da4abc3e",
+      "raw_symbol": "AGENT",
+      "trade_date": "2026-07-31",
+      "status": "completed",
+      "created_at": "2026-07-31 06:02:35.886168",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "invalid_format"
+    },
+    {
+      "id": "48c2eb8881f0491085a7dcbb25e74977",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 11:41:56.446791",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "b2d7b4ace31140ec8819c5cd74a11d2d",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 11:59:34.944119",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "d81df0cce42648cab86275d1d683b333",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 12:15:48.292300",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "e65a38f4019d47c7b815dea58a20def3",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 12:42:08.839240",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "c506ba8dbab94371bdcda81e01d53730",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 12:48:19.882747",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "d29457d6ec61455895ce8aa901345af1",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 13:33:01.105283",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "465502dc3f70447c81adfb41258e7a84",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 13:33:37.731303",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "c4b82f532a0e4e30a4fffa0b29d03a64",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 14:15:25.676130",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "5722c91cfc724d3dbbe356421953c774",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 15:23:07.609497",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "9ffddb53a3e94ba8a69a8634e8919a23",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 15:34:54.541763",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "22b176c14133466486d9944cfd04e780",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 16:14:34.264444",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "4dc2a72564a94ec4bd55eebb809239c2",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 16:20:20.635159",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "25025c28594f46ce8197dde45d855715",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 16:21:05.021275",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "f99274bcd4d14d1f85f6a6275bb6ff89",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 16:22:38.266634",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "9153bb5b21114ee984ae55cee5ffe8dd",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 16:36:11.016519",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "f75f228595fb4651ad404f451453089d",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 16:41:14.595626",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "ea0a2e6bb17542eeb890324a1e28d9b5",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 16:41:22.158290",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "903821bb659745d8ac3b7bec9c38770e",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 16:41:53.958913",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "4b80212d580d4df9a72ebde91eddd7c0",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 16:58:24.890393",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "6e47fec2be864fd49f908e2ffd715115",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 17:00:59.287996",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "8992dd2307074df69af7f2e388038a81",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 17:02:12.484356",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "37b176d623a64ad591819c2829dcebf3",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 17:06:30.839431",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "a930990cc7c14b7d95e57dc74b63e09d",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 17:23:41.956968",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "f279911c75b140cb9a93408f52bd6ffe",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-07-31 17:24:40.618994",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "f72dcee5c13946a1b1fdf97cf707835d",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-08-01 19:04:45.427888",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "e14ae51f5fb54340a15180d0b23863f8",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-08-02 12:23:02.285928",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "932ad25532de4ba4a9b214dc847e9ccb",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-08-02 12:35:35.318737",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "bae030dab9e64f2891d5c85f76b1d0d1",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-08-02 18:17:49.501095",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "a35d053747c84a0489a76389dd62dc4f",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-08-02 18:30:44.880522",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "1581307b65e74c458d22f018453eb7b6",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-08-03 21:24:42.443766",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "a27341541f8a4ddd83d0bbc63dadac9b",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-08-03 21:46:22.269283",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "5ae6e4f4713f46af94d7d83b692f9bd8",
+      "raw_symbol": "",
+      "trade_date": "2024-01-15",
+      "status": "failed",
+      "created_at": "2026-08-03 21:59:28.865985",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "empty"
+    },
+    {
+      "id": "f0a52c2b9c8144989f19ad003f7db466",
+      "raw_symbol": "AUUSDO",
+      "trade_date": "2026-08-06",
+      "status": "completed",
+      "created_at": "2026-08-05 20:30:11.153328",
+      "canonical_symbol": null,
+      "canonical_status": "unmappable",
+      "reason": "invalid_format"
+    }
+  ],
+  "bse_excluded_list": [],
+  "post_migration_collision_verification": {
+    "000001.SZ_count": 59,
+    "600519.SH_count": 740,
+    "603259.SH_count": 12,
+    "000001_bare_count": 0,
+    "600519_bare_count": 0,
+    "603259_bare_count": 0
+  }
+}
