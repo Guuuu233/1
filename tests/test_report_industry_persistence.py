@@ -337,6 +337,8 @@ class TestH1bGateMultiIndustryVerification:
                 decision="BUY" if winner == "bull" else "SELL",
                 result_data={
                     "symbol": sym,
+                    "analysis_status": "VALID",
+                    "trade_action": "BUY" if winner == "bull" else "SELL",
                     "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED,
                     "manager_verdict": {"winner": winner, "direction": "看多" if winner == "bull" else "看空"},
                 },

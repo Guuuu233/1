@@ -554,6 +554,48 @@ def extract_report_industry(sample: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def extract_report_analysis_status_and_action(report: Mapping[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    """Extract canonical (analysis_status, trade_action) from report dictionary.
+
+    STRICT D-009 §5 CONTRACT:
+    - Extracts analysis_status from canonical locations.
+    - Extracts trade_action ONLY from canonical `trade_action` field name.
+      NEVER falls back to legacy `decision` or `action` fields (RT-1 / DAV-783).
+    """
+    if not isinstance(report, Mapping):
+        return None, None
+
+    res_data = report.get("result_data") if isinstance(report.get("result_data"), Mapping) else {}
+    inv_state = report.get("investment_debate_state") if isinstance(report.get("investment_debate_state"), Mapping) else (
+        res_data.get("investment_debate_state") if isinstance(res_data.get("investment_debate_state"), Mapping) else {}
+    )
+    dec_status = report.get("decision_status") if isinstance(report.get("decision_status"), Mapping) else (
+        res_data.get("decision_status") if isinstance(res_data.get("decision_status"), Mapping) else (
+            inv_state.get("decision_status") if isinstance(inv_state.get("decision_status"), Mapping) else {}
+        )
+    )
+
+    # 1. Canonical analysis_status
+    raw_status = (
+        report.get("analysis_status")
+        or res_data.get("analysis_status")
+        or (dec_status.get("analysis_status") if isinstance(dec_status, Mapping) else None)
+        or (inv_state.get("analysis_status") if isinstance(inv_state, Mapping) else None)
+    )
+    analysis_status = str(raw_status).strip().upper() if raw_status is not None and str(raw_status).strip() else None
+
+    # 2. Canonical trade_action (STRICT: NO fallback to decision/action)
+    raw_action = (
+        report.get("trade_action")
+        or res_data.get("trade_action")
+        or (dec_status.get("trade_action") if isinstance(dec_status, Mapping) else None)
+        or (inv_state.get("trade_action") if isinstance(inv_state, Mapping) else None)
+    )
+    trade_action = str(raw_action).strip().upper() if raw_action is not None and str(raw_action).strip() else None
+
+    return analysis_status, trade_action
+
+
 def is_qualifying_v2_report(report: Mapping[str, Any]) -> bool:
     """Return True if report is a completed v2 structured debate report with a valid v2 manager verdict winner.
 
@@ -611,6 +653,58 @@ def is_qualifying_v2_report(report: Mapping[str, Any]) -> bool:
     return False
 
 
+# Alias for clarity in multi-stage pipeline accounting
+is_v2_protocol_report = is_qualifying_v2_report
+
+
+def classify_v2_report_d009_exclusion(report: Mapping[str, Any]) -> Optional[str]:
+    """Classify why a v2 protocol report is excluded under D-009 §5.
+
+    Returns None if report qualifies:
+    - analysis_status == 'VALID'
+    - trade_action in {'BUY', 'SELL', 'HOLD'}
+
+    Returns one of the categorized exclusion reasons otherwise:
+    - 'legacy_null': analysis_status IS NULL (pre-D-009 sample)
+    - 'abstain': analysis_status == 'ABSTAIN'
+    - 'invalid_run': analysis_status == 'INVALID_RUN'
+    - 'data_error': analysis_status in ('DATA_ERROR', 'PARTIAL')
+    - 'wait': analysis_status == 'VALID' but trade_action == 'WAIT'
+    - 'no_trade': analysis_status == 'VALID' but trade_action is NO_TRADE / missing / non-directional
+    """
+    st_val, act_val = extract_report_analysis_status_and_action(report)
+
+    if st_val is None:
+        return "legacy_null"
+    if st_val == "ABSTAIN":
+        return "abstain"
+    if st_val == "INVALID_RUN":
+        return "invalid_run"
+    if st_val in ("DATA_ERROR", "PARTIAL"):
+        return "data_error"
+
+    if st_val == "VALID":
+        if act_val == "WAIT":
+            return "wait"
+        if act_val in {"BUY", "SELL", "HOLD"}:
+            return None
+        # Missing trade_action or NO_TRADE or other non-directional action
+        return "no_trade"
+
+    return "invalid_run"
+
+
+def is_qualifying_h1b_report(report: Mapping[str, Any]) -> bool:
+    """Return True if report is a completed v2 structured debate report qualifying for H1b pool under D-009 §5:
+    - is_qualifying_v2_report(report) is True (completed v2 debate report with winner)
+    - analysis_status == 'VALID'
+    - canonical trade_action in {'BUY', 'SELL', 'HOLD'} (strictly no decision/action fallback)
+    """
+    if not is_qualifying_v2_report(report):
+        return False
+    return classify_v2_report_d009_exclusion(report) is None
+
+
 def normalize_report_for_evaluation(sample: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize a raw report dictionary for gate evaluation."""
     if not isinstance(sample, Mapping):
@@ -642,13 +736,67 @@ def normalize_report_for_evaluation(sample: Mapping[str, Any]) -> dict[str, Any]
 
 def filter_v2_completed_reports(
     reports: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Filter and normalize reports, returning only qualifying completed v2 reports with a valid winner."""
+    *,
+    return_excluded_counts: bool = False,
+    return_ledger: bool = False,
+) -> Union[
+    list[dict[str, Any]],
+    tuple[list[dict[str, Any]], dict[str, int]],
+    tuple[list[dict[str, Any]], dict[str, int], dict[str, int]],
+]:
+    """Filter and normalize reports, returning only qualifying completed v2 reports under D-009 §5.
+
+    Implements three-stage pipeline accounting (DAV-783 / RT-2):
+    Stage 1: raw input reports
+    Stage 2: qualifying v2 protocol reports (protocol_version=v2_structured, completed, valid winner)
+    Stage 3: D-009 §5 eligible reports (analysis_status=VALID, trade_action in {BUY, SELL, HOLD})
+
+    `excluded_counts` ONLY counts reports that entered the v2 pool (Stage 2) and were excluded
+    under D-009 §5 (Stage 3). Non-v2 reports filtered at Stage 2 are tracked in ledger['non_v2_excluded']
+    and NEVER conflated into D-009 `excluded_counts`.
+    """
     qualifying: list[dict[str, Any]] = []
+    excluded_counts: dict[str, int] = {
+        "legacy_null": 0,
+        "abstain": 0,
+        "invalid_run": 0,
+        "data_error": 0,
+        "no_trade": 0,
+        "wait": 0,
+    }
+    ledger: dict[str, int] = {
+        "raw_count": len(reports),
+        "qualifying_v2_count": 0,
+        "eligible_count": 0,
+        "non_v2_excluded": 0,
+        "d009_excluded": 0,
+    }
+
     for r in reports:
-        if is_qualifying_v2_report(r):
+        # Stage 1 -> Stage 2: Must be a qualifying v2 protocol report first
+        if not is_v2_protocol_report(r):
+            ledger["non_v2_excluded"] += 1
+            continue
+
+        ledger["qualifying_v2_count"] += 1
+
+        # Stage 2 -> Stage 3: Classify under D-009 §5
+        cat = classify_v2_report_d009_exclusion(r)
+        if cat is None:
             normalized = normalize_report_for_evaluation(r)
             qualifying.append(normalized)
+            ledger["eligible_count"] += 1
+        else:
+            ledger["d009_excluded"] += 1
+            if cat in excluded_counts:
+                excluded_counts[cat] += 1
+            else:
+                excluded_counts[cat] = excluded_counts.get(cat, 0) + 1
+
+    if return_ledger:
+        return qualifying, excluded_counts, ledger
+    if return_excluded_counts:
+        return qualifying, excluded_counts
     return qualifying
 
 
@@ -884,6 +1032,8 @@ def evaluate_h1b_system_gates(
     as_of: Optional[Union[str, date, datetime]] = None,
     trading_calendar: Optional[Sequence[Union[str, date]]] = None,
     calendar_dates: Optional[Sequence[Union[str, date]]] = None,
+    excluded_counts: Optional[Mapping[str, int]] = None,
+    pipeline_ledger: Optional[Mapping[str, int]] = None,
 ) -> dict[str, Any]:
     """Evaluate 7-dimension gate thresholds for credit weighting activation.
 
@@ -917,6 +1067,19 @@ def evaluate_h1b_system_gates(
         as_of_date = parsed_as_of if parsed_as_of is not None else now_cn().date()
     else:
         as_of_date = now_cn().date()
+
+    initial_excluded: dict[str, int] = {
+        "legacy_null": 0,
+        "abstain": 0,
+        "invalid_run": 0,
+        "data_error": 0,
+        "no_trade": 0,
+        "wait": 0,
+    }
+    if excluded_counts:
+        initial_excluded.update(excluded_counts)
+
+    current_ledger = dict(pipeline_ledger) if pipeline_ledger else None
 
     cohort_meta: dict[str, Any] = {}
     homogeneity_passed = True
@@ -1336,7 +1499,11 @@ def evaluate_h1b_system_gates(
             "recommendation": recommendation,
             "cohort": cohort_meta.get("canonical_key"),
             "commit_shas": cohort_meta.get("commit_shas", []),
+            "excluded_counts": dict(initial_excluded),
+            "pipeline_ledger": current_ledger,
         },
+        "excluded_counts": dict(initial_excluded),
+        "pipeline_ledger": current_ledger,
         "recommendation": recommendation,
         "cohort": cohort_meta.get("canonical_key"),
         "cohort_info": cohort_meta,

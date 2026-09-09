@@ -74,6 +74,9 @@ def _build_mock_debate_sample(
         "trade_date": trade_date,
         "market_regime": market_regime,
         "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED,
+        "status": "completed",
+        "analysis_status": "VALID",
+        "trade_action": "BUY" if winner == "bull" else ("SELL" if winner == "bear" else "HOLD"),
         "final_trade_decision": "决策建议",
         "market_report": "市场分析报告正文",
         "fundamentals_report": "基本面分析报告正文",
@@ -626,11 +629,13 @@ class TestH1bV2OnlySampleFilteringAndIndustry:
         assert extract_report_industry({"quadrant_1_protocol_metadata": {"industry": "未知行业"}}) is None
 
     def test_is_qualifying_v2_report_true_for_valid_v2_and_winner(self):
-        """is_qualifying_v2_report returns True only for completed v2 reports with winner."""
+        """is_qualifying_v2_report returns True only for completed v2 reports with analysis_status=VALID, directional action, and winner."""
         # Standard v2 report with winner
         v2_bull = {
             "status": "completed",
             "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED,
+            "analysis_status": "VALID",
+            "trade_action": "BUY",
             "manager_verdict": {"winner": "bull", "direction": "看多"},
         }
         assert is_qualifying_v2_report(v2_bull) is True
@@ -638,6 +643,8 @@ class TestH1bV2OnlySampleFilteringAndIndustry:
         v2_bear = {
             "status": "completed",
             "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED,
+            "analysis_status": "VALID",
+            "trade_action": "SELL",
             "manager_verdict": {"winner": "bear", "direction": "看空"},
         }
         assert is_qualifying_v2_report(v2_bear) is True
@@ -645,6 +652,8 @@ class TestH1bV2OnlySampleFilteringAndIndustry:
         # Nested in result_data
         v2_nested = {
             "status": "completed",
+            "analysis_status": "VALID",
+            "trade_action": "HOLD",
             "result_data": {
                 "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED,
                 "investment_debate_state": {
@@ -702,11 +711,13 @@ class TestH1bV2OnlySampleFilteringAndIndustry:
             {"symbol": "600003.SH", "status": "completed", "protocol_version": "v1_legacy"},
             # 1 failed v2 report
             {"symbol": "600004.SH", "status": "failed", "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED, "manager_verdict": {"winner": "bull"}},
-            # 4 valid completed v2 reports
+            # 4 valid completed v2 reports with VALID analysis_status and directional actions
             {
                 "symbol": "600519.SH",
                 "industry": "白酒",
                 "status": "completed",
+                "analysis_status": "VALID",
+                "trade_action": "BUY",
                 "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED,
                 "trade_date": "2026-08-01",
                 "manager_verdict": {"winner": "bull", "direction": "看多"},
@@ -715,6 +726,8 @@ class TestH1bV2OnlySampleFilteringAndIndustry:
                 "symbol": "000858.SZ",
                 "industry": "白酒",
                 "status": "completed",
+                "analysis_status": "VALID",
+                "trade_action": "BUY",
                 "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED,
                 "trade_date": "2026-08-02",
                 "manager_verdict": {"winner": "bull", "direction": "看多"},
@@ -723,6 +736,8 @@ class TestH1bV2OnlySampleFilteringAndIndustry:
                 "symbol": "600276.SH",
                 "industry": "医药",
                 "status": "completed",
+                "analysis_status": "VALID",
+                "trade_action": "SELL",
                 "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED,
                 "trade_date": "2026-08-03",
                 "manager_verdict": {"winner": "bear", "direction": "看空"},
@@ -731,6 +746,8 @@ class TestH1bV2OnlySampleFilteringAndIndustry:
                 "symbol": "300750.SZ",
                 "industry": "新能源",
                 "status": "completed",
+                "analysis_status": "VALID",
+                "trade_action": "SELL",
                 "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED,
                 "trade_date": "2026-08-04",
                 "manager_verdict": {"winner": "bear", "direction": "看空"},
@@ -772,6 +789,16 @@ class TestH1bV2OnlySampleFilteringAndIndustry:
             with open(fpath, "r", encoding="utf-8") as f:
                 raw_samples.append(json.load(f))
 
+        # D-009 §5 contract: raw pre-D-009 golden samples (analysis_status IS NULL) are excluded as legacy_null
+        filtered_raw, excluded = filter_v2_completed_reports(raw_samples, return_excluded_counts=True)
+        assert len(filtered_raw) == 0
+        assert excluded["legacy_null"] == 3
+
+        # Calibrated golden samples with VALID analysis_status and directional trade_action qualify
+        for s in raw_samples:
+            s["analysis_status"] = "VALID"
+            s["trade_action"] = "BUY" if s.get("manager_verdict", {}).get("winner") == "bull" else "SELL"
+
         filtered = filter_v2_completed_reports(raw_samples)
         assert len(filtered) == 3
 
@@ -793,17 +820,36 @@ class TestH1bV2OnlySampleFilteringAndIndustry:
     def test_verify_h1b_gates_script_runs_and_verifies_v2_only(self, tmp_path):
         """scripts/verify_h1b_gates.py run_verify produces correct v2-only output JSON and structure."""
         from scripts.verify_h1b_gates import load_reports_from_db, run_verify
+        import glob
 
-        # 1. Test load_reports_from_db fallback to golden samples
-        reports = load_reports_from_db()
-        assert len(reports) == 3
-        for r in reports:
-            assert r.get("industry") is not None
-            assert r.get("manager_verdict", {}).get("winner") in ("bull", "bear", "tie")
+        # 1. Test load_reports_from_db fallback to golden samples:
+        # Under D-009 §5, legacy golden samples without analysis_status are excluded as legacy_null
+        reports, excluded = load_reports_from_db(return_excluded_counts=True)
+        assert len(reports) == 0
+        assert excluded["legacy_null"] == 3
 
-        # 2. Test run_verify execution with output json
+        # 2. Test run_verify execution with input_file containing qualifying v2 reports
+        golden_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "tests",
+            "golden",
+            "audit_20260823",
+        )
+        golden_files = sorted(glob.glob(os.path.join(golden_dir, "*_result_data.json")))
+        qualifying_samples = []
+        for fpath in golden_files:
+            with open(fpath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                data["analysis_status"] = "VALID"
+                data["trade_action"] = "BUY" if data.get("manager_verdict", {}).get("winner") == "bull" else "SELL"
+                qualifying_samples.append(data)
+
+        sample_file = str(tmp_path / "qualifying_input.json")
+        with open(sample_file, "w", encoding="utf-8") as f:
+            json.dump(qualifying_samples, f)
+
         out_json = str(tmp_path / "test_h1b_report.json")
-        res = run_verify(output_json=out_json)
+        res = run_verify(input_file=sample_file, output_json=out_json, cohort="legacy_unversioned")
         assert res["task_id"] == "P3-H1b"
         assert res["sample_count"] == 3
         assert res["gate_evaluation"]["matrix"]["dimension_n"]["details"]["unique_industries"] == 3
@@ -835,6 +881,8 @@ class TestH1bVerifyGatesDbPath:
                 symbol="600519.SH",
                 trade_date="2026-08-01",
                 status="completed",
+                analysis_status="VALID",
+                trade_action="BUY",
                 result_data={
                     "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED,
                     "industry": "白酒",
@@ -847,6 +895,8 @@ class TestH1bVerifyGatesDbPath:
                 symbol="000858.SZ",
                 trade_date="2026-08-02",
                 status="completed",
+                analysis_status="VALID",
+                trade_action="BUY",
                 result_data={
                     "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED,
                     "industry": "白酒",
@@ -859,6 +909,8 @@ class TestH1bVerifyGatesDbPath:
                 symbol="600276.SH",
                 trade_date="2026-08-03",
                 status="completed",
+                analysis_status="VALID",
+                trade_action="SELL",
                 result_data={
                     "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED,
                     "industry": "医药",
@@ -871,6 +923,8 @@ class TestH1bVerifyGatesDbPath:
                 symbol="300750.SZ",
                 trade_date="2026-08-04",
                 status="completed",
+                analysis_status="VALID",
+                trade_action="SELL",
                 result_data={
                     "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED,
                     "industry": "新能源",
@@ -1044,10 +1098,10 @@ class TestH1bVerifyGatesDbPath:
         )
         conn.execute(
             """
-            INSERT INTO reports (id, symbol, trade_date, status, result_data) VALUES
-            ('rep-unmig-1', '600519.SH', '2026-08-01', 'completed', '{"protocol_version": "v2_structured_disagreement", "industry": "白酒", "manager_verdict": {"winner": "bull", "direction": "看多"}}'),
-            ('rep-unmig-2', '000858.SZ', '2026-08-02', 'completed', '{"protocol_version": "v2_structured_disagreement", "industry": "白酒", "manager_verdict": {"winner": "bear", "direction": "看空"}}'),
-            ('rep-unmig-3', '600036.SH', '2026-08-03', 'failed', '{"protocol_version": "v2_structured_disagreement", "manager_verdict": {"winner": "bull"}}')
+            INSERT INTO reports (id, symbol, trade_date, status, analysis_status, trade_action, result_data) VALUES
+            ('rep-unmig-1', '600519.SH', '2026-08-01', 'completed', 'VALID', 'BUY', '{"protocol_version": "v2_structured_disagreement", "industry": "白酒", "manager_verdict": {"winner": "bull", "direction": "看多"}}'),
+            ('rep-unmig-2', '000858.SZ', '2026-08-02', 'completed', 'VALID', 'SELL', '{"protocol_version": "v2_structured_disagreement", "industry": "白酒", "manager_verdict": {"winner": "bear", "direction": "看空"}}'),
+            ('rep-unmig-3', '600036.SH', '2026-08-03', 'failed', 'INVALID_RUN', 'NO_TRADE', '{"protocol_version": "v2_structured_disagreement", "manager_verdict": {"winner": "bull"}}')
             """
         )
         conn.commit()
@@ -1303,6 +1357,9 @@ class TestH1bTPlus5DueInference:
                 "id": f"rep-{i}",
                 "symbol": f"6000{i % 20:02d}.SH",
                 "trade_date": "2026-08-03",
+                "status": "completed",
+                "analysis_status": "VALID",
+                "trade_action": "BUY" if i % 2 == 0 else "SELL",
                 "result_data": {
                     "protocol_version": PROTOCOL_VERSION_V2_STRUCTURED,
                     "trade_date": "2026-08-03",
