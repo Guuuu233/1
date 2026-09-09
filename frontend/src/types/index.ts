@@ -687,13 +687,28 @@ export interface CalibrationFilters {
     limit: number
 }
 
+export interface CalibrationExcludedCounts {
+    legacy_null: number
+    invalid: number
+    abstain: number
+    no_trade: number
+    incomplete_outcome: number
+    incomplete: number
+    total: number
+}
+
 export interface CalibrationResponse {
     brier_score: number | null
     sample_size: number
+    probability_sample_size: number
+    sample_sufficient?: boolean
+    min_sample_size?: number
+    insufficient_reason?: string | null
     skipped_no_outcome: number
     truncated_before_filter: boolean
     buckets: CalibrationBucket[]
     filters: CalibrationFilters
+    excluded_counts?: CalibrationExcludedCounts
 }
 
 export interface AnnouncementItem {

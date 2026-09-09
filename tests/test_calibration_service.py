@@ -256,6 +256,7 @@ class TestReliabilityCurveBucketing:
                 user_id=user_id,
                 hold_days=5,
                 outcome_resolver=outcome_resolver,
+                min_sample_size=3,
             )
 
         bucket = next(b for b in result["buckets"] if b["bucket"] == "60-70%")
@@ -317,7 +318,7 @@ class TestBrierScore:
             return report.probability >= 0.5
 
         with get_db_ctx() as db:
-            result = cal.compute_calibration(db, user_id=user_id, outcome_resolver=resolver)
+            result = cal.compute_calibration(db, user_id=user_id, outcome_resolver=resolver, min_sample_size=2)
 
         assert result["brier_score"] == pytest.approx(0.0, abs=1e-6)
 
@@ -331,7 +332,7 @@ class TestBrierScore:
             return report.probability < 0.5  # always the opposite of prediction
 
         with get_db_ctx() as db:
-            result = cal.compute_calibration(db, user_id=user_id, outcome_resolver=resolver)
+            result = cal.compute_calibration(db, user_id=user_id, outcome_resolver=resolver, min_sample_size=2)
 
         assert result["brier_score"] == pytest.approx(1.0)
 
@@ -610,7 +611,7 @@ class TestDefaultPriceOutcome:
             patch.object(cal, "_get_price_after_strict", side_effect=_fake_price_after(110.0)),
         ):
             with get_db_ctx() as db:
-                result = cal.compute_calibration(db, user_id=user_id)
+                result = cal.compute_calibration(db, user_id=user_id, min_sample_size=1)
         assert result["sample_size"] == 1
         assert result["buckets"][-1]["rise_count"] == 1
         assert result["buckets"][-1]["rise_rate"] == 100.0
@@ -671,8 +672,9 @@ class TestApiWiring:
         calls = [dependency.call for dependency in route.dependant.dependencies]
         assert _require_api_user in calls
 
-    def test_calibration_endpoint_returns_curve_and_brier(self, client):
+    def test_calibration_endpoint_returns_curve_and_brier(self, client, monkeypatch):
         user_id, token = _user_token()
+        monkeypatch.setattr(cal, "DEFAULT_MIN_CALIBRATION_SAMPLE_SIZE", 1)
         _seed_report(symbol="600519.SH", trade_date="2024-01-02", probability=0.8, user_id=user_id)
 
         with (
@@ -912,6 +914,7 @@ class TestV2WinnerOnlyCalibration:
                 user_id=user_id,
                 hold_days=5,
                 outcome_resolver=outcome_resolver,
+                min_sample_size=2,
             )
 
         assert result["sample_size"] == 4
