@@ -5,6 +5,7 @@ from enum import Enum
 import hashlib
 import json
 import logging
+import math
 import re
 from typing import Any, Mapping, Sequence, Tuple, Union
 
@@ -15,6 +16,7 @@ from tradingagents.agents.utils.evidence_relations import (
     FailClosedReason,
     RelationType,
     ValidationResult,
+    validate_relation_graph,
 )
 
 logger = logging.getLogger(__name__)
@@ -379,6 +381,267 @@ def _build_clusters_map(
     return clusters_map, unsupported_ids
 
 
+RELATION_GRAPH_STATUS_AVAILABLE = "available"
+RELATION_GRAPH_STATUS_PENDING = "pending"
+RELATION_GRAPH_STATUS_INVALID = "invalid"
+_RELATION_FOLDING_TYPES = frozenset({
+    RelationType.SOURCE_REPETITION,
+    RelationType.DERIVED_OBSERVATION,
+})
+_RAW_PAYLOAD_MAX_DEPTH = 20
+
+
+@dataclass(frozen=True)
+class _RelationGraphRejection:
+    """Why a supplied relation graph was not folded; serialized into relation_audit.error."""
+    stage: str                                          # status / deserialize / validate / reduce
+    error: BaseException
+    validation_results: Tuple[ValidationResult, ...] = ()
+    raw_payload: Any = None                             # JSON-safe copy when deserialization failed
+
+
+def _relation_sequence(relation_graph: Any) -> list[EvidenceRelation]:
+    if isinstance(relation_graph, EvidenceRelationGraph):
+        return list(relation_graph.relations)
+    if isinstance(relation_graph, (list, tuple)):
+        return [item for item in relation_graph if isinstance(item, EvidenceRelation)]
+    return []
+
+
+def _coerce_relation_graph(raw_graph: Any) -> EvidenceRelationGraph:
+    """Deserialize only an explicitly supplied E-01 graph representation."""
+    if isinstance(raw_graph, EvidenceRelationGraph):
+        return raw_graph
+    if isinstance(raw_graph, Mapping):
+        return EvidenceRelationGraph.from_dict(raw_graph)
+    if isinstance(raw_graph, (list, tuple)):
+        raw_relations = list(raw_graph)
+        if all(isinstance(item, EvidenceRelation) for item in raw_relations):
+            return EvidenceRelationGraph.from_relations(raw_relations)
+        return EvidenceRelationGraph.from_dict({"relations": raw_relations})
+    raise TypeError(
+        "evidence relation graph must be EvidenceRelationGraph, a graph mapping, "
+        f"or an explicit relation sequence, got {type(raw_graph).__name__}"
+    )
+
+
+def _json_safe_payload(value: Any, depth: int = 0) -> Any:
+    """Copy a rejected relation payload into JSON-safe audit data without reinterpreting it."""
+    if isinstance(value, (EvidenceRelation, EvidenceRelationGraph)):
+        return value.to_dict()
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    if depth < _RAW_PAYLOAD_MAX_DEPTH:
+        if isinstance(value, Mapping):
+            return {str(key): _json_safe_payload(item, depth + 1) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_json_safe_payload(item, depth + 1) for item in value]
+    return repr(value)
+
+
+def _reduce_supplied_relation_graph(
+    claim_ids: list[str],
+    relation_graph: Any,
+) -> tuple[EvidenceReductionResult | None, list[EvidenceRelation], _RelationGraphRejection | None]:
+    """Deserialize, E-01-validate, then reduce a supplied graph; a rejected graph is never folded."""
+    if relation_graph is None:
+        return None, [], _RelationGraphRejection("deserialize", TypeError("available relation graph is missing"))
+    try:
+        graph = _coerce_relation_graph(relation_graph)
+    except (TypeError, ValueError) as exc:
+        return None, [], _RelationGraphRejection(
+            "deserialize",
+            exc,
+            raw_payload=_json_safe_payload(relation_graph),
+        )
+
+    raw_relations = _relation_sequence(relation_graph) or list(graph.relations)
+    try:
+        graph_valid, validation_results = validate_relation_graph(graph, set(claim_ids))
+    except (TypeError, ValueError) as exc:
+        return None, raw_relations, _RelationGraphRejection("validate", exc)
+    if not graph_valid:
+        details = "; ".join(item.message or str(item.reason) for item in validation_results)
+        error = EvidenceReductionError(
+            error_reason=validation_results[0].reason or FailClosedReason.UNSUPPORTED_INFERENCE,
+            message=f"E-01 relation graph validation failed: {details}",
+        )
+        return None, raw_relations, _RelationGraphRejection("validate", error, tuple(validation_results))
+
+    try:
+        return reduce_evidence_claims(claim_ids, graph), raw_relations, None
+    except (EvidenceReductionError, TypeError, ValueError) as exc:
+        return None, raw_relations, _RelationGraphRejection("reduce", exc)
+
+
+def _serialize_relation_reduction(
+    result: EvidenceReductionResult | None,
+    raw_relations: Sequence[EvidenceRelation],
+    status: str,
+    reason: str,
+    pending_claim_ids: Sequence[str],
+    rejection: _RelationGraphRejection | None = None,
+) -> dict[str, Any]:
+    """Serialize reducer output without turning audit data into a voting signal."""
+    folded_components: list[dict[str, Any]] = []
+    audit_edges: list[dict[str, Any]] = []
+    unconnected_claim_ids: list[str] = []
+    independence_status = IndependenceStatus.UNKNOWN.value
+    contribution_cap = 0
+
+    if result is not None:
+        unconnected_claim_ids = list(result.unconnected_claim_ids)
+        independence_status = result.independence_status.value
+        contribution_cap = result.global_contribution_cap
+        audit_edges = [edge.to_dict() for edge in result.audit_edges]
+        for component in result.folded_components:
+            component_edges = [edge.to_dict() for edge in component.audit_edges]
+            folded_components.append({
+                "component_id": component.component_id,
+                "member_claim_ids": list(component.member_claim_ids),
+                "derived_terminal_ids": list(component.derived_terminal_ids),
+                "audit_edges": component_edges,
+                "reason": (
+                    "explicit E-01 SOURCE_REPETITION/DERIVED_OBSERVATION relation(s) "
+                    "connect these claims; this is not an independence proof"
+                ),
+            })
+
+    raw_edge_dicts = [edge.to_dict() for edge in raw_relations]
+    ignored_relations = [
+        edge.to_dict()
+        for edge in raw_relations
+        if edge.relation_type not in _RELATION_FOLDING_TYPES
+    ]
+    pending_audit = [
+        {
+            "claim_id": claim_id,
+            "status": "pending",
+            "reason": (
+                "no explicit E-01 SOURCE_REPETITION or DERIVED_OBSERVATION "
+                "edge proves a contribution relationship; independence is UNKNOWN"
+            ),
+        }
+        for claim_id in pending_claim_ids
+    ]
+
+    audit: dict[str, Any] = {
+        "status": status,
+        "reason": reason,
+        "raw_relations": raw_edge_dicts,
+        "raw_payload": rejection.raw_payload if rejection is not None else None,
+        "audit_edges": audit_edges,
+        "ignored_relations": ignored_relations,
+        "folded_components": folded_components,
+        "unconnected_claim_ids": unconnected_claim_ids,
+        "pending_claims": pending_audit,
+        "independence_status": independence_status,
+        "global_contribution_cap": contribution_cap,
+    }
+    if rejection is not None:
+        error_reason = getattr(rejection.error, "error_reason", None)
+        audit["error"] = {
+            "type": type(rejection.error).__name__,
+            "stage": rejection.stage,
+            "reason": getattr(error_reason, "value", None) or str(error_reason or "INVALID_RELATION_GRAPH"),
+            "message": str(rejection.error),
+            "validation_results": [
+                {"reason": getattr(item.reason, "value", None), "message": item.message}
+                for item in rejection.validation_results
+            ],
+        }
+    return audit
+
+
+def _apply_relation_reduction(
+    metrics: dict[str, Any],
+    claims: Sequence[Mapping[str, Any]],
+    relation_graph: Any,
+    relation_graph_status: str,
+    relation_graph_reason: str,
+) -> dict[str, Any]:
+    """Replace keyword-derived contribution fields with the E-02 conservative seam."""
+    status = str(relation_graph_status or RELATION_GRAPH_STATUS_PENDING).strip().lower()
+    reason = str(relation_graph_reason or "").strip()
+    claim_ids = sorted({
+        str(claim.get("claim_id") or "").strip()
+        for claim in claims
+        if str(claim.get("claim_id") or "").strip()
+    })
+    raw_relations = _relation_sequence(relation_graph)
+    result: EvidenceReductionResult | None = None
+    rejection: _RelationGraphRejection | None = None
+
+    if status == RELATION_GRAPH_STATUS_AVAILABLE:
+        result, raw_relations, rejection = _reduce_supplied_relation_graph(claim_ids, relation_graph)
+        if rejection is not None:
+            reason = f"{reason}; rejected: {rejection.error}" if reason else str(rejection.error)
+    elif status == RELATION_GRAPH_STATUS_PENDING:
+        # An absent graph is represented explicitly by an empty relation input;
+        # no edge is invented and every claim stays pending/unknown.
+        result = reduce_evidence_claims(claim_ids, [])
+        reason = reason or "E-01 relation graph is unavailable; contribution remains pending"
+    elif status == RELATION_GRAPH_STATUS_INVALID:
+        reason = reason or "E-01 relation graph is invalid; contribution remains pending"
+        rejection = _RelationGraphRejection("status", ValueError(reason))
+    else:
+        unsupported = ValueError(f"Unsupported relation_graph_status: {status!r}")
+        reason = reason or str(unsupported)
+        rejection = _RelationGraphRejection("status", unsupported)
+
+    if rejection is not None:
+        status = RELATION_GRAPH_STATUS_INVALID
+        logger.warning(
+            "[claim_cluster] E-01 relation graph not folded (%s stage): %s",
+            rejection.stage,
+            rejection.error,
+        )
+
+    if status == RELATION_GRAPH_STATUS_AVAILABLE and result is not None:
+        pending_claim_ids = list(result.unconnected_claim_ids)
+    else:
+        pending_claim_ids = claim_ids
+
+    effective_contribution_count = int(
+        status == RELATION_GRAPH_STATUS_AVAILABLE
+        and result is not None
+        and bool(result.folded_components)
+        and result.global_contribution_cap > 0
+    )
+    legacy_metrics = dict(metrics)
+    relation_audit = _serialize_relation_reduction(
+        result=result,
+        raw_relations=raw_relations,
+        status=status,
+        reason=reason,
+        pending_claim_ids=pending_claim_ids,
+        rejection=rejection,
+    )
+
+    metrics.update({
+        # Keep the historical field names, but make them conservative and
+        # explicitly unrelated to keyword-cluster voting.
+        "independent_cluster_count": effective_contribution_count,
+        "bull_cluster_count": 0,
+        "bear_cluster_count": 0,
+        "neutral_cluster_count": 0,
+        "direction_cluster_counts": {"bull": 0, "bear": 0, "neutral": 0},
+        "cluster_weights": {"bull": 0.0, "bear": 0.0, "neutral": 0.0},
+        "relation_graph_status": status,
+        "relation_graph_reason": reason,
+        "independence_status": relation_audit["independence_status"],
+        "global_contribution_cap": relation_audit["global_contribution_cap"],
+        "folded_component_count": len(relation_audit["folded_components"]),
+        "effective_contribution_count": effective_contribution_count,
+        "pending_claim_ids": pending_claim_ids,
+        "relation_audit": relation_audit,
+        "legacy_keyword_metrics": legacy_metrics,
+    })
+    return metrics
+
+
 def tally_cluster_votes(
     claims: Sequence[Mapping[str, Any]] | None = None,
     reports: Mapping[str, str] | None = None,
@@ -386,8 +649,20 @@ def tally_cluster_votes(
     symbol: str | None = None,
     trade_date: str | None = None,
     horizon: str | None = None,
+    relation_graph: Any = None,
+    relation_graph_status: str | None = None,
+    relation_graph_reason: str | None = None,
 ) -> dict[str, Any]:
-    """Tally directional votes across deduplicated evidence clusters."""
+    """Tally legacy explanatory metrics and optionally apply the E-02 seam.
+
+    The optional relation arguments are deliberately opt-in so existing callers
+    retain their explanatory keyword metrics. The research manager always passes
+    an explicit status, including ``pending`` when the graph is absent.
+    ``relation_graph`` may be an ``EvidenceRelationGraph``, a serialized graph
+    mapping, or an explicit relation sequence. A payload that cannot be
+    deserialized or fails E-01 validation is never folded; ``relation_audit``
+    keeps its JSON-safe ``raw_payload`` and a structured ``error``.
+    """
     claims_list = list(claims or [])
     enriched_claims = cluster_claims(
         claims_list,
@@ -421,7 +696,7 @@ def tally_cluster_votes(
         bull_weight = 0.0
         bear_weight = 0.0
 
-    return {
+    metrics = {
         "analyst_count": analyst_count,
         "independent_cluster_count": independent_cluster_count,
         "verified_evidence_count": verified_evidence_count,
@@ -452,6 +727,78 @@ def tally_cluster_votes(
             for cl in clusters_map.values()
         ],
     }
+    if relation_graph_status is not None or relation_graph is not None:
+        return _apply_relation_reduction(
+            metrics,
+            claims_list,
+            relation_graph,
+            relation_graph_status or RELATION_GRAPH_STATUS_AVAILABLE,
+            relation_graph_reason or "",
+        )
+    return metrics
+
+
+def _format_relation_summary_for_prompt(
+    metrics: Mapping[str, Any],
+    language: str,
+) -> str:
+    audit = metrics.get("relation_audit") or {}
+    status = str(metrics.get("relation_graph_status") or audit.get("status") or "pending").upper()
+    reason = str(metrics.get("relation_graph_reason") or audit.get("reason") or "").strip()
+    independence = str(metrics.get("independence_status") or "UNKNOWN")
+    cap = metrics.get("global_contribution_cap", 0)
+    effective = metrics.get("effective_contribution_count", 0)
+    analyst_count = metrics.get("analyst_count", 0)
+    verified_evidence_count = metrics.get("verified_evidence_count", 0)
+    pending = metrics.get("pending_claim_ids") or audit.get("unconnected_claim_ids") or []
+    folded = audit.get("folded_components") or []
+    raw_relations = audit.get("raw_relations") or []
+    ignored = audit.get("ignored_relations") or []
+
+    if language == "en":
+        lines = [
+            "### Evidence Relation Reduction (E-02; no independent-vote inference)",
+            f"- E-01 relation graph status: {status} ({reason})",
+            f"- analyst_count: {analyst_count} (explanatory context only; not an independence proof)",
+            f"- verified_evidence_count: {verified_evidence_count} (factual verification only; not a voting weight)",
+            f"- independence_status: {independence}; global_contribution_cap: {cap}; effective contribution slots (independent_cluster_count compatibility field): {effective}",
+            f"- pending/unknown claim IDs: {', '.join(map(str, pending)) or 'none'}",
+            f"- folded relation components: {len(folded)} (relation grouping only; not proof of mutual independence)",
+        ]
+        for component in folded:
+            members = ", ".join(component.get("member_claim_ids") or []) or "none"
+            terminals = ", ".join(component.get("derived_terminal_ids") or []) or "not applicable"
+            lines.append(f"  * component={component.get('component_id')}, members=[{members}], derived_terminals=[{terminals}]")
+            lines.append(f"    reason: {component.get('reason', '')}")
+        if raw_relations:
+            lines.append("- raw relation audit (original references retained):")
+            lines.extend(f"  * {json.dumps(edge, ensure_ascii=False, sort_keys=True)}" for edge in raw_relations)
+        if ignored:
+            lines.append("- relations not used for folding (no same-fact inference):")
+            lines.extend(f"  * {json.dumps(edge, ensure_ascii=False, sort_keys=True)}" for edge in ignored)
+        return "\n".join(lines)
+
+    lines = [
+        "### 证据关系折叠与贡献约束 (E-02；禁止推断独立票)",
+        f"- E-01关系图状态: {status}（{reason}）",
+        f"- 参与分析师人数 (analyst_count): {analyst_count}（仅作解释性参考，不证明独立性）",
+        f"- 真实核验有效证据数 (verified_evidence_count): {verified_evidence_count}（仅作事实核验，不是投票权重）",
+        f"- 独立性证明 (independence_status): {independence}；全局贡献上限 (global_contribution_cap): {cap}；当前有效贡献槽（兼容字段 independent_cluster_count）: {effective}",
+        f"- 待补关系/未知 claim: {', '.join(map(str, pending)) or '无'}",
+        f"- 已证明折叠组数: {len(folded)}（仅表示关系分组，不证明组间相互独立）",
+    ]
+    for component in folded:
+        members = ", ".join(component.get("member_claim_ids") or []) or "无"
+        terminals = ", ".join(component.get("derived_terminal_ids") or []) or "不适用"
+        lines.append(f"  * 组件={component.get('component_id')}，成员=[{members}]，派生终点=[{terminals}]")
+        lines.append(f"    合并原因: {component.get('reason', '')}")
+    if raw_relations:
+        lines.append("- 原始关系审计（保留原始引用与 metadata）:")
+        lines.extend(f"  * {json.dumps(edge, ensure_ascii=False, sort_keys=True)}" for edge in raw_relations)
+    if ignored:
+        lines.append("- 未用于折叠的关系（不得据此推断同事实/独立性）:")
+        lines.extend(f"  * {json.dumps(edge, ensure_ascii=False, sort_keys=True)}" for edge in ignored)
+    return "\n".join(lines)
 
 
 def format_claim_cluster_summary_for_prompt(
@@ -461,6 +808,8 @@ def format_claim_cluster_summary_for_prompt(
     """Format a concise, human/LLM-consumable summary of claim evidence cluster metrics."""
     if not metrics:
         return ""
+    if metrics.get("relation_graph_status"):
+        return _format_relation_summary_for_prompt(metrics, language)
     analyst_count = metrics.get("analyst_count", 0)
     independent_cluster_count = metrics.get("independent_cluster_count", 0)
     verified_evidence_count = metrics.get("verified_evidence_count", 0)

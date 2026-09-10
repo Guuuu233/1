@@ -1,5 +1,7 @@
 import logging
+import re
 import time
+from typing import Any, Mapping, Sequence
 
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
@@ -28,6 +30,8 @@ from tradingagents.agents.utils.evidence_verifier import (
     format_claims_with_verification_for_prompt,
 )
 from tradingagents.agents.utils.claim_cluster import (
+    RELATION_GRAPH_STATUS_AVAILABLE,
+    RELATION_GRAPH_STATUS_PENDING,
     cluster_claims,
     format_claim_cluster_summary_for_prompt,
     tally_cluster_votes,
@@ -48,6 +52,164 @@ from tradingagents.graph.intent_parser import (
 )
 
 _logger = logging.getLogger(__name__)
+
+_RELATION_GRAPH_KEYS = ("evidence_relation_graph", "evidence_relations")
+
+
+class RelationPromptGuardError(ValueError):
+    """The research manager prompt template no longer matches the E-02 prompt guard."""
+
+
+# E-02: the manager always passes an explicit relation status, so the legacy
+# keyword-cluster tally and analyst weighting instructions are rewritten into
+# relation-only contribution rules.  Every legacy segment must match exactly the
+# expected number of times and no weighting instruction may survive, so template
+# drift fails closed instead of silently restoring keyword voting.
+_RELATION_PROMPT_REWRITES: dict[str, tuple[tuple[str, str, int], ...]] = {
+    "zh": (
+        (
+            "1. **各分析师 Verdict 全景概览与动态加权**：",
+            "1. **各分析师 Verdict 全景概览与证据贡献状态**：",
+            1,
+        ),
+        (
+            "与动态加权权重：",
+            "与证据贡献状态（引用上文 E-02 关系折叠结果；无显式 E-01 关系时写 UNKNOWN，不得给出百分比或分值）：",
+            1,
+        ),
+        ("：verdict 与权重", "：verdict 与证据贡献状态", 7),
+        (
+            "   - 计票按 cluster_id 去重计票：analyst_count 发言人数仅作解释，不得当作独立权重；"
+            "同属价格冲击（收盘价/成交量/当日涨跌幅）的技术面、量价与主力资金只计一票 independent_cluster_count。",
+            "   - E-02 仅使用上文显式 E-01 关系图折叠结果约束贡献；禁止根据关键词簇、分析师人数、"
+            "供应商/来源差异或核验状态推断独立支持。PENDING/UNKNOWN claim 不得增加方向性支持。",
+            1,
+        ),
+        (
+            "需根据分析视角与本次研究档（horizon）与市场环境动态赋予权重，并按研究档明确区分核心裁决依据：",
+            "不得为分析师或 claim 设定百分比、分值或加总比例，只按本次研究档（horizon）明确区分核心裁决依据"
+            "（下列“侧重”仅表示裁决关注点，不产生方向性支持）：",
+            1,
+        ),
+        ("技术面、资金面、情绪面高权重，", "裁决侧重技术面、资金面、情绪面，", 1),
+        ("基本面、宏观与产业链权重高，", "裁决侧重基本面、宏观与产业链，", 1),
+        (
+            "趋势行情加权技术与资金，震荡市加权基本面与情绪，宏观大转折期加权宏观与产业链。",
+            "趋势行情侧重技术与资金，震荡市侧重基本面与情绪，宏观大转折期侧重宏观与产业链"
+            "（仅调整关注重点，不产生方向性支持）。",
+            1,
+        ),
+    ),
+    "en": (
+        (
+            "1) Tally independent evidence clusters (deduplicating claims by cluster_id) and compute "
+            "cluster-based directional weight; analyst list serves as explanatory context only "
+            "(analyst_count must not be used directly as independent voting weight).",
+            "1) Use only the explicit E-01 relation reduction shown above for contribution grouping; "
+            "do not infer independent support from keyword clusters, analyst count, provider/source "
+            "differences, or verifier status. Pending/unknown claims must not add directional support.",
+            1,
+        ),
+        (
+            "2) Dynamically weight perspectives and distinguish core adjudication criteria by research horizon:",
+            "2) Do not assign percentages or scores to analysts or claims; distinguish core adjudication "
+            "criteria by research horizon (the focus below marks what is decisive and adds no directional support):",
+            1,
+        ),
+        ("Primary weight on ", "Primary adjudication focus on ", 2),
+    ),
+}
+_RELATION_PROMPT_FORBIDDEN = {
+    "zh": re.compile(r"权重|加权|计票|cluster_id"),
+    "en": re.compile(r"\bweight|\btally\b|\bvot(?:e|ing)|cluster_id", re.IGNORECASE),
+}
+
+
+def _resolve_relation_graph_context(
+    state: Mapping[str, Any],
+    investment_debate_state: Mapping[str, Any],
+) -> tuple[Any, str, str]:
+    """Locate an explicitly supplied E-01 graph, or mark the relation contribution as pending.
+
+    The current graph pipeline has no relation producer.  This function therefore
+    never derives edges from claim text, reports, event coverage, or verifier
+    status; it only forwards a named E-01 graph payload.  Deserialization, E-01
+    validation and the rejection audit (raw payload + structured error) happen in
+    ``tally_cluster_votes`` so every manager path records the same evidence.
+    """
+    containers = (
+        ("state", state),
+        ("investment_debate_state", investment_debate_state),
+        ("market_data_context", state.get("market_data_context")),
+        ("event_coverage", state.get("event_coverage")),
+    )
+    for container_name, container in containers:
+        if not isinstance(container, Mapping):
+            continue
+        for key in _RELATION_GRAPH_KEYS:
+            if key not in container:
+                continue
+            raw_graph = container.get(key)
+            source = f"{container_name}.{key}"
+            if raw_graph is None:
+                return (
+                    [],
+                    RELATION_GRAPH_STATUS_PENDING,
+                    f"E-01 relation graph at {source} is null; claim contribution remains pending/unknown",
+                )
+            return (
+                raw_graph,
+                RELATION_GRAPH_STATUS_AVAILABLE,
+                f"explicit E-01 relation graph supplied at {source}",
+            )
+
+    return (
+        [],
+        RELATION_GRAPH_STATUS_PENDING,
+        "E-01 relation graph is not produced in the current pipeline; claim contribution remains pending/unknown",
+    )
+
+
+def _apply_relation_prompt_guard(prompt_template: str, language: str) -> str:
+    """Rewrite legacy keyword-cluster weighting instructions into E-02 contribution rules.
+
+    Raises ``RelationPromptGuardError`` when the template drifts: each legacy segment
+    must match the expected number of times and no weighting/tally instruction may
+    survive the rewrite.
+    """
+    lang = "en" if language == "en" else "zh"
+    guarded = prompt_template
+    for legacy, replacement, expected in _RELATION_PROMPT_REWRITES[lang]:
+        found = guarded.count(legacy)
+        if found != expected:
+            raise RelationPromptGuardError(
+                f"{lang} legacy segment matched {found} time(s), expected {expected}: {legacy[:48]!r}"
+            )
+        guarded = guarded.replace(legacy, replacement)
+    survivors = [
+        line.strip()
+        for line in guarded.splitlines()
+        if _RELATION_PROMPT_FORBIDDEN[lang].search(line)
+    ]
+    if survivors:
+        raise RelationPromptGuardError(
+            f"{lang} weighting/tally instruction survived E-02 rewrite: {survivors[:3]}"
+        )
+    return guarded
+
+
+def _format_relation_prompt_guard(relation_graph_status: str, language: str) -> str:
+    """Final E-02 status line; the status comes from the reduction seam, not graph discovery."""
+    status = str(relation_graph_status or RELATION_GRAPH_STATUS_PENDING).upper()
+    if language == "en":
+        return (
+            "E-02 relation guard: status=" + status + ". Treat independence as UNKNOWN; "
+            "the global contribution cap is conservative and no unconnected claim is an independent vote."
+        )
+    return (
+        "E-02 关系贡献硬闸：状态=" + status + "。独立性恒为 UNKNOWN；遵守保守全局贡献上限，"
+        "未被显式关系连接的 claim 不得作为独立票。"
+    )
 
 
 def _resolve_research_horizon(state: dict | None) -> str:
@@ -93,11 +255,21 @@ def _blocked_manager_payload(
     evidence_verification: list | None = None,
     claim_cluster_metrics: dict | None = None,
     research_horizon: str = "short",
+    reports: Mapping[str, str] | None = None,
+    claims_verification: Sequence[Mapping[str, Any]] | Mapping[str, Any] | None = None,
+    relation_graph: Any = None,
+    relation_graph_status: str | None = None,
+    relation_graph_reason: str | None = None,
 ) -> dict:
     """Shared early-return shape for INVALID/ABSTAIN manager short-circuits."""
     if claim_cluster_metrics is None:
         claim_cluster_metrics = tally_cluster_votes(
             claims=investment_debate_state.get("claims", []),
+            reports=reports,
+            claims_verification=claims_verification,
+            relation_graph=relation_graph,
+            relation_graph_status=relation_graph_status,
+            relation_graph_reason=relation_graph_reason,
         )
     manager_verdict = {
         "direction": DIRECTION_NA,
@@ -124,6 +296,8 @@ def _blocked_manager_payload(
         "confirmation_state": decision_status.get("confirmation_state", "UNRESOLVED"),
         "horizon": research_horizon,
         "research_horizon": research_horizon,
+        "evidence_relation_status": claim_cluster_metrics.get("relation_graph_status", "pending"),
+        "evidence_relation_reason": claim_cluster_metrics.get("relation_graph_reason", ""),
     }
     payload = {
         "fund_flow_consensus_guard": fund_flow_guard,
@@ -145,6 +319,8 @@ def _blocked_manager_payload(
             "evidence_verification": list(evidence_verification or []),
             "report_manifest": report_manifest,
             "claim_cluster_metrics": claim_cluster_metrics,
+            "evidence_relation_status": claim_cluster_metrics.get("relation_graph_status", "pending"),
+            "evidence_relation_reduction": claim_cluster_metrics.get("relation_audit", {}),
             "independent_cluster_count": claim_cluster_metrics.get("independent_cluster_count", 0),
             "analyst_count": claim_cluster_metrics.get("analyst_count", 0),
             "verified_evidence_count": claim_cluster_metrics.get("verified_evidence_count", 0),
@@ -190,6 +366,10 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
         claims = investment_debate_state.get("claims", [])
         unresolved_claim_ids = investment_debate_state.get("unresolved_claim_ids", [])
         round_summary = investment_debate_state.get("round_summary", "")
+        relation_graph, relation_graph_status, relation_graph_reason = _resolve_relation_graph_context(
+            state,
+            investment_debate_state,
+        )
 
         curr_situation = (
             f"{macro_report}\n\n"
@@ -263,6 +443,10 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
                 consistency_check_passed=False,
                 failed_checks=list(run_integrity.reason_codes),
                 research_horizon=research_horizon,
+                reports=seven_reports,
+                relation_graph=relation_graph,
+                relation_graph_status=relation_graph_status,
+                relation_graph_reason=relation_graph_reason,
             )
 
         # ── Provenance & Data Failure Context ──────────────────────────────
@@ -340,6 +524,10 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
                 run_integrity=run_integrity.to_dict(),
                 consistency_check_passed=True,
                 research_horizon=research_horizon,
+                reports=seven_reports,
+                relation_graph=relation_graph,
+                relation_graph_status=relation_graph_status,
+                relation_graph_reason=relation_graph_reason,
             )
 
         # ── 辩论前置硬闸检查 (Debate Pre-Gate Hard Gate - fail-closed before LLM) ──
@@ -389,6 +577,10 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
                 failed_checks=[f"辩论前置硬闸未通过: {err}" for err in gate_errors],
                 evidence_verification=claims_verification,
                 research_horizon=research_horizon,
+                reports=seven_reports,
+                relation_graph=relation_graph,
+                relation_graph_status=relation_graph_status,
+                relation_graph_reason=relation_graph_reason,
             )
             # Preserve pre-gate debate bookkeeping fields
             debate_state = payload["investment_debate_state"]
@@ -443,6 +635,9 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             claims_verification=claims_verification,
             symbol=symbol_val,
             trade_date=analysis_baseline_date,
+            relation_graph=relation_graph,
+            relation_graph_status=relation_graph_status,
+            relation_graph_reason=relation_graph_reason,
         )
 
         claims_text = format_claims_with_verification_for_prompt(
@@ -514,7 +709,37 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
         )
 
         injection_slots = build_injection_slots(custom_prompt, placement, role_key="research_manager")
-        base_prompt = get_prompt("research_manager_prompt", config=config).format(
+        prompt_language = _resolve_language(config)
+        try:
+            prompt_template = _apply_relation_prompt_guard(
+                get_prompt("research_manager_prompt", config=config),
+                language=prompt_language,
+            )
+        except RelationPromptGuardError as exc:
+            guard_failure = f"E-02 关系提示词守卫未通过：{exc}"
+            _logger.error("[research_manager] %s", guard_failure)
+            from tradingagents.agents.utils.decision_status import abstain_status
+
+            return _blocked_manager_payload(
+                investment_debate_state=investment_debate_state,
+                report_manifest=report_manifest,
+                fund_flow_guard=fund_flow_guard,
+                decision_status=abstain_status(
+                    reason_codes=["e02_relation_prompt_guard_failed"],
+                    trade_action="NO_TRADE",
+                    risk_status="BLOCKED",
+                ).to_dict(),
+                blocked_plan=f"{guard_failure}。状态=ABSTAIN，动作=NO_TRADE；已阻断进入 Trader 执行阶段。",
+                manager_reason=guard_failure,
+                run_integrity=run_integrity.to_dict(),
+                claim_evidence_summary=claim_evidence_summary,
+                consistency_check_passed=False,
+                failed_checks=[guard_failure],
+                evidence_verification=claims_verification,
+                claim_cluster_metrics=claim_cluster_metrics,
+                research_horizon=research_horizon,
+            )
+        base_prompt = prompt_template.format(
             past_memory_str=past_memory_str,
             provenance_context=provenance_context,
             history=history,
@@ -536,6 +761,11 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             battlefield_coverage_text=battlefield_coverage_text,
             **injection_slots,
         )
+        relation_guard = _format_relation_prompt_guard(
+            claim_cluster_metrics.get("relation_graph_status", RELATION_GRAPH_STATUS_PENDING),
+            prompt_language,
+        )
+        base_prompt = f"{base_prompt}\n\n{relation_guard}"
         prompt = f"{horizon_ctx}\n\n{base_prompt}"
 
         _logger.info(
@@ -632,6 +862,8 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
         )
         manager_verdict["horizon"] = research_horizon
         manager_verdict["research_horizon"] = research_horizon
+        manager_verdict["evidence_relation_status"] = claim_cluster_metrics.get("relation_graph_status", "pending")
+        manager_verdict["evidence_relation_reason"] = claim_cluster_metrics.get("relation_graph_reason", "")
 
         if not manager_verdict["consistency_check_passed"]:
             failed_reasons = "; ".join(manager_verdict["failed_checks"])
@@ -708,6 +940,8 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             "challenge_verification": challenges_verification,
             "report_manifest": report_manifest,
             "claim_cluster_metrics": claim_cluster_metrics,
+            "evidence_relation_status": claim_cluster_metrics.get("relation_graph_status", "pending"),
+            "evidence_relation_reduction": claim_cluster_metrics.get("relation_audit", {}),
             "independent_cluster_count": claim_cluster_metrics.get("independent_cluster_count", 0),
             "analyst_count": claim_cluster_metrics.get("analyst_count", 0),
             "verified_evidence_count": claim_cluster_metrics.get("verified_evidence_count", 0),
