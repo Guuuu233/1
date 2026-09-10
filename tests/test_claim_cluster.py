@@ -669,6 +669,75 @@ class TestRelationAwareClaimMetrics:
         assert "Missing required field 'relation_type'" in audit["error"]["message"]
         json.dumps(audit, allow_nan=False)
 
+    @pytest.mark.parametrize(
+        "payload, error_type, message",
+        [
+            pytest.param({}, "ValueError", "missing required key 'relations'", id="empty-mapping"),
+            pytest.param({"version": "v1"}, "ValueError", "missing required key 'relations'", id="version-only"),
+            pytest.param({"foo": "bar"}, "ValueError", "unexpected key(s) ['foo']", id="garbage-mapping"),
+            pytest.param(
+                {"relation": [{"source_id": "A", "relation_type": "SOURCE_REPETITION", "target_id": "B"}]},
+                "ValueError",
+                "unexpected key(s) ['relation']",
+                id="misspelled-relations-key",
+            ),
+            pytest.param({"relations": None}, "TypeError", "must be a list or tuple, got NoneType", id="null-relations"),
+        ],
+    )
+    def test_graph_mapping_without_relations_list_is_rejected_not_empty(self, payload, error_type, message):
+        metrics = tally_cluster_votes(
+            claims=self._claims(),
+            relation_graph=payload,
+            relation_graph_status="available",
+        )
+        audit = metrics["relation_audit"]
+
+        assert metrics["relation_graph_status"] == "invalid"
+        assert metrics["effective_contribution_count"] == 0
+        assert metrics["independent_cluster_count"] == 0
+        assert metrics["pending_claim_ids"] == ["A", "B", "C", "D"]
+        assert audit["raw_payload"] == payload
+        assert audit["error"]["type"] == error_type
+        assert audit["error"]["stage"] == "deserialize"
+        assert message in audit["error"]["message"]
+        json.dumps(audit, allow_nan=False)
+
+    def test_explicit_empty_serialized_graph_is_available_without_contribution(self):
+        metrics = tally_cluster_votes(
+            claims=self._claims(),
+            relation_graph={"version": "v1", "relations": []},
+            relation_graph_status="available",
+        )
+
+        assert metrics["relation_graph_status"] == "available"
+        assert metrics["effective_contribution_count"] == 0
+        assert metrics["independent_cluster_count"] == 0
+        assert metrics["pending_claim_ids"] == ["A", "B", "C", "D"]
+        assert "error" not in metrics["relation_audit"]
+
+    def test_invalid_or_unsupported_status_keeps_raw_payload_in_audit(self):
+        payload = {"relations": [{"source_id": "A", "relation_type": "SOURCE_REPETITION", "target_id": "B"}]}
+
+        invalid = tally_cluster_votes(
+            claims=self._claims(),
+            relation_graph=payload,
+            relation_graph_status="invalid",
+            relation_graph_reason="upstream marked the graph invalid",
+        )
+        unsupported = tally_cluster_votes(
+            claims=self._claims(),
+            relation_graph=payload,
+            relation_graph_status="bogus",
+        )
+
+        for metrics in (invalid, unsupported):
+            assert metrics["relation_graph_status"] == "invalid"
+            assert metrics["folded_component_count"] == 0
+            assert metrics["relation_audit"]["raw_payload"] == payload
+            assert metrics["relation_audit"]["error"]["stage"] == "status"
+        assert invalid["relation_audit"]["error"]["message"] == "upstream marked the graph invalid"
+        assert unsupported["relation_audit"]["error"]["message"] == "Unsupported relation_graph_status: 'bogus'"
+
 
 class TestResearchManagerRelationGraphWiring:
     """Manager path: graph discovery, seam coercion, state propagation, and prompt status."""
@@ -776,6 +845,77 @@ class TestResearchManagerRelationGraphWiring:
         assert audit["raw_payload"] == {"relations": "INV-1->INV-2"}
         assert audit["error"]["type"] == "TypeError"
         assert audit["error"]["stage"] == "deserialize"
+
+    @pytest.mark.parametrize(
+        "placements",
+        [
+            pytest.param(
+                [("state", "evidence_relations", None), ("investment_debate_state", "evidence_relation_graph", "valid")],
+                id="null-does-not-hide-later-graph",
+            ),
+            pytest.param(
+                [
+                    ("state", "evidence_relation_graph", "valid"),
+                    ("investment_debate_state", "evidence_relation_graph", "auto_inferred"),
+                ],
+                id="valid-graph-does-not-shadow-invalid-graph",
+            ),
+            pytest.param(
+                [
+                    ("market_data_context", "evidence_relation_graph", "valid"),
+                    ("market_data_context", "evidence_relations", "valid"),
+                ],
+                id="two-keys-in-one-container",
+            ),
+        ],
+    )
+    def test_multiple_relation_graph_payloads_fail_closed(self, placements):
+        payloads = {
+            None: None,
+            "valid": {
+                "relations": [
+                    {
+                        "source_id": "INV-1",
+                        "relation_type": "SOURCE_REPETITION",
+                        "target_id": "INV-2",
+                        "metadata": {"canonical_event_id": "cninfo:evt-1"},
+                    }
+                ]
+            },
+            "auto_inferred": {
+                "relations": [
+                    {
+                        "source_id": "INV-3",
+                        "relation_type": "SOURCE_REPETITION",
+                        "target_id": "INV-4",
+                        "metadata": {"auto_inferred": True},
+                    }
+                ]
+            },
+        }
+        state = _research_manager_state()
+        for container, key, payload in placements:
+            target = state if container == "state" else state[container]
+            target[key] = payloads[payload]
+
+        result, captured_prompts = _run_research_manager(state)
+        debate_state = result["investment_debate_state"]
+        metrics = debate_state["claim_cluster_metrics"]
+        audit = debate_state["evidence_relation_reduction"]
+        sources = [f"{container}.{key}" for container, key, _ in placements]
+
+        assert metrics["relation_graph_status"] == "invalid"
+        assert metrics["independent_cluster_count"] == 0
+        assert metrics["folded_component_count"] == 0
+        assert metrics["relation_graph_reason"].startswith(
+            f"multiple E-01 relation graph payloads supplied at {sources}"
+        )
+        assert audit["raw_payload"] == {
+            f"{container}.{key}": payloads[payload] for container, key, payload in placements
+        }
+        assert audit["error"]["stage"] == "status"
+        assert result["manager_verdict"]["evidence_relation_status"] == "invalid"
+        assert "E-02 关系贡献硬闸：状态=INVALID" in captured_prompts[0]
 
     def test_prompt_template_drift_fails_closed_before_llm(self, monkeypatch):
         from tradingagents.agents.managers import research_manager

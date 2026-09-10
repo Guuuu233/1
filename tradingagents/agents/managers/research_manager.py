@@ -31,6 +31,7 @@ from tradingagents.agents.utils.evidence_verifier import (
 )
 from tradingagents.agents.utils.claim_cluster import (
     RELATION_GRAPH_STATUS_AVAILABLE,
+    RELATION_GRAPH_STATUS_INVALID,
     RELATION_GRAPH_STATUS_PENDING,
     cluster_claims,
     format_claim_cluster_summary_for_prompt,
@@ -136,6 +137,11 @@ def _resolve_relation_graph_context(
     status; it only forwards a named E-01 graph payload.  Deserialization, E-01
     validation and the rejection audit (raw payload + structured error) happen in
     ``tally_cluster_votes`` so every manager path records the same evidence.
+
+    Exactly one location may carry the graph.  More than one supplied payload
+    (an explicit null included) is ambiguous: it is marked invalid with every
+    payload kept for audit, instead of silently using whichever location is
+    scanned first.
     """
     containers = (
         ("state", state),
@@ -143,25 +149,35 @@ def _resolve_relation_graph_context(
         ("market_data_context", state.get("market_data_context")),
         ("event_coverage", state.get("event_coverage")),
     )
+    supplied: list[tuple[str, Any]] = []
     for container_name, container in containers:
         if not isinstance(container, Mapping):
             continue
         for key in _RELATION_GRAPH_KEYS:
-            if key not in container:
-                continue
-            raw_graph = container.get(key)
-            source = f"{container_name}.{key}"
-            if raw_graph is None:
-                return (
-                    [],
-                    RELATION_GRAPH_STATUS_PENDING,
-                    f"E-01 relation graph at {source} is null; claim contribution remains pending/unknown",
-                )
+            if key in container:
+                supplied.append((f"{container_name}.{key}", container.get(key)))
+
+    if len(supplied) > 1:
+        sources = [source for source, _ in supplied]
+        return (
+            dict(supplied),
+            RELATION_GRAPH_STATUS_INVALID,
+            f"multiple E-01 relation graph payloads supplied at {sources}; ambiguous relation input "
+            "is not folded and claim contribution remains pending/unknown",
+        )
+    if supplied:
+        source, raw_graph = supplied[0]
+        if raw_graph is None:
             return (
-                raw_graph,
-                RELATION_GRAPH_STATUS_AVAILABLE,
-                f"explicit E-01 relation graph supplied at {source}",
+                [],
+                RELATION_GRAPH_STATUS_PENDING,
+                f"E-01 relation graph at {source} is null; claim contribution remains pending/unknown",
             )
+        return (
+            raw_graph,
+            RELATION_GRAPH_STATUS_AVAILABLE,
+            f"explicit E-01 relation graph supplied at {source}",
+        )
 
     return (
         [],

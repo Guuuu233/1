@@ -389,6 +389,7 @@ _RELATION_FOLDING_TYPES = frozenset({
     RelationType.DERIVED_OBSERVATION,
 })
 _RAW_PAYLOAD_MAX_DEPTH = 20
+_RELATION_GRAPH_MAPPING_KEYS = frozenset({"version", "relations"})
 
 
 @dataclass(frozen=True)
@@ -413,6 +414,23 @@ def _coerce_relation_graph(raw_graph: Any) -> EvidenceRelationGraph:
     if isinstance(raw_graph, EvidenceRelationGraph):
         return raw_graph
     if isinstance(raw_graph, Mapping):
+        # EvidenceRelationGraph.from_dict falls back to an empty graph for {} and for a
+        # missing/None "relations" entry.  At the E-02 seam that fallback would report a
+        # malformed payload as an available empty graph without an error audit, so the
+        # serialized graph shape is required explicitly here.
+        unexpected = sorted(str(key) for key in raw_graph if key not in _RELATION_GRAPH_MAPPING_KEYS)
+        if unexpected:
+            raise ValueError(
+                f"evidence relation graph mapping has unexpected key(s) {unexpected}; "
+                "expected 'relations' and optional 'version'"
+            )
+        if "relations" not in raw_graph:
+            raise ValueError("evidence relation graph mapping is missing required key 'relations'")
+        relations = raw_graph["relations"]
+        if not isinstance(relations, (list, tuple)):
+            raise TypeError(
+                f"evidence relation graph 'relations' must be a list or tuple, got {type(relations).__name__}"
+            )
         return EvidenceRelationGraph.from_dict(raw_graph)
     if isinstance(raw_graph, (list, tuple)):
         raw_relations = list(raw_graph)
@@ -585,11 +603,19 @@ def _apply_relation_reduction(
         reason = reason or "E-01 relation graph is unavailable; contribution remains pending"
     elif status == RELATION_GRAPH_STATUS_INVALID:
         reason = reason or "E-01 relation graph is invalid; contribution remains pending"
-        rejection = _RelationGraphRejection("status", ValueError(reason))
+        rejection = _RelationGraphRejection(
+            "status",
+            ValueError(reason),
+            raw_payload=None if relation_graph is None else _json_safe_payload(relation_graph),
+        )
     else:
         unsupported = ValueError(f"Unsupported relation_graph_status: {status!r}")
         reason = reason or str(unsupported)
-        rejection = _RelationGraphRejection("status", unsupported)
+        rejection = _RelationGraphRejection(
+            "status",
+            unsupported,
+            raw_payload=None if relation_graph is None else _json_safe_payload(relation_graph),
+        )
 
     if rejection is not None:
         status = RELATION_GRAPH_STATUS_INVALID
