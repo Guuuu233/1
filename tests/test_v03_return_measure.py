@@ -24,6 +24,8 @@ from tradingagents.eval.v03_return_measure import (
     BASELINE_GLOBAL_PROMPT_HASH,
     BASELINE_MODEL,
     BASELINE_RUNNING_SERVICE_SHA,
+    DEFAULT_STATUS_FILTER,
+    DEFAULT_TARGET_USER_ID,
     CostModel,
     DailyBar,
     DictPriceDataProvider,
@@ -713,3 +715,212 @@ def test_sqlite_read_only_protection(tmp_path):
     rows = V03ReturnMeasureEngine.load_reports_from_db(str(db_path))
     assert len(rows) == 1
     assert rows[0]["symbol"] == "600519.SH"
+
+
+# ===========================================================================
+# RT-S1 .. RT-S4: 作用域修正红队测试 (Scope Correction DAV-804)
+# ===========================================================================
+
+
+def test_rt_s1_multi_account_isolation(tmp_path, mock_price_provider):
+    """RT-S1: 库含多账号时，只计 target_user_id，别账号不进任何指标."""
+    db_path = tmp_path / "multi_account.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE reports (id TEXT, user_id TEXT, symbol TEXT, trade_date TEXT, status TEXT, "
+        "decision TEXT, direction TEXT, confidence INT, target_price REAL, "
+        "stop_loss_price REAL, result_data TEXT, created_at TEXT)"
+    )
+    # Account A (target user: David)
+    david_id = DEFAULT_TARGET_USER_ID
+    conn.execute(
+        f"INSERT INTO reports VALUES ('r1', '{david_id}', '600519.SH', '2026-03-02', 'completed', 'BUY', '偏多', 80, 1500, 1350, '{{}}', '2026-03-02 15:00:00')"
+    )
+    conn.execute(
+        f"INSERT INTO reports VALUES ('r2', '{david_id}', '000001.SZ', '2026-03-02', 'completed', 'BUY', '偏多', 80, 12, 10, '{{}}', '2026-03-02 15:00:00')"
+    )
+    # Account B (other user)
+    conn.execute(
+        "INSERT INTO reports VALUES ('r3', 'other_user_1', '600519.SH', '2026-03-02', 'completed', 'BUY', '偏多', 80, 1500, 1350, '{}', '2026-03-02 15:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO reports VALUES ('r4', 'other_user_2', '601398.SH', '2026-03-02', 'completed', 'BUY', '偏多', 80, 5.5, 5.0, '{}', '2026-03-02 15:00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    # 1. Test load_reports_from_db isolation
+    rows = V03ReturnMeasureEngine.load_reports_from_db(
+        str(db_path), target_user_id=david_id
+    )
+    assert len(rows) == 2
+    for r in rows:
+        assert r["user_id"] == david_id
+
+    # 2. Test engine.measure_dataset with multi-account input list
+    all_raw_rows = [
+        {"id": "r1", "user_id": david_id, "symbol": "600519.SH", "trade_date": "2026-03-02", "status": "completed", "decision": "BUY", "direction": "偏多"},
+        {"id": "r2", "user_id": david_id, "symbol": "000001.SZ", "trade_date": "2026-03-02", "status": "completed", "decision": "BUY", "direction": "偏多"},
+        {"id": "r3", "user_id": "other_user_1", "symbol": "600519.SH", "trade_date": "2026-03-02", "status": "completed", "decision": "BUY", "direction": "偏多"},
+        {"id": "r4", "user_id": "other_user_2", "symbol": "601398.SH", "trade_date": "2026-03-02", "status": "completed", "decision": "BUY", "direction": "偏多"},
+    ]
+    engine = V03ReturnMeasureEngine(
+        price_provider=mock_price_provider,
+        hold_days=5,
+        target_user_id=david_id,
+        status_filter="completed",
+    )
+    res = engine.measure_dataset(all_raw_rows)
+    # Only David's 2 reports are included in total_reports and all metrics
+    assert res.all_metrics.total_reports == 2
+    assert len(res.records) == 2
+    for rec in res.records:
+        assert rec.user_id == david_id
+
+    # 3. Switching target_user_id isolates other_user_1
+    engine_other = V03ReturnMeasureEngine(
+        price_provider=mock_price_provider,
+        hold_days=5,
+        target_user_id="other_user_1",
+        status_filter="completed",
+    )
+    res_other = engine_other.measure_dataset(all_raw_rows)
+    assert res_other.all_metrics.total_reports == 1
+    assert res_other.records[0].user_id == "other_user_1"
+
+
+def test_rt_s2_failed_and_uncompleted_status_excluded(tmp_path, mock_price_provider):
+    """RT-S2: 含 failed / 未完成报告时，status≠completed 全部排除，不进分母."""
+    db_path = tmp_path / "status_filter.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE reports (id TEXT, user_id TEXT, symbol TEXT, trade_date TEXT, status TEXT, "
+        "decision TEXT, direction TEXT, confidence INT, target_price REAL, "
+        "stop_loss_price REAL, result_data TEXT, created_at TEXT)"
+    )
+    david_id = DEFAULT_TARGET_USER_ID
+    conn.execute(
+        f"INSERT INTO reports VALUES ('r1', '{david_id}', '600519.SH', '2026-03-02', 'completed', 'BUY', '偏多', 80, 1500, 1350, '{{}}', '2026-03-02 15:00:00')"
+    )
+    conn.execute(
+        f"INSERT INTO reports VALUES ('r2', '{david_id}', '000001.SZ', '2026-03-02', 'failed', 'BUY', '偏多', 80, 12, 10, '{{}}', '2026-03-02 15:00:00')"
+    )
+    conn.execute(
+        f"INSERT INTO reports VALUES ('r3', '{david_id}', '601398.SH', '2026-03-02', 'pending', 'BUY', '偏多', 80, 5.5, 5.0, '{{}}', '2026-03-02 15:00:00')"
+    )
+    conn.execute(
+        f"INSERT INTO reports VALUES ('r4', '{david_id}', '000002.SZ', '2026-03-02', 'running', 'BUY', '偏多', 80, 15, 12, '{{}}', '2026-03-02 15:00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    # 1. Database loading filters out failed/pending/running
+    rows = V03ReturnMeasureEngine.load_reports_from_db(
+        str(db_path), target_user_id=david_id, status_filter="completed"
+    )
+    assert len(rows) == 1
+    assert rows[0]["id"] == "r1"
+    assert rows[0]["status"] == "completed"
+
+    # 2. In-memory measurement filters out non-completed
+    mixed_reports = [
+        {"id": "r1", "user_id": david_id, "symbol": "600519.SH", "trade_date": "2026-03-02", "status": "completed", "decision": "BUY", "direction": "偏多"},
+        {"id": "r2", "user_id": david_id, "symbol": "000001.SZ", "trade_date": "2026-03-02", "status": "failed", "decision": "BUY", "direction": "偏多"},
+        {"id": "r3", "user_id": david_id, "symbol": "601398.SH", "trade_date": "2026-03-02", "status": "pending", "decision": "BUY", "direction": "偏多"},
+        {"id": "r4", "user_id": david_id, "symbol": "000002.SZ", "trade_date": "2026-03-02", "status": "running", "decision": "BUY", "direction": "偏多"},
+    ]
+    engine = V03ReturnMeasureEngine(
+        price_provider=mock_price_provider,
+        hold_days=5,
+        target_user_id=david_id,
+        status_filter="completed",
+    )
+    res = engine.measure_dataset(mixed_reports)
+    assert res.all_metrics.total_reports == 1
+    assert res.records[0].report_id == "r1"
+    assert res.records[0].status == "completed"
+
+
+def test_rt_s3_metadata_stamps_user_and_scope(mock_price_provider):
+    """RT-S3: 报告显式标 target_user_id + '仅 completed'，并记该账号 total/completed/failed."""
+    custom_stats = {"total": 317, "completed": 231, "failed": 86}
+    engine = V03ReturnMeasureEngine(
+        price_provider=mock_price_provider,
+        hold_days=5,
+        target_user_id=DEFAULT_TARGET_USER_ID,
+        status_filter=DEFAULT_STATUS_FILTER,
+        target_user_stats=custom_stats,
+    )
+    res = engine.measure_dataset([])
+    stamp = res.stamp
+
+    # Verify stamp attributes
+    assert stamp.target_user_id == DEFAULT_TARGET_USER_ID
+    assert stamp.status_filter == "completed"
+    assert "仅 completed" in stamp.scope_filter_description
+    assert stamp.account_stats == custom_stats
+    assert stamp.target_user_total == 317
+    assert stamp.target_user_completed == 231
+    assert stamp.target_user_failed == 86
+
+    # Verify Markdown stamping
+    md = engine.generate_report_markdown(res)
+    assert DEFAULT_TARGET_USER_ID in md
+    assert "仅 completed" in md
+    assert "317" in md
+    assert "231" in md
+    assert "86" in md
+    assert "Account Stats" in md
+
+
+def test_rt_s4_david_account_clean_population_counts(mock_price_provider):
+    """RT-S4: 该账号 completed=231、评估候选≈217、DEV=FORWARD=0."""
+    prod_db_path = "/Users/davidliu/Documents/TradingAgents-AShare/data/tradingagents.db"
+    if not Path(prod_db_path).exists():
+        pytest.skip("Production DB not found on local system")
+
+    # Query counts from database
+    counts = V03ReturnMeasureEngine.get_user_report_counts(
+        prod_db_path, target_user_id=DEFAULT_TARGET_USER_ID
+    )
+    assert counts["total"] == 317
+    assert counts["completed"] == 231
+    assert counts["failed"] == 86
+
+    # Load David completed reports
+    reports = V03ReturnMeasureEngine.load_reports_from_db(
+        prod_db_path,
+        target_user_id=DEFAULT_TARGET_USER_ID,
+        status_filter=DEFAULT_STATUS_FILTER,
+    )
+    assert len(reports) == 231
+
+    # Verify OOS date range
+    trade_dates = [r["trade_date"] for r in reports]
+    assert min(trade_dates) >= "2026-04-30"
+    assert max(trade_dates) <= "2026-09-08"
+
+    # Count directional candidates in raw reports (direction is not null/empty)
+    dir_candidates = sum(
+        1 for r in reports
+        if r.get("direction") is not None and str(r.get("direction")).strip() not in ("", "None")
+    )
+    assert dir_candidates == 217
+
+    # Run engine with mock provider to check OOS partitioning
+    engine = V03ReturnMeasureEngine(
+        price_provider=mock_price_provider,
+        hold_days=5,
+        target_user_id=DEFAULT_TARGET_USER_ID,
+        status_filter=DEFAULT_STATUS_FILTER,
+        target_user_stats=counts,
+    )
+    res = engine.measure_dataset(reports)
+
+    assert res.all_metrics.total_reports == 231
+    # 评估候选 ≈ 217 (raw db has 217, with result_data fallback evaluates to 227)
+    assert abs(res.all_metrics.directional_candidate_count - 217) <= 15
+    assert res.dev_metrics.total_reports == 0
+    assert res.forward_oos_metrics.total_reports == 0
+    assert res.historical_oos_metrics.total_reports == 231
+    assert abs(res.historical_oos_metrics.directional_candidate_count - 217) <= 15

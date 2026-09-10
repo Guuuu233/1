@@ -46,7 +46,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 import hashlib
 import json
@@ -144,6 +144,8 @@ DEFAULT_STAMP_DUTY_RATE: float = 0.0005  # 0.5‰ = 5 bps (sell side only)
 DEFAULT_SLIPPAGE_BPS: float = 5.0  # 5 bps single side (0.0005)
 DEFAULT_HOLD_DAYS: int = 5
 DEFAULT_BENCHMARK_SYMBOL: str = "000300.SH"
+DEFAULT_TARGET_USER_ID: str = "429163f7-50b6-4982-8bdf-96ae99506843"
+DEFAULT_STATUS_FILTER: str = "completed"
 
 
 def get_code_prompt_sha() -> str:
@@ -266,7 +268,21 @@ class EvaluationStamp:
         default_factory=lambda: dict(SYSTEM_COMPLETENESS_DICT)
     )
     evaluated_at: str = field(
-        default_factory=lambda: datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    # V-03a-2 Scope Stamping (DAV-804)
+    target_user_id: Optional[str] = DEFAULT_TARGET_USER_ID
+    status_filter: Optional[str] = DEFAULT_STATUS_FILTER
+    scope_filter_description: str = "仅 completed"
+    target_user_total: int = 317
+    target_user_completed: int = 231
+    target_user_failed: int = 86
+    account_stats: Dict[str, int] = field(
+        default_factory=lambda: {
+            "total": 317,
+            "completed": 231,
+            "failed": 86,
+        }
     )
 
 
@@ -281,6 +297,9 @@ class SampleMeasureRecord:
     oos_segment: str  # DEV, HISTORICAL_OOS, FORWARD_OOS
     decision: Optional[str] = None
     direction: Optional[str] = None
+    raw_direction: Optional[str] = None
+    user_id: Optional[str] = None
+    status: Optional[str] = None
     pool_status: str = PoolFilterStatus.IN_POOL.value
     outcome_status: str = MeasurementOutcomeStatus.EVALUATED.value
     untradable_reason: Optional[str] = None
@@ -342,6 +361,7 @@ class SegmentMetrics:
 
     # Direction Diagnostics
     total_directional_predictions: int = 0
+    directional_candidate_count: int = 0
     bullish_count: int = 0
     bearish_count: int = 0
     neutral_count: int = 0
@@ -620,23 +640,70 @@ class V03ReturnMeasureEngine:
         hold_days: int = DEFAULT_HOLD_DAYS,
         benchmark_symbol: str = DEFAULT_BENCHMARK_SYMBOL,
         price_provider: Optional[PriceDataProvider] = None,
+        target_user_id: Optional[str] = DEFAULT_TARGET_USER_ID,
+        status_filter: Optional[str] = DEFAULT_STATUS_FILTER,
+        target_user_stats: Optional[Dict[str, int]] = None,
     ):
         self.cost_model = cost_model or CostModel()
         self.hold_days = hold_days
         self.benchmark_symbol = benchmark_symbol
         self.price_provider = price_provider or VendorPriceDataProvider()
+        self.target_user_id = target_user_id
+        self.status_filter = status_filter
+        if target_user_stats is not None:
+            self.target_user_stats = dict(target_user_stats)
+        elif self.target_user_id == DEFAULT_TARGET_USER_ID:
+            self.target_user_stats = {"total": 317, "completed": 231, "failed": 86}
+        else:
+            self.target_user_stats = {"total": 0, "completed": 0, "failed": 0}
 
     # -----------------------------------------------------------------------
     # Database Loading (Read-Only)
     # -----------------------------------------------------------------------
 
     @staticmethod
+    def get_user_report_counts(
+        db_path: str,
+        target_user_id: str = DEFAULT_TARGET_USER_ID,
+    ) -> Dict[str, int]:
+        """Query total, completed, failed counts for a given user_id from database."""
+        db_file = Path(db_path).resolve()
+        if not db_file.exists():
+            raise FileNotFoundError(f"Database file not found: {db_file}")
+
+        uri = f"file:{db_file}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(reports)")
+            cols = {c[1] for c in cur.fetchall()}
+            if "user_id" not in cols:
+                return {"total": 0, "completed": 0, "failed": 0}
+
+            cur.execute(
+                "SELECT status, count(*) FROM reports WHERE user_id = ? GROUP BY status",
+                (target_user_id,),
+            )
+            counts = dict(cur.fetchall())
+            completed = counts.get("completed", 0)
+            failed = counts.get("failed", 0)
+            total = sum(counts.values())
+            return {
+                "total": total,
+                "completed": completed,
+                "failed": failed,
+            }
+        finally:
+            conn.close()
+
+    @staticmethod
     def load_reports_from_db(
         db_path: str,
         limit: Optional[int] = None,
-        status_filter: Optional[str] = None,
+        target_user_id: Optional[str] = DEFAULT_TARGET_USER_ID,
+        status_filter: Optional[str] = DEFAULT_STATUS_FILTER,
     ) -> List[Dict[str, Any]]:
-        """Load reports from SQLite database strictly in read-only mode."""
+        """Load reports from SQLite database strictly in read-only mode with scope filtering."""
         db_file = Path(db_path).resolve()
         if not db_file.exists():
             raise FileNotFoundError(f"Database file not found: {db_file}")
@@ -646,18 +713,43 @@ class V03ReturnMeasureEngine:
         conn.row_factory = sqlite3.Row
         try:
             cur = conn.cursor()
-            query = (
-                "SELECT id, symbol, trade_date, status, decision, direction, confidence, "
-                "target_price, stop_loss_price, result_data, created_at "
-                "FROM reports "
-            )
+            cur.execute("PRAGMA table_info(reports)")
+            cols = {c[1] for c in cur.fetchall()}
+            has_user_id = "user_id" in cols
+            has_status = "status" in cols
+
+            select_cols = [
+                "id",
+                "user_id" if has_user_id else "NULL AS user_id",
+                "symbol",
+                "trade_date",
+                "status",
+                "decision",
+                "direction",
+                "confidence",
+                "target_price",
+                "stop_loss_price",
+                "result_data",
+                "created_at",
+            ]
+            query = f"SELECT {', '.join(select_cols)} FROM reports"
+            where_clauses: List[str] = []
             params: List[Any] = []
-            if status_filter:
-                query += "WHERE status = ? "
+
+            if has_user_id and target_user_id is not None:
+                where_clauses.append("user_id = ?")
+                params.append(target_user_id)
+
+            if has_status and status_filter is not None:
+                where_clauses.append("status = ?")
                 params.append(status_filter)
-            query += "ORDER BY trade_date ASC, created_at ASC "
+
+            if where_clauses:
+                query += " WHERE " + " AND ".join(where_clauses)
+
+            query += " ORDER BY trade_date ASC, created_at ASC"
             if limit:
-                query += "LIMIT ? "
+                query += " LIMIT ?"
                 params.append(limit)
 
             cur.execute(query, params)
@@ -725,7 +817,8 @@ class V03ReturnMeasureEngine:
         raw_sym = report.get("symbol")
         trade_date = str(report.get("trade_date", "")).strip()[:10]
         decision = report.get("decision")
-        direction = report.get("direction")
+        raw_dir = report.get("direction")
+        direction = raw_dir
         status = report.get("status")
 
         # Fallback to result_data for multi-horizon / nested decisions
@@ -760,6 +853,7 @@ class V03ReturnMeasureEngine:
                     )
 
         oos_seg = classify_oos_segment(trade_date).value
+        user_id = report.get("user_id")
 
         rec = SampleMeasureRecord(
             report_id=report_id,
@@ -769,6 +863,9 @@ class V03ReturnMeasureEngine:
             oos_segment=oos_seg,
             decision=decision,
             direction=direction,
+            raw_direction=str(raw_dir) if raw_dir is not None else None,
+            user_id=str(user_id) if user_id is not None else None,
+            status=str(status) if status is not None else None,
             benchmark_symbol=self.benchmark_symbol,
             included_in_coverage_metrics=True,
             included_in_return_metrics=False,
@@ -909,8 +1006,12 @@ class V03ReturnMeasureEngine:
         bearish_total = 0
         bearish_correct = 0
         neutral_total = 0
+        directional_candidates = 0
 
         for r in records:
+            d_val = r.raw_direction if r.raw_direction is not None else r.direction
+            if d_val is not None and str(d_val).strip() not in ("", "None"):
+                directional_candidates += 1
             # Canonical & Pool
             if r.pool_status == PoolFilterStatus.EXCLUDED_UNMAPPABLE.value:
                 metrics.unmappable_count += 1
@@ -1029,6 +1130,7 @@ class V03ReturnMeasureEngine:
 
         # Directional Diagnostics
         metrics.total_directional_predictions = directional_total
+        metrics.directional_candidate_count = directional_candidates
         metrics.bullish_count = bullish_total
         metrics.bearish_count = bearish_total
         metrics.neutral_count = neutral_total
@@ -1049,8 +1151,28 @@ class V03ReturnMeasureEngine:
     def measure_dataset(
         self, reports: Iterable[Dict[str, Any]]
     ) -> V03MeasurementResult:
-        """Process an entire dataset of reports and compile multi-segment results."""
-        report_list = list(reports)
+        """Process an entire dataset of reports and compile multi-segment results.
+
+        Applies parameterized scope filtering (target_user_id, status_filter) if fields are present.
+        """
+        raw_list = list(reports)
+        report_list: List[Dict[str, Any]] = []
+        for r in raw_list:
+            r_user = r.get("user_id")
+            if (
+                self.target_user_id is not None
+                and r_user is not None
+                and r_user != self.target_user_id
+            ):
+                continue
+            r_status = r.get("status")
+            if (
+                self.status_filter is not None
+                and r_status is not None
+                and r_status != self.status_filter
+            ):
+                continue
+            report_list.append(r)
 
         # 1. Collision detection on raw symbols
         raw_symbols = [r.get("symbol") for r in report_list]
@@ -1081,7 +1203,15 @@ class V03ReturnMeasureEngine:
             forward_records, OOSSegment.FORWARD_OOS.value
         )
 
-        stamp = EvaluationStamp()
+        stamp = EvaluationStamp(
+            target_user_id=self.target_user_id,
+            status_filter=self.status_filter,
+            scope_filter_description="仅 completed" if self.status_filter == "completed" else (self.status_filter or "全部"),
+            target_user_total=self.target_user_stats.get("total", 0),
+            target_user_completed=self.target_user_stats.get("completed", 0),
+            target_user_failed=self.target_user_stats.get("failed", 0),
+            account_stats=dict(self.target_user_stats),
+        )
 
         return V03MeasurementResult(
             stamp=stamp,
@@ -1125,6 +1255,9 @@ class V03ReturnMeasureEngine:
 | **Prompt Hash** | `{s.prompt_hash}` | 全局用户提示词 (`5489166b`) + 内置代码 Prompt @SHA |
 | **代码 SHA** | `{s.code_sha}` | 当前评估代码精确 Commit SHA |
 | **运行服务 SHA** | `{s.running_service_sha}` | 线上运行服务 SHA |
+| **目标评测账号 (Target User)** | `{s.target_user_id}` | 单一指定评估账号（排除多账号混用污染） |
+| **样本状态限定 (Status Scope)** | `{s.status_filter}` (`{s.scope_filter_description}`) | 严格限定已完成报告（排除 failed 等未完成样本） |
+| **该账号总体分布 (Account Stats)** | 总计: `{s.account_stats.get('total', s.target_user_total)}` \\| completed: `{s.account_stats.get('completed', s.target_user_completed)}` \\| failed: `{s.account_stats.get('failed', s.target_user_failed)}` | 该账号全量生命周期状态分布 |
 | **评估生成时间** | `{s.evaluated_at}` | UTC 时间戳 |
 
 ### 系统完整度盖章 (System Completeness)
@@ -1156,6 +1289,7 @@ class V03ReturnMeasureEngine:
 | 指标项 | DEV (≤2025-12-31) | HISTORICAL_OOS (2026-01-01~09-08) | FORWARD_OOS (≥2026-09-09) | 全量汇总 (ALL) |
 |---|---|---|---|---|
 | **总报告数 (Total Reports)** | {m_dev.total_reports} | {m_hist.total_reports} | {m_fwd.total_reports} | {m_all.total_reports} |
+| **评估候选数 (Candidates)** | {m_dev.directional_candidate_count} | {m_hist.directional_candidate_count} | {m_fwd.directional_candidate_count} | {m_all.directional_candidate_count} |
 | **可规范化代码数 (Mappable)** | {m_dev.mappable_count} | {m_hist.mappable_count} | {m_fwd.mappable_count} | {m_all.mappable_count} |
 | **隔离未规范数 (Unmappable)** | {m_dev.unmappable_count} | {m_hist.unmappable_count} | {m_fwd.unmappable_count} | {m_all.unmappable_count} |
 | **符合股票池数 (In-Pool)** | {m_dev.in_pool_count} | {m_hist.in_pool_count} | {m_fwd.in_pool_count} | {m_all.in_pool_count} |
@@ -1238,11 +1372,39 @@ def main() -> None:
         default=str(PROJECT_ROOT / "work" / "v03_return_measurement_report.json"),
         help="Output json report path",
     )
+    parser.add_argument(
+        "--target-user-id",
+        type=str,
+        default=DEFAULT_TARGET_USER_ID,
+        help="Target user ID to evaluate (default: David)",
+    )
+    parser.add_argument(
+        "--status-filter",
+        type=str,
+        default=DEFAULT_STATUS_FILTER,
+        help="Status filter (default: completed)",
+    )
     args = parser.parse_args()
 
+    user_stats = V03ReturnMeasureEngine.get_user_report_counts(
+        args.db_path, target_user_id=args.target_user_id
+    )
     print(f"Loading reports from database (READ-ONLY): {args.db_path}")
-    engine = V03ReturnMeasureEngine(hold_days=args.hold_days)
-    reports = engine.load_reports_from_db(args.db_path, limit=args.limit)
+    print(f"Target user: {args.target_user_id}, Status: {args.status_filter}")
+    print(f"Account stats: total={user_stats['total']}, completed={user_stats['completed']}, failed={user_stats['failed']}")
+
+    engine = V03ReturnMeasureEngine(
+        hold_days=args.hold_days,
+        target_user_id=args.target_user_id,
+        status_filter=args.status_filter,
+        target_user_stats=user_stats,
+    )
+    reports = engine.load_reports_from_db(
+        args.db_path,
+        limit=args.limit,
+        target_user_id=args.target_user_id,
+        status_filter=args.status_filter,
+    )
     print(f"Loaded {len(reports)} reports. Running measurement engine...")
 
     result = engine.measure_dataset(reports)

@@ -14,67 +14,76 @@
       "overall_missing_items_rate_approx": 0.3,
       "status_note": "半成品基线,非定性判断"
     },
-    "evaluated_at": "2026-09-09T17:17:30Z"
+    "evaluated_at": "2026-09-10T02:28:00Z",
+    "target_user_id": "429163f7-50b6-4982-8bdf-96ae99506843",
+    "status_filter": "completed",
+    "scope_filter_description": "仅 completed",
+    "target_user_total": 317,
+    "target_user_completed": 231,
+    "target_user_failed": 86,
+    "account_stats": {
+      "total": 317,
+      "completed": 231,
+      "failed": 86
+    }
   },
   "all_metrics": {
     "segment_name": "ALL",
-    "total_reports": 1408,
-    "mappable_count": 1374,
-    "unmappable_count": 34,
-    "in_pool_count": 1374,
-    "excluded_pool_count": 34,
-    "tradable_count": 1374,
+    "total_reports": 231,
+    "mappable_count": 229,
+    "unmappable_count": 2,
+    "in_pool_count": 229,
+    "excluded_pool_count": 2,
+    "tradable_count": 229,
     "untradable_count": 0,
-    "evaluated_count": 403,
-    "typed_missing_count": 13,
-    "non_actionable_count": 958,
-    "coverage_rate": 0.2933,
+    "evaluated_count": 89,
+    "typed_missing_count": 9,
+    "non_actionable_count": 131,
+    "coverage_rate": 0.3886,
     "evaluability_rate": 1.0,
     "pool_exclusion_reasons": {
-      "excluded_unmappable": 34
+      "excluded_unmappable": 2
     },
     "untradable_reasons": {},
     "missing_reasons": {
-      "entry_bar_missing": 1,
-      "exit_bar_missing": 12
+      "exit_bar_missing": 9
     },
-    "return_sample_count": 403,
-    "mean_gross_return": -0.001101,
-    "mean_net_return": -0.003117,
-    "median_net_return": -0.004044,
-    "mean_benchmark_return": 0.017435,
-    "mean_excess_return": -0.020552,
-    "win_rate": 0.2655,
-    "excess_win_rate": 0.1216,
-    "profit_loss_ratio": 1.8857,
+    "return_sample_count": 89,
+    "mean_gross_return": 0.006161,
+    "mean_net_return": 0.00413,
+    "median_net_return": 0.001314,
+    "mean_benchmark_return": 0.001481,
+    "mean_excess_return": 0.002649,
+    "win_rate": 0.5618,
+    "excess_win_rate": 0.5506,
+    "profit_loss_ratio": 0.987,
     "max_return": 0.19452,
     "min_return": -0.115361,
-    "return_std": 0.030137,
-    "total_directional_predictions": 596,
-    "bullish_count": 403,
-    "bearish_count": 193,
-    "neutral_count": 145,
-    "bullish_accuracy": 0.268,
-    "bearish_accuracy": 0.7668,
-    "overall_accuracy": 0.4295
+    "return_std": 0.053988,
+    "total_directional_predictions": 156,
+    "directional_candidate_count": 227,
+    "bullish_count": 89,
+    "bearish_count": 67,
+    "neutral_count": 29,
+    "bullish_accuracy": 0.573,
+    "bearish_accuracy": 0.3881,
+    "overall_accuracy": 0.4936
   },
   "dev_metrics": {
     "segment_name": "DEV",
-    "total_reports": 231,
-    "mappable_count": 199,
-    "unmappable_count": 32,
-    "in_pool_count": 199,
-    "excluded_pool_count": 32,
-    "tradable_count": 199,
+    "total_reports": 0,
+    "mappable_count": 0,
+    "unmappable_count": 0,
+    "in_pool_count": 0,
+    "excluded_pool_count": 0,
+    "tradable_count": 0,
     "untradable_count": 0,
     "evaluated_count": 0,
     "typed_missing_count": 0,
-    "non_actionable_count": 199,
+    "non_actionable_count": 0,
     "coverage_rate": 0.0,
-    "evaluability_rate": 1.0,
-    "pool_exclusion_reasons": {
-      "excluded_unmappable": 32
-    },
+    "evaluability_rate": 0.0,
+    "pool_exclusion_reasons": {},
     "untradable_reasons": {},
     "missing_reasons": {},
     "return_sample_count": 0,
@@ -90,6 +99,7 @@
     "min_return": null,
     "return_std": null,
     "total_directional_predictions": 0,
+    "directional_candidate_count": 0,
     "bullish_count": 0,
     "bearish_count": 0,
     "neutral_count": 0,
@@ -99,45 +109,45 @@
   },
   "historical_oos_metrics": {
     "segment_name": "HISTORICAL_OOS",
-    "total_reports": 1177,
-    "mappable_count": 1175,
+    "total_reports": 231,
+    "mappable_count": 229,
     "unmappable_count": 2,
-    "in_pool_count": 1175,
+    "in_pool_count": 229,
     "excluded_pool_count": 2,
-    "tradable_count": 1175,
+    "tradable_count": 229,
     "untradable_count": 0,
-    "evaluated_count": 403,
-    "typed_missing_count": 13,
-    "non_actionable_count": 759,
-    "coverage_rate": 0.343,
+    "evaluated_count": 89,
+    "typed_missing_count": 9,
+    "non_actionable_count": 131,
+    "coverage_rate": 0.3886,
     "evaluability_rate": 1.0,
     "pool_exclusion_reasons": {
       "excluded_unmappable": 2
     },
     "untradable_reasons": {},
     "missing_reasons": {
-      "entry_bar_missing": 1,
-      "exit_bar_missing": 12
+      "exit_bar_missing": 9
     },
-    "return_sample_count": 403,
-    "mean_gross_return": -0.001101,
-    "mean_net_return": -0.003117,
-    "median_net_return": -0.004044,
-    "mean_benchmark_return": 0.017435,
-    "mean_excess_return": -0.020552,
-    "win_rate": 0.2655,
-    "excess_win_rate": 0.1216,
-    "profit_loss_ratio": 1.8857,
+    "return_sample_count": 89,
+    "mean_gross_return": 0.006161,
+    "mean_net_return": 0.00413,
+    "median_net_return": 0.001314,
+    "mean_benchmark_return": 0.001481,
+    "mean_excess_return": 0.002649,
+    "win_rate": 0.5618,
+    "excess_win_rate": 0.5506,
+    "profit_loss_ratio": 0.987,
     "max_return": 0.19452,
     "min_return": -0.115361,
-    "return_std": 0.030137,
-    "total_directional_predictions": 596,
-    "bullish_count": 403,
-    "bearish_count": 193,
-    "neutral_count": 145,
-    "bullish_accuracy": 0.268,
-    "bearish_accuracy": 0.7668,
-    "overall_accuracy": 0.4295
+    "return_std": 0.053988,
+    "total_directional_predictions": 156,
+    "directional_candidate_count": 227,
+    "bullish_count": 89,
+    "bearish_count": 67,
+    "neutral_count": 29,
+    "bullish_accuracy": 0.573,
+    "bearish_accuracy": 0.3881,
+    "overall_accuracy": 0.4936
   },
   "forward_oos_metrics": {
     "segment_name": "FORWARD_OOS",
@@ -169,6 +179,7 @@
     "min_return": null,
     "return_std": null,
     "total_directional_predictions": 0,
+    "directional_candidate_count": 0,
     "bullish_count": 0,
     "bearish_count": 0,
     "neutral_count": 0,
@@ -177,46 +188,9 @@
     "overall_accuracy": null
   },
   "collision_summary": {
-    "total_collisions_detected": 3,
-    "collisions": {
-      "600519.SH": {
-        "canonical_symbol": "600519.SH",
-        "raw_symbols": [
-          "600519",
-          "600519.SH"
-        ],
-        "raw_counts": {
-          "600519.SH": 739,
-          "600519": 1
-        },
-        "total_occurrences": 740
-      },
-      "000001.SZ": {
-        "canonical_symbol": "000001.SZ",
-        "raw_symbols": [
-          "000001",
-          "000001.SZ"
-        ],
-        "raw_counts": {
-          "000001.SZ": 57,
-          "000001": 2
-        },
-        "total_occurrences": 59
-      },
-      "603259.SH": {
-        "canonical_symbol": "603259.SH",
-        "raw_symbols": [
-          "603259",
-          "603259.SH"
-        ],
-        "raw_counts": {
-          "603259.SH": 11,
-          "603259": 1
-        },
-        "total_occurrences": 12
-      }
-    },
+    "total_collisions_detected": 0,
+    "collisions": {},
     "note": "Collision symbols merged into unified canonical entity; returns preserved without duplication."
   },
-  "records_count": 1408
+  "records_count": 231
 }

@@ -25,6 +25,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from tradingagents.eval.v03_return_measure import (
     DEFAULT_BENCHMARK_SYMBOL,
     DEFAULT_HOLD_DAYS,
+    DEFAULT_STATUS_FILTER,
+    DEFAULT_TARGET_USER_ID,
     CostModel,
     VendorPriceDataProvider,
     V03ReturnMeasureEngine,
@@ -70,18 +72,35 @@ def run_measurement(
     output_json: str,
     hold_days: int = DEFAULT_HOLD_DAYS,
     limit: int | None = None,
+    target_user_id: str = DEFAULT_TARGET_USER_ID,
+    status_filter: str = DEFAULT_STATUS_FILTER,
 ) -> None:
-    """Execute measurement engine on replica database."""
+    """Execute measurement engine on replica database with scope filtering."""
+    user_stats = V03ReturnMeasureEngine.get_user_report_counts(
+        replica_db_path, target_user_id=target_user_id
+    )
     print(f"[3/4] Initializing V-03a measurement engine on replica: {replica_db_path}")
+    print(f"      Target User: {target_user_id}")
+    print(f"      Status Scope: {status_filter} (仅 completed)")
+    print(f"      Account Stats: Total={user_stats['total']}, Completed={user_stats['completed']}, Failed={user_stats['failed']}")
+
     engine = V03ReturnMeasureEngine(
         cost_model=CostModel(),
         hold_days=hold_days,
         benchmark_symbol=DEFAULT_BENCHMARK_SYMBOL,
         price_provider=VendorPriceDataProvider(),
+        target_user_id=target_user_id,
+        status_filter=status_filter,
+        target_user_stats=user_stats,
     )
 
-    reports = engine.load_reports_from_db(replica_db_path, limit=limit)
-    print(f"      Loaded {len(reports)} reports from replica database.")
+    reports = engine.load_reports_from_db(
+        replica_db_path,
+        limit=limit,
+        target_user_id=target_user_id,
+        status_filter=status_filter,
+    )
+    print(f"      Loaded {len(reports)} completed reports from replica database for target account.")
 
     print("[4/4] Executing measurement across OOS segments (DEV / HISTORICAL / FORWARD)...")
     result = engine.measure_dataset(reports)
@@ -91,8 +110,11 @@ def run_measurement(
     print("\n" + "=" * 60)
     print("V-03a 测量结果摘要 (V-03a Progress Baseline Summary)")
     print(f"核心定位: {result.stamp.disclaimer}")
+    print(f"评测账号: {result.stamp.target_user_id} | 状态限定: {result.stamp.status_filter} ({result.stamp.scope_filter_description})")
+    print(f"账号分布: 总计={result.stamp.account_stats.get('total')} | completed={result.stamp.account_stats.get('completed')} | failed={result.stamp.account_stats.get('failed')}")
     print("=" * 60)
     print(f"总报告数: {m_all.total_reports}")
+    print(f"评估候选数: {m_all.directional_candidate_count}")
     print(f"规范化合格: {m_all.mappable_count} | 隔离未规范: {m_all.unmappable_count}")
     print(f"入池数 (In-Pool): {m_all.in_pool_count} | 池排除数: {m_all.excluded_pool_count}")
     print(f"可交易数: {m_all.tradable_count} | 停牌/封死不可交易: {m_all.untradable_count}")
@@ -128,6 +150,18 @@ def main() -> None:
     parser.add_argument("--hold-days", type=int, default=DEFAULT_HOLD_DAYS, help="Holding days")
     parser.add_argument("--limit", type=int, default=None, help="Limit records for quick audit")
     parser.add_argument(
+        "--target-user-id",
+        type=str,
+        default=DEFAULT_TARGET_USER_ID,
+        help="Target user ID to evaluate (default: David)",
+    )
+    parser.add_argument(
+        "--status-filter",
+        type=str,
+        default=DEFAULT_STATUS_FILTER,
+        help="Status filter (default: completed)",
+    )
+    parser.add_argument(
         "--skip-backup", action="store_true", help="Skip backup if replica already exists"
     )
     args = parser.parse_args()
@@ -141,6 +175,8 @@ def main() -> None:
         output_json=args.output_json,
         hold_days=args.hold_days,
         limit=args.limit,
+        target_user_id=args.target_user_id,
+        status_filter=args.status_filter,
     )
 
 
