@@ -25,7 +25,7 @@ import os
 import re
 import time
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -33,6 +33,12 @@ import requests
 
 from .base import BaseMarketDataProvider
 from ..config import get_config
+from ..financial_announce import (
+    Q2DerivationResult,
+    classify_financial_period_kind,
+    derive_q2_from_h1_q1,
+    format_q2_derivation_block,
+)
 from ..trade_calendar import (
     CN_TZ,
     DateDataUnavailable,
@@ -77,6 +83,66 @@ _ABILITY_LABELS = {
     "solvency": "偿债能力",
     "operation": "营运能力",
     "cash-flow": "现金流",
+}
+
+# Fuyao labels the income/cash-flow rows as Q1/Q2/Q3/Q4, while the values for
+# Q2/Q3 are cumulative report-period values.  The period end is authoritative;
+# fiscal_period is retained as the vendor's original label and used only as a
+# fallback when a fixture or an upstream response omits period_end_ms.
+_FISCAL_PERIOD_ENDS = {
+    "Q1": "0331",
+    "Q2": "0630",
+    "Q3": "0930",
+    "Q4": "1231",
+    "H1": "0630",
+    "FY": "1231",
+    "Y": "1231",
+    "ANNUAL": "1231",
+}
+
+# Only additive flow fields are eligible for an explicit H1-Q1 derived block.
+# The raw Fuyao table remains untouched; the block is separate and carries its
+# own derivation_formula so a derived amount cannot be mistaken for an API row.
+_FUYAO_DERIVATION_FIELD_ALIASES: dict[str, dict[str, str]] = {
+    "income": {
+        "operating_income": "营业收入",
+        "operating_revenue": "营业收入",
+        "operating_costs": "营业成本",
+        "operating_expenses": "营业总成本",
+        "sales_fee": "销售费用",
+        "selling_expenses": "销售费用",
+        "manage_fee": "管理费用",
+        "management_expenses": "管理费用",
+        "financial_expenses": "财务费用",
+        "finance_fee": "财务费用",
+        "operating_profit": "营业利润",
+        "total_profit": "利润总额",
+        "income_tax": "所得税费用",
+        "net_profit": "净利润",
+        "parent_net_profit": "归属于母公司所有者的净利润",
+        "net_profit_parent": "归属于母公司所有者的净利润",
+    },
+    "cashflow": {
+        "cash_received_from_sales": "销售商品、提供劳务收到的现金",
+        "cash_operating_inflow": "经营活动现金流入小计",
+        "cash_paid_for_goods": "购买商品、接受劳务支付的现金",
+        "cash_paid_to_employees": "支付给职工以及为职工支付的现金",
+        "taxes_paid": "支付的各项税费",
+        "cash_operating_outflow": "经营活动现金流出小计",
+        "act_cash_flow_net": "经营活动产生的现金流量净额",
+        "invest_cash_flow_net": "投资活动产生的现金流量净额",
+        "financing_cash_flow_net": "筹资活动产生的现金流量净额",
+        "pay_fixed_assets_etc_cash": "购建固定资产、无形资产和其他长期资产所支付的现金",
+        "cash_net_increase": "现金及现金等价物净增加额",
+    },
+}
+
+_FUYAO_SCOPE_FIELD_ALIASES = {
+    "currency": "币种",
+    "unit": "单位",
+    "reporting_unit": "报表单位",
+    "accounting_scope": "会计口径",
+    "consolidation_scope": "合并范围",
 }
 
 
@@ -162,9 +228,274 @@ class CnFuyaoProvider(BaseMarketDataProvider):
         """毫秒 Unix 时间戳（Asia/Shanghai）→ ``YYYY-MM-DD``。"""
         try:
             f = float(ms)
-        except (TypeError, ValueError):
+            if f <= 0:
+                return None
+            return datetime.fromtimestamp(f / 1000.0, tz=CN_TZ).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OverflowError, OSError):
             return None
-        return datetime.fromtimestamp(f / 1000.0, tz=CN_TZ).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _date_like_to_iso(value: Any) -> str | None:
+        """Normalize a non-millisecond date value to ``YYYY-MM-DD``."""
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text or text.lower() in {"nan", "none", "nat", "null"}:
+            return None
+        digits = re.sub(r"[^0-9]", "", text)
+        if len(digits) >= 8:
+            try:
+                return datetime.strptime(digits[:8], "%Y%m%d").strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"):
+            try:
+                return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        return None
+
+    @classmethod
+    def _fiscal_period_end(
+        cls, fiscal_year: Any, fiscal_period: Any
+    ) -> str | None:
+        """Infer a period end only when ``period_end_ms`` is absent."""
+        year_match = re.search(r"(?:19|20)\d{2}", str(fiscal_year or ""))
+        if not year_match:
+            return None
+        year = year_match.group(0)
+        period = re.sub(r"[^A-Z0-9]", "", str(fiscal_period or "").upper())
+        if period in _FISCAL_PERIOD_ENDS:
+            month_day = _FISCAL_PERIOD_ENDS[period]
+        else:
+            quarter_match = re.fullmatch(r"(?:Q|QUARTER)?([1-4])", period)
+            if not quarter_match:
+                return None
+            month_day = _FISCAL_PERIOD_ENDS[f"Q{quarter_match.group(1)}"]
+        try:
+            return datetime.strptime(year + month_day, "%Y%m%d").strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
+    @classmethod
+    def _row_period_end(cls, row: dict[str, Any]) -> str | None:
+        """Read Fuyao's period end, with a conservative fiscal-period fallback."""
+        return (
+            cls._ms_to_date_str(row.get("period_end_ms"))
+            or cls._date_like_to_iso(row.get("period_end"))
+            or cls._fiscal_period_end(row.get("fiscal_year"), row.get("fiscal_period"))
+        )
+
+    @staticmethod
+    def _requested_date(curr_date: str) -> date:
+        return datetime.strptime(str(curr_date).strip(), "%Y-%m-%d").date()
+
+    @classmethod
+    def _annotate_financial_rows(
+        cls,
+        items: list[dict[str, Any]],
+        statement_kind: str,
+        curr_date: str,
+    ) -> pd.DataFrame:
+        """Add row-level dates and period semantics before markdown rendering."""
+        requested_date = cls._requested_date(curr_date)
+        annotated: list[dict[str, Any]] = []
+        for source in items:
+            row = dict(source)
+            period_end = cls._row_period_end(row)
+            period_token = period_end.replace("-", "") if period_end else None
+            period_info = classify_financial_period_kind(period_token, statement_kind)
+            report_date = cls._ms_to_date_str(row.get("report_date_ms"))
+            if report_date is None:
+                report_date = cls._date_like_to_iso(row.get("report_date"))
+            if report_date is None:
+                report_date_status = "missing"
+            elif datetime.strptime(report_date, "%Y-%m-%d").date() > requested_date:
+                report_date_status = "future"
+            else:
+                report_date_status = "verified"
+
+            row.update(
+                {
+                    # These are deliberately separate from the raw *_ms values:
+                    # the collector consumes the ISO candidates, while the raw
+                    # fields preserve the upstream evidence for audit/debugging.
+                    "report_date": report_date or "unknown",
+                    "period_end": period_end or "unknown",
+                    "fiscal_period": row.get("fiscal_period") or "unknown",
+                    "reported_period_label": period_info.reported_period_label or "unknown",
+                    "period_kind": period_info.period_kind,
+                    "derivation_formula": period_info.derivation_formula,
+                    "report_date_status": report_date_status,
+                }
+            )
+            annotated.append(row)
+
+        if not annotated:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(annotated)
+        metadata_columns = [
+            "report_date",
+            "period_end",
+            "fiscal_period",
+            "reported_period_label",
+            "period_kind",
+            "derivation_formula",
+            "report_date_status",
+        ]
+        ordered_columns = metadata_columns + [
+            c for c in df.columns if c not in metadata_columns
+        ]
+        return df.loc[:, ordered_columns]
+
+    @classmethod
+    def _derivation_frame(
+        cls, df: pd.DataFrame, statement_kind: str, curr_date: str
+    ) -> pd.DataFrame:
+        """Translate additive Fuyao fields to the shared H1-Q1 derivation API."""
+        aliases = _FUYAO_DERIVATION_FIELD_ALIASES.get(statement_kind, {})
+        rows: list[dict[str, Any]] = []
+        for _, source in df.iterrows():
+            period_end = str(source.get("period_end") or "")
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", period_end):
+                continue
+            if period_end > curr_date or source.get("report_date_status") == "future":
+                continue
+            derived_row: dict[str, Any] = {"报告日": period_end}
+            for raw_name, canonical_name in aliases.items():
+                if raw_name in source.index:
+                    derived_row[canonical_name] = source.get(raw_name)
+            for raw_name, canonical_name in _FUYAO_SCOPE_FIELD_ALIASES.items():
+                if raw_name in source.index:
+                    derived_row[canonical_name] = source.get(raw_name)
+            # Keep already canonical fields available for synthetic fixtures.
+            for canonical_name in (
+                "币种",
+                "单位",
+                "报表单位",
+                "会计口径",
+                "合并范围",
+                "营业收入",
+                "营业成本",
+                "营业总成本",
+                "销售费用",
+                "管理费用",
+                "财务费用",
+                "营业利润",
+                "利润总额",
+                "所得税费用",
+                "净利润",
+                "归属于母公司所有者的净利润",
+                "经营活动现金流入小计",
+                "经营活动现金流出小计",
+                "经营活动产生的现金流量净额",
+                "投资活动产生的现金流量净额",
+                "筹资活动产生的现金流量净额",
+                "购建固定资产、无形资产和其他长期资产所支付的现金",
+                "现金及现金等价物净增加额",
+            ):
+                if canonical_name in source.index:
+                    derived_row[canonical_name] = source.get(canonical_name)
+            rows.append(derived_row)
+        return pd.DataFrame(rows)
+
+    @classmethod
+    def _q2_derivation_block(
+        cls, df: pd.DataFrame, statement_kind: str, curr_date: str
+    ) -> str:
+        """Render an explicit H1-Q1 result, including a fail-closed refusal."""
+        if statement_kind not in ("income", "cashflow") or df.empty:
+            return ""
+        period_end = df.get("period_end")
+        if period_end is None:
+            return ""
+        h1_rows = df[period_end.astype(str).str.endswith("-06-30")]
+        if h1_rows.empty:
+            return ""
+
+        eligible_h1 = h1_rows[
+            (h1_rows["period_end"].astype(str) <= curr_date)
+            & (h1_rows["report_date_status"] != "future")
+        ]
+        if eligible_h1.empty:
+            h1_period = str(h1_rows.iloc[0]["period_end"]).replace("-", "")
+            q1_period = h1_period[:4] + "0331" if len(h1_period) >= 4 else ""
+            result = Q2DerivationResult(
+                reported_period_label=(
+                    f"{h1_period[:4]}Q2" if len(h1_period) >= 4 else "unknown"
+                ),
+                period_kind="unknown",
+                derivation_formula="not_derived",
+                h1_period=h1_period,
+                q1_period=q1_period,
+                values={},
+                missing=(),
+                reason="future_report_date",
+            )
+        else:
+            frame = cls._derivation_frame(df, statement_kind, curr_date)
+            result = derive_q2_from_h1_q1(statement_kind, frame)
+        return format_q2_derivation_block(result)
+
+    @staticmethod
+    def _sanitize_future_rows(df: pd.DataFrame) -> pd.DataFrame:
+        """Keep future-date evidence while removing its financial values."""
+        if df.empty or "report_date_status" not in df.columns:
+            return df
+        future_mask = df["report_date_status"].astype(str).eq("future")
+        if not future_mask.any():
+            return df
+        metadata_columns = {
+            "report_date",
+            "period_end",
+            "fiscal_period",
+            "reported_period_label",
+            "period_kind",
+            "derivation_formula",
+            "report_date_status",
+        }
+        sanitized = df.astype(object).copy()
+        for column in sanitized.columns:
+            if column not in metadata_columns:
+                sanitized.loc[future_mask, column] = "future（不可用）"
+        return sanitized
+
+    @staticmethod
+    def _financial_semantic_notes(
+        df: pd.DataFrame, statement_kind: str, curr_date: str
+    ) -> str:
+        kinds = []
+        if "period_kind" in df.columns:
+            for kind in df["period_kind"].astype(str).tolist():
+                if kind not in kinds:
+                    kinds.append(kind)
+        kind_note = ", ".join(f"period_kind={kind}" for kind in kinds) or "period_kind=unknown"
+        report_dates = []
+        if "report_date" in df.columns:
+            for value, status in zip(
+                df["report_date"].astype(str),
+                df.get("report_date_status", pd.Series(dtype=str)).astype(str),
+            ):
+                if status == "verified" and re.fullmatch(r"20\d{2}-\d{2}-\d{2}", value):
+                    report_dates.append(value)
+        latest_report_date = max(report_dates) if report_dates else None
+        notes = [
+            f"分析日 {curr_date}",
+            (
+                f"实际报告日 {latest_report_date}"
+                if latest_report_date
+                else "实际报告日缺失"
+            ),
+            "实际报告日由 report_date_ms 转换为 report_date",
+            "每行均带 fiscal_period、period_end、period_kind",
+            kind_note,
+        ]
+        if statement_kind in ("income", "cashflow") and "half_year_cumulative" in kinds:
+            notes.append("0630/H1 为累计口径，禁止把 H1 累计当作 Q2 单季使用")
+        if "future" in set(df.get("report_date_status", pd.Series(dtype=str)).astype(str)):
+            notes.append("future 报告日行仅保留日期元数据，金额不可用于分析")
+        return "；".join(notes)
 
     @staticmethod
     def _date_to_ms(date_str: str) -> int:
@@ -457,14 +788,24 @@ class CnFuyaoProvider(BaseMarketDataProvider):
                 f"## {title_cn} ({ticker})\n\n"
                 f"未获取到报表数据（同花顺 fuyao {path}，截至 {curr_date}）。"
             )
-        df = pd.DataFrame(
-            [{k: v for k, v in r.items()} for r in items if isinstance(r, dict)]
+        records = [r for r in items if isinstance(r, dict)]
+        df = self._annotate_financial_rows(records, kind, curr_date)
+        if df.empty:
+            return (
+                f"## {title_cn} ({ticker}) — 同花顺 fuyao {path}\n\n"
+                f"【数据获取失败】接口返回的报表行不可解析（分析日 {curr_date}）。"
+            )
+        visible_df = self._sanitize_future_rows(df)
+        table = self._shrink_table(
+            visible_df, max_rows=12, max_cols=18, table_kind="generic"
         )
-        table = self._shrink_table(df, max_rows=12, max_cols=18, table_kind="generic")
-        freq_note = "单季度" if period == "quarterly" else "报告期口径以接口为准"
+        notes = self._financial_semantic_notes(df, kind, curr_date)
+        derivation = self._q2_derivation_block(df, kind, curr_date)
+        if derivation:
+            table = f"{table}\n\n{derivation}"
         return (
             f"## {title_cn} ({ticker}) — 同花顺 fuyao {path}"
-            f"（{freq_note}，截至 {curr_date}）\n\n{table}"
+            f"（{notes}）\n\n{table}"
         )
 
     def get_balance_sheet(

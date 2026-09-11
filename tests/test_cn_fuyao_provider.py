@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -200,6 +201,143 @@ def test_get_stock_data_3001_maps_to_vendor_empty():
 
 
 # ── 三大报表 / 财务指标 ───────────────────────────────────────────────
+
+
+_FUYAO_FINANCIAL_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "cn_fuyao" / "600873_sh_financial_reports.json"
+)
+
+
+def _fuyao_fixture_items(statement_kind):
+    payload = json.loads(_FUYAO_FINANCIAL_FIXTURE.read_text(encoding="utf-8"))
+    return payload["financials"][statement_kind]
+
+
+def test_fuyao_financial_rows_expose_period_and_report_dates():
+    provider = CnFuyaoProvider()
+    body = _ok_payload(item=_fuyao_fixture_items("cashflow"))
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_fuyao_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ):
+        out = provider.get_cashflow("600873.SH", "quarterly", "2026-09-10")
+
+    assert "2026-08-15" in out  # report_date_ms, not the request cutoff
+    assert "2026-06-30" in out  # period_end_ms
+    assert "分析日 2026-09-10" in out
+    assert "请求截止日 2026-09-10" not in out
+    assert "period_kind=half_year_cumulative" in out
+    from tradingagents.graph.data_collector import _extract_source_as_of
+
+    assert _extract_source_as_of(out, "2026-09-10") == "2026-08-15"
+    assert "period_kind" in out and "period_end" in out and "fiscal_period" in out
+    assert "（单季度" not in out
+    assert "禁止把 H1 累计当作 Q2 单季使用" in out
+    assert "derivation_formula=H1-Q1" in out
+
+
+def test_fuyao_financial_period_kinds_cover_all_report_ends():
+    def row(period, report_date):
+        month_day = {"Q1": "0331", "Q2": "0630", "Q3": "0930", "Q4": "1231"}[period]
+        period_end = f"2026{month_day}"
+        return {
+            "fiscal_year": 2026,
+            "fiscal_period": period,
+            "report_date_ms": CnFuyaoProvider._date_to_ms(report_date),
+            "period_end_ms": CnFuyaoProvider._date_to_ms(
+                f"2026-{month_day[:2]}-{month_day[2:]}"
+            ),
+            "currency": "CNY",
+            "operating_income": 100.0,
+        }
+
+    provider = CnFuyaoProvider()
+    body = _ok_payload(
+        item=[
+            row("Q1", "2026-04-20"),
+            row("Q2", "2026-08-15"),
+            row("Q3", "2026-10-20"),
+            row("Q4", "2027-03-20"),
+        ]
+    )
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_fuyao_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ):
+        income = provider.get_income_statement("600873.SH", "quarterly", "2027-04-01")
+
+    for kind in (
+        "first_quarter",
+        "half_year_cumulative",
+        "nine_month_cumulative",
+        "annual_cumulative",
+    ):
+        assert f"period_kind={kind}" in income
+
+    balance_body = _ok_payload(item=_fuyao_fixture_items("balance"))
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_fuyao_provider.requests.get",
+             return_value=_mock_json_response(balance_body),
+         ):
+        balance = provider.get_balance_sheet("600873.SH", "quarterly", "2026-09-10")
+    assert "period_kind=period_end_stock" in balance
+
+
+def test_fuyao_q2_derivation_refuses_when_q1_is_missing():
+    provider = CnFuyaoProvider()
+    q2 = _fuyao_fixture_items("cashflow")[0]
+    body = _ok_payload(item=[q2])
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_fuyao_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ):
+        out = provider.get_cashflow("600873.SH", "quarterly", "2026-09-10")
+
+    assert "Q2_single_quarter=N/A" in out
+    assert "reason=missing_q1" in out
+    assert "禁止把 H1 累计当作 Q2 单季使用" in out
+
+
+def test_fuyao_future_report_date_is_explicitly_fail_closed():
+    provider = CnFuyaoProvider()
+    row = dict(_fuyao_fixture_items("cashflow")[0])
+    row["report_date_ms"] = CnFuyaoProvider._date_to_ms("2026-09-11")
+    body = _ok_payload(item=[row])
+    with patch.object(provider, "_resolve_api_key", return_value="k"), \
+         patch(
+             "tradingagents.dataflows.providers.cn_fuyao_provider.requests.get",
+             return_value=_mock_json_response(body),
+         ):
+        out = provider.get_cashflow("600873.SH", "quarterly", "2026-09-10")
+
+    assert "report_date_status" in out
+    assert "future" in out
+    assert "2026-09-11" in out
+    assert "389140000" not in out  # future financial values are fail-closed
+    assert "reason=future_report_date" in out
+    assert "derivation_formula=H1-Q1" not in out
+
+
+def test_fuyao_zero_timestamp_falls_back_to_fiscal_period():
+    row = {
+        "fiscal_year": 2026,
+        "fiscal_period": "Q2",
+        "period_end_ms": 0,
+        "report_date_ms": 0,
+        "currency": "CNY",
+        "act_cash_flow_net": 1.0,
+    }
+    df = CnFuyaoProvider._annotate_financial_rows(
+        [row], "cashflow", "2026-09-10"
+    )
+    assert CnFuyaoProvider._ms_to_date_str(0) is None
+    assert df.iloc[0]["period_end"] == "2026-06-30"
+    assert df.iloc[0]["report_date"] == "unknown"
+    assert df.iloc[0]["report_date_status"] == "missing"
 
 
 def test_get_income_statement_markdown():
