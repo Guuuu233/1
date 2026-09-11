@@ -14,6 +14,7 @@ import pytest
 from tradingagents.dataflows.financial_announce import (
     FinancialPeriodKind,
     Q2DerivationResult,
+    _is_scope_comparison_column,
     classify_financial_period_kind,
     derive_q2_from_h1_q1,
     financial_cutoff_header,
@@ -418,3 +419,150 @@ def test_format_q2_derivation_block_failure():
     assert "reason=missing_q1" in block
     assert ("禁止把 H1 累计当作 Q2 单季" in block or "禁止把H1累计当作Q2单季" in block)
     assert "150" not in block  # no fabricated amounts
+
+
+# ── F-3 (DAV-817 / RT-11) Annotated Scope Columns & Amount Isolation ──
+
+
+@pytest.mark.parametrize(
+    "col, expected",
+    [
+        # Exact keywords
+        ("单位", True),
+        ("币种", True),
+        ("合并范围", True),
+        ("会计口径", True),
+        # Legal suffixes
+        ("报表单位", True),
+        ("报表币种", True),
+        ("本期会计口径", True),
+        # Colon annotations (full/half-width, whitespace variations)
+        ("单位：元", True),
+        ("单位:元", True),
+        ("单位: 元", True),
+        ("单位 : 元", True),
+        ("单位：万元", True),
+        ("报表单位：千元", True),
+        ("本期会计口径:新准则", True),
+        # Bracket annotations (full/half-width, square brackets, whitespace)
+        ("币种（CNY）", True),
+        ("币种(CNY)", True),
+        ("币种 (CNY)", True),
+        ("币种（RMB）", True),
+        ("币种 [CNY]", True),
+        ("单位(元)", True),
+        ("单位【元】", True),
+        ("报表币种（CNY）", True),
+        ("会计口径（合并）", True),
+        ("会计口径(合并)", True),
+        # Excluded amount / operational unit subjects
+        ("营业单位", False),
+        ("营业单位：元", False),
+        ("营业单位(元)", False),
+        ("处置子公司及其他营业单位收到的现金净额", False),
+        ("按币种折算金额", False),
+        ("营业收入", False),
+        ("营业收入(元)", False),
+        ("净利润", False),
+        ("每股收益", False),
+        ("", False),
+        (None, False),
+        (123, False),
+    ],
+)
+def test_is_scope_comparison_column_annotated_and_amount_isolation(col, expected):
+    """F-3 unit test: verify scope column recognition with annotations and amount isolation."""
+    assert _is_scope_comparison_column(col) is expected
+
+
+@pytest.mark.parametrize(
+    "scope_col, h1_val, q1_val",
+    [
+        ("单位：元", "元", "万元"),
+        ("单位:元", "元", "万元"),
+        ("单位 : 元", "元", "万元"),
+        ("币种（CNY）", "CNY", "USD"),
+        ("币种(CNY)", "CNY", "USD"),
+        ("币种 (CNY)", "CNY", "USD"),
+        ("报表单位：元", "元", "万元"),
+        ("报表币种（CNY）", "CNY", "USD"),
+        ("会计口径（新准则）", "新准则", "旧准则"),
+        ("本期会计口径:新准则", "新准则", "旧准则"),
+        ("单位：元", "元", None),
+        ("币种（CNY）", "CNY", None),
+        ("币种(CNY)", None, "CNY"),
+    ],
+)
+def test_derive_q2_annotated_scope_columns_mismatch(scope_col, h1_val, q1_val):
+    """F-3 / RT-11: Annotated scope metadata columns trigger scope_mismatch when differing or single-sided missing."""
+    df = pd.DataFrame(
+        {
+            "报告日": ["20240630", "20240331"],
+            scope_col: [h1_val, q1_val],
+            "净利润": [250.0, 100.0],
+        }
+    )
+    res = derive_q2_from_h1_q1("income", df)
+    assert res.period_kind == "unknown"
+    assert res.reason == "scope_mismatch"
+    assert len(res.values) == 0
+
+
+@pytest.mark.parametrize(
+    "scope_col, h1_val, q1_val",
+    [
+        ("单位：元", "元", "元"),
+        ("单位:元", "元", "元"),
+        ("币种（CNY）", "CNY", "CNY"),
+        ("币种(CNY)", "CNY", "CNY"),
+        ("报表单位：千元", "千元", "千元"),
+        ("本期会计口径:新准则", "新准则", "新准则"),
+    ],
+)
+def test_derive_q2_annotated_scope_columns_consistent_derives_success(scope_col, h1_val, q1_val):
+    """F-3 / RT-11: When annotated scope metadata column values match across periods, derivation succeeds."""
+    df = pd.DataFrame(
+        {
+            "报告日": ["20240630", "20240331"],
+            scope_col: [h1_val, q1_val],
+            "净利润": [250.0, 100.0],
+        }
+    )
+    res = derive_q2_from_h1_q1("income", df)
+    assert res.period_kind == "single_quarter_derived"
+    assert res.reason == "ok"
+    assert res.values["净利润"] == 150.0
+
+
+def test_derive_q2_operating_unit_and_amount_columns_not_treated_as_metadata():
+    """F-3 / RT-11: Amount and operating-unit columns do not trigger scope_mismatch even if single-sided missing."""
+    df = pd.DataFrame(
+        {
+            "报告日": ["20240630", "20240331"],
+            "营业单位": [100.0, None],
+            "处置子公司及其他营业单位收到的现金净额": [322188026.4, None],
+            "按币种折算金额": [100.0, None],
+            "经营活动产生的现金流量净额": [500.0, 200.0],
+            "购建固定资产、无形资产和其他长期资产所支付的现金": [1000.0, 400.0],
+        }
+    )
+    res = derive_q2_from_h1_q1("cashflow", df)
+    assert res.period_kind == "single_quarter_derived"
+    assert res.reason == "ok"
+    assert res.values["经营活动产生的现金流量净额"] == 300.0
+    assert res.values["购建固定资产、无形资产和其他长期资产所支付的现金"] == 600.0
+
+
+def test_derive_q2_operating_unit_string_column_does_not_block_income_derivation():
+    """F-3 / RT-11: An operating unit column in income statement with one side missing does not block derivation."""
+    df = pd.DataFrame(
+        {
+            "报告日": ["20240630", "20240331"],
+            "营业单位": ["总部", None],
+            "净利润": [250.0, 100.0],
+        }
+    )
+    res = derive_q2_from_h1_q1("income", df)
+    assert res.period_kind == "single_quarter_derived"
+    assert res.reason == "ok"
+    assert res.values["净利润"] == 150.0

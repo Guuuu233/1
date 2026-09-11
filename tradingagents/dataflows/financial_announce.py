@@ -207,6 +207,20 @@ SCOPE_COMPARISON_COL_KEYWORDS: tuple[str, ...] = (
     "会计口径",
 )
 
+# Operational / entity subjects that end with metadata keywords (e.g. "营业单位")
+# but represent business operating segments / accounting subjects rather than
+# measurement or reporting units. Explicit exclusion prevents false-positive scope mismatches.
+SCOPE_COMPARISON_EXCLUDED_KEYWORDS: tuple[str, ...] = (
+    "营业单位",
+)
+
+# Trailing annotations on metadata columns:
+# 1. Colons: ASCII ':' or full-width '：', followed by comment/value (e.g. '单位：元', '单位: 万元')
+# 2. Brackets: full-width '（...）', '【...】' or ASCII '(...)', '[...]' (e.g. '币种（CNY）', '币种(CNY)')
+_SCOPE_ANNOTATION_RE = re.compile(
+    r"(?:\s*[:：].*|\s*(?:[（(][^）)]*[）)]|[【\[][^】\]]*[】\]]))\s*$"
+)
+
 PERCENTAGE_COL_KEYWORDS: tuple[str, ...] = (
     "同比",
     "环比",
@@ -226,12 +240,36 @@ PER_SHARE_COL_KEYWORDS: tuple[str, ...] = (
 
 
 def _is_scope_comparison_column(column: object) -> bool:
-    """Return whether a column is dedicated comparability metadata."""
+    """Return whether a column is dedicated comparability metadata.
+
+    Recognizes base keywords (e.g. '币种', '单位', '合并范围', '会计口径'),
+    valid prefix/suffix variants (e.g. '报表币种', '报表单位', '本期会计口径'),
+    and annotated variants (e.g. '单位：元', '币种（CNY）', '币种(CNY)').
+
+    Excludes accounting/amount subjects such as '营业单位' (business/operating
+    units) and lines like '处置子公司及其他营业单位收到的现金净额', '按币种折算金额',
+    avoiding arbitrary substring matching.
+    """
     if not isinstance(column, str):
         return False
     name = column.strip()
+    if not name:
+        return False
+
+    # Strip trailing annotations (colons and parenthetical comments)
+    base_name = _SCOPE_ANNOTATION_RE.sub("", name).strip()
+    if not base_name:
+        return False
+
+    # Explicit exclusion for business/operating units ending with "单位"
+    if any(
+        base_name == excluded or base_name.endswith(excluded)
+        for excluded in SCOPE_COMPARISON_EXCLUDED_KEYWORDS
+    ):
+        return False
+
     return any(
-        name == keyword or name.endswith(keyword)
+        base_name == keyword or base_name.endswith(keyword)
         for keyword in SCOPE_COMPARISON_COL_KEYWORDS
     )
 
