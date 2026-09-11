@@ -408,6 +408,18 @@ class HorizonRunMetadata(TypedDict, total=False):
     evaluation_eligible: Annotated[bool, "Whether run is eligible for evaluation (defaults to False/omitted)"]
 
 
+class GameTheorySignals(TypedDict, total=False):
+    board: Annotated[Optional[str], "Board context or sector flow"]
+    players: Annotated[Optional[List[str]], "List of market players"]
+    player_states: Annotated[Optional[dict[str, str]], "Posture of each player"]
+    likely_actions: Annotated[Optional[dict[str, list[str]]], "Likely actions per player"]
+    dominant_strategy: Annotated[Optional[str], "Dominant strategic recommendation"]
+    fragile_equilibrium: Annotated[Optional[str], "Equilibrium fragility assessment"]
+    counter_consensus_signal: Annotated[Optional[str], "Counter-consensus warning or signal"]
+    confidence: Annotated[Optional[float], "Confidence score in [0.0, 1.0]"]
+    data_status: Annotated[Optional[str], "available | partial | unavailable"]
+
+
 class AgentState(MessagesState):
     company_of_interest: Annotated[str, "Company that we are interested in trading"]
     trade_date: Annotated[str, "What date we are trading at"]
@@ -443,6 +455,8 @@ class AgentState(MessagesState):
     macro_report: Annotated[str, "Report from the Macro/Sector Analyst"]
     smart_money_report: Annotated[str, "Report from the Smart Money Analyst"]
     volume_price_report: Annotated[str, "Report from the Volume Price Analyst"]
+    game_theory_report: Annotated[Optional[str], "Report from the Game Theory Analyst"]
+    game_theory_signals: Annotated[Optional[dict[str, Any]], "Structured game theory signals"]
     event_coverage: Annotated[dict[str, Any], "Structured news event evidence and coverage summary"]
     user_intent: Annotated[Optional[UserIntent], "Parsed user intent from natural language"]
     horizon: Annotated[str, "Current analysis horizon: short or medium"]

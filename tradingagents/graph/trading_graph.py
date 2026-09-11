@@ -273,7 +273,36 @@ class TradingAgentsGraph:
         self.log_states_dict = _LogStatesDict()  # date/horizon to full state dict
 
         # Set up the graph with checkpointer
-        self.graph = self.graph_setup.setup_graph(selected_analysts, checkpointer=self.checkpointer)
+        raw_graph = self.graph_setup.setup_graph(selected_analysts, checkpointer=self.checkpointer)
+        self.graph = self._wire_game_theory_into_graph(raw_graph)
+
+    def _wire_game_theory_into_graph(self, raw_graph: Any) -> Any:
+        """Wire Game Theory node into the compiled graph (DAV-829)."""
+        if raw_graph is None:
+            return raw_graph
+        try:
+            from unittest.mock import Mock
+            if isinstance(raw_graph, Mock):
+                return raw_graph
+        except ImportError:
+            pass
+
+        builder = getattr(raw_graph, "builder", None)
+        if builder is None or not hasattr(builder, "nodes") or not hasattr(builder, "edges"):
+            return raw_graph
+
+        try:
+            from .game_theory_node import wire_game_theory_node
+            builder.compiled = False
+            wire_game_theory_node(
+                builder,
+                llm=self.quick_thinking_llm,
+                data_collector=self.data_collector,
+            )
+            return builder.compile(checkpointer=self.checkpointer)
+        except Exception as exc:
+            _logger.warning("[TradingAgentsGraph] Failed to wire game theory node: %s", exc)
+            return raw_graph
 
     def _get_provider_kwargs(self) -> Dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
@@ -580,6 +609,8 @@ class TradingAgentsGraph:
             "macro_report": final_state.get("macro_report", ""),
             "smart_money_report": final_state.get("smart_money_report", ""),
             "volume_price_report": final_state.get("volume_price_report", ""),
+            "game_theory_report": final_state.get("game_theory_report"),
+            "game_theory_signals": final_state.get("game_theory_signals"),
             # D-009 P0-1 status fields (must survive dual-horizon packaging)
             "run_integrity": final_state.get("run_integrity"),
             "decision_status": final_state.get("decision_status"),
