@@ -225,6 +225,16 @@ PER_SHARE_COL_KEYWORDS: tuple[str, ...] = (
 )
 
 
+def _is_scope_comparison_column(column: object) -> bool:
+    """Return whether a column is dedicated comparability metadata."""
+    if not isinstance(column, str):
+        return False
+    name = column.strip()
+    return any(
+        name == keyword or name.endswith(keyword)
+        for keyword in SCOPE_COMPARISON_COL_KEYWORDS
+    )
+
 
 def parse_yyyymmdd(value) -> Optional[date]:
     """Parse common vendor date forms into a ``date``; invalid → None."""
@@ -483,7 +493,7 @@ def derive_q2_from_h1_q1(
     scope_cols = [
         c
         for c in df.columns
-        if any(k in c for k in SCOPE_COMPARISON_COL_KEYWORDS)
+        if _is_scope_comparison_column(c)
     ]
     for sc in scope_cols:
         h1_val = h1_row.get(sc)
@@ -573,7 +583,7 @@ def derive_q2_from_h1_q1(
             for c in df.columns
             if c not in REPORT_COL_CANDIDATES
             and c not in ANNOUNCE_COL_CANDIDATES
-            and not any(k in c for k in SCOPE_COMPARISON_COL_KEYWORDS)
+            and not _is_scope_comparison_column(c)
         ]
         if candidate_cols and all(
             any(p in c for p in PERCENTAGE_COL_KEYWORDS) for c in candidate_cols

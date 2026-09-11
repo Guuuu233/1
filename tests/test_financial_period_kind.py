@@ -5,7 +5,10 @@ D-009 / audit plan §P0-3a contract tests.
 
 from __future__ import annotations
 
+import json
 from datetime import date
+from pathlib import Path
+
 import pytest
 
 from tradingagents.dataflows.financial_announce import (
@@ -247,6 +250,51 @@ def test_derive_q2_cashflow_statement_success_and_excludes_stock():
     assert "期初现金及现金等价物余额" not in res.values
 
 
+def test_derive_q2_cashflow_sina_fixture_ignores_amount_columns_with_scope_words():
+    """600873 cashflow rows must not treat an amount field containing ``单位`` as scope."""
+    fixture_path = (
+        Path(__file__).parent
+        / "fixtures"
+        / "financial_period_kind"
+        / "600873_sh_financial_reports.json"
+    )
+    payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+    income_df = pd.DataFrame(payload["reports"]["income_statement"])
+    df = pd.DataFrame(payload["reports"]["cashflow"])
+
+    income_res = derive_q2_from_h1_q1("income", income_df)
+    res = derive_q2_from_h1_q1("cashflow", df)
+
+    assert income_res.period_kind == "single_quarter_derived"
+    assert income_res.reason == "ok"
+    assert income_res.values["净利润"] == pytest.approx(543941742.16)
+    assert res.period_kind == "single_quarter_derived"
+    assert res.reported_period_label == "2026Q2"
+    assert res.reason == "ok"
+    assert res.values["经营活动产生的现金流量净额"] == pytest.approx(1544697572.57)
+    assert res.values["购建固定资产、无形资产和其他长期资产所支付的现金"] == pytest.approx(612034279.74)
+
+
+def test_derive_q2_ignores_scope_words_inside_amount_columns():
+    """Only dedicated metadata columns may trigger a scope mismatch."""
+    df = pd.DataFrame(
+        {
+            "报告日": ["20240630", "20240331"],
+            "处置子公司及其他营业单位收到的现金净额": [322188026.4, None],
+            "按币种折算金额": [100.0, None],
+            "经营活动产生的现金流量净额": [500.0, 200.0],
+            "购建固定资产、无形资产和其他长期资产所支付的现金": [1000.0, 400.0],
+        }
+    )
+
+    res = derive_q2_from_h1_q1("cashflow", df)
+
+    assert res.period_kind == "single_quarter_derived"
+    assert res.reason == "ok"
+    assert res.values["经营活动产生的现金流量净额"] == 300.0
+    assert res.values["购建固定资产、无形资产和其他长期资产所支付的现金"] == 600.0
+
+
 def test_derive_q2_missing_q1():
     """When Q1 is missing from filtered df, returns missing_q1 without values."""
     df = pd.DataFrame(
@@ -282,6 +330,9 @@ def test_derive_q2_not_h1_latest():
         ("币种", "CNY", "USD"),
         ("单位", "千元", "元"),
         ("会计口径", "新准则", "旧准则"),
+        ("报表币种", "CNY", "USD"),
+        ("报表单位", "千元", "元"),
+        ("本期会计口径", "新准则", "旧准则"),
         ("合并范围", "合并", None),
     ],
 )
