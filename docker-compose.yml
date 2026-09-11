@@ -10,8 +10,6 @@ services:
       - ./data:/app/data
       - ./api:/app/api
       - ./tradingagents:/app/tradingagents
-      - ./tests:/app/tests
-      - ./scripts:/app/scripts
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
