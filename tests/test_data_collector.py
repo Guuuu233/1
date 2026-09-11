@@ -594,3 +594,123 @@ def test_extract_source_as_of_rejects_cached_at_as_data_as_of():
     # 4. 显式日期无法解析时返回 None，记录日志，不得 pass 后填今天或 cached_at
     assert _extract_source_as_of({"as_of": "invalid-date", "cached_at": "2026-08-20"}, "2026-08-21") is None
 
+
+def test_f2_fuyao_red_team_rt5_through_rt12():
+    """Direct validation of D-012 red_team_scenarios RT-5, RT-6, RT-7, RT-8, RT-9, RT-12."""
+    import pandas as pd
+    from tradingagents.dataflows.vendor_result import VendorFail, VendorEmpty
+
+    # RT-5: future-only Fuyao row
+    rt5_table = (
+        "| report_date | period_end | fiscal_period | report_date_status | act_cash_flow_net |\n"
+        "|:---|:---|:---|:---|:---|\n"
+        "| 2026-09-11 | 2026-09-30 | Q3 | future | future（不可用） |"
+    )
+    p5 = _build_source_provenance({"cashflow": rt5_table}, "2026-09-10")
+    assert p5["cashflow"]["status"] == "future"
+    assert p5["cashflow"]["provenance_status"] == "future"
+    assert p5["cashflow"]["actual_as_of"] == "2026-09-11"
+    assert p5["cashflow"]["as_of"] == "2026-09-11"
+    assert "晚于请求日期" in p5["cashflow"]["gap"]
+
+    # RT-6: Fuyao verified four financial sources
+    fuyao_notes = "分析日 2026-09-10；实际报告日 2026-08-15；实际报告日由 report_date_ms 转换为 report_date"
+    cf_table = (
+        f"## 现金流量表 (600873.SH)（{fuyao_notes}）\n\n"
+        "| report_date | period_end | report_date_status | act_cash_flow_net |\n"
+        "|:---|:---|:---|:---|\n"
+        "| 2026-08-15 | 2026-06-30 | verified | 389140000 |"
+    )
+    inc_table = (
+        f"## 利润表 (600873.SH)（{fuyao_notes}）\n\n"
+        "| report_date | period_end | report_date_status | operating_income |\n"
+        "|:---|:---|:---|:---|\n"
+        "| 2026-08-15 | 2026-06-30 | verified | 12235095339.54 |"
+    )
+    bal_table = (
+        f"## 资产负债表 (600873.SH)（{fuyao_notes}）\n\n"
+        "| report_date | period_end | report_date_status | assets_total |\n"
+        "|:---|:---|:---|:---|\n"
+        "| 2026-08-15 | 2026-06-30 | verified | 26785400000 |"
+    )
+    fund_text = (
+        "## Fundamentals for 600873.SH（同花顺 fuyao 财务指标，report=2026-2）\n\n"
+        "- **成长能力**：operating_income=12235095339.54; net_profit=661862706.23"
+    )
+    p6 = _build_source_provenance({
+        "cashflow": cf_table,
+        "income_statement": inc_table,
+        "balance_sheet": bal_table,
+        "fundamentals": fund_text,
+    }, "2026-09-10", daily_as_of="2026-09-10")
+    for k in ("cashflow", "income_statement", "balance_sheet", "fundamentals"):
+        assert p6[k]["status"] == "available", f"{k}: {p6[k]}"
+        assert p6[k]["provenance_status"] == "verified", f"{k}: {p6[k]}"
+        assert p6[k]["actual_as_of"] == "2026-08-15", f"{k}: {p6[k]}"
+        assert p6[k]["as_of"] == "2026-08-15", f"{k}: {p6[k]}"
+        assert "gap" not in p6[k], f"{k}: {p6[k]}"
+
+    # RT-7: only 分析日 or 截至 with financial values
+    p7 = _build_source_provenance({
+        "balance_sheet": "## 资产负债表\n分析日 2026-09-10\n总资产 26785400000",
+        "income_statement": "## 利润表\n截至 2026-09-10\noperating_income=12235095339.54",
+        "cashflow": "## 现金流量表\n请求截止日 2026-09-10\nact_cash_flow_net=389140000",
+        "fundamentals": "## 财务指标\n分析日 2026-09-10\n- **成长能力**：operating_income=12235095339.54",
+    }, "2026-09-10")
+    for k in ("balance_sheet", "income_statement", "cashflow", "fundamentals"):
+        assert p7[k]["status"] == "available_unverified_as_of", f"{k}: {p7[k]}"
+        assert p7[k]["provenance_status"] == "unverified", f"{k}: {p7[k]}"
+        assert p7[k]["actual_as_of"] is None, f"{k}: {p7[k]}"
+        assert p7[k]["as_of"] is None, f"{k}: {p7[k]}"
+        assert "gap" not in p7[k], f"{k}: {p7[k]}"
+
+    # RT-8: provider error, empty table, 【数据获取失败】
+    p8 = _build_source_provenance({
+        "cashflow": VendorFail("上游连接断开"),
+        "balance_sheet": pd.DataFrame(),
+        "income_statement": "【数据获取失败】接口返回的报表行不可解析",
+        "fundamentals": VendorEmpty("无指标数据"),
+    }, "2026-09-10")
+    assert p8["cashflow"]["status"] == "failed"
+    assert p8["cashflow"]["provenance_status"] == "refused"
+    assert p8["balance_sheet"]["status"] == "unavailable"
+    assert p8["balance_sheet"]["provenance_status"] == "refused"
+    assert "未返回可验证数据日期" in p8["balance_sheet"]["gap"]
+    assert p8["income_statement"]["status"] == "failed"
+    assert p8["income_statement"]["provenance_status"] == "refused"
+    assert p8["fundamentals"]["status"] == "unavailable"
+    assert p8["fundamentals"]["provenance_status"] == "refused"
+
+    # RT-9: three-way non-convergence
+    p9 = _build_source_provenance({
+        "cashflow": cf_table,
+        "income_statement": "## 利润表\n分析日 2026-09-10\noperating_income=10000000.0",
+        "balance_sheet": "【数据获取失败】balance_sheet：服务异常",
+        "fundamentals": rt5_table,
+    }, "2026-09-10")
+    assert p9["cashflow"]["status"] == "available" and p9["cashflow"]["provenance_status"] == "verified"
+    assert p9["income_statement"]["status"] == "available_unverified_as_of" and p9["income_statement"]["provenance_status"] == "unverified"
+    assert p9["balance_sheet"]["status"] == "failed" and p9["balance_sheet"]["provenance_status"] == "refused"
+    assert p9["fundamentals"]["status"] == "future" and p9["fundamentals"]["provenance_status"] == "future"
+
+    # RT-12: verified items do not enter failure ledger; future items enter with status=future
+    ledger_ver = []
+    for s, p in p6.items():
+        if p.get("gap"):
+            ledger_ver.append({"source": s, "status": p.get("status"), "gap": p.get("gap")})
+    assert len(ledger_ver) == 0
+
+    p12 = _build_source_provenance({
+        "cashflow": rt5_table,
+        "income_statement": inc_table,
+        "balance_sheet": bal_table,
+        "fundamentals": fund_text,
+    }, "2026-09-10")
+    ledger_mix = []
+    for s, p in p12.items():
+        if p.get("gap"):
+            ledger_mix.append({"source": s, "status": p.get("status"), "gap": p.get("gap")})
+    assert len(ledger_mix) == 1
+    assert ledger_mix[0]["source"] == "cashflow"
+    assert ledger_mix[0]["status"] == "future"
+    assert "晚于请求日期" in ledger_mix[0]["gap"]

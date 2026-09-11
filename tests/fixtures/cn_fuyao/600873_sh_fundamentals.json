@@ -1,0 +1,38 @@
+{
+  "symbol": "600873.SH",
+  "captured_for_analysis_date": "2026-09-10",
+  "report": "2026-2",
+  "report_date": "2026-08-15",
+  "abilities": [
+    {
+      "ability": "growth",
+      "indicators": [
+        {
+          "index_id": "operating_income",
+          "value": 12235095339.54
+        },
+        {
+          "index_id": "net_profit",
+          "value": 661862706.23
+        },
+        {
+          "index_id": "total_assets_growth_ratio",
+          "value": 3.14
+        }
+      ]
+    },
+    {
+      "ability": "solvency",
+      "indicators": [
+        {
+          "index_id": "assets_total",
+          "value": 26785400000.0
+        },
+        {
+          "index_id": "total_debt",
+          "value": 11114500000.0
+        }
+      ]
+    }
+  ]
+}

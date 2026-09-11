@@ -429,3 +429,271 @@ def test_provider_sina_failure_refuses_ths_fallback_and_reports_failure(monkeypa
         assert status in ("failed", "unavailable", "refused")
 
 
+# ── F-2 Fuyao Provenance and RT-5 ~ RT-12 Tests ──────────────────────────────
+
+_FUYAO_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "cn_fuyao" / "600873_sh_financial_reports.json"
+)
+_FUYAO_FUTURE_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "cn_fuyao" / "rt5_future_financial_reports.json"
+)
+_FUYAO_FUNDAMENTALS_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "cn_fuyao" / "600873_sh_fundamentals.json"
+)
+
+
+def _render_fuyao_fixture_markdown(statement_kind: str, curr_date: str = "2026-09-10") -> str:
+    """Render authentic Fuyao provider output from frozen fixture."""
+    from tradingagents.dataflows.providers.cn_fuyao_provider import CnFuyaoProvider
+
+    payload = json.loads(_FUYAO_FIXTURE_PATH.read_text(encoding="utf-8"))
+    items = payload["financials"][statement_kind]
+    title_cn_map = {"balance": "资产负债表", "income": "利润表", "cashflow": "现金流量表"}
+    title_cn = title_cn_map[statement_kind]
+    ticker = payload.get("symbol", "600873.SH")
+
+    df = CnFuyaoProvider._annotate_financial_rows(items, statement_kind, curr_date)
+    visible_df = CnFuyaoProvider._sanitize_future_rows(df)
+    table = CnFuyaoProvider._shrink_table(visible_df, max_rows=12, max_cols=18, table_kind="generic")
+    notes = CnFuyaoProvider._financial_semantic_notes(df, statement_kind, curr_date)
+    derivation = CnFuyaoProvider._q2_derivation_block(df, statement_kind, curr_date)
+    if derivation:
+        table = f"{table}\n\n{derivation}"
+    return f"## {title_cn} ({ticker}) — 同花顺 fuyao /api/a-share/financials/{statement_kind}（{notes}）\n\n{table}"
+
+
+def _render_fuyao_future_fixture_markdown(statement_kind: str, curr_date: str = "2026-09-10") -> str:
+    """Render authentic Fuyao future provider output from frozen future fixture."""
+    from tradingagents.dataflows.providers.cn_fuyao_provider import CnFuyaoProvider
+
+    payload = json.loads(_FUYAO_FUTURE_FIXTURE_PATH.read_text(encoding="utf-8"))
+    items = payload["financials"][statement_kind]
+    title_cn_map = {"balance": "资产负债表", "income": "利润表", "cashflow": "现金流量表"}
+    title_cn = title_cn_map[statement_kind]
+    ticker = payload.get("symbol", "600873.SH")
+
+    df = CnFuyaoProvider._annotate_financial_rows(items, statement_kind, curr_date)
+    visible_df = CnFuyaoProvider._sanitize_future_rows(df)
+    table = CnFuyaoProvider._shrink_table(visible_df, max_rows=12, max_cols=18, table_kind="generic")
+    notes = CnFuyaoProvider._financial_semantic_notes(df, statement_kind, curr_date)
+    derivation = CnFuyaoProvider._q2_derivation_block(df, statement_kind, curr_date)
+    if derivation:
+        table = f"{table}\n\n{derivation}"
+    return f"## {title_cn} ({ticker}) — 同花顺 fuyao /api/a-share/financials/{statement_kind}（{notes}）\n\n{table}"
+
+
+def test_rt5_future_only_fuyao_enters_future_ledger():
+    """RT-5: future-only Fuyao row (report_date=2026-09-11, report_date_status=future, desensitized amount).
+    Expected: status=future, provenance_status=future, not refused.
+    """
+    cf_markdown = _render_fuyao_future_fixture_markdown("cashflow", curr_date="2026-09-10")
+    results = {"cashflow": cf_markdown}
+    prov = _build_source_provenance(results, "2026-09-10")
+
+    entry = prov["cashflow"]
+    assert entry["status"] == "future"
+    assert entry["provenance_status"] == "future"
+    assert entry["actual_as_of"] == "2026-09-11"
+    assert entry["as_of"] == "2026-09-11"
+    assert "晚于请求日期" in entry.get("gap", "")
+    assert "未返回可验证数据日期" not in entry.get("gap", "")
+
+
+def test_rt6_fuyao_verified_four_financial_sources():
+    """RT-6: F-1 600873.SH fixture, actual report date 2026-08-15, analysis date 2026-09-10.
+    Expected: all 4 financial sources available/verified, no '未返回可验证数据日期'.
+    """
+    cf = _render_fuyao_fixture_markdown("cashflow", "2026-09-10")
+    inc = _render_fuyao_fixture_markdown("income", "2026-09-10")
+    bal = _render_fuyao_fixture_markdown("balance", "2026-09-10")
+    fund = (
+        "## Fundamentals for 600873.SH（同花顺 fuyao 财务指标，实际报告日 2026-08-15，report=2026-2）\n\n"
+        "- **成长能力**：operating_income=12235095339.54; net_profit=661862706.23; total_assets_growth_ratio=3.14\n"
+        "- **偿债能力**：assets_total=26785400000; total_debt=11114500000"
+    )
+
+    results = {
+        "cashflow": cf,
+        "income_statement": inc,
+        "balance_sheet": bal,
+        "fundamentals": fund,
+    }
+    prov = _build_source_provenance(results, "2026-09-10", daily_as_of="2026-09-10")
+
+    for key in ("cashflow", "income_statement", "balance_sheet", "fundamentals"):
+        entry = prov[key]
+        assert entry["status"] == "available", f"{key} status mismatch: {entry}"
+        assert entry["provenance_status"] == "verified", f"{key} provenance_status mismatch: {entry}"
+        assert entry["actual_as_of"] == "2026-08-15", f"{key} actual_as_of mismatch: {entry}"
+        assert entry["as_of"] == "2026-08-15", f"{key} as_of mismatch: {entry}"
+        assert "gap" not in entry, f"{key} unexpected gap: {entry.get('gap')}"
+
+
+def test_rt7_unverified_as_of_with_financial_values():
+    """RT-7: only '分析日 2026-09-10' or '截至 2026-09-10' with English/Chinese financial values.
+    Expected: available_unverified_as_of / unverified, does not treat 2026-09-10 as actual date.
+    """
+    results = {
+        "balance_sheet": (
+            "## 资产负债表 (600873.SH) — 缺少实际报告日\n\n"
+            "分析日 2026-09-10；实际报告日缺失\n\n"
+            "| assets_total | total_debt |\n|:---|:---|\n| 26785400000 | 11114500000 |"
+        ),
+        "income_statement": (
+            "## 利润表 (600873.SH)\n\n"
+            "截至 2026-09-10\n\n"
+            "| operating_income | net_profit |\n|:---|:---|\n| 12235095339.54 | 661862706.23 |"
+        ),
+        "cashflow": (
+            "## 现金流量表 (600873.SH)\n\n"
+            "请求截止日 2026-09-10\n\n"
+            "经营活动产生的现金流量净额: 389140000"
+        ),
+        "fundamentals": (
+            "## Fundamentals for 600873.SH\n\n"
+            "分析日 2026-09-10\n\n"
+            "- **成长能力**：operating_income=12235095339.54; net_profit=661862706.23"
+        ),
+    }
+    prov = _build_source_provenance(results, "2026-09-10")
+
+    for key in ("balance_sheet", "income_statement", "cashflow", "fundamentals"):
+        entry = prov[key]
+        assert entry["status"] == "available_unverified_as_of", f"{key}: {entry}"
+        assert entry["provenance_status"] == "unverified", f"{key}: {entry}"
+        assert entry["actual_as_of"] is None, f"{key}: {entry}"
+        assert entry["as_of"] is None, f"{key}: {entry}"
+        assert "gap" not in entry, f"{key}: {entry}"
+
+
+def test_rt8_provider_error_empty_table_failure_remain_refused():
+    """RT-8: provider error, empty table, 【数据获取失败】.
+    Expected: unavailable/refused with existing gap text.
+    """
+    from tradingagents.dataflows.vendor_result import VendorFail, VendorEmpty
+
+    results = {
+        "cashflow": VendorFail("上游连接断开"),
+        "balance_sheet": pd.DataFrame(),
+        "income_statement": "## 利润表 (600873.SH)\n\n【数据获取失败】接口返回的报表行不可解析（分析日 2026-09-10）。",
+        "fundamentals": VendorEmpty("无指标数据"),
+    }
+    prov = _build_source_provenance(results, "2026-09-10")
+
+    assert prov["cashflow"]["status"] == "failed"
+    assert prov["cashflow"]["provenance_status"] == "refused"
+    assert "【数据获取失败】" in prov["cashflow"]["gap"]
+
+    assert prov["balance_sheet"]["status"] == "unavailable"
+    assert prov["balance_sheet"]["provenance_status"] == "refused"
+    assert "未返回可验证数据日期" in prov["balance_sheet"]["gap"]
+
+    assert prov["income_statement"]["status"] == "failed"
+    assert prov["income_statement"]["provenance_status"] == "refused"
+    assert "【数据获取失败】" in prov["income_statement"]["gap"]
+
+    assert prov["fundamentals"]["status"] == "unavailable"
+    assert prov["fundamentals"]["provenance_status"] == "refused"
+    assert "【数据获取失败】" in prov["fundamentals"]["gap"]
+
+
+def test_rt9_three_way_non_convergence():
+    """RT-9: verified, unverified (no date with values), and real failure must not converge."""
+    cf_verified = _render_fuyao_fixture_markdown("cashflow", "2026-09-10")
+    inc_unverified = "## 利润表\n分析日 2026-09-10\noperating_income=10000000.0"
+    bal_failure = "【数据获取失败】balance_sheet：服务异常"
+    fut_row = """| report_date | period_end | fiscal_period | report_date_status | act_cash_flow_net |
+|:---|:---|:---|:---|:---|
+| 2026-09-11 | 2026-09-30 | Q3 | future | future（不可用） |"""
+
+    results = {
+        "cashflow": cf_verified,
+        "income_statement": inc_unverified,
+        "balance_sheet": bal_failure,
+        "fundamentals": fut_row,
+    }
+    prov = _build_source_provenance(results, "2026-09-10")
+
+    # 1. Verified
+    assert prov["cashflow"]["status"] == "available"
+    assert prov["cashflow"]["provenance_status"] == "verified"
+    assert prov["cashflow"]["actual_as_of"] == "2026-08-15"
+    assert "gap" not in prov["cashflow"]
+
+    # 2. Unverified
+    assert prov["income_statement"]["status"] == "available_unverified_as_of"
+    assert prov["income_statement"]["provenance_status"] == "unverified"
+    assert prov["income_statement"]["actual_as_of"] is None
+    assert "gap" not in prov["income_statement"]
+
+    # 3. Failure
+    assert prov["balance_sheet"]["status"] == "failed"
+    assert prov["balance_sheet"]["provenance_status"] == "refused"
+    assert "gap" in prov["balance_sheet"]
+
+    # 4. Future
+    assert prov["fundamentals"]["status"] == "future"
+    assert prov["fundamentals"]["provenance_status"] == "future"
+    assert prov["fundamentals"]["actual_as_of"] == "2026-09-11"
+    assert "晚于请求日期" in prov["fundamentals"]["gap"]
+
+
+def test_rt10_akshare_fallback_semantics(offline_financial_ak):
+    """RT-10: AkShare fallback retains 2026H1, half_year_cumulative, '禁止把 H1 当 Q2 单季使用', verified ledger."""
+    from tradingagents.dataflows.interface import route_to_vendor
+
+    curr_date = "2026-08-21"
+    res = route_to_vendor("get_income_statement", ticker="600900.SH", freq="quarterly", curr_date=curr_date)
+    prov = _build_source_provenance({"income_statement": res}, curr_date)
+
+    assert prov["income_statement"]["status"] == "available"
+    assert prov["income_statement"]["provenance_status"] == "verified"
+    assert prov["income_statement"]["actual_as_of"] == "2026-04-30"
+    assert "gap" not in prov["income_statement"]
+
+
+def test_rt12_fuyao_four_sources_provenance_and_failure_ledger():
+    """RT-12: full Fuyao 4-way results enter source_provenance / market_data_context.
+    Verified cases do NOT enter data_failure_ledger; future cases only enter future gap.
+    """
+    cf_ver = _render_fuyao_fixture_markdown("cashflow", "2026-09-10")
+    inc_ver = _render_fuyao_fixture_markdown("income", "2026-09-10")
+    bal_ver = _render_fuyao_fixture_markdown("balance", "2026-09-10")
+    fund_ver = "## Fundamentals for 600873.SH（同花顺 fuyao 财务指标，实际报告日 2026-08-15，report=2026-2）\n- **成长能力**：operating_income=12235095339.54"
+
+    # Case A: all 4 verified
+    results_ver = {
+        "cashflow": cf_ver,
+        "income_statement": inc_ver,
+        "balance_sheet": bal_ver,
+        "fundamentals": fund_ver,
+    }
+    prov_ver = _build_source_provenance(results_ver, "2026-09-10")
+    failure_ledger_ver = []
+    for s, p in prov_ver.items():
+        gap = p.get("gap")
+        if gap:
+            failure_ledger_ver.append({"source": s, "status": p.get("status"), "gap": gap})
+    assert len(failure_ledger_ver) == 0, f"Verified items should not enter failure ledger: {failure_ledger_ver}"
+
+    # Case B: future cashflow
+    cf_fut = _render_fuyao_future_fixture_markdown("cashflow", "2026-09-10")
+    results_mix = {
+        "cashflow": cf_fut,
+        "income_statement": inc_ver,
+        "balance_sheet": bal_ver,
+        "fundamentals": fund_ver,
+    }
+    prov_mix = _build_source_provenance(results_mix, "2026-09-10")
+    failure_ledger_mix = []
+    for s, p in prov_mix.items():
+        gap = p.get("gap")
+        if gap:
+            failure_ledger_mix.append({"source": s, "status": p.get("status"), "gap": gap})
+
+    assert len(failure_ledger_mix) == 1
+    assert failure_ledger_mix[0]["source"] == "cashflow"
+    assert failure_ledger_mix[0]["status"] == "future"
+    assert "晚于请求日期" in failure_ledger_mix[0]["gap"]
+
+

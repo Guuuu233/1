@@ -1,0 +1,72 @@
+{
+  "symbol": "600873.SH",
+  "captured_for_analysis_date": "2026-09-10",
+  "financials": {
+    "cashflow": [
+      {
+        "thscode": "600873.SH",
+        "ticker": "600873",
+        "period": "quarterly",
+        "fiscal_year": 2026,
+        "fiscal_period": "Q3",
+        "report_date_ms": 1789056000000,
+        "period_end_ms": 1790697600000,
+        "report_date": "2026-09-11",
+        "period_end": "2026-09-30",
+        "fiscal_period": "Q3",
+        "reported_period_label": "2026Q3",
+        "period_kind": "nine_month_cumulative",
+        "derivation_formula": "not_derived",
+        "report_date_status": "future",
+        "currency": "CNY",
+        "act_cash_flow_net": "future（不可用）",
+        "invest_cash_flow_net": "future（不可用）",
+        "financing_cash_flow_net": "future（不可用）",
+        "pay_fixed_assets_etc_cash": "future（不可用）"
+      }
+    ],
+    "income": [
+      {
+        "thscode": "600873.SH",
+        "ticker": "600873",
+        "period": "quarterly",
+        "fiscal_year": 2026,
+        "fiscal_period": "Q3",
+        "report_date_ms": 1789056000000,
+        "period_end_ms": 1790697600000,
+        "report_date": "2026-09-11",
+        "period_end": "2026-09-30",
+        "fiscal_period": "Q3",
+        "reported_period_label": "2026Q3",
+        "period_kind": "nine_month_cumulative",
+        "derivation_formula": "not_derived",
+        "report_date_status": "future",
+        "currency": "CNY",
+        "operating_income": "future（不可用）",
+        "operating_costs": "future（不可用）",
+        "net_profit": "future（不可用）"
+      }
+    ],
+    "balance": [
+      {
+        "thscode": "600873.SH",
+        "ticker": "600873",
+        "period": "quarterly",
+        "fiscal_year": 2026,
+        "fiscal_period": "Q3",
+        "report_date_ms": 1789056000000,
+        "period_end_ms": 1790697600000,
+        "report_date": "2026-09-11",
+        "period_end": "2026-09-30",
+        "fiscal_period": "Q3",
+        "reported_period_label": "2026Q3",
+        "period_kind": "period_end_stock",
+        "derivation_formula": "not_derived",
+        "report_date_status": "future",
+        "currency": "CNY",
+        "assets_total": "future（不可用）",
+        "total_debt": "future（不可用）"
+      }
+    ]
+  }
+}

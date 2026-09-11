@@ -47,6 +47,13 @@ from tradingagents.agents.utils.agent_utils import (
     get_northbound_flow,
 )
 from tradingagents.dataflows.interface import _registry, route_to_vendor
+from tradingagents.dataflows.vendor_result import (
+    VendorEmpty,
+    VendorFail,
+    VendorRefuse,
+    VendorResult,
+)
+from tradingagents.dataflows.trade_calendar import CN_TZ
 from tradingagents.dataflows.providers.cn_akshare_provider import (
     PRICE_BASIS_PIT_ADJUSTED,
     PRICE_BASIS_PIT_RAW,
@@ -833,6 +840,12 @@ def _compact_failure_reason(status: str) -> str:
 
 def _classify_failure_value(value: Any) -> Optional[str]:
     """Classify only explicit failures; None/empty/not_applicable stay non-failure."""
+    if isinstance(value, VendorRefuse):
+        return "refused"
+    if isinstance(value, VendorEmpty):
+        return "unavailable"
+    if isinstance(value, VendorFail):
+        return "failed"
     if isinstance(value, dict):
         status = str(value.get("status") or "").strip().lower()
         if status in {"available", "not_applicable", "ok", "completed"}:
@@ -874,6 +887,10 @@ def _determine_gap_class(source: str, value: Any, status: str) -> str:
       - Unverified as-of, missing completed daily bars.
       - Quality gate / calculation failures.
     """
+    if isinstance(value, VendorRefuse):
+        return "structural"
+    if isinstance(value, (VendorEmpty, VendorFail)):
+        return "operational"
     if isinstance(value, dict):
         explicit_class = value.get("gap_class")
         if explicit_class in ("structural", "operational"):
@@ -886,7 +903,7 @@ def _determine_gap_class(source: str, value: Any, status: str) -> str:
         if any(marker in combined_meta for marker in ("停止披露", "披露停止", "制度性停更", "仅提供当前快照", "仅支持当日快照", "无法用于历史日期分析", "快照拒绝")):
             return "structural"
 
-    text = value if isinstance(value, str) else str(value or "")
+    text = value if isinstance(value, str) else ("" if value is None else str(value))
 
     # 1. Structural Northbound stoppage
     if source == "northbound_flow" or any(marker in text for marker in ("停止披露", "披露停止", "制度性停更", "沪深港通个股每日持股明细自 2024 年 8 月起停止披露")):
@@ -945,6 +962,9 @@ def _build_data_failure_ledger(results: Dict[str, Any]) -> List[Dict[str, str]]:
 
 
 _SOURCE_AS_OF_PATTERNS = (
+    r"实际报告日(?:期)?\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
+    r"report_date\s*[：:=]?\s*(20\d{2}-\d{2}-\d{2})",
+    r"实际公告日\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"最新数据日\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"最新发布时间\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"【数据日期】\s*(20\d{2}-\d{2}-\d{2})",
@@ -953,16 +973,16 @@ _SOURCE_AS_OF_PATTERNS = (
     r"排查基准日\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"数据日期[】：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"生效公告日\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
-    r"截止日(?:期)?\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
+    r"(?<![分析请求查询])截止日(?:期)?\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"统计截止日\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"公告日(?:期)?\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
-    r"报告日(?:期)?\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
+    r"(?<!实际)报告日(?:期)?\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"报告期(?:截止日|日)?\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"解禁日(?:期)?\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"变动日(?:期)?\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"交易日(?:期)?\s*[：:]?\s*(20\d{2}-\d{2}-\d{2})",
     r"截至于\s*(20\d{2}-\d{2}-\d{2})",
-    r"日期\s*[：:]\s*(20\d{2}-\d{2}-\d{2})",
+    r"(?<![分析请求查询])日期\s*[：:]\s*(20\d{2}-\d{2}-\d{2})",
     r"龙虎榜明细[（(]\s*(20\d{2}-\d{2}-\d{2})",
     r"涨停池[（(]\s*(20\d{2}-\d{2}-\d{2})",
     r"(20\d{2}-\d{2}-\d{2})\s+涨停家数",
@@ -972,13 +992,182 @@ _SOURCE_AS_OF_PATTERNS = (
 _SOURCE_AS_OF_YYYYMMDD_PATTERNS = (
     r"查询报告期\s*=\s*(20\d{2})(\d{2})(\d{2})",
     r"报告期\s*[：:=]?\s*(20\d{2})(\d{2})(\d{2})",
+    r"报告日\s*[：:=]?\s*(20\d{2})(\d{2})(\d{2})",
+    r"公告日(?:期)?\s*[：:=]?\s*(20\d{2})(\d{2})(\d{2})",
 )
+
+
+def _extract_table_dates(text: str) -> list[tuple[str, Optional[str]]]:
+    """Extract (date_str, status_str) from markdown tables with report_date column."""
+    if not isinstance(text, str) or "|" not in text:
+        return []
+    results: list[tuple[str, Optional[str]]] = []
+    lines = text.splitlines()
+    header_indices: dict[str, int] = {}
+    in_table = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("|") or not stripped.endswith("|"):
+            in_table = False
+            header_indices = {}
+            continue
+        cells = [c.strip() for c in stripped[1:-1].split("|")]
+        if not in_table:
+            lowered = [c.lower() for c in cells]
+            date_col_idx = None
+            status_col_idx = None
+            for idx, name in enumerate(lowered):
+                if name in ("report_date", "实际报告日", "报告日", "公告日期", "实际公告日", "生效公告日"):
+                    date_col_idx = idx
+                elif name in ("report_date_status", "status"):
+                    status_col_idx = idx
+            if date_col_idx is not None:
+                header_indices = {"date": date_col_idx}
+                if status_col_idx is not None:
+                    header_indices["status"] = status_col_idx
+                in_table = True
+            continue
+
+        if any(c.startswith(":-") or c.startswith("---") or c.endswith("-:") for c in cells):
+            continue
+
+        date_idx = header_indices.get("date")
+        if date_idx is not None and date_idx < len(cells):
+            cell_val = cells[date_idx]
+            match = re.search(r"20\d{2}-\d{2}-\d{2}", cell_val)
+            if match:
+                date_str = match.group(0)
+                status_str = None
+                status_idx = header_indices.get("status")
+                if status_idx is not None and status_idx < len(cells):
+                    status_str = cells[status_idx].strip().lower()
+                results.append((date_str, status_str))
+
+    return results
+
+
+def _detect_source_future_as_of(
+    value: Any, requested_as_of: str
+) -> tuple[bool, Optional[str]]:
+    """Check if value signals a future report date or has dates > requested_as_of."""
+    if isinstance(value, dict):
+        if value.get("status") == "future":
+            return True, value.get("actual_as_of") or value.get("as_of") or value.get("report_date")
+        if value.get("report_date_status") == "future":
+            cand = value.get("report_date") or value.get("as_of") or value.get("actual_as_of")
+            if cand:
+                m = re.search(r"20\d{2}-\d{2}-\d{2}", str(cand))
+                if m:
+                    return True, m.group(0)
+            return True, None
+        for key in (
+            "report_date",
+            "actual_as_of",
+            "as_of",
+            "quote_as_of",
+            "data_as_of",
+            "实际报告日",
+            "生效公告日",
+            "公告日期",
+        ):
+            cand = value.get(key)
+            if cand is not None:
+                m = re.search(r"20\d{2}-\d{2}-\d{2}", str(cand))
+                if m and m.group(0) > requested_as_of:
+                    return True, m.group(0)
+        ms = value.get("report_date_ms")
+        if ms is not None:
+            try:
+                f = float(ms)
+                if f > 0:
+                    d = datetime.fromtimestamp(f / 1000.0, tz=CN_TZ).strftime("%Y-%m-%d")
+                    if d > requested_as_of:
+                        return True, d
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
+        for list_key in ("items", "item", "financials"):
+            rows = value.get(list_key)
+            if isinstance(rows, list):
+                for row in rows:
+                    is_fut, fut_d = _detect_source_future_as_of(row, requested_as_of)
+                    if is_fut:
+                        return True, fut_d
+
+    if isinstance(value, pd.DataFrame):
+        if not value.empty:
+            if "report_date_status" in value.columns:
+                fut_mask = value["report_date_status"].astype(str).eq("future")
+                if fut_mask.any():
+                    if "report_date" in value.columns:
+                        for d in value.loc[fut_mask, "report_date"].astype(str):
+                            if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", d):
+                                return True, d
+                    return True, None
+            if "report_date" in value.columns:
+                for d in value["report_date"].astype(str):
+                    if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", d) and d > requested_as_of:
+                        return True, d
+
+    text = value if isinstance(value, str) else ("" if value is None else str(value))
+    if not text.strip():
+        return False, None
+
+    for d, st in _extract_table_dates(text):
+        if st == "future" or d > requested_as_of:
+            return True, d
+
+    if re.search(r"report_date_status\s*[:=]\s*future", text, re.I):
+        m = re.search(r"report_date\s*[:=]?\s*(20\d{2}-\d{2}-\d{2})", text)
+        if m:
+            return True, m.group(1)
+        all_dates = re.findall(r"20\d{2}-\d{2}-\d{2}", text)
+        future_dates = [ad for ad in all_dates if ad > requested_as_of]
+        if future_dates:
+            return True, max(future_dates)
+        return True, None
+
+    text_dates: list[str] = []
+    for pattern in _SOURCE_AS_OF_PATTERNS:
+        text_dates.extend(match.group(1) for match in re.finditer(pattern, text))
+    for pattern in _SOURCE_AS_OF_YYYYMMDD_PATTERNS:
+        for match in re.finditer(pattern, text):
+            text_dates.append(f"{match.group(1)}-{match.group(2)}-{match.group(3)}")
+    future_text_dates = [d for d in text_dates if d > requested_as_of]
+    if future_text_dates:
+        return True, max(future_text_dates)
+
+    return False, None
 
 
 def _extract_source_as_of(value: Any, requested_as_of: str) -> Optional[str]:
     """Extract the latest explicitly reported source date, excluding request windows."""
+    if isinstance(value, pd.DataFrame):
+        if value.empty:
+            return None
+        for col in ("as_of", "actual_as_of", "report_date", "实际报告日", "报告日", "生效公告日", "公告日期"):
+            if col in value.columns:
+                for val in value[col]:
+                    match = re.search(r"20\d{2}-\d{2}-\d{2}", str(val))
+                    if match and match.group(0) <= requested_as_of:
+                        return match.group(0)
+        return None
+
     if isinstance(value, dict):
-        for key in ("as_of", "actual_as_of", "quote_as_of", "data_as_of"):
+        if value.get("report_date_status") == "future":
+            return None
+        for key in (
+            "as_of",
+            "actual_as_of",
+            "quote_as_of",
+            "data_as_of",
+            "report_date",
+            "实际报告日",
+            "实际公告日",
+            "报告日",
+            "生效公告日",
+            "公告日期",
+        ):
             candidate = value.get(key)
             if candidate is not None:
                 match = re.search(r"20\d{2}-\d{2}-\d{2}", str(candidate))
@@ -987,6 +1176,16 @@ def _extract_source_as_of(value: Any, requested_as_of: str) -> Optional[str]:
                         return match.group(0)
                 else:
                     logger.warning("Explicit date field %s='%s' cannot be parsed", key, candidate)
+        ms = value.get("report_date_ms")
+        if ms is not None:
+            try:
+                f = float(ms)
+                if f > 0:
+                    d = datetime.fromtimestamp(f / 1000.0, tz=CN_TZ).strftime("%Y-%m-%d")
+                    if d <= requested_as_of:
+                        return d
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
         return None
 
     if hasattr(value, "fund_flow_evidence_meta") and isinstance(value.fund_flow_evidence_meta, dict):
@@ -1000,7 +1199,7 @@ def _extract_source_as_of(value: Any, requested_as_of: str) -> Optional[str]:
                 else:
                     logger.warning("fund_flow_evidence_meta date field %s='%s' cannot be parsed", key, candidate)
 
-    if hasattr(value, "as_of") and getattr(value, "as_of"):
+    if hasattr(value, "as_of") and not callable(getattr(value, "as_of")):
         candidate = getattr(value, "as_of")
         if candidate is not None:
             match = re.search(r"20\d{2}-\d{2}-\d{2}", str(candidate))
@@ -1010,8 +1209,15 @@ def _extract_source_as_of(value: Any, requested_as_of: str) -> Optional[str]:
             else:
                 logger.warning("Explicit as_of attribute '%s' cannot be parsed", candidate)
 
-    text = value if isinstance(value, str) else str(value or "")
+    text = value if isinstance(value, str) else ("" if value is None else str(value))
     candidates: list[str] = []
+
+    # 1. Extract from markdown tables
+    for d, st in _extract_table_dates(text):
+        if st != "future" and d <= requested_as_of:
+            candidates.append(d)
+
+    # 2. Extract from regex patterns
     for pattern in _SOURCE_AS_OF_PATTERNS:
         candidates.extend(match.group(1) for match in re.finditer(pattern, text))
     for pattern in _SOURCE_AS_OF_YYYYMMDD_PATTERNS:
@@ -1130,7 +1336,7 @@ def _extract_industry_linkage_actual_as_of(value: Any, requested_as_of: str) -> 
 def _build_source_provenance(
     results: Dict[str, Any],
     requested_as_of: str,
-    daily_as_of: Optional[str],
+    daily_as_of: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Persist per-source cutoff evidence beside the compact failure ledger."""
     provenance: Dict[str, Dict[str, Any]] = {}
@@ -1170,6 +1376,23 @@ def _build_source_provenance(
         if source == "stock_data":
             as_of = daily_as_of
 
+        # Sibling inheritance for fundamentals: when fundamentals has values but no explicit ISO date,
+        # inherit verified report date from sibling statement if present.
+        if (
+            source == "fundamentals"
+            and as_of is None
+            and _has_financial_field_value_pair(value)
+        ):
+            is_fut, _ = _detect_source_future_as_of(value, requested_as_of)
+            if not is_fut:
+                for sibling_key in ("balance_sheet", "income_statement", "cashflow"):
+                    sib_val = results.get(sibling_key)
+                    if sib_val is not None:
+                        sib_as_of = _extract_source_as_of(sib_val, requested_as_of)
+                        if sib_as_of and sib_as_of <= requested_as_of:
+                            as_of = sib_as_of
+                            break
+
         if classified_status is not None:
             status = classified_status
             gap_class = _determine_gap_class(str(source), value, status)
@@ -1198,8 +1421,35 @@ def _build_source_provenance(
                     ),
                     "provenance_status": "refused",
                 }
+            elif as_of is not None and as_of > requested_as_of:
+                entry = {
+                    "requested_as_of": requested_as_of,
+                    "actual_as_of": as_of,
+                    "as_of": as_of,
+                    "status": "future",
+                    "gap_class": "operational",
+                    "gap": f"【数据获取失败】{source}：实际最新数据日 {as_of} 晚于请求日期 {requested_as_of}",
+                    "provenance_status": "future",
+                }
             elif as_of is None and source != "realtime":
-                if (
+                is_future, future_date = _detect_source_future_as_of(value, requested_as_of)
+                if is_future:
+                    actual_future_date = future_date
+                    gap_msg = (
+                        f"【数据获取失败】{source}：实际最新数据日 {actual_future_date} 晚于请求日期 {requested_as_of}"
+                        if actual_future_date
+                        else f"【数据获取失败】{source}：数据日期晚于请求日期 {requested_as_of}"
+                    )
+                    entry = {
+                        "requested_as_of": requested_as_of,
+                        "actual_as_of": actual_future_date,
+                        "as_of": actual_future_date,
+                        "status": "future",
+                        "gap_class": "operational",
+                        "gap": gap_msg,
+                        "provenance_status": "future",
+                    }
+                elif (
                     source in _FINANCIAL_PROVENANCE_SOURCES
                     and _has_financial_field_value_pair(value)
                 ):
@@ -1225,17 +1475,7 @@ def _build_source_provenance(
                         "provenance_status": "refused",
                     }
             else:
-                if as_of is not None and as_of > requested_as_of:
-                    entry = {
-                        "requested_as_of": requested_as_of,
-                        "actual_as_of": as_of,
-                        "as_of": as_of,
-                        "status": "future",
-                        "gap_class": "operational",
-                        "gap": f"【数据获取失败】{source}：实际最新数据日 {as_of} 晚于请求日期 {requested_as_of}",
-                        "provenance_status": "future",
-                    }
-                elif as_of is None:
+                if as_of is None:
                     entry = {
                         "requested_as_of": requested_as_of,
                         "actual_as_of": None,
@@ -1743,6 +1983,7 @@ _FINANCIAL_PROVENANCE_SOURCES = frozenset(
 )
 # Field names that must appear paired with a numeric value — codes/years alone do not count.
 _FINANCIAL_FIELD_NAMES = (
+    # Chinese fields
     "总资产",
     "总负债",
     "净资产",
@@ -1755,7 +1996,11 @@ _FINANCIAL_FIELD_NAMES = (
     "存货",
     "营业总收入",
     "营业收入",
+    "营业成本",
     "营业总成本",
+    "营业利润",
+    "利润总额",
+    "所得税费用",
     "净利润",
     "归属于母公司所有者的净利润",
     "归属于母公司",
@@ -1763,25 +2008,182 @@ _FINANCIAL_FIELD_NAMES = (
     "毛利率",
     "经营活动产生的现金流量净额",
     "经营活动现金流入小计",
+    "经营活动现金流出小计",
     "销售商品、提供劳务收到的现金",
+    "购买商品、接受劳务支付的现金",
+    "支付给职工以及为职工支付的现金",
+    "支付的各项税费",
+    "投资活动产生的现金流量净额",
+    "筹资活动产生的现金流量净额",
+    "购建固定资产、无形资产和其他长期资产所支付的现金",
+    "现金及现金等价物净增加额",
+    "销售费用",
+    "管理费用",
+    "财务费用",
+    # Fuyao English fields
+    "act_cash_flow_net",
+    "invest_cash_flow_net",
+    "financing_cash_flow_net",
+    "pay_fixed_assets_etc_cash",
+    "cash_received_from_sales",
+    "cash_operating_inflow",
+    "cash_paid_for_goods",
+    "cash_paid_to_employees",
+    "taxes_paid",
+    "cash_operating_outflow",
+    "cash_net_increase",
+    "operating_income",
+    "operating_revenue",
+    "operating_costs",
+    "operating_expenses",
+    "sales_fee",
+    "selling_expenses",
+    "manage_fee",
+    "management_expenses",
+    "financial_expenses",
+    "finance_fee",
+    "operating_profit",
+    "total_profit",
+    "income_tax",
+    "net_profit",
+    "parent_net_profit",
+    "net_profit_parent",
+    "assets_total",
+    "total_assets",
+    "total_debt",
+    "debt_total",
+    "net_assets",
+    "monetary_funds",
+    "accounts_receivable",
+    "inventory",
+    "total_equity",
+    "equity_total",
+    "total_assets_growth_ratio",
+    "net_profit_growth_ratio",
+    "operating_revenue_growth_ratio",
 )
+
+
+def _is_financial_numeric_value(cell: Any) -> bool:
+    """True if cell represents a real financial numeric amount.
+
+    0, 0.0, Decimal(0) are valid numbers.
+    Strings like 'future（不可用）', 'unknown', 'missing', '缺失', 'N/A', '--' are not.
+    """
+    if cell is None or pd.isna(cell):
+        return False
+    if isinstance(cell, bool):
+        return False
+    if isinstance(cell, (int, float, Decimal)):
+        return True
+    text = str(cell).strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered in ("nan", "none", "null", "nat", "unknown", "missing", "缺失", "n/a", "--", "-"):
+        return False
+    if "future" in lowered or "不可用" in text:
+        return False
+    cleaned = text.replace(",", "")
+    if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", cleaned):
+        return False
+    try:
+        float(cleaned)
+        return True
+    except ValueError:
+        return False
 
 
 def _has_financial_field_value_pair(value: Any) -> bool:
     """True only when a known financial field name is paired with a numeric value.
 
     Stock codes (e.g. 688981.SH) and bare report years must not count as data.
+    0 / 0.0 / Decimal(0) are valid numeric values.
+    Desensitized placeholders like 'future（不可用）' do not count as numeric.
     """
-    text = value if isinstance(value, str) else str(value or "")
+    if value is None:
+        return False
+
+    if isinstance(value, pd.DataFrame):
+        if value.empty:
+            return False
+        for col in value.columns:
+            if str(col).strip() in _FINANCIAL_FIELD_NAMES:
+                for val in value[col]:
+                    if _is_financial_numeric_value(val):
+                        return True
+        return False
+
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if str(k).strip() in _FINANCIAL_FIELD_NAMES:
+                if _is_financial_numeric_value(v):
+                    return True
+        abilities = value.get("abilities")
+        if isinstance(abilities, list):
+            for block in abilities:
+                if isinstance(block, dict):
+                    for ind in block.get("indicators", []):
+                        if isinstance(ind, dict):
+                            idx = str(ind.get("index_id") or "").strip()
+                            if idx in _FINANCIAL_FIELD_NAMES and _is_financial_numeric_value(ind.get("value")):
+                                return True
+        for sub_key in ("cashflow", "income", "balance", "items", "item"):
+            sub_list = value.get(sub_key)
+            if isinstance(sub_list, list):
+                for row in sub_list:
+                    if _has_financial_field_value_pair(row):
+                        return True
+        return False
+
+    if isinstance(value, list):
+        for item in value:
+            if _has_financial_field_value_pair(item):
+                return True
+        return False
+
+    text = value if isinstance(value, str) else ("" if value is None else str(value))
     if not text.strip():
         return False
+
+    if "|" in text:
+        lines = text.splitlines()
+        header_indices: dict[int, str] = {}
+        in_table = False
+        for line in lines:
+            stripped = line.strip()
+            if not stripped.startswith("|") or not stripped.endswith("|"):
+                in_table = False
+                header_indices = {}
+                continue
+            cells = [c.strip() for c in stripped[1:-1].split("|")]
+            if not in_table:
+                for idx, c in enumerate(cells):
+                    if c in _FINANCIAL_FIELD_NAMES:
+                        header_indices[idx] = c
+                if header_indices:
+                    in_table = True
+                continue
+            if any(c.startswith(":-") or c.startswith("---") or c.endswith("-:") for c in cells):
+                continue
+            for idx in header_indices:
+                if idx < len(cells) and _is_financial_numeric_value(cells[idx]):
+                    return True
+
     for field in _FINANCIAL_FIELD_NAMES:
-        # 「总资产 123.45」/ 「总资产：123」/ 「总资产=123」
-        if re.search(rf"{re.escape(field)}\s*[:：=]?\s*-?\d", text):
-            return True
-        # table-ish 「123.45 总资产」
-        if re.search(rf"-?\d[\d,.]*(?:\s+|\|){re.escape(field)}", text):
-            return True
+        field_esc = re.escape(field)
+        prefix = r"(?:\b|_)" if field[0].isascii() else r"(?:^|[^\w])"
+        pattern_after = rf"{prefix}{field_esc}\s*[:：=]?\s*(-?[\d,]+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b"
+        for m in re.finditer(pattern_after, text):
+            val_str = m.group(1).replace(",", "")
+            if _is_financial_numeric_value(val_str):
+                return True
+        pattern_before = rf"(-?[\d,]+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*(?:\||\s+){field_esc}"
+        for m in re.finditer(pattern_before, text):
+            val_str = m.group(1).replace(",", "")
+            if _is_financial_numeric_value(val_str):
+                return True
+
     return False
 
 
@@ -2450,7 +2852,11 @@ def _fetch_all(
                 {
                     "source": str(source),
                     "status": str(provenance.get("status") or "unavailable"),
-                    "reason": "unverified as-of",
+                    "reason": (
+                        "future as-of"
+                        if provenance.get("status") == "future"
+                        else "unverified as-of"
+                    ),
                     "gap": str(gap),
                     "gap_class": str(provenance.get("gap_class") or "operational"),
                 }
