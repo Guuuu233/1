@@ -625,7 +625,16 @@ def resolve_horizon_return_label(
             import io
 
             start_fetch = window.signal_date
-            end_fetch = window.roll_candidate_dates[-1] if window.roll_candidate_dates else window.target_calendar_date
+            signal_idx = trading_days.index(signal_date)
+            eval_offset = window.eval_offset
+            max_roll = window.max_roll_days
+            subsequent_idx = signal_idx + eval_offset + max_roll + 1
+            if subsequent_idx < len(trading_days):
+                end_fetch = trading_days[subsequent_idx]
+            elif window.roll_candidate_dates:
+                end_fetch = window.roll_candidate_dates[-1]
+            else:
+                end_fetch = window.target_calendar_date
             csv_data = route_to_vendor("get_stock_data", clean_symbol, start_fetch, end_fetch)
             if not csv_data or str(csv_data).startswith("【数据获取失败】") or str(csv_data).startswith("No data found"):
                 provider_failed = True
@@ -741,7 +750,12 @@ def resolve_horizon_return_label(
                 _, _, _, t2_c, t2_v, _, _, _ = _extract_bar_fields(t2_bar)
                 if t2_c is not None and t2_c > 0 and t2_v > 0:
                     has_subsequent = True
-        entry_status = OutcomeStatus.SUSPENSION.value if (has_preceding and has_subsequent) else OutcomeStatus.DATA_MISSING.value
+        # T+1 suspension proves entry was unexecutable (never entered), so status is UNEXECUTABLE_ENTRY
+        entry_status = (
+            OutcomeStatus.UNEXECUTABLE_ENTRY.value
+            if (has_preceding and has_subsequent)
+            else OutcomeStatus.DATA_MISSING.value
+        )
 
         return HorizonReturnResult(
             symbol=clean_symbol,
