@@ -905,10 +905,29 @@ def _get_price_after_strict(symbol: str, base_date: str, hold_days: int) -> Opti
         date_cols = [c for c in df.columns if "date" in c.lower() or "日期" in c or "time" in c.lower()]
         if not close_cols or not date_cols:
             return None
-        df = df.sort_values(date_cols[0]).reset_index(drop=True)
-        if len(df) < max(1, hold_days):
+
+        date_col = date_cols[0]
+        close_col = close_cols[0]
+        df[date_col] = df[date_col].astype(str).str[:10]
+        df = df.sort_values(date_col).drop_duplicates(subset=[date_col]).reset_index(drop=True)
+
+        from tradingagents.dataflows.trade_calendar import trading_days_forward
+
+        df_dates = sorted(df[date_col].unique())
+        try:
+            target_days = trading_days_forward(base_date, hold_days, calendar_dates=df_dates)
+            if len(target_days) < hold_days:
+                return None
+            target_date = target_days[hold_days - 1]
+        except Exception:
             return None
-        return float(df[close_cols[0]].iloc[hold_days - 1])
+
+        match = df[df[date_col] == target_date]
+        if not match.empty:
+            val = float(match.iloc[0][close_col])
+            if val > 0:
+                return val
+        return None
     except Exception:
         return None
 
