@@ -191,15 +191,14 @@ def _get_price_after(
     *,
     trading_days: Optional[Sequence[str]] = None,
     max_roll_days: int = 0,
-    use_calendar: bool = False,
 ) -> Optional[float]:
     """Fetch closing price hold_days trading days after base_date using akshare or raw provider.
 
     Refuses to shorten hold_days when the fetched series is shorter than hold_days;
     returns None to ensure strict T+N evaluation (D-009 / P1-3).
-    When trading_days is provided, use_calendar=True, or max_roll_days > 0, resolves the exact
-    target trading day and roll candidates via trading calendar semantics (V-01-2 / DAV-830)
-    instead of row-count slicing, avoiding date drift on holidays, weekends, and missing rows.
+    Resolves the exact target trading day and roll candidates via trading calendar semantics
+    (V-01-2 / DAV-830) strictly based on date matching, completely eliminating naive row-count
+    slicing (iloc[hold_days - 1]) and avoiding date drift on holidays, weekends, and missing rows.
     When price_basis is PRICE_BASIS_VENDOR_QFQ (default): routes to existing vendor get_stock_data.
     When price_basis is PRICE_BASIS_RAW: routes to cn_akshare provider with price_basis="raw".
     When price_basis is neither (unspecified, pit_raw, pit_adjusted, unknown): fails closed (returns None).
@@ -278,52 +277,48 @@ def _get_price_after(
         df[date_col] = df[date_col].astype(str).str[:10]
         df = df.sort_values(date_col).drop_duplicates(subset=[date_col]).reset_index(drop=True)
 
-        if trading_days is not None or use_calendar or max_roll_days > 0:
-            from tradingagents.dataflows.trade_calendar import trading_days_forward
+        df_dates = sorted(df[date_col].unique())
 
-            target_date: Optional[str] = None
-            candidate_dates: list[str] = []
+        from tradingagents.dataflows.trade_calendar import trading_days_forward
 
-            if trading_days is not None:
-                try:
-                    target_days = trading_days_forward(
-                        base_date, hold_days + max_roll_days, calendar_dates=trading_days
-                    )
-                    if len(target_days) >= hold_days:
-                        target_date = target_days[hold_days - 1]
-                        candidate_dates = target_days[hold_days : hold_days + max_roll_days]
-                except Exception:
-                    target_date = None
-            else:
-                try:
-                    target_days = trading_days_forward(base_date, hold_days + max_roll_days)
-                    if len(target_days) >= hold_days:
-                        target_date = target_days[hold_days - 1]
-                        candidate_dates = target_days[hold_days : hold_days + max_roll_days]
-                except Exception:
-                    target_date = None
+        target_date: Optional[str] = None
+        candidate_dates: list[str] = []
 
-            if not target_date:
+        if trading_days is not None:
+            try:
+                target_days = trading_days_forward(
+                    base_date, hold_days + max_roll_days, calendar_dates=trading_days
+                )
+                if len(target_days) >= hold_days:
+                    target_date = target_days[hold_days - 1]
+                    candidate_dates = target_days[hold_days : hold_days + max_roll_days]
+                else:
+                    return None
+            except Exception:
                 return None
+        else:
+            if len(df_dates) < max(1, hold_days):
+                return None
+            target_date = df_dates[hold_days - 1]
+            candidate_dates = df_dates[hold_days : hold_days + max_roll_days] if max_roll_days > 0 else []
 
-            match = df[df[date_col] == target_date]
+        if not target_date:
+            return None
+
+        match = df[df[date_col] == target_date]
+        if not match.empty:
+            val = float(match.iloc[0][close_col])
+            if val > 0:
+                return val
+
+        for c_date in candidate_dates:
+            match = df[df[date_col] == c_date]
             if not match.empty:
                 val = float(match.iloc[0][close_col])
                 if val > 0:
                     return val
 
-            for c_date in candidate_dates:
-                match = df[df[date_col] == c_date]
-                if not match.empty:
-                    val = float(match.iloc[0][close_col])
-                    if val > 0:
-                        return val
-
-            return None
-        else:
-            if len(df) < max(1, hold_days):
-                return None
-            return float(df[close_col].iloc[hold_days - 1])
+        return None
     except Exception as exc:
         logger.warning(
             "_get_price_after failed for %s @ %s (hold_days=%s, price_basis=%s): %s",
