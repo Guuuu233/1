@@ -907,8 +907,10 @@ def resolve_horizon_return_label(
     assert actual_exit_date is not None
 
     if return_type == ReturnType.TOTAL_RETURN.value:
-        # RT-5: Missing dividend data must fail-closed, never silently treated as 0
-        if dividend_data is None:
+        # RT-5 & RT-9: Atomic completeness for total_return.
+        # Both dividend_data and split_data MUST be present.
+        # If either is None, fail-closed to DATA_MISSING to prevent fake crashes (-50% drop on unadjusted split).
+        if dividend_data is None or split_data is None:
             return HorizonReturnResult(
                 symbol=clean_symbol,
                 horizon=horizon,
@@ -941,13 +943,12 @@ def resolve_horizon_return_label(
                     pass
 
         split_total = 1.0
-        if split_data is not None:
-            for s_str, s_val in split_data.items():
-                if entry_date < s_str <= actual_exit_date:
-                    try:
-                        split_total *= float(s_val)
-                    except (ValueError, TypeError):
-                        pass
+        for s_str, s_val in split_data.items():
+            if entry_date < s_str <= actual_exit_date:
+                try:
+                    split_total *= float(s_val)
+                except (ValueError, TypeError):
+                    pass
 
         effective_exit = actual_exit_price * split_total + cash_div_total
         raw_ret = (effective_exit - entry_price) / entry_price * 100.0

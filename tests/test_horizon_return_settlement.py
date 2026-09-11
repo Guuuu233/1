@@ -533,3 +533,169 @@ class TestRT8CrossProfilePoolIsolation:
             rep_short, target_horizon=None
         )
         assert admissible_short_for_legacy is False, "Legacy T+5 must NOT admit explicit short samples"
+
+
+# ==============================================================================
+# RT-9: 分红/送转半缺失形态（total_return 口径下防假暴跌）
+# ==============================================================================
+
+
+class TestRT9TotalReturnMissingSplitPreventFakeCrash:
+    """RT-9: Verifies atomic completeness of dividend and split data under total_return."""
+
+    def test_missing_split_data_fails_closed_preventing_fake_drop(self):
+        """When split data is missing (None), must fail-closed to DATA_MISSING, preventing -50% fake drop."""
+        # Suppose a stock split 10送10 (ratio 2.0) occurs, halving price from 20.0 to 10.0
+        # If split_data is missing (None) and defaulted to 1.0, return would falsely show -50%!
+        bars = {
+            "2024-02-01": {"close": 20.0, "volume": 1000},
+            "2024-02-02": {"open": 20.0, "close": 20.0, "volume": 1000},
+            "2024-02-23": {"open": 10.0, "close": 10.0, "volume": 1500},  # Post-split price
+        }
+        # Dividend data is provided, but split data is missing (None)
+        dividends = {"2024-02-19": 0.0}
+
+        res = rl.resolve_horizon_return_label(
+            symbol="600519.SH",
+            signal_date="2024-02-01",
+            horizon="short",
+            trading_days=FIXTURE_SPRING_FESTIVAL_2024,
+            as_of="2024-02-23",
+            as_of_market_closed=True,
+            bar_data=bars,
+            return_type=rl.ReturnType.TOTAL_RETURN.value,
+            dividend_data=dividends,
+            split_data=None,  # Missing split data!
+        )
+
+        assert res["outcome_status"] == rl.OutcomeStatus.DATA_MISSING.value
+        assert res["return_pct"] is None, "Must NOT compute return with unadjusted split ratio (prevent -50% fake crash)"
+        assert res["evaluation_eligible"] is False
+
+    def test_missing_dividend_data_fails_closed_atomic_completeness(self):
+        """When dividend data is missing (None) but split data provided, atomic completeness fails closed."""
+        bars = {
+            "2024-02-01": {"close": 20.0, "volume": 1000},
+            "2024-02-02": {"open": 20.0, "close": 20.0, "volume": 1000},
+            "2024-02-23": {"open": 12.0, "close": 12.0, "volume": 1500},
+        }
+        splits = {"2024-02-20": 2.0}
+
+        res = rl.resolve_horizon_return_label(
+            symbol="600519.SH",
+            signal_date="2024-02-01",
+            horizon="short",
+            trading_days=FIXTURE_SPRING_FESTIVAL_2024,
+            as_of="2024-02-23",
+            as_of_market_closed=True,
+            bar_data=bars,
+            return_type=rl.ReturnType.TOTAL_RETURN.value,
+            dividend_data=None,  # Missing dividend data!
+            split_data=splits,
+        )
+
+        assert res["outcome_status"] == rl.OutcomeStatus.DATA_MISSING.value
+        assert res["return_pct"] is None
+        assert res["evaluation_eligible"] is False
+
+    def test_both_present_calculates_accurately(self):
+        """When both dividend and split data are present, computes return accurately."""
+        bars = {
+            "2024-02-01": {"close": 20.0, "volume": 1000},
+            "2024-02-02": {"open": 20.0, "close": 20.0, "volume": 1000},
+            "2024-02-23": {"open": 12.0, "close": 12.0, "volume": 1500},
+        }
+        dividends = {"2024-02-19": 0.50}
+        splits = {"2024-02-20": 2.0}
+
+        res = rl.resolve_horizon_return_label(
+            symbol="600519.SH",
+            signal_date="2024-02-01",
+            horizon="short",
+            trading_days=FIXTURE_SPRING_FESTIVAL_2024,
+            as_of="2024-02-23",
+            as_of_market_closed=True,
+            bar_data=bars,
+            return_type=rl.ReturnType.TOTAL_RETURN.value,
+            dividend_data=dividends,
+            split_data=splits,
+        )
+
+        assert res["outcome_status"] == rl.OutcomeStatus.EVALUATED_OK.value
+        # effective_exit = 12.0 * 2.0 + 0.50 = 24.50
+        # return_pct = (24.50 - 20.0) / 20.0 * 100 = 22.5%
+        assert res["return_pct"] == 22.5
+        assert res["cash_dividend_total"] == 0.50
+        assert res["split_ratio_total"] == 2.0
+        assert res["evaluation_eligible"] is True
+
+
+# ==============================================================================
+# RT-10: 不受支持的价格基准与日历异常，严禁回退行切片
+# ==============================================================================
+
+
+class TestRT10UnsupportedPriceBasisAndCalendarFailClosed:
+    """RT-10: Verifies unsupported price_basis and calendar failure fail-closed behavior (no iloc fallback)."""
+
+    @pytest.mark.parametrize(
+        "bad_basis",
+        ["unspecified", "pit_raw", "pit_adjusted", "unknown_price_basis", "invalid"],
+    )
+    def test_unsupported_price_basis_returns_unsupported_status_in_resolve_label(self, bad_basis):
+        """resolve_horizon_return_label fails closed with UNSUPPORTED_PRICE_BASIS on unknown basis."""
+        res = rl.resolve_horizon_return_label(
+            symbol="600519.SH",
+            signal_date="2024-02-01",
+            horizon="short",
+            trading_days=FIXTURE_SPRING_FESTIVAL_2024,
+            as_of="2024-02-23",
+            as_of_market_closed=True,
+            price_basis=bad_basis,
+        )
+
+        assert res["outcome_status"] == rl.OutcomeStatus.UNSUPPORTED_PRICE_BASIS.value
+        assert res["price_basis"] == bad_basis
+        assert res["return_pct"] is None
+        assert res["evaluation_eligible"] is False
+
+    @pytest.mark.parametrize(
+        "bad_basis",
+        ["unspecified", "pit_raw", "pit_adjusted", "unknown_price_basis"],
+    )
+    def test_unsupported_price_basis_returns_none_in_backtest_service(self, bad_basis):
+        """backtest_service._get_price_after fails closed with None on unsupported price_basis."""
+        price = bt._get_price_after("600519.SH", "2024-01-01", 5, price_basis=bad_basis)
+        assert price is None, f"_get_price_after must return None on unsupported price_basis {bad_basis!r}"
+
+    def test_insufficient_trading_calendar_raises_error_no_silent_iloc_fallback(self):
+        """When trading calendar is truncated/insufficient, raises InsufficientTradingCalendarError (no iloc fallback)."""
+        # Calendar only covers up to T+9 (needs T+10 + 2 roll = T+12)
+        truncated_calendar = FIXTURE_SPRING_FESTIVAL_2024[:10]
+
+        with pytest.raises(rl.InsufficientTradingCalendarError):
+            rl.resolve_horizon_return_label(
+                symbol="600519.SH",
+                signal_date="2024-02-01",
+                horizon="short",
+                trading_days=truncated_calendar,
+                as_of="2024-02-23",
+                as_of_market_closed=True,
+            )
+
+    def test_calendar_aware_backtest_does_not_fall_back_to_iloc_when_calendar_insufficient(self):
+        """backtest_service._get_price_after with explicit trading_days fails closed to None when calendar insufficient."""
+        csv_data = "date,close\n2024-01-02,100\n2024-01-03,101\n2024-01-04,102\n2024-01-05,103\n2024-01-08,104\n"
+        # Calendar only has 2 days (insufficient for hold_days=5)
+        short_calendar = ["2024-01-02", "2024-01-03"]
+
+        with patch("tradingagents.dataflows.interface.route_to_vendor", return_value=csv_data):
+            price = bt._get_price_after(
+                "600519.SH",
+                "2024-01-01",
+                5,
+                trading_days=short_calendar,
+                max_roll_days=2,
+            )
+            # Must return None, absolutely never fall back to iloc[4]
+            assert price is None
