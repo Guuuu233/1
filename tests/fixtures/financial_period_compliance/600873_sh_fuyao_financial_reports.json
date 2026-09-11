@@ -1,0 +1,90 @@
+{
+  "symbol": "600873.SH",
+  "captured_for_analysis_date": "2026-09-10",
+  "financials": {
+    "cashflow": [
+      {
+        "thscode": "600873.SH",
+        "ticker": "600873",
+        "period": "quarterly",
+        "fiscal_year": 2026,
+        "fiscal_period": "Q2",
+        "report_date_ms": 1786723200000,
+        "period_end_ms": 1782748800000,
+        "currency": "CNY",
+        "act_cash_flow_net": 389140000,
+        "invest_cash_flow_net": -1775150000,
+        "financing_cash_flow_net": 22626600,
+        "pay_fixed_assets_etc_cash": 1134640000
+      },
+      {
+        "thscode": "600873.SH",
+        "ticker": "600873",
+        "period": "quarterly",
+        "fiscal_year": 2026,
+        "fiscal_period": "Q1",
+        "report_date_ms": 1776787200000,
+        "period_end_ms": 1774886400000,
+        "currency": "CNY",
+        "act_cash_flow_net": -1155560000,
+        "invest_cash_flow_net": -526905000,
+        "financing_cash_flow_net": 97011000,
+        "pay_fixed_assets_etc_cash": 522610000
+      }
+    ],
+    "income": [
+      {
+        "thscode": "600873.SH",
+        "ticker": "600873",
+        "period": "quarterly",
+        "fiscal_year": 2026,
+        "fiscal_period": "Q2",
+        "report_date_ms": 1786723200000,
+        "period_end_ms": 1782748800000,
+        "currency": "CNY",
+        "operating_income": 12235095339.54,
+        "operating_costs": 10653093825.19,
+        "net_profit": 661862706.23
+      },
+      {
+        "thscode": "600873.SH",
+        "ticker": "600873",
+        "period": "quarterly",
+        "fiscal_year": 2026,
+        "fiscal_period": "Q1",
+        "report_date_ms": 1776787200000,
+        "period_end_ms": 1774886400000,
+        "currency": "CNY",
+        "operating_income": 5985630000,
+        "operating_costs": 5415280000,
+        "net_profit": 117920000
+      }
+    ],
+    "balance": [
+      {
+        "thscode": "600873.SH",
+        "ticker": "600873",
+        "period": "quarterly",
+        "fiscal_year": 2026,
+        "fiscal_period": "Q2",
+        "report_date_ms": 1786723200000,
+        "period_end_ms": 1782748800000,
+        "currency": "CNY",
+        "assets_total": 26785400000,
+        "total_debt": 11114500000
+      },
+      {
+        "thscode": "600873.SH",
+        "ticker": "600873",
+        "period": "quarterly",
+        "fiscal_year": 2026,
+        "fiscal_period": "Q1",
+        "report_date_ms": 1776787200000,
+        "period_end_ms": 1774886400000,
+        "currency": "CNY",
+        "assets_total": 25968700000,
+        "total_debt": 9551460000
+      }
+    ]
+  }
+}

@@ -49,6 +49,7 @@ class TraceItem(TypedDict, total=False):
     direction_allowed: bool
     reason_codes: list[str]
     evidence_refs: list[str]
+    financial_period_compliance: dict[str, Any]
 
 
 class InstrumentContext(TypedDict, total=False):

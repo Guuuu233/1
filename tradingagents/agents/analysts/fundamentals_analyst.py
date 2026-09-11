@@ -15,6 +15,9 @@ from tradingagents.agents.utils.agent_states import (
     check_llm_output_degraded,
     check_stream_chunk_degraded,
 )
+from tradingagents.agents.utils.financial_period_compliance import (
+    check_financial_period_compliance,
+)
 from tradingagents.agents.utils.context_utils import get_cn_stock_name, format_phase1_reports
 from tradingagents.agents.utils.knowledge_context import (
     resolve_industry_context,
@@ -279,6 +282,15 @@ def create_fundamentals_analyst(llm, data_collector=None):
             degraded=full_content.endswith("本项不可用"),
         )
         verdict, confidence = extract_verdict(full_content)
+        try:
+            compliance = check_financial_period_compliance(full_content, outputs)
+        except Exception as exc:
+            logger.warning("[Fundamentals Analyst] Financial period compliance check error: %s", exc)
+            compliance = {
+                "status": "not_checked",
+                "not_checked_reason": f"校验运行异常: {exc}",
+                "violations": [],
+            }
         return {
             "fundamentals_report": full_content,
             "analyst_traces": [{
@@ -290,6 +302,7 @@ def create_fundamentals_analyst(llm, data_collector=None):
                 "key_finding": f"基本面分析结论：{verdict}",
                 "verdict": verdict,
                 "confidence": confidence,
+                "financial_period_compliance": compliance,
             }],
         }
 
