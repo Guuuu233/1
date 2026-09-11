@@ -436,7 +436,13 @@ def validate_relation_graph(
     return len(results) == 0, results
 
 
-def build_canonical_source_repetition(ev1: Any, ev2: Any) -> EvidenceRelation | None:
+def build_canonical_source_repetition(
+    ev1: Any,
+    ev2: Any,
+    *,
+    source_node_id: str | None = None,
+    target_node_id: str | None = None,
+) -> EvidenceRelation | None:
     """Sole automatic builder: builds SOURCE_REPETITION edge if and only if both evidences share identical non-empty canonical_event_id and distinct non-empty evidence_ids."""
     if ev1 is None or ev2 is None:
         return None
@@ -463,10 +469,18 @@ def build_canonical_source_repetition(ev1: Any, ev2: Any) -> EvidenceRelation | 
     e1 = getattr(ev1, "evidence_id", None)
     if e1 is None and isinstance(ev1, Mapping):
         e1 = ev1.get("evidence_id")
+        if e1 is None and ev1.get("evidence_ids"):
+            raw_eids = ev1.get("evidence_ids")
+            if isinstance(raw_eids, (list, tuple)) and raw_eids and isinstance(raw_eids[0], str):
+                e1 = raw_eids[0]
 
     e2 = getattr(ev2, "evidence_id", None)
     if e2 is None and isinstance(ev2, Mapping):
         e2 = ev2.get("evidence_id")
+        if e2 is None and ev2.get("evidence_ids"):
+            raw_eids = ev2.get("evidence_ids")
+            if isinstance(raw_eids, (list, tuple)) and raw_eids and isinstance(raw_eids[0], str):
+                e2 = raw_eids[0]
 
     if e1 is None or e2 is None:
         return None
@@ -479,9 +493,31 @@ def build_canonical_source_repetition(ev1: Any, ev2: Any) -> EvidenceRelation | 
     if not s_e1 or not s_e2 or s_e1 == s_e2:
         return None
 
+    c1 = getattr(ev1, "claim_id", None)
+    if c1 is None and isinstance(ev1, Mapping):
+        c1 = ev1.get("claim_id")
+    c2 = getattr(ev2, "claim_id", None)
+    if c2 is None and isinstance(ev2, Mapping):
+        c2 = ev2.get("claim_id")
+
+    if source_node_id is not None or target_node_id is not None:
+        src_id = str(source_node_id or "").strip()
+        tgt_id = str(target_node_id or "").strip()
+    elif c1 is not None and c2 is not None:
+        if not isinstance(c1, str) or not isinstance(c2, str):
+            return None
+        src_id = c1.strip()
+        tgt_id = c2.strip()
+    else:
+        src_id = s_e1
+        tgt_id = s_e2
+
+    if not src_id or not tgt_id or src_id == tgt_id:
+        return None
+
     return EvidenceRelation(
-        source_id=s_e1,
+        source_id=src_id,
         relation_type=RelationType.SOURCE_REPETITION,
-        target_id=s_e2,
+        target_id=tgt_id,
         metadata={"canonical_event_id": c_id1},
     )

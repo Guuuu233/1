@@ -52,7 +52,7 @@ _MACHINE_LIST_FIELDS = (
 )
 _MACHINE_TEXT_FIELDS = ("round_summary", "round_goal")
 _MACHINE_FIELDS = frozenset((*_MACHINE_LIST_FIELDS, *_MACHINE_TEXT_FIELDS, "challenges", "self_win_prob"))
-_MACHINE_CLAIM_FIELDS = frozenset(("claim", "evidence", "confidence", "target_claim_ids", "battlefield", "evidence_ids", "cluster_id"))
+_MACHINE_CLAIM_FIELDS = frozenset(("claim", "evidence", "confidence", "target_claim_ids", "battlefield", "evidence_ids", "cluster_id", "canonical_event_id", "evidence_id"))
 _MACHINE_CHALLENGE_FIELDS = frozenset(("challenge_id", "target_claim_id", "weakest_point", "evidence", "severity"))
 
 
@@ -565,6 +565,12 @@ def _sanitize_machine_payload(payload: Mapping[str, Any], tag: str) -> dict[str,
         raw_cluster_id = raw_claim.get("cluster_id")
         if raw_cluster_id is not None:
             claim_dict["cluster_id"] = str(raw_cluster_id).strip()
+        raw_canonical = raw_claim.get("canonical_event_id")
+        if raw_canonical is not None:
+            claim_dict["canonical_event_id"] = str(raw_canonical).strip() if isinstance(raw_canonical, str) else raw_canonical
+        raw_evidence_id = raw_claim.get("evidence_id")
+        if raw_evidence_id is not None:
+            claim_dict["evidence_id"] = str(raw_evidence_id).strip() if isinstance(raw_evidence_id, str) else raw_evidence_id
         claims.append(claim_dict)
     normalized["new_claims"] = claims
     return normalized
@@ -1587,6 +1593,118 @@ def _record_unstructured_response(
         return new_state
 
 
+def build_debate_claim_relation_graph(
+    claims: Sequence[Mapping[str, Any]],
+    *,
+    prior_graph: Any = None,
+    claim_canonical_anchors: Mapping[str, str] | None = None,
+    analysis_baseline_date: str | None = None,
+) -> Any:
+    """Produce an immutable E-01 EvidenceRelationGraph from debate claims (Claim-to-Claim path).
+
+    Contract:
+    - SOURCE_REPETITION edges are produced between claims that share identical non-empty
+      canonical_event_id and distinct non-empty evidence_ids (via build_canonical_source_repetition).
+    - DERIVED_OBSERVATION edges are produced from explicit target_claim_ids on claims.
+    - Endpoints are strictly claim_ids, matching the downstream closed-universe node universe.
+    - Preserves any prior explicit relations without deriving edges from title similarity,
+      overlapping keywords, verifier status, or LLM inference.
+    """
+    from tradingagents.agents.utils.evidence_relations import (
+        EvidenceRelation,
+        EvidenceRelationGraph,
+        RelationType,
+        build_canonical_source_repetition,
+    )
+
+    relations: list[EvidenceRelation] = []
+
+    # 1. Ingest prior_graph if provided
+    if prior_graph is not None:
+        if isinstance(prior_graph, EvidenceRelationGraph):
+            relations.extend(prior_graph.relations)
+        elif isinstance(prior_graph, Mapping) and "relations" in prior_graph:
+            raw_list = prior_graph.get("relations")
+            if isinstance(raw_list, (list, tuple)):
+                for r in raw_list:
+                    if isinstance(r, EvidenceRelation):
+                        relations.append(r)
+                    elif isinstance(r, Mapping):
+                        try:
+                            relations.append(EvidenceRelation.from_dict(r))
+                        except Exception:
+                            pass
+        elif isinstance(prior_graph, (list, tuple)):
+            for r in prior_graph:
+                if isinstance(r, EvidenceRelation):
+                    relations.append(r)
+                elif isinstance(r, Mapping):
+                    try:
+                        relations.append(EvidenceRelation.from_dict(r))
+                    except Exception:
+                        pass
+
+    claim_list: list[dict[str, Any]] = []
+    for c in claims:
+        if isinstance(c, Mapping):
+            cid = str(c.get("claim_id") or "").strip()
+            if cid:
+                entry = dict(c)
+                if claim_canonical_anchors and cid in claim_canonical_anchors and not entry.get("canonical_event_id"):
+                    entry["canonical_event_id"] = claim_canonical_anchors[cid]
+                claim_list.append(entry)
+
+    # 2. Derive DERIVED_OBSERVATION edges from explicit target_claim_ids
+    for c in claim_list:
+        src_id = str(c.get("claim_id") or "").strip()
+        raw_targets = c.get("target_claim_ids")
+        targets: list[str] = []
+        if isinstance(raw_targets, (list, tuple)):
+            for t in raw_targets:
+                if t is not None:
+                    s_t = str(t).strip()
+                    if s_t:
+                        targets.append(s_t)
+        elif isinstance(raw_targets, str) and raw_targets.strip():
+            targets.append(raw_targets.strip())
+
+        raw_single = c.get("target_claim_id")
+        if isinstance(raw_single, str) and raw_single.strip():
+            s_single = raw_single.strip()
+            if s_single not in targets:
+                targets.append(s_single)
+
+        for tgt_id in targets:
+            meta: dict[str, Any] = {
+                "producer": "debate_protocol_v2",
+                "derivation_source": "target_claim_ids",
+            }
+            if c.get("stage"):
+                meta["derivation_stage"] = str(c.get("stage"))
+            if analysis_baseline_date:
+                meta["timestamp"] = str(analysis_baseline_date)
+            relations.append(
+                EvidenceRelation(
+                    source_id=src_id,
+                    relation_type=RelationType.DERIVED_OBSERVATION,
+                    target_id=tgt_id,
+                    metadata=meta,
+                )
+            )
+
+    # 3. Produce SOURCE_REPETITION edges from shared official canonical_event_id
+    n = len(claim_list)
+    for i in range(n):
+        c1 = claim_list[i]
+        for j in range(i + 1, n):
+            c2 = claim_list[j]
+            rep_rel = build_canonical_source_repetition(c1, c2)
+            if rep_rel is not None:
+                relations.append(rep_rel)
+
+    return EvidenceRelationGraph.from_relations(relations)
+
+
 def update_debate_state_with_payload(
     *,
     state: Mapping[str, Any],
@@ -1771,6 +1889,7 @@ def update_debate_state_with_payload(
                 if str(item).strip()
             ]
             target_claim_ids = _filter_known_claim_ids(claim_payload.get("target_claim_ids"), claim_map)
+            raw_target_claim_ids = _string_list(claim_payload.get("target_claim_ids"))
             claim_entry = {
                 "claim_id": claim_id,
                 "speaker": speaker_label,
@@ -1780,7 +1899,7 @@ def update_debate_state_with_payload(
                 "evidence": evidence,
                 "confidence": claim_payload["confidence"],
                 "status": "open",
-                "target_claim_ids": target_claim_ids,
+                "target_claim_ids": raw_target_claim_ids,
                 "round_index": message_index,
                 "debate_round": debate_round,
                 "message_index": message_index,
@@ -1792,6 +1911,10 @@ def update_debate_state_with_payload(
                 claim_entry["evidence_ids"] = list(claim_payload["evidence_ids"])
             if claim_payload.get("cluster_id"):
                 claim_entry["cluster_id"] = claim_payload["cluster_id"]
+            if claim_payload.get("canonical_event_id"):
+                claim_entry["canonical_event_id"] = claim_payload["canonical_event_id"]
+            if claim_payload.get("evidence_id"):
+                claim_entry["evidence_id"] = claim_payload["evidence_id"]
 
             # Inline import to avoid circular dependency with claim_cluster (which imports normalize_text from debate_utils)
             from tradingagents.agents.utils.claim_cluster import assign_claim_cluster
@@ -1950,6 +2073,18 @@ def update_debate_state_with_payload(
         updates[current_response_key] = argument
     if store_current_response and current_response_key != "current_response":
         updates["current_response"] = argument
+
+    prior_rel_graph = state.get("evidence_relation_graph")
+    rel_graph = build_debate_claim_relation_graph(claims, prior_graph=prior_rel_graph)
+    if rel_graph.relations:
+        updates["evidence_relation_graph"] = rel_graph.to_dict()
+    else:
+        if prior_rel_graph is not None and not isinstance(prior_rel_graph, (dict, list, tuple)):
+            updates["evidence_relation_graph"] = prior_rel_graph
+        elif isinstance(prior_rel_graph, dict) and prior_rel_graph.get("relations"):
+            updates["evidence_relation_graph"] = prior_rel_graph
+        else:
+            updates["evidence_relation_graph"] = None
 
     temp_state = dict(state)
     temp_state.update(updates)
