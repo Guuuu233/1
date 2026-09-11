@@ -815,14 +815,61 @@ class TestZeroNetworkAssertion:
         assert window.is_due is True
 
 
-class TestNoResolveHorizonReturnLabelPlaceholder:
-    """20. Assert that resolve_horizon_return_label placeholder is NOT implemented in V-01-1."""
+class TestResolveHorizonReturnLabelContract:
+    """20. Assert resolve_horizon_return_label implementation contract (V-01-2 / DAV-830)."""
 
-    def test_no_half_baked_return_label_stub(self):
-        assert not hasattr(rl, "resolve_horizon_return_label"), (
-            "resolve_horizon_return_label must NOT be implemented as a placeholder or "
-            "NotImplementedError stub in V-01-1; deferred to V-01-2+."
+    def test_resolve_horizon_return_label_callable_and_contract_spec(self):
+        assert hasattr(rl, "resolve_horizon_return_label")
+        assert callable(rl.resolve_horizon_return_label)
+        assert hasattr(rl, "LABEL_CONTRACT_V1_SPEC")
+        assert isinstance(rl.LABEL_CONTRACT_V1_SPEC, str)
+        # Verify 5 audited core concepts in contract text
+        assert "T 定义" in rl.LABEL_CONTRACT_V1_SPEC
+        assert "cutoff 资格" in rl.LABEL_CONTRACT_V1_SPEC
+        assert "主评价日" in rl.LABEL_CONTRACT_V1_SPEC
+        assert "研究基准" in rl.LABEL_CONTRACT_V1_SPEC
+        assert "可执行入场" in rl.LABEL_CONTRACT_V1_SPEC
+
+    def test_unsupported_price_basis_fails_closed(self):
+        res = rl.resolve_horizon_return_label(
+            symbol="600519.SH",
+            signal_date="2024-02-01",
+            horizon="short",
+            trading_days=FIXTURE_SPRING_FESTIVAL_2024,
+            as_of="2024-02-23",
+            as_of_market_closed=True,
+            price_basis="pit_adjusted",  # unsupported
         )
+        assert res["outcome_status"] == rl.OutcomeStatus.UNSUPPORTED_PRICE_BASIS.value
+        assert res["evaluation_eligible"] is False
+        assert res["return_pct"] is None
+
+    def test_unsupported_return_type_raises_value_error(self):
+        with pytest.raises(ValueError, match="Unsupported return_type"):
+            rl.resolve_horizon_return_label(
+                symbol="600519.SH",
+                signal_date="2024-02-01",
+                horizon="short",
+                trading_days=FIXTURE_SPRING_FESTIVAL_2024,
+                as_of="2024-02-23",
+                as_of_market_closed=True,
+                return_type="invalid_return_type",
+            )
+
+    def test_unmatured_sample_returns_pending_due_without_truncation(self):
+        # as_of before target_calendar_date (2024-02-23)
+        res = rl.resolve_horizon_return_label(
+            symbol="600519.SH",
+            signal_date="2024-02-01",
+            horizon="short",
+            trading_days=FIXTURE_SPRING_FESTIVAL_2024,
+            as_of="2024-02-19",
+            as_of_market_closed=True,
+        )
+        assert res["outcome_status"] == rl.OutcomeStatus.PENDING_DUE.value
+        assert res["evaluation_eligible"] is False
+        assert res["return_pct"] is None
+        assert res["target_calendar_date"] == "2024-02-23"
 
 
 class TestV02EvaluationRoutingBoundary:
