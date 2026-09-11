@@ -150,6 +150,9 @@
 - `scheduler/main.py:23` `Any`、`Dict`；`:93` `_new_job_store`；`:106` `_set_job`；`:108` `_emit_job_event`
 - `api/main.py:40` `fastapi.status`（另 `:825/:1577/:1596` 的 `status` 重定义、`:2996` 循环变量遮蔽 `status`）；`:48` `UserLLMConfigDB`/`ReportDB`/`ImportedPortfolioPositionDB`/`ModelProfileDB`/`RoleBindingDB`
 - `tradingagents/graph/data_collector.py:17` `get_indicators`；`:686` 无占位 f-string
+  > 注（DAV-82 收口 · P2-15 回补）：`get_indicators` **保留原因——测试 patch 目标**。`tests/test_dav28_data_boundaries.py`
+  > 以 `patch.multiple("tradingagents.graph.data_collector", **patch_targets)` 批量替换该模块内的
+  > `get_indicators`/`get_stock_data` 等数据入口；删除此导入会触发 `AttributeError`，使相关离线用例失败。
 - `tradingagents/graph/trading_graph.py:3,8,9,10,19` `asyncio`/`date`/`Tuple`/`sqlite3`/`AgentState`/`InvestDebateState`/`RiskDebateState`
 - `tradingagents/graph/setup.py:3` `List`；`propagation.py:4` `AgentState`
 - `tradingagents/dataflows/interface.py:17` `result_to_prompt`
@@ -217,7 +220,7 @@
 |---|---|---|
 | P2-55 | `tradingagents/llm_clients/TODO.md` | 源码包内遗留任务文档（4 条未完成项：validate_model 未调用、参数未统一、base_url 被忽略、validators 未同步），建议转 issue 后删除或移到 docs/ |
 | P2-56 | `api/database.py:84` `exc_val`/`exc_tb`、`scripts/smoke_custom_prompts.py:61` `exc_val`/`exc_tb`、`cn_akshare_provider.py:138` `exc_info` | `except ... as` 绑定未使用变量（可改 `except Exception:`） |
-| P2-57 | `tradingagents/dataflows/alpha_vantage.py`（4 行） | 纯再导出 shim；若全仓无消费者可整体删除（grep 未发现导入者） |
+| P2-57 | `tradingagents/dataflows/alpha_vantage.py`（4 行） | **不适用**——纯再导出 shim，无真实逻辑，无需处理（grep 复核仍无任何消费者；保留零副作用，删除亦无实际收益） |
 | P2-58 | `scheduler/__init__.py`、`tests/__init__.py`、`tradingagents/dataflows/__init__.py` | 空文件（包标记，正常，仅记录） |
 
 ### 4.7 前端依赖

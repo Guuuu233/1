@@ -35,6 +35,13 @@ M1~M5 里程碑（DAV-67~71，2026-07/08）竣工，随附 H1~H3 审计与清理
 - **H2（DAV-74）**：测试体检 + 日期炸弹修复（P1-4），全量 780 passed / 0 failed；登记覆盖缺口（Redis fakeredis 恢复、裁决链行为级测试）。
 - **H3（DAV-75）**：按审计报告逐条销号——删死代码、合并重复逻辑、清理未用导入与孤立文件、依赖体检（移除 `langchain-experimental`、补 `python-dotenv`）、文档同步（README/CHANGELOG/AGENTS/frontend README 与代码一致）。
 
+### 数据源与稳定性（v0.6.0 之后）
+- **H5（DAV-77/83/87）**：接入同花顺（fuyao.aicubes.cn）数据源——行情快照、历史日 K、三大报表、财务指标、涨跌停池、龙虎榜、交易日历，`FUYAO_API_KEY` 可配；财务 `3001` 映射 `VendorFail` 降级弱源，交易日历 akshare→fuyao→缓存回退。
+- **DAV-88**：五连 bug 修复——A 股票名搜索 NFKC 归一 + 整句兜底；B 中断任务恢复轮询封顶 ~5min + 持久化报告终态解锁；C 置信度从 x/75 格式与 `trader_investment_plan` 提取回退；D 报告文本剥离 thinking 独白（prompt 输出纪律 + cleaner）；E 新浪历史资金流接口作为 Source 2.5（历史分析日东财限流时可回退）。
+- **DAV-89**：角色路由将 `user_id` 透传进运行时配置，`role_llms` 按用户绑定模型解析。
+- **DAV-91**：LLM 瞬态错误重试（网络/5xx/429），由 `TA_LLM_RETRY_TIMES` 控制（默认 2，0 禁用）。
+- **DAV-92**：股票名映射表加载失败按失败退避窗口重试（`TA_STOCK_MAP_RETRY_INTERVAL`，默认 30 分钟），成功后才起算 7 天 TTL。
+
 ## [v0.5.0] - 2026-03-22
 
 ### Added
