@@ -70,3 +70,43 @@ def get_northbound_flow(
 ) -> str:
     """获取北向资金（陆股通）持股变动。"""
     return route_to_vendor("get_northbound_flow", symbol, curr_date=curr_date)
+
+
+def fetch_board_fund_flow(curr_date: str | None = None) -> str:
+    """直接调用获取今日行业板块资金流向排名。"""
+    return route_to_vendor("get_board_fund_flow", curr_date)
+
+
+def fetch_individual_fund_flow(symbol: str, curr_date: str | None = None) -> str:
+    """直接调用获取个股资金流数据。"""
+    return route_to_vendor("get_individual_fund_flow", symbol, curr_date)
+
+
+def fetch_lhb_detail(symbol: str, date: str) -> str:
+    """直接调用获取个股龙虎榜数据。"""
+    return route_to_vendor("get_lhb_detail", symbol, date)
+
+
+def fetch_zt_pool(date: str) -> str:
+    """直接调用获取市场涨停板情绪池。"""
+    return route_to_vendor("get_zt_pool", date)
+
+
+def fetch_hot_stocks_xq(curr_date: str | None = None) -> str:
+    """直接调用获取雪球热搜股票列表。"""
+    return route_to_vendor("get_hot_stocks_xq", curr_date)
+
+
+def fetch_shareholder_count(symbol: str, curr_date: str | None = None) -> str:
+    """直接调用获取股东户数变动与筹码集中度。"""
+    return route_to_vendor("get_shareholder_count", symbol, curr_date=curr_date)
+
+
+def fetch_margin_trading(symbol: str, curr_date: str | None = None) -> str:
+    """直接调用获取融资融券交易明细。"""
+    return route_to_vendor("get_margin_trading", symbol, curr_date=curr_date)
+
+
+def fetch_northbound_flow(symbol: str, curr_date: str | None = None) -> str:
+    """直接调用获取北向资金（陆股通）持股变动。"""
+    return route_to_vendor("get_northbound_flow", symbol, curr_date=curr_date)
