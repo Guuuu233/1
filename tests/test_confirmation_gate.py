@@ -885,3 +885,216 @@ def test_trader_risk_and_db_consistency_contract():
     assert result_wait["target_price"] is None
     assert result_wait["stop_loss_price"] is None
 
+
+# ── DAV-854: Red Team Scenarios (RT-1 ~ RT-6) ─────────────────────────────────
+
+def test_dav854_rt1_ordinary_contradicted_restores_wait():
+    """RT-1: Core or adopted claim contradicted without PIT failure -> UNRESOLVED + WAIT."""
+    mv = {
+        "direction": "看多",
+        "winner": "bull",
+        "position_pct": 50,
+        "consistency_check_passed": True,
+        "adopted_claim_ids": ["CLM-CORE"],
+        "partially_adopted_claims": [],
+        "rejected_claim_ids": [],
+    }
+    ev_summary = {
+        "CLM-CORE": {
+            "counts": {"total": 1, "verified": 0, "unsupported": 0, "contradicted": 1, "source_unavailable": 0},
+            "coverage": 0.0,
+            "decision": "reject",
+            "pit_failed": False,
+        }
+    }
+    c_state, r_codes = evaluate_confirmation_state(
+        focus_claim_ids=["CLM-CORE"],
+        claim_evidence_summary=ev_summary,
+        adopted_claim_ids=["CLM-CORE"],
+    )
+    assert c_state == CONFIRM_UNRESOLVED
+    assert "fatal_core_claims:CLM-CORE" in r_codes
+    assert "fatal_adopted_claims:CLM-CORE" in r_codes
+
+    status = status_from_manager_verdict(
+        mv,
+        focus_claim_ids=["CLM-CORE"],
+        claim_evidence_summary=ev_summary,
+    )
+    assert status.confirmation_state == CONFIRM_UNRESOLVED
+    assert status.trade_action == ACTION_WAIT
+    assert status.analysis_status == ANALYSIS_VALID
+    assert any("fatal_core_claims:CLM-CORE" in c for c in status.reason_codes)
+
+
+def test_dav854_rt2_bull_bear_symmetry():
+    """RT-2: Symmetry between bull and bear when contradicted -> both sides are WAIT."""
+    # Bull side
+    mv_bull = {
+        "direction": "看多",
+        "winner": "bull",
+        "position_pct": 40,
+        "consistency_check_passed": True,
+        "adopted_claim_ids": ["CLM-BULL"],
+        "partially_adopted_claims": [],
+        "rejected_claim_ids": [],
+    }
+    summary_bull = {
+        "CLM-BULL": {"counts": {"total": 1, "verified": 0, "contradicted": 1}, "decision": "reject", "pit_failed": False}
+    }
+    status_bull = status_from_manager_verdict(
+        mv_bull,
+        focus_claim_ids=["CLM-BULL"],
+        claim_evidence_summary=summary_bull,
+    )
+    assert status_bull.confirmation_state == CONFIRM_UNRESOLVED
+    assert status_bull.trade_action == ACTION_WAIT
+
+    # Bear side
+    mv_bear = {
+        "direction": "看空",
+        "winner": "bear",
+        "position_pct": 40,
+        "consistency_check_passed": True,
+        "adopted_claim_ids": ["CLM-BEAR"],
+        "partially_adopted_claims": [],
+        "rejected_claim_ids": [],
+    }
+    summary_bear = {
+        "CLM-BEAR": {"counts": {"total": 1, "verified": 0, "contradicted": 1}, "decision": "reject", "pit_failed": False}
+    }
+    status_bear = status_from_manager_verdict(
+        mv_bear,
+        focus_claim_ids=["CLM-BEAR"],
+        claim_evidence_summary=summary_bear,
+    )
+    assert status_bear.confirmation_state == CONFIRM_UNRESOLVED
+    assert status_bear.trade_action == ACTION_WAIT
+
+
+def test_dav854_rt3_pit_failure_must_abstain_no_trade():
+    """RT-3: Adopting claim with PIT failure must fail closed with ABSTAIN + NO_TRADE + BLOCKED."""
+    mv = {
+        "direction": "看多",
+        "winner": "bull",
+        "position_pct": 50,
+        "consistency_check_passed": True,
+        "adopted_claim_ids": ["CLM-PIT"],
+        "partially_adopted_claims": [],
+        "rejected_claim_ids": [],
+    }
+    ev_summary = {
+        "CLM-PIT": {
+            "counts": {"total": 1, "verified": 0, "contradicted": 1},
+            "decision": "reject",
+            "pit_failed": True,
+            "reason": "存在前视偏差/PIT失败 (pit_date=2026-09-20 > baseline=2026-09-08)",
+        }
+    }
+    status = status_from_manager_verdict(
+        mv,
+        focus_claim_ids=["CLM-PIT"],
+        claim_evidence_summary=ev_summary,
+    )
+    assert status.analysis_status == ANALYSIS_ABSTAIN
+    assert status.trade_action == ACTION_NO_TRADE
+    assert status.risk_status == "BLOCKED"
+    assert any("manager_consistency_hard_gate" in c for c in status.reason_codes)
+
+
+def test_dav854_rt4_partially_adopted_contradicted_remains_wait():
+    """RT-4: Contradicted claim in partially_adopted_claims -> UNRESOLVED + WAIT (same as RT-1)."""
+    mv = {
+        "direction": "看多",
+        "winner": "bull",
+        "position_pct": 50,
+        "consistency_check_passed": True,
+        "adopted_claim_ids": [],
+        "partially_adopted_claims": ["CLM-PARTIAL-CONTRA"],
+        "rejected_claim_ids": [],
+    }
+    ev_summary = {
+        "CLM-PARTIAL-CONTRA": {
+            "counts": {"total": 1, "verified": 0, "contradicted": 1},
+            "decision": "reject",
+            "pit_failed": False,
+        }
+    }
+    c_state, r_codes = evaluate_confirmation_state(
+        focus_claim_ids=[],
+        claim_evidence_summary=ev_summary,
+        partially_adopted_claims=["CLM-PARTIAL-CONTRA"],
+    )
+    assert c_state == CONFIRM_UNRESOLVED
+    assert "fatal_partially_adopted_claims:CLM-PARTIAL-CONTRA" in r_codes
+
+    status = status_from_manager_verdict(
+        mv,
+        claim_evidence_summary=ev_summary,
+    )
+    assert status.confirmation_state == CONFIRM_UNRESOLVED
+    assert status.trade_action == ACTION_WAIT
+    assert status.analysis_status == ANALYSIS_VALID
+
+
+def test_dav854_rt5_observation_hypotheses_stratification():
+    """RT-5: Observation/hypotheses unverified with factual verified core does not collapse to WAIT."""
+    claims = [
+        {"claim_id": "CLM-FACT", "claim": "主力净流入1.2亿", "evidence": ["E1"], "claim_type": "fact"},
+        {"claim_id": "CLM-OBS", "claim": "【观察】形态初显", "evidence": ["E2"], "claim_type": "observation"},
+    ]
+    summary = {
+        "CLM-FACT": {"decision": "adopt", "counts": {"total": 1, "verified": 1, "contradicted": 0, "source_unavailable": 0}, "is_observation_or_hypothesis": False},
+        "CLM-OBS": {"decision": "partial", "counts": {"total": 1, "verified": 1, "contradicted": 0, "source_unavailable": 0}, "is_observation_or_hypothesis": True},
+    }
+    mv = {
+        "direction": "看多",
+        "winner": "bull",
+        "position_pct": 50,
+        "adopted_claim_ids": ["CLM-FACT"],
+        "partially_adopted_claims": ["CLM-OBS"],
+        "consistency_check_passed": True,
+    }
+    status = status_from_manager_verdict(
+        mv,
+        claims=claims,
+        claim_evidence_summary=summary,
+        focus_claim_ids=["CLM-FACT", "CLM-OBS"],
+    )
+    assert status.analysis_status == ANALYSIS_VALID
+    assert status.trade_action == ACTION_BUY
+    assert status.confirmation_state == CONFIRM_CONFIRMED
+
+
+def test_dav854_rt6_non_executable_clears_metrics():
+    """RT-6: Non-executable trade actions (WAIT/NO_TRADE) strip confidence, probability, and targets."""
+    mv = {
+        "direction": "看多",
+        "winner": "bull",
+        "position_pct": 50,
+        "consistency_check_passed": True,
+        "adopted_claim_ids": ["CLM-1"],
+        "partially_adopted_claims": [],
+        "rejected_claim_ids": [],
+        "confidence": 85,
+        "probability": 0.88,
+    }
+    ev_summary = {
+        "CLM-1": {"counts": {"total": 1, "verified": 0, "contradicted": 1}, "decision": "reject"}
+    }
+    status = status_from_manager_verdict(
+        mv,
+        focus_claim_ids=["CLM-1"],
+        claim_evidence_summary=ev_summary,
+    )
+    assert status.trade_action == ACTION_WAIT
+    assert status.confidence is None
+    assert status.probability is None
+
+    result = apply_decision_status_to_result(
+        {"target_price": 50.0, "stop_loss_price": 45.0, "confidence": 85, "probability": 0.88},
+        status,
+    )
+    assert result["target_price"] is None
+    assert result["stop_loss_price"] is None
+

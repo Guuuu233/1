@@ -359,6 +359,27 @@ def evaluate_confirmation_state(
                 return True
         return False
 
+    def _is_claim_pit_failed(cid: str) -> bool:
+        sm = summary_map.get(cid)
+        if sm:
+            if sm.get("pit_failed") is True:
+                return True
+            r = str(sm.get("reason") or "")
+            if any(term in r for term in ("PIT失败", "ERR_SPEC_LOOKAHEAD_PIT", "pit_date")):
+                return True
+        for v in ver_by_cid.get(cid, []):
+            if v.get("pit_failed") is True or v.get("error_code") == "ERR_SPEC_LOOKAHEAD_PIT":
+                return True
+            msg = str(v.get("error_msg") or "")
+            if any(term in msg for term in ("PIT失败", "ERR_SPEC_LOOKAHEAD_PIT", "pit_date")):
+                return True
+        cl = known_claims.get(cid)
+        if cl:
+            app = cl.get("applicability")
+            if isinstance(app, Mapping) and (app.get("pit_failed") is True or app.get("is_pit_failed") is True):
+                return True
+        return False
+
     def _get_claim_decision(cid: str) -> str:
         if _is_claim_fatal(cid):
             return "reject"
@@ -448,6 +469,9 @@ def evaluate_confirmation_state(
     adopted_fatal = [cid for cid in adopted_ids if _is_claim_fatal(cid)]
     partially_adopted_fatal = [cid for cid in partially_adopted_ids if _is_claim_fatal(cid)]
 
+    adopted_pit = [cid for cid in adopted_ids if _is_claim_pit_failed(cid)]
+    partially_adopted_pit = [cid for cid in partially_adopted_ids if _is_claim_pit_failed(cid)]
+
     fatal_codes: list[str] = []
     if adopted_fatal:
         fatal_codes.append(f"fatal_adopted_claims:{','.join(sorted(adopted_fatal))}")
@@ -455,6 +479,10 @@ def evaluate_confirmation_state(
         fatal_codes.append(f"fatal_core_claims:{','.join(sorted(core_fatal))}")
     if partially_adopted_fatal:
         fatal_codes.append(f"fatal_partially_adopted_claims:{','.join(sorted(partially_adopted_fatal))}")
+    if adopted_pit:
+        fatal_codes.append(f"pit_failed_adopted_claims:{','.join(sorted(adopted_pit))}")
+    if partially_adopted_pit:
+        fatal_codes.append(f"pit_failed_partially_adopted_claims:{','.join(sorted(partially_adopted_pit))}")
     if fatal_codes:
         return CONFIRM_UNRESOLVED, fatal_codes
 
@@ -679,12 +707,23 @@ def status_from_manager_verdict(
         rejected_claim_ids=rejected_ids,
     )
 
-    # Consistency hard gate: rejected + adopt or unadjudicated material claim with adopt or fatal in adopted/partially adopted
-    if any(
+    # Consistency hard gate: rejected + adopt, unadjudicated material claim with adopt, or PIT failure in adopted/partially adopted
+    adopted_has_pit = False
+    if ev_summary:
+        for cid in list(adopted_ids or []) + list(partially_adopted_ids or []):
+            s = ev_summary.get(cid)
+            if isinstance(s, Mapping) and (
+                s.get("pit_failed") is True
+                or any(term in str(s.get("reason") or "") for term in ("PIT失败", "ERR_SPEC_LOOKAHEAD_PIT", "pit_date"))
+            ):
+                adopted_has_pit = True
+                break
+
+    if adopted_has_pit or any(
         code.startswith("verdict_consistency_rejected_adopt:")
         or code.startswith("unadjudicated_material_claims_adopt:")
-        or code.startswith("fatal_adopted_claims:")
-        or code.startswith("fatal_partially_adopted_claims:")
+        or code.startswith("pit_failed_adopted_claims:")
+        or code.startswith("pit_failed_partially_adopted_claims:")
         for code in confirm_codes
     ):
         return abstain_status(
