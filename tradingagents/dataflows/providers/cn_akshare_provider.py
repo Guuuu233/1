@@ -815,27 +815,40 @@ class CnAkshareProvider(BaseMarketDataProvider):
             "date": "Date",
             "Date": "Date",
             "trade_date": "Date",
+            "交易日期": "Date",
+            "时间": "Date",
+            "datetime": "Date",
             "开盘": "Open",
             "open": "Open",
             "Open": "Open",
+            "开盘价": "Open",
             "最高": "High",
             "high": "High",
             "High": "High",
+            "最高价": "High",
             "最低": "Low",
             "low": "Low",
             "Low": "Low",
+            "最低价": "Low",
             "收盘": "Close",
             "close": "Close",
             "Close": "Close",
+            "收盘价": "Close",
             "成交量": "Volume",
             "volume": "Volume",
             "Volume": "Volume",
             "vol": "Volume",
+            "成交量(股)": "Volume",
+            "成交量（股）": "Volume",
+            "成交量(手)": "Volume",
+            "成交量（手）": "Volume",
+            "成交股数": "Volume",
             "成交额": "Amount",
             "amount": "Amount",
             "Amount": "Amount",
         }
-        df = raw_df.rename(columns=col_map).copy()
+        clean_cols = {c: str(c).strip() for c in raw_df.columns}
+        df = raw_df.rename(columns=clean_cols).rename(columns=col_map).copy()
         required = ["Date", "Open", "High", "Low", "Close", "Volume"]
         missing = [c for c in required if c not in df.columns]
         if missing:

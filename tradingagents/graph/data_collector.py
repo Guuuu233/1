@@ -89,6 +89,7 @@ from tradingagents.dataflows.news_event_evidence import (
     parse_news_markdown_to_evidences,
 )
 from tradingagents.dataflows.trade_calendar import (
+    DuplicateBarConflictError,
     dedupe_daily_bars,
     is_historical_analysis_date,
 )
@@ -128,6 +129,83 @@ logger = logging.getLogger(__name__)
 
 _OHLCV_COLS = ["date", "open", "high", "low", "close", "volume"]
 
+_OHLCV_COLUMN_MAP: Dict[str, str] = {
+    # Date aliases
+    "date": "date",
+    "trade_date": "date",
+    "tradedate": "date",
+    "datetime": "date",
+    "time": "date",
+    "timestamp": "date",
+    "日期": "date",
+    "交易日期": "date",
+    "时间": "date",
+    # Open aliases
+    "open": "open",
+    "open_price": "open",
+    "openprice": "open",
+    "开盘": "open",
+    "开盘价": "open",
+    # High aliases
+    "high": "high",
+    "high_price": "high",
+    "highprice": "high",
+    "最高": "high",
+    "最高价": "high",
+    # Low aliases
+    "low": "low",
+    "low_price": "low",
+    "lowprice": "low",
+    "最低": "low",
+    "最低价": "low",
+    # Close aliases
+    "close": "close",
+    "close_price": "close",
+    "closeprice": "close",
+    "收盘": "close",
+    "收盘价": "close",
+    # Volume aliases
+    "volume": "volume",
+    "vol": "volume",
+    "成交量": "volume",
+    "成交量(股)": "volume",
+    "成交量（股）": "volume",
+    "成交量(手)": "volume",
+    "成交量（手）": "volume",
+    "成交股数": "volume",
+}
+
+
+def _resolve_ohlcv_columns(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Resolve and rename OHLCV column variations to canonical lowercase names.
+
+    Maps Chinese names (日期, 开盘, 最高, 最低, 收盘, 成交量, 开盘价, etc.),
+    Tushare names (trade_date, vol), and case/whitespace variations to canonical
+    ('date', 'open', 'high', 'low', 'close', 'volume').
+
+    Returns renamed DataFrame if all 6 required fields are present, else None.
+    Does NOT positional-slice or invent missing columns.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+
+    found_targets: Dict[str, Any] = {}
+    for orig_col in df.columns:
+        clean_key = str(orig_col).strip().lower()
+        target = _OHLCV_COLUMN_MAP.get(clean_key)
+        if target is not None:
+            # Canonical match takes precedence over aliases
+            if target not in found_targets or clean_key == target:
+                found_targets[target] = orig_col
+
+    required = {"date", "open", "high", "low", "close", "volume"}
+    if not required.issubset(found_targets.keys()):
+        return None
+
+    rename_dict = {found_targets[t]: t for t in required}
+    out = df[list(rename_dict.keys())].rename(columns=rename_dict).copy()
+    return out
+
 
 def _normalize_daily_frame(df: Optional[pd.DataFrame], trade_date: str) -> Optional[pd.DataFrame]:
     """Normalize an OHLCV frame to completed bars <= trade_date.
@@ -140,14 +218,13 @@ def _normalize_daily_frame(df: Optional[pd.DataFrame], trade_date: str) -> Optio
     empty after the date filter, or conflicting duplicate dates) so callers can
     surface an explicit unavailable instead of forwarding raw vendor CSV.
     """
-    if df is None or df.empty:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return None
-    required = {"date", "open", "high", "low", "close", "volume"}
-    if not required.issubset({str(c).lower() for c in df.columns}):
+    resolved = _resolve_ohlcv_columns(df)
+    if resolved is None or resolved.empty:
         return None
-    cols_map = {str(c).lower(): c for c in df.columns}
-    out = df.rename(columns={cols_map[t]: t for t in required}).copy()
-    out = out[list(required)].copy()
+
+    out = resolved.copy()
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     for col in ("open", "high", "low", "close", "volume"):
         out[col] = pd.to_numeric(out[col], errors="coerce")
@@ -161,7 +238,7 @@ def _normalize_daily_frame(df: Optional[pd.DataFrame], trade_date: str) -> Optio
         out = dedupe_daily_bars(
             out, "date", ["open", "high", "low", "close", "volume"]
         )
-    except ValueError:
+    except (ValueError, DuplicateBarConflictError):
         # Conflicting same-date rows: no deterministic choice, refuse the field.
         return None
     return out if not out.empty else None
@@ -178,26 +255,27 @@ def _csv_comment_lines(raw_csv: str) -> list[str]:
     ]
 
 
-def _parse_csv_to_dataframe(raw_csv: str) -> Optional[pd.DataFrame]:
-    """Parse raw CSV string into a normalized OHLCV DataFrame.
+def _parse_csv_to_dataframe(raw_csv: Any) -> Optional[pd.DataFrame]:
+    """Parse raw CSV string or DataFrame into a normalized OHLCV DataFrame.
 
-    Returns None if parsing fails or the CSV is too short/empty.
+    Returns None if parsing fails or input is empty/unusable.
     """
-    if not isinstance(raw_csv, str) or len(raw_csv) <= 50:
+    if raw_csv is None:
+        return None
+    if isinstance(raw_csv, pd.DataFrame):
+        return _resolve_ohlcv_columns(raw_csv)
+    if not isinstance(raw_csv, str):
+        return None
+    stripped = raw_csv.strip()
+    if not stripped or len(stripped) < 10:
         return None
     try:
-        df = pd.read_csv(io.StringIO(raw_csv), on_bad_lines='skip', comment='#')
+        df = pd.read_csv(io.StringIO(stripped), on_bad_lines='skip', comment='#')
     except Exception:
         return None
-    if df.empty:
+    if df is None or df.empty:
         return None
-    cols_map = {c.lower(): c for c in df.columns}
-    rename_dict = {}
-    for target in _OHLCV_COLS:
-        if target in cols_map:
-            rename_dict[cols_map[target]] = target
-    df = df.rename(columns=rename_dict)
-    return df
+    return _resolve_ohlcv_columns(df)
 
 
 # ── VPA (Volume Price Analysis) 预计算 ──────────────────────────
@@ -264,11 +342,11 @@ def compute_vpa_deterministic_features(
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return insufficient_result
 
-    required = {"open", "high", "low", "close", "volume"}
-    if not required.issubset(set(df.columns)):
+    resolved = _resolve_ohlcv_columns(df)
+    if resolved is None or resolved.empty:
         return insufficient_result
 
-    df = df.copy()
+    df = resolved.copy()
 
     # If date column is available, sort and truncate strictly <= cutoff
     if "date" in df.columns:
@@ -318,7 +396,12 @@ def compute_vpa_deterministic_features(
     df["consecutive_down_days"] = consec_down
 
     last_bar = df.iloc[-1]
-    as_of = str(last_bar.get("date", cutoff_str or ""))
+    raw_as_of = last_bar.get("date", cutoff_str or "")
+    if hasattr(raw_as_of, "strftime"):
+        as_of = raw_as_of.strftime("%Y-%m-%d")
+    else:
+        as_of_dt = pd.to_datetime(raw_as_of, errors="coerce")
+        as_of = as_of_dt.strftime("%Y-%m-%d") if pd.notna(as_of_dt) else str(raw_as_of or cutoff_str or "")
 
     # ── Regime Detection (look at recent bars up to cutoff, e.g. last 5 bars) ──
     recent_len = min(5, len(df))
@@ -406,11 +489,14 @@ def _compute_vpa_indicators(df: pd.DataFrame, window: int = 20) -> str:
     All numerical comparisons are done here so the LLM only needs to
     interpret the results, not do arithmetic.
     """
-    required = {"open", "high", "low", "close", "volume"}
-    if not required.issubset(set(df.columns)):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return "VPA 数据不足：缺少 OHLCV 列"
 
-    df = df.copy()
+    resolved = _resolve_ohlcv_columns(df)
+    if resolved is None or resolved.empty:
+        return "VPA 数据不足：缺少 OHLCV 列"
+
+    df = resolved.copy()
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
     df["open"] = pd.to_numeric(df["open"], errors="coerce")
     df["high"] = pd.to_numeric(df["high"], errors="coerce")
@@ -423,10 +509,10 @@ def _compute_vpa_indicators(df: pd.DataFrame, window: int = 20) -> str:
 
     # ── 派生指标 ──
     df["vol_ma"] = df["volume"].rolling(window).mean()
-    df["volume_ratio"] = df["volume"] / df["vol_ma"]
+    df["volume_ratio"] = np.where(df["vol_ma"] > 0, df["volume"] / df["vol_ma"], 0.0)
 
     hl_range = df["high"] - df["low"]
-    df["bar_spread"] = hl_range / df["close"]  # 实体相对大小
+    df["bar_spread"] = np.where(df["close"] > 0, hl_range / df["close"], 0.0)  # 实体相对大小
     df["close_position"] = np.where(
         hl_range > 0,
         (df["close"] - df["low"]) / hl_range,
@@ -454,7 +540,7 @@ def _compute_vpa_indicators(df: pd.DataFrame, window: int = 20) -> str:
 
     # 量能趋势 (5日均量 vs 20日均量)
     df["vol_ma5"] = df["volume"].rolling(5).mean()
-    df["vol_trend_ratio"] = df["vol_ma5"] / df["vol_ma"]
+    df["vol_trend_ratio"] = np.where(df["vol_ma"] > 0, df["vol_ma5"] / df["vol_ma"], 0.0)
 
     # 量价一致性
     df["vp_harmony"] = np.where(
@@ -492,7 +578,9 @@ def _compute_vpa_indicators(df: pd.DataFrame, window: int = 20) -> str:
     vol_5d = recent["volume"].tail(5).mean()
     vol_20d = last["vol_ma"] if pd.notna(last["vol_ma"]) else 0
     vol_summary = "放量" if vol_5d > vol_20d * 1.2 else ("缩量" if vol_5d < vol_20d * 0.8 else "平稳")
-    lines.append(f"**近5日量能趋势**: {vol_summary}（5日均量/20日均量 = {last.get('vol_trend_ratio', 0):.2f}）\n")
+    trend_val = last.get('vol_trend_ratio', 0)
+    trend_str = f"{float(trend_val):.2f}" if (pd.notna(trend_val) and not np.isinf(float(trend_val))) else "N/A"
+    lines.append(f"**近5日量能趋势**: {vol_summary}（5日均量/20日均量 = {trend_str}）\n")
 
     lines.append("### 逐日量价数据\n")
     lines.append("| 日期 | 类型 | 涨跌幅 | 实体大小 | 收盘位置 | 上影线 | 下影线 | 量比 | 量价关系 |")
@@ -860,7 +948,14 @@ def _classify_failure_value(value: Any) -> Optional[str]:
     lowered = normalized.lower()
     if "【财务数据截至" in normalized or "生效公告日" in normalized:
         return None
-    if "停止披露" in normalized or "披露停止" in normalized:
+    if (
+        "停止披露" in normalized
+        or "披露停止" in normalized
+        or "无有效完整日线数据" in normalized
+        or "无有效完整未复权日线数据" in normalized
+        or "确认无数据" in normalized
+        or "no data found" in lowered
+    ):
         return "unavailable"
     if "仅提供当前快照" in normalized or "仅支持当日快照" in normalized:
         return "refused"
@@ -2789,14 +2884,50 @@ def _fetch_all(
             formatted = "\n".join(provenance) + "\n" + out.to_csv(index=False)
             results["stock_data"] = StockDataText(formatted, price_basis=PRICE_BASIS_VENDOR_QFQ)
     else:
+        # Determine specific failure, refusal, or missing reason
+        is_provider_failure = False
+        is_refusal = False
+        fail_detail = None
+
+        if isinstance(raw_csv, VendorRefuse):
+            is_refusal = True
+            fail_detail = raw_csv.to_prompt()
+        elif isinstance(raw_csv, VendorFail):
+            is_provider_failure = True
+            fail_detail = raw_csv.error
+        elif isinstance(raw_csv, str):
+            raw_str = raw_csv.strip()
+            if any(m in raw_str for m in ("调用失败", "调用异常", "接口请求失败", "服务异常", "连接失败", "provider unavailable", "provider timeout", "未获取到可验证数据")) or any(
+                m in raw_str.lower() for m in ("超时", "timeout", "runtimeerror", "exception", "connection refused", "connection error")
+            ):
+                is_provider_failure = True
+                fail_detail = raw_str
+            elif any(m in raw_str for m in ("快照拒绝", "仅支持当日快照", "仅提供当前快照", "无法用于历史日期分析")):
+                is_refusal = True
+                fail_detail = raw_str
+
         if norm_price_basis == PRICE_BASIS_RAW:
-            err_details = (
-                str(raw_csv).strip()
-                if isinstance(raw_csv, str) and ("失败" in raw_csv or "tushare" in raw_csv or "provider" in raw_csv or "error" in raw_csv.lower())
-                else f"{ticker} 在 {trade_date} 无有效完整未复权日线数据（缺列/非法日期/全部行无效/重复冲突），本项不可用。"
-            )
-            if not err_details.startswith("【数据获取失败】"):
-                err_details = f"【数据获取失败】stock_data raw 失败: {err_details}"
+            if is_provider_failure:
+                err_details = (
+                    fail_detail
+                    if fail_detail and fail_detail.startswith("【数据获取失败】")
+                    else f"【数据获取失败】stock_data raw 失败: {fail_detail or raw_csv}"
+                )
+                ledger_status = "failed"
+                ledger_reason = "raw daily fetch failed"
+            elif is_refusal:
+                err_details = fail_detail or "【数据获取失败】stock_data raw: 拒绝访问"
+                ledger_status = "refused"
+                ledger_reason = "historical snapshot refused"
+            else:
+                err_details = (
+                    str(raw_csv).strip()
+                    if isinstance(raw_csv, str) and ("失败" in raw_csv or "tushare" in raw_csv or "provider" in raw_csv or "error" in raw_csv.lower())
+                    else f"【数据获取失败】{ticker} 在 {trade_date} 无有效完整未复权日线数据（缺列/非法日期/全部行无效/重复冲突），本项不可用。"
+                )
+                ledger_status = "unavailable"
+                ledger_reason = "no valid completed daily bars"
+
             results["stock_data"] = err_details
             if not any(
                 isinstance(entry, dict) and entry.get("source") == "stock_data"
@@ -2805,17 +2936,34 @@ def _fetch_all(
                 data_failure_ledger.append(
                     {
                         "source": "stock_data",
-                        "status": "failed",
-                        "reason": "raw daily fetch failed",
+                        "status": ledger_status,
+                        "reason": ledger_reason,
                         "gap": err_details,
-                        "gap_class": "operational",
+                        "gap_class": "structural" if ledger_status == "refused" else "operational",
                     }
                 )
         else:
-            results["stock_data"] = (
-                f"【数据获取失败】{ticker} 在 {trade_date} 无有效完整日线数据"
-                "（缺列/非法日期/全部行无效/重复冲突），本项不可用。"
-            )
+            if is_provider_failure:
+                err_details = (
+                    fail_detail
+                    if fail_detail and fail_detail.startswith("【数据获取失败】")
+                    else f"【数据获取失败】stock_data 数据源调用失败: {fail_detail or 'provider failure'}"
+                )
+                ledger_status = "failed"
+                ledger_reason = "provider call failed"
+            elif is_refusal:
+                err_details = fail_detail or "【数据获取失败】stock_data 历史快照拒绝"
+                ledger_status = "refused"
+                ledger_reason = "historical snapshot refused"
+            else:
+                err_details = (
+                    f"【数据获取失败】{ticker} 在 {trade_date} 无有效完整日线数据"
+                    "（缺列/非法日期/全部行无效/重复冲突），本项不可用。"
+                )
+                ledger_status = "unavailable"
+                ledger_reason = "no valid completed daily bars"
+
+            results["stock_data"] = err_details
             if not any(
                 isinstance(entry, dict) and entry.get("source") == "stock_data"
                 for entry in data_failure_ledger
@@ -2823,13 +2971,10 @@ def _fetch_all(
                 data_failure_ledger.append(
                     {
                         "source": "stock_data",
-                        "status": "unavailable",
-                        "reason": "no valid completed daily bars",
-                        "gap": (
-                            f"【数据获取失败】stock_data：{ticker} 在 {trade_date} "
-                            "无有效完整日线数据"
-                        ),
-                        "gap_class": "operational",
+                        "status": ledger_status,
+                        "reason": ledger_reason,
+                        "gap": err_details,
+                        "gap_class": "structural" if ledger_status == "refused" else "operational",
                     }
                 )
     daily_context = _build_daily_context(df, trade_date)
@@ -2944,10 +3089,29 @@ def _fetch_all(
                 "vwma": "vwma"
             }
 
+            min_bars_map = {
+                "close_50_sma": 50,
+                "close_200_sma": 200,
+                "close_10_ema": 10,
+                "rsi": 14,
+                "macd": 26,
+                "boll": 20,
+                "boll_ub": 20,
+                "boll_lb": 20,
+                "atr": 14,
+                "vwma": 1,
+            }
+
             for key, ss_key in calc_map.items():
+                if len(df) < min_bars_map.get(key, 1):
+                    indicators_res[key] = "N/A"
+                    continue
                 try:
                     val = ss[ss_key].iloc[-1]
-                    indicators_res[key] = round(float(val), 2) if isinstance(val, (int, float)) else str(val)
+                    if pd.isna(val) or np.isinf(float(val)):
+                        indicators_res[key] = "N/A"
+                    else:
+                        indicators_res[key] = round(float(val), 2)
                 except Exception:
                     indicators_res[key] = "N/A"
         else:
