@@ -699,3 +699,64 @@ class TestRT10UnsupportedPriceBasisAndCalendarFailClosed:
             )
             # Must return None, absolutely never fall back to iloc[4]
             assert price is None
+
+
+# ==============================================================================
+# 生产缺省调用回归验证（不传 trading_days，验证真实交易日历语义与零行号切片）
+# ==============================================================================
+
+
+class TestProductionDefaultCalendarCallWithoutTradingDays:
+    """Regression tests covering production default _get_price_after calls without trading_days."""
+
+    def test_default_call_middle_suspension_hits_real_t5_without_drifting(self):
+        """Reviewer Evidence A: when middle day (2024-01-04) is suspended/missing, hits real T+5 (2024-01-08)."""
+        # A-share trading calendar: Jan 2 (T+1), Jan 3 (T+2), Jan 4 (T+3), Jan 5 (T+4), Jan 8 (T+5)
+        # Stock suspended on Jan 4; data contains 5 rows: Jan 2, 3, 5, 8, 9
+        # Default call with trading_days=None must resolve to 2024-01-08 (108.0), NOT drift to Jan 9 (109.0)!
+        csv_data = """date,close
+2024-01-02,102.0
+2024-01-03,103.0
+2024-01-05,105.0
+2024-01-08,108.0
+2024-01-09,109.0
+"""
+        with patch("tradingagents.dataflows.interface.route_to_vendor", return_value=csv_data):
+            price = bt._get_price_after("600519.SH", "2024-01-01", 5)  # trading_days=None
+            assert price == 108.0, "Must hit real canonical T+5 date (2024-01-08)"
+            assert price != 109.0, "Must NOT drift to 5th data row (2024-01-09)"
+
+    def test_default_call_target_suspension_fails_closed_when_zero_roll(self):
+        """Reviewer Evidence B: when target T+5 date (2024-01-08) is suspended/missing and max_roll_days=0, returns None."""
+        # Stock suspended on Jan 8; data contains Jan 2, 3, 4, 5, 9 (Jan 8 missing)
+        csv_data = """date,close
+2024-01-02,102.0
+2024-01-03,103.0
+2024-01-04,104.0
+2024-01-05,105.0
+2024-01-09,110.0
+"""
+        with patch("tradingagents.dataflows.interface.route_to_vendor", return_value=csv_data):
+            price = bt._get_price_after("600519.SH", "2024-01-01", 5, max_roll_days=0)  # trading_days=None
+            # Must return None (fail-closed), NOT advance to Jan 9 (110.0)
+            assert price is None, "Must fail closed to None when target T+5 date is missing and max_roll_days=0"
+
+    def test_default_call_target_suspension_rolls_when_roll_allowed(self):
+        """When target T+5 date (2024-01-08) is missing but max_roll_days=2, rolls to next trading day (2024-01-09)."""
+        csv_data = """date,close
+2024-01-02,102.0
+2024-01-03,103.0
+2024-01-04,104.0
+2024-01-05,105.0
+2024-01-09,110.0
+"""
+        with patch("tradingagents.dataflows.interface.route_to_vendor", return_value=csv_data):
+            price = bt._get_price_after("600519.SH", "2024-01-01", 5, max_roll_days=2)  # trading_days=None
+            assert price == 110.0, "Must roll to candidate trading day (2024-01-09)"
+
+    def test_default_call_short_series_fails_closed_to_none(self):
+        """When series has fewer rows than hold_days, returns None (no truncation)."""
+        short_csv = "date,close\n2024-01-02,100\n2024-01-03,101\n"
+        with patch("tradingagents.dataflows.interface.route_to_vendor", return_value=short_csv):
+            price = bt._get_price_after("600519.SH", "2024-01-01", 5)  # trading_days=None
+            assert price is None
