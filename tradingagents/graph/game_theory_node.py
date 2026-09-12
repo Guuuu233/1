@@ -7,14 +7,18 @@ Orchestrates multi-agent counterparty game theory analysis across:
 3. 杠杆资金 (Leveraged Margin Capital)
 4. 散户群体 (Retail Investors & Chip Concentration)
 
-Contracts & Disciplines (AGENTS.md §3.4, §3.5, §4, §5):
-- Pure deterministic calculations for all numeric signals and strategy derivation.
-- No LLM hallucination of numerical indicators (RT-6).
-- Explicit unavailability marking for missing/failed sources; never return empty string or fake zeros (RT-2).
-- Fail-safe execution: Node exceptions never crash the workflow; leaves traceable logs and audit trails (RT-3).
-- Graph reachability: executed cleanly between Research Manager and Trader (RT-4).
-- State & persistence: game_theory_report and game_theory_signals written to state, persisted to ReportDB,
-  and verified on readback (RT-1, RT-5).
+Contracts & Disciplines:
+- AGENTS.md §3.4, §3.5, §4, §5: Explicit unavailability marking; no fabricated metrics.
+- RT-6: Pure deterministic calculations for all numeric signals and strategy derivation; no LLM hallucination.
+- RT-8: Atomicity & semantic consistency:
+  - When degraded/failed: {"game_theory_report": "【博弈论分析不可用】原因：...", "game_theory_signals": None}
+  - When successful: report and signals both complete, never mismatched.
+  - Strict JSON safety: no NaN, Inf, -Inf, numpy scalars or ndarrays.
+- RT-9: Historical backtest mode & asset-specific normal absence of data:
+  - Distinguishes service failures from normal business states (non-margin stocks, non-connect stocks, non-abnormal days).
+  - Snapshot tools in historical dates identified as rule-based unavailability, not service outages.
+  - Remaining available indicators calculated normally without throwing.
+- RT-3 / RT-4: Safe execution (never crashes graph) and audit traceability via analyst_traces.
 """
 
 from __future__ import annotations
@@ -23,10 +27,10 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import re
 from typing import Any, Mapping, Optional
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableLambda
 from langgraph.graph import StateGraph
 
@@ -34,7 +38,6 @@ from tradingagents.agents.utils.agent_states import (
     AgentState,
     GameTheorySignals,
     TraceItem,
-    check_llm_output_degraded,
     current_tracker_var,
 )
 from tradingagents.agents.utils.game_theory_tools import (
@@ -47,7 +50,10 @@ from tradingagents.agents.utils.game_theory_tools import (
     fetch_shareholder_count,
     fetch_zt_pool,
 )
-from tradingagents.prompts import get_prompt
+from tradingagents.dataflows.trade_calendar import (
+    SNAPSHOT_ONLY_REFUSAL,
+    is_historical_analysis_date,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,26 +62,99 @@ AGENT_NAME: str = "game_theory_analyst"
 REPORT_KEY: str = "game_theory_report"
 SIGNALS_KEY: str = "game_theory_signals"
 
-FAILURE_MARKERS: tuple[str, ...] = (
+# Service failure indicators (server error, timeout, crash)
+SERVICE_FAILURE_MARKERS: tuple[str, ...] = (
     "【数据获取失败】",
-    "未获取",
-    "超时",
-    "失败",
-    "异常",
-    "不可用",
-    "无数据",
-    "停更",
+    "接口超时",
+    "请求超时",
+    "调用失败",
+    "服务异常",
+    "接口异常",
+    "网络错误",
+    "ConnectionError",
+    "TimeoutError",
+    "HTTP 500",
+    "HTTP 502",
+    "HTTP 504",
+)
+
+# Normal business absence indicators (e.g. non-margin, non-connect, non-abnormal day, snapshot limitation)
+NORMAL_ABSENCE_MARKERS: tuple[str, ...] = (
+    "非两融标的",
+    "未纳入融资融券",
+    "暂无两融",
+    "无融资融券",
+    "非陆股通标的",
+    "未纳入陆股通",
+    "自 2024 年 8 月起停止披露",
+    "非异动日",
+    "未上榜",
+    "无龙虎榜",
+    "无上榜记录",
+    "该数据源仅提供当前快照",
+    "无法用于历史日期分析",
 )
 
 
-def _is_failed_text(val: Any) -> bool:
-    """Return True if a data source text indicates failure or unavailability."""
+def ensure_json_safe(obj: Any) -> Any:
+    """Recursively sanitize objects to guarantee strict JSON safety (RT-8).
+
+    - NaN / Inf / -Inf converted to None
+    - numpy scalars (float64, int64, bool_) converted to native Python types
+    - numpy ndarray converted to list
+    - dict keys converted to str
+    - Validated with json.dumps(..., allow_nan=False)
+    """
+    if obj is None:
+        return None
+
+    # Check numpy types without hard dependency
+    type_name = type(obj).__name__
+    module_name = type(obj).__module__
+
+    if "numpy" in module_name:
+        if hasattr(obj, "shape") and getattr(obj, "shape") != ():
+            return [ensure_json_safe(i) for i in obj.tolist()]
+        elif hasattr(obj, "item"):
+            try:
+                obj = obj.item()
+            except Exception:
+                pass
+
+    if isinstance(obj, (float,)):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return float(obj)
+    if isinstance(obj, bool):
+        return bool(obj)
+    if isinstance(obj, int):
+        return int(obj)
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, Mapping):
+        return {str(k): ensure_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [ensure_json_safe(i) for i in obj]
+
+    return str(obj)
+
+
+def _is_service_failure(val: Any) -> bool:
+    """Return True if text indicates an unexpected external service failure or timeout."""
+    if val is None:
+        return False
+    s = str(val).strip()
+    return any(marker in s for marker in SERVICE_FAILURE_MARKERS)
+
+
+def _is_normal_absence(val: Any) -> bool:
+    """Return True if data indicates a normal business absence (non-margin, non-connect, non-LHB, etc.)."""
     if val is None:
         return True
     s = str(val).strip()
-    if not s or s == "无数据":
+    if not s or s == "无数据" or s == "[]" or s == "{}":
         return True
-    return any(marker in s for marker in FAILURE_MARKERS)
+    return any(marker in s for marker in NORMAL_ABSENCE_MARKERS)
 
 
 def _safe_float(val: Any) -> Optional[float]:
@@ -83,7 +162,7 @@ def _safe_float(val: Any) -> Optional[float]:
         return None
     try:
         f = float(val)
-        return f if f == f else None  # Filter NaN
+        return f if (f == f and not math.isinf(f)) else None
     except (ValueError, TypeError):
         return None
 
@@ -97,16 +176,15 @@ def _extract_fund_flow_info(
     result: dict[str, Any] = {
         "status": "unavailable",
         "net_amount": None,
-        "direction": 0,  # +1 inflow, -1 outflow, 0 neutral
-        "direction_label": "中性",
-        "description": "资金流数据不可用",
+        "direction": 0,
+        "direction_label": "数据不可用",
+        "description": "个股主力资金流数据不可用",
     }
 
-    # 1. Check fund_flow_evidence mapping if present
+    # 1. fund_flow_evidence mapping
     if isinstance(fund_flow_evidence, Mapping):
         sel = fund_flow_evidence.get("selection")
         if isinstance(sel, Mapping):
-            status = sel.get("selection_status")
             val = _safe_float(sel.get("selected_value"))
             if val is not None:
                 result["net_amount"] = val
@@ -126,7 +204,7 @@ def _extract_fund_flow_info(
                     result["description"] = f"主力资金净额平衡 (0 {unit})"
                 return result
 
-    # 2. Check scale_metrics
+    # 2. scale_metrics mapping
     if isinstance(scale_metrics, Mapping):
         net_val = _safe_float(scale_metrics.get("net_amount"))
         if net_val is not None:
@@ -143,13 +221,12 @@ def _extract_fund_flow_info(
             else:
                 result["direction"] = 0
                 result["direction_label"] = "主力中性"
-                result["description"] = "主力资金净额平衡 (0 万元)"
+                result["description"] = "主力资金净额基本持平"
             return result
 
-    # 3. Fallback: Parse raw string from individual fund flow
-    if fund_flow_raw and not _is_failed_text(fund_flow_raw):
+    # 3. Raw individual fund flow text
+    if fund_flow_raw and not _is_service_failure(fund_flow_raw):
         text = str(fund_flow_raw)
-        # Match e.g. "净额: 1234.56" or "净流入: -567.89"
         m = re.search(r'(?:净流入|净额)[^\d\-+]*([+\-]?\d+(?:\.\d+)?)', text)
         if m:
             val = _safe_float(m.group(1))
@@ -159,41 +236,56 @@ def _extract_fund_flow_info(
                 if val > 0:
                     result["direction"] = 1
                     result["direction_label"] = "主力净流入"
-                    result["description"] = f"主力净额呈现流入 ({val:.2f})"
+                    result["description"] = f"主力资金净流入 ({val:.2f})"
                 elif val < 0:
                     result["direction"] = -1
                     result["direction_label"] = "主力净流出"
-                    result["description"] = f"主力净额呈现流出 ({val:.2f})"
+                    result["description"] = f"主力资金净流出 ({val:.2f})"
                 else:
                     result["direction"] = 0
                     result["direction_label"] = "主力中性"
-                    result["description"] = "主力净额基本持平"
+                    result["description"] = "主力资金净额基本平衡"
                 return result
+        if len(text) > 10:
+            result["status"] = "partial"
+            result["description"] = text[:120].strip()
+            return result
 
-        result["status"] = "partial"
-        result["description"] = text[:120].strip()
-        return result
-
-    result["description"] = "【数据获取失败】个股主力资金流向数据不可用"
+    if _is_service_failure(fund_flow_raw):
+        result["status"] = "failed"
+        result["description"] = f"【数据获取失败】主力资金流接口异常：{str(fund_flow_raw)[:80]}"
+    else:
+        result["description"] = "【数据缺失】个股主力资金流数据未提供，本项不可用"
     return result
 
 
 def _extract_margin_info(margin_raw: Any) -> dict[str, Any]:
-    """Deterministically parse margin trading (leveraged capital) metrics."""
+    """Deterministically parse margin trading (leveraged capital) metrics (RT-9)."""
     result: dict[str, Any] = {
         "status": "unavailable",
         "direction": 0,
-        "direction_label": "中性",
+        "direction_label": "数据不可用",
         "description": "融资融券数据不可用",
     }
-    if not margin_raw or _is_failed_text(margin_raw):
-        result["description"] = "【数据获取失败】融资融券明细数据不可用"
+
+    # Case 1: Service failure
+    if _is_service_failure(margin_raw):
+        result["status"] = "failed"
+        result["direction_label"] = "数据获取失败"
+        result["description"] = "【数据获取失败】融资融券明细接口超时或服务异常，该项不可用。"
+        return result
+
+    # Case 2: Normal business absence (RT-9: 非两融标的)
+    if _is_normal_absence(margin_raw):
+        result["status"] = "not_applicable_normal"
+        result["direction"] = 0
+        result["direction_label"] = "非两融标的"
+        result["description"] = "标的未纳入融资融券标的范围（非两融标的），无杠杆资金数据属正常业务状态。"
         return result
 
     text = str(margin_raw)
     result["status"] = "available"
 
-    # Match 融资买入额 vs 融资偿还额
     buy_m = re.search(r'融资买入额[^\d]*(\d+(?:\.\d+)?)', text)
     repay_m = re.search(r'融资偿还额[^\d]*(\d+(?:\.\d+)?)', text)
     balance_m = re.search(r'融资余额[^\d]*(\d+(?:\.\d+)?)', text)
@@ -232,17 +324,25 @@ def _extract_shareholder_info(shareholder_raw: Any) -> dict[str, Any]:
     result: dict[str, Any] = {
         "status": "unavailable",
         "direction": 0,
-        "direction_label": "中性",
+        "direction_label": "数据未披露",
         "description": "股东户数数据不可用",
     }
-    if not shareholder_raw or _is_failed_text(shareholder_raw):
-        result["description"] = "【数据获取失败】股东户数与筹码集中度数据不可用"
+
+    if _is_service_failure(shareholder_raw):
+        result["status"] = "failed"
+        result["direction_label"] = "数据获取失败"
+        result["description"] = "【数据获取失败】股东户数与筹码集中度接口异常或超时，该项不可用。"
+        return result
+
+    if not shareholder_raw or str(shareholder_raw).strip() in ("", "无数据", "None"):
+        result["status"] = "unavailable"
+        result["direction_label"] = "数据未披露"
+        result["description"] = "【数据缺失】股东户数未披露，该项不可用。"
         return result
 
     text = str(shareholder_raw)
     result["status"] = "available"
 
-    # Match change percent: 较上期变动: -3.5%
     m = re.search(r'较上期变动[^\d\-+]*([+\-]?\d+(?:\.\d+)?)%?', text)
     count_m = re.search(r'股东户数[^\d]*(\d+)', text)
 
@@ -251,11 +351,11 @@ def _extract_shareholder_info(shareholder_raw: Any) -> dict[str, Any]:
 
     if chg_pct is not None:
         if chg_pct < -1.0:
-            result["direction"] = 1  # Chip concentration is bullish
+            result["direction"] = 1
             result["direction_label"] = "筹码集中"
             result["description"] = f"股东户数较上期减少 {abs(chg_pct):.2f}%（筹码持续集中，散户离场/主力锁仓）"
         elif chg_pct > 1.0:
-            result["direction"] = -1  # Chip dispersion is bearish
+            result["direction"] = -1
             result["direction_label"] = "筹码分散"
             result["description"] = f"股东户数较上期增加 {chg_pct:.2f}%（筹码趋向分散，散户涌入/主力派发）"
         else:
@@ -274,18 +374,27 @@ def _extract_shareholder_info(shareholder_raw: Any) -> dict[str, Any]:
 
 
 def _extract_northbound_info(northbound_raw: Any) -> dict[str, Any]:
-    """Deterministically parse northbound foreign capital metrics."""
+    """Deterministically parse northbound foreign capital metrics (RT-9)."""
     result: dict[str, Any] = {
         "status": "unavailable",
         "direction": 0,
-        "direction_label": "中性",
+        "direction_label": "数据不可用",
         "description": "北向资金数据不可用",
     }
-    if not northbound_raw or _is_failed_text(northbound_raw):
-        if northbound_raw and "自 2024 年 8 月起停止披露" in str(northbound_raw):
-            result["description"] = "【数据制度性停更】沪深港通个股每日持股明细自2024年8月起停止披露，本项不可用。"
-        else:
-            result["description"] = "【数据获取失败】北向资金持股变动数据不可用"
+
+    # Case 1: Service failure
+    if _is_service_failure(northbound_raw) and "停止披露" not in str(northbound_raw):
+        result["status"] = "failed"
+        result["direction_label"] = "数据获取失败"
+        result["description"] = "【数据获取失败】北向资金持股变动接口异常或超时，该项不可用。"
+        return result
+
+    # Case 2: Normal business absence / institutional cessation (RT-9: 非陆股通标的或停更)
+    if _is_normal_absence(northbound_raw) or (northbound_raw and "自 2024 年 8 月起停止披露" in str(northbound_raw)):
+        result["status"] = "not_applicable_normal"
+        result["direction"] = 0
+        result["direction_label"] = "非陆股通标的/停更"
+        result["description"] = "标的未纳入陆股通范围或每日持股明细自2024年8月起制度性停更，无北向数据属正常业务状态。"
         return result
 
     text = str(northbound_raw)
@@ -306,19 +415,40 @@ def _extract_northbound_info(northbound_raw: Any) -> dict[str, Any]:
     return result
 
 
-def _extract_board_flow_info(board_raw: Any) -> dict[str, Any]:
-    """Deterministically parse sector/board fund flow context."""
-    if not board_raw or _is_failed_text(board_raw):
+def _extract_snapshot_tool_info(
+    tool_label: str,
+    raw_val: Any,
+    trade_date: str,
+) -> dict[str, Any]:
+    """Handle real-time snapshot tools with historical backtest awareness (RT-9)."""
+    is_historical = is_historical_analysis_date(trade_date)
+    raw_str = str(raw_val or "").strip()
+
+    if is_historical or SNAPSHOT_ONLY_REFUSAL in raw_str or "历史日拒绝" in raw_str:
+        return {
+            "status": "snapshot_historical_rule",
+            "board": f"{tool_label}历史不可用（快照类规则）",
+            "description": f"【数据不可用】{tool_label}仅提供当前实时快照，历史回测分析（{trade_date}）按规则不予提供（正常业务约束）。",
+        }
+
+    if _is_service_failure(raw_val):
+        return {
+            "status": "failed",
+            "board": f"{tool_label}接口失败",
+            "description": f"【数据获取失败】{tool_label}服务异常或超时，该项不可用。",
+        }
+
+    if not raw_str or raw_str == "无数据":
         return {
             "status": "unavailable",
-            "board": "板块资金流向数据不可用",
-            "description": "【数据获取失败】行业板块资金流向数据不可用",
+            "board": f"{tool_label}暂无数据",
+            "description": f"【数据缺失】{tool_label}暂无数据。",
         }
-    text = str(board_raw).strip()
+
     return {
         "status": "available",
-        "board": text[:120].strip(),
-        "description": text[:200].strip(),
+        "board": raw_str[:120].strip(),
+        "description": raw_str[:200].strip(),
     }
 
 
@@ -327,11 +457,15 @@ def compute_game_theory_signals(
     trade_date: str,
     raw_data: Mapping[str, Any],
     consensus_direction: Optional[str] = None,
-) -> tuple[str, GameTheorySignals]:
+) -> tuple[str, Optional[GameTheorySignals]]:
     """Pure deterministic computation of game theory signals and markdown report.
 
     Strict zero hallucination (RT-6): all values, player states, dominant strategies,
     and equilibrium evaluations are determined in Python from raw evidence.
+
+    Degraded state (RT-8):
+    When all opponent data is genuinely failed / unavailable, returns:
+    ("【博弈论分析不可用】原因：...", None)
     """
     fund_flow_raw = raw_data.get("fund_flow_individual")
     fund_flow_evidence = raw_data.get("fund_flow_evidence")
@@ -342,47 +476,36 @@ def compute_game_theory_signals(
     board_raw = raw_data.get("fund_flow_board")
     lhb_raw = raw_data.get("lhb")
 
-    # 1. Parse individual players
+    # 1. Parse individual players with RT-9 awareness
     ff_info = _extract_fund_flow_info(fund_flow_raw, fund_flow_evidence, scale_metrics)
     margin_info = _extract_margin_info(margin_raw)
     sh_info = _extract_shareholder_info(shareholder_raw)
     nb_info = _extract_northbound_info(northbound_raw)
-    board_info = _extract_board_flow_info(board_raw)
+    board_info = _extract_snapshot_tool_info("行业板块资金流向", board_raw, trade_date)
 
-    # 2. Track availability
-    dimensions = {
-        "主力资金": ff_info["status"],
-        "杠杆资金": margin_info["status"],
-        "散户筹码": sh_info["status"],
-        "北向资金": nb_info["status"],
-        "行业板块": board_info["status"],
-    }
-    available_count = sum(1 for st in dimensions.values() if st == "available")
-    total_count = len(dimensions)
+    # 2. Track availability vs normal absence (RT-9)
+    # Genuine active data sources that provide directional trading evidence
+    core_statuses = [ff_info["status"], margin_info["status"], sh_info["status"], nb_info["status"]]
+    has_active_data = any(st in ("available", "partial") for st in core_statuses)
 
-    # RT-2: All opponent data missing/failed -> fail closed
-    if available_count == 0:
-        report_text = (
-            f"## 博弈论与对手盘分析报告（{ticker} | {trade_date}）\n\n"
-            "【数据获取失败】博弈论对手方数据源（个股主力资金流、融资融券、股东户数、北向资金等）全部缺失或不可用。"
-            "根据 AGENTS.md §3.4 规范，本项显式标注不可用，严禁伪造默认值，不得据此判断无博弈风险。\n\n"
-            "<!-- VERDICT: {\"direction\": \"中性\", \"confidence\": \"低\", \"reason\": \"对手方数据全部缺失\"} -->"
+    # Total failure / Degraded condition (RT-8 convention)
+    # If all core dimensions have 0 active data
+    if not has_active_data:
+        degraded_report = (
+            f"【博弈论分析不可用】原因：标的 {ticker} 在分析日 {trade_date} 的对手方核心数据源"
+            "（个股主力资金流、融资融券、股东户数、北向资金等）全部缺失或接口调用失败，"
+            "无法建立确定性博弈矩阵与占优策略推导。本项不可用，严禁编造默认指标。"
         )
-        signals: GameTheorySignals = {
-            "board": "板块数据不可用",
-            "players": ["主力机构", "北向资金", "杠杆资金", "散户群体"],
-            "player_states": {k: "数据不可用" for k in ["主力机构", "北向资金", "杠杆资金", "散户群体"]},
-            "likely_actions": {k: ["动作未知（数据缺失）"] for k in ["主力机构", "北向资金", "杠杆资金", "散户群体"]},
-            "dominant_strategy": "数据缺失/保持观望",
-            "fragile_equilibrium": "对手方数据缺失，无法判定博弈均衡状态。",
-            "counter_consensus_signal": "数据不可用，无反共识信号",
-            "confidence": 0.0,
-            "data_status": "unavailable",
-        }
-        return report_text, signals
+        return degraded_report, None
 
-    data_status = "available" if available_count == total_count else "partial"
-    confidence_score = round(available_count / total_count, 2)
+    # Calculate confidence based on available / normally accounted dimensions
+    # Available = available, normal_absence counts towards accounted completeness
+    valid_count = sum(1 for st in core_statuses if st in ("available", "partial"))
+    accounted_count = sum(1 for st in core_statuses if st in ("available", "partial", "not_applicable_normal"))
+    total_count = len(core_statuses)
+
+    confidence_score = round(valid_count / total_count, 2)
+    data_status = "available" if accounted_count == total_count and valid_count >= 2 else "partial"
 
     # 3. Assemble player states and likely actions
     player_states: dict[str, str] = {
@@ -400,17 +523,21 @@ def compute_game_theory_signals(
     else:
         likely_actions["主力机构"] = ["存量观望", "按兵不动"]
 
-    if nb_info["direction"] == 1:
+    if nb_info["status"] == "not_applicable_normal":
+        likely_actions["北向资金"] = ["非陆股通标的/无北向交易"]
+    elif nb_info["direction"] == 1:
         likely_actions["北向资金"] = ["核心资产配置", "顺势增持"]
     elif nb_info["direction"] == -1:
         likely_actions["北向资金"] = ["流动性套现", "逢高流出"]
     else:
         likely_actions["北向资金"] = ["配置平稳或停更"]
 
-    if margin_info["direction"] == 1:
+    if margin_info["status"] == "not_applicable_normal":
+        likely_actions["杠杆资金"] = ["非两融标的/无杠杆交易"]
+    elif margin_info["direction"] == 1:
         likely_actions["杠杆资金"] = ["利用融资杠杆追逐弹性", "顺势做多"]
     elif margin_info["direction"] == -1:
-        likely_actions["杠杆资金"] = ["被动或主动降低融资负债", "防守避险"]
+        likely_actions["杠杆资金"] = ["降低融资负债", "防守避险"]
     else:
         likely_actions["杠杆资金"] = ["杠杆仓位保持稳定"]
 
@@ -421,7 +548,7 @@ def compute_game_theory_signals(
     else:
         likely_actions["散户群体"] = ["观望等待"]
 
-    # 4. Deterministic Dominant Strategy derivation
+    # 4. Deterministic Dominant Strategy derivation (RT-6)
     main_dir = ff_info["direction"]
     sh_dir = sh_info["direction"]
     margin_dir = margin_info["direction"]
@@ -438,6 +565,12 @@ def compute_game_theory_signals(
     elif main_dir == -1 and sh_dir == 1:
         dominant_strategy = "防御观察：主力微幅兑现但底仓筹码集中度未破，观察关键技术均线与支撑有效性"
         overall_dir = "中性"
+    elif main_dir == 1:
+        dominant_strategy = "顺势跟随：主力资金呈增持做多意愿，适度参与多头博弈"
+        overall_dir = "偏多"
+    elif main_dir == -1:
+        dominant_strategy = "谨慎避险：主力资金流出减仓，建议以防守观望为主"
+        overall_dir = "偏空"
     else:
         dominant_strategy = "中性博弈：多空对手盘分歧明显，未见明确主导方，建议保持仓位克制与观望"
         overall_dir = "中性"
@@ -478,7 +611,8 @@ def compute_game_theory_signals(
     else:
         counter_consensus_signal = "无显著反共识信号：资金博弈动向与研判逻辑基本一致。"
 
-    signals: GameTheorySignals = {
+    # 7. Construct and sanitize structured signals (RT-8 JSON safety)
+    raw_signals: dict[str, Any] = {
         "board": board_info["board"],
         "players": ["主力机构", "北向资金", "杠杆资金", "散户群体"],
         "player_states": player_states,
@@ -490,15 +624,25 @@ def compute_game_theory_signals(
         "data_status": data_status,
     }
 
-    # 7. Construct Markdown report
-    conf_label = "高" if confidence_score >= 0.8 else ("中" if confidence_score >= 0.4 else "低")
-    lhb_snippet = ""
-    if lhb_raw and not _is_failed_text(lhb_raw):
-        lhb_snippet = f"- **龙虎榜席位事实**：{str(lhb_raw)[:150].strip()}\n"
+    # Strict JSON sanitization (no NaN, Inf, numpy types)
+    signals: GameTheorySignals = ensure_json_safe(raw_signals)
+    json.dumps(signals, allow_nan=False)  # Assert strict JSON serialization
+
+    # 8. Construct Markdown report
+    conf_label = "高" if confidence_score >= 0.75 else ("中" if confidence_score >= 0.35 else "低")
+
+    # LHB section (RT-9: 非异动日正常处理)
+    lhb_str = str(lhb_raw or "").strip()
+    if _is_normal_absence(lhb_str) or not lhb_str or lhb_str == "无数据":
+        lhb_snippet = "- **龙虎榜席位事实**：当日无龙虎榜上榜记录（非异动日），属正常业务状态。\n"
+    elif _is_service_failure(lhb_str):
+        lhb_snippet = f"- **龙虎榜席位事实**：【数据获取失败】龙虎榜接口异常，该项不可用。\n"
+    else:
+        lhb_snippet = f"- **龙虎榜席位事实**：{lhb_str[:150].strip()}\n"
 
     report_text = (
         f"## 博弈论与对手盘分析报告（{ticker} | {trade_date}）\n\n"
-        f"**数据覆盖度与置信度**：{available_count}/{total_count} 项可用（置信度: {confidence_score:.2f} | {conf_label}）\n\n"
+        f"**数据覆盖与置信度**：{valid_count}/{total_count} 项核心数据有效参与计算（置信度: {confidence_score:.2f} | {conf_label}）\n\n"
         f"### 1. 市场参与主体画像与立场解构\n"
         f"- **主力机构**：{ff_info['description']}\n"
         f"{lhb_snippet}"
@@ -531,7 +675,7 @@ def _gather_game_theory_raw_data(
     state: Mapping[str, Any],
     data_collector: Any,
 ) -> dict[str, Any]:
-    """Collect data from pool or fallback functions with non-blocking error handling."""
+    """Collect data from pool or fallback functions across all 8 tools with non-blocking safety."""
     pool: Optional[dict[str, Any]] = None
     if data_collector is not None and hasattr(data_collector, "get"):
         try:
@@ -547,7 +691,6 @@ def _gather_game_theory_raw_data(
     if not isinstance(pool_market_ctx, Mapping):
         pool_market_ctx = market_data_ctx
 
-    # Extract or fallback for each item
     def _fetch_or_fallback(key: str, fallback_fn, *args, **kwargs) -> Any:
         if pool and key in pool and pool[key] is not None:
             return pool[key]
@@ -556,6 +699,7 @@ def _gather_game_theory_raw_data(
         except Exception as exc:
             return f"【数据获取失败】{key} — 原因：{exc}。该项不可用。"
 
+    # Gather all 8 tool inputs enumerated in game_theory_tools.py
     raw_data: dict[str, Any] = {
         "fund_flow_evidence": pool_market_ctx.get("fund_flow_evidence") or market_data_ctx.get("fund_flow_evidence"),
         "scale_metrics": pool_market_ctx.get("scale_metrics") or market_data_ctx.get("scale_metrics"),
@@ -578,7 +722,7 @@ def create_game_theory_node(
     """Create the Game Theory LangGraph node runnable with sync & async compatibility."""
 
     def _execute_node(state: AgentState) -> dict[str, Any]:
-        """Core node execution logic with full exception isolation (RT-3)."""
+        """Core node execution logic with atomicity & fail-safe guarantees (RT-3, RT-8)."""
         ticker = state.get("company_of_interest", "")
         trade_date = state.get("trade_date", "")
         horizon = state.get("horizon") or "short"
@@ -601,13 +745,42 @@ def create_game_theory_node(
                 elif "SELL" in plan or "卖出" in plan or "看空" in plan:
                     consensus_dir = "SELL"
 
-            # 3. Deterministic calculation (RT-6)
+            # 3. Deterministic calculation (RT-6, RT-8, RT-9)
             report_text, signals = compute_game_theory_signals(
                 ticker=ticker,
                 trade_date=trade_date,
                 raw_data=raw_data,
                 consensus_direction=consensus_dir,
             )
+
+            # Semantic consistency & atomicity validation (RT-8):
+            # If signals is None or report is broken/unavailable, both must atomically degrade.
+            if signals is None or not report_text or str(report_text).startswith("【博弈论分析不可用】"):
+                degraded_report = (
+                    str(report_text)
+                    if (report_text and str(report_text).startswith("【博弈论分析不可用】"))
+                    else f"【博弈论分析不可用】原因：标的 {ticker} 在分析日 {trade_date} 信号计算或报告生成不完整，保持原子性降级。"
+                )
+                fail_trace: TraceItem = {
+                    "agent": AGENT_NAME,
+                    "horizon": horizon,
+                    "data_window": "短期博弈",
+                    "key_finding": "博弈论分析不可用（数据缺失或降级状态）",
+                    "verdict": "中性",
+                    "confidence": "低",
+                    "source_status": "unavailable",
+                    "source_mode": "deterministic_game_theory",
+                    "bundle_id": "game_theory_v1",
+                    "direction_allowed": False,
+                    "reason_codes": ["data_unavailable_or_degraded"],
+                    "evidence_refs": [],
+                    "financial_period_compliance": {},
+                }
+                return {
+                    REPORT_KEY: degraded_report,
+                    SIGNALS_KEY: None,
+                    "analyst_traces": [fail_trace],
+                }
 
             # 4. Extract verdict for trace
             m = re.search(r'<!--\s*VERDICT:\s*(\{.*?\})\s*-->', report_text, re.DOTALL)
@@ -635,7 +808,7 @@ def create_game_theory_node(
                 "bundle_id": "game_theory_v1",
                 "direction_allowed": (source_status != "unavailable"),
                 "reason_codes": [signals.get("dominant_strategy", "")[:30]],
-                "evidence_refs": [k for k, v in raw_data.items() if not _is_failed_text(v)],
+                "evidence_refs": [k for k, v in raw_data.items() if not _is_service_failure(v)],
                 "financial_period_compliance": {},
             }
 
@@ -657,6 +830,7 @@ def create_game_theory_node(
                 signals.get("confidence", 0.0),
             )
 
+            # Return atomically with guaranteed JSON safety (RT-8)
             return {
                 REPORT_KEY: report_text,
                 SIGNALS_KEY: signals,
@@ -664,20 +838,10 @@ def create_game_theory_node(
             }
 
         except Exception as exc:
-            # RT-3: Never crash the graph on node failure; leave explicit gap and traceable record
+            # RT-3 / RT-8: Fail-closed atomic degradation:
+            # {"game_theory_report": "【博弈论分析不可用】原因：...", "game_theory_signals": None}
             logger.error("[GameTheoryNode] Execution failed: %s", exc, exc_info=True)
-            fail_msg = f"【数据获取失败】博弈论分析节点异常 — 原因：{type(exc).__name__}: {exc}。本项不可用。"
-            fail_signals: GameTheorySignals = {
-                "board": "节点异常不可用",
-                "players": ["主力机构", "北向资金", "杠杆资金", "散户群体"],
-                "player_states": {k: "节点异常不可用" for k in ["主力机构", "北向资金", "杠杆资金", "散户群体"]},
-                "likely_actions": {k: ["节点异常不可用"] for k in ["主力机构", "北向资金", "杠杆资金", "散户群体"]},
-                "dominant_strategy": "节点异常/不可用",
-                "fragile_equilibrium": "节点异常，无法判定博弈均衡状态。",
-                "counter_consensus_signal": "节点异常，无反共识信号",
-                "confidence": 0.0,
-                "data_status": "unavailable",
-            }
+            degraded_msg = f"【博弈论分析不可用】原因：节点执行严重异常（{type(exc).__name__}: {exc}），该项不可用。"
             fail_trace: TraceItem = {
                 "agent": AGENT_NAME,
                 "horizon": horizon,
@@ -694,13 +858,12 @@ def create_game_theory_node(
                 "financial_period_compliance": {},
             }
             return {
-                REPORT_KEY: fail_msg,
-                SIGNALS_KEY: fail_signals,
+                REPORT_KEY: degraded_msg,
+                SIGNALS_KEY: None,
                 "analyst_traces": [fail_trace],
             }
 
     async def _async_node(state: AgentState) -> dict[str, Any]:
-        # Run execution logic directly in async loop
         return await asyncio.to_thread(_execute_node, state)
 
     return RunnableLambda(_execute_node, afunc=_async_node)
@@ -723,7 +886,6 @@ def wire_game_theory_node(
     node_runnable = create_game_theory_node(llm=llm, data_collector=data_collector)
     workflow.add_node(NODE_NAME, node_runnable)
 
-    # Check if edge ('Research Manager', 'Trader') exists and rewire
     if hasattr(workflow, "edges"):
         edge_pair = ("Research Manager", "Trader")
         if edge_pair in workflow.edges:
@@ -733,5 +895,4 @@ def wire_game_theory_node(
             logger.info("[GameTheoryNode] Successfully wired between Research Manager and Trader")
             return
 
-    # Fallback wiring if Research Manager or Trader edge wasn't found directly
     workflow.add_edge(NODE_NAME, "Trader")
