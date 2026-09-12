@@ -138,7 +138,7 @@ class TestSevenReportsInputAndManifest:
         def fake_bear_stream(prompt):
             bear_captured_prompts.append(prompt)
             return _fake_stream(
-                '空头分析\n<!-- DEBATE_STATE: {"responded_claim_ids": ["INV-1"], "new_claims": [{"claim": "空头主张", "evidence": ["证据"], "confidence": 0.8, "target_claim_ids": ["INV-1"]}], "resolved_claim_ids": [], "unresolved_claim_ids": [], "next_focus_claim_ids": [], "round_summary": "空头立论", "round_goal": "立论"} -->'
+                '空头分析\n<!-- DEBATE_STATE: {"responded_claim_ids": [], "new_claims": [{"claim": "空头主张", "evidence": ["证据"], "confidence": 0.8, "target_claim_ids": []}], "resolved_claim_ids": [], "unresolved_claim_ids": [], "next_focus_claim_ids": [], "round_summary": "空头立论", "round_goal": "立论"} -->'
             )
 
         mock_llm_bear.astream = MagicMock(side_effect=fake_bear_stream)

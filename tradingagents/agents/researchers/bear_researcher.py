@@ -1,10 +1,12 @@
 import logging
+from typing import Any, Mapping
 from tradingagents.dataflows.config import get_config
 from tradingagents.prompts import get_prompt
 from tradingagents.graph.intent_parser import build_horizon_context
 from tradingagents.agents.utils.agent_states import current_tracker_var, is_v2_debate_enabled
 from tradingagents.agents.utils.debate_utils import (
     DebateProtocolError,
+    _string_list,
     build_debate_report_manifest,
     format_claim_subset_for_prompt,
     format_claims_for_prompt,
@@ -16,6 +18,121 @@ from tradingagents.agents.utils.debate_utils import (
 from tradingagents.agents.utils.prompt_injection import build_injection_slots, Placement, DEFAULT_PLACEMENT
 
 _logger = logging.getLogger(__name__)
+
+
+def _validate_bear_claim_references(
+    state: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    is_opening_stage: bool,
+) -> tuple[bool, str, str]:
+    """Validate claim reference boundaries for Bear Analyst (E-03b-2).
+
+    Contract:
+    1. v2 Opening: Bear opening speaker has no opponent claims to reference (double-blind).
+       Must maintain double-blind: responded_claim_ids=[], new_claims[].target_claim_ids=[],
+       challenges=[], resolved_claim_ids=[], unresolved_claim_ids=[], next_focus_claim_ids=[].
+       No placeholder or invented opponent claim IDs.
+    2. All stages: Any claim reference field (responded_claim_ids, target_claim_ids,
+       challenges.target_claim_id, resolved_claim_ids, unresolved_claim_ids, next_focus_claim_ids)
+       containing an ID not present in the current claim ledger must fail-closed.
+    """
+    known_claims = state.get("claims", []) or []
+    known_claim_ids = {
+        str(c.get("claim_id", "")).strip()
+        for c in known_claims
+        if isinstance(c, Mapping) and str(c.get("claim_id", "")).strip()
+    }
+
+    if is_opening_stage:
+        raw_responded = _string_list(payload.get("responded_claim_ids"))
+        if raw_responded:
+            return (
+                False,
+                "invalid_protocol",
+                f"Opening 阶段 (Bear) 必须为独立双盲立论，responded_claim_ids 必须为空数组 [] "
+                f"(当前包含: {raw_responded})，严禁生成或提示占位的对手 claim ID",
+            )
+
+        for idx, nc in enumerate(payload.get("new_claims") or [], start=1):
+            if isinstance(nc, Mapping):
+                t_ids = _string_list(nc.get("target_claim_ids"))
+                if t_ids:
+                    return (
+                        False,
+                        "invalid_protocol",
+                        f"Opening 阶段 (Bear) 第 {idx} 条 claim 的 target_claim_ids 必须为空数组 [] "
+                        f"(当前包含: {t_ids})，严禁生成或提示占位的对手 claim ID",
+                    )
+                single_tid = nc.get("target_claim_id")
+                if single_tid and str(single_tid).strip():
+                    return (
+                        False,
+                        "invalid_protocol",
+                        f"Opening 阶段 (Bear) 第 {idx} 条 claim 的 target_claim_id 必须为空 "
+                        f"(当前包含: {single_tid})，严禁生成或提示占位的对手 claim ID",
+                    )
+
+        raw_challenges = payload.get("challenges") or []
+        if raw_challenges:
+            return (
+                False,
+                "invalid_protocol",
+                f"Opening 阶段 (Bear) 为立论阶段，禁止提交 challenges 盘问载荷 "
+                f"(当前包含 {len(raw_challenges)} 条 challenge)",
+            )
+
+        raw_resolved = _string_list(payload.get("resolved_claim_ids"))
+        if raw_resolved:
+            return (
+                False,
+                "invalid_protocol",
+                f"Opening 阶段 (Bear) resolved_claim_ids 必须为空数组 [] (当前包含: {raw_resolved})",
+            )
+
+        raw_unresolved = _string_list(payload.get("unresolved_claim_ids"))
+        if raw_unresolved:
+            return (
+                False,
+                "invalid_protocol",
+                f"Opening 阶段 (Bear) unresolved_claim_ids 必须为空数组 [] (当前包含: {raw_unresolved})",
+            )
+
+        raw_next_focus = _string_list(payload.get("next_focus_claim_ids"))
+        if raw_next_focus:
+            return (
+                False,
+                "invalid_protocol",
+                f"Opening 阶段 (Bear) next_focus_claim_ids 必须为空数组 [] (当前包含: {raw_next_focus})",
+            )
+
+    # All stages: check for unknown claim IDs against the current claim ledger
+    referenced_ids: list[str] = []
+    referenced_ids.extend(_string_list(payload.get("responded_claim_ids")))
+    for nc in payload.get("new_claims") or []:
+        if isinstance(nc, Mapping):
+            referenced_ids.extend(_string_list(nc.get("target_claim_ids")))
+            single_tid = nc.get("target_claim_id")
+            if single_tid and str(single_tid).strip():
+                referenced_ids.append(str(single_tid).strip())
+    for ch in payload.get("challenges") or []:
+        if isinstance(ch, Mapping):
+            t_id = str(ch.get("target_claim_id") or "").strip()
+            if t_id:
+                referenced_ids.append(t_id)
+    referenced_ids.extend(_string_list(payload.get("resolved_claim_ids")))
+    referenced_ids.extend(_string_list(payload.get("unresolved_claim_ids")))
+    referenced_ids.extend(_string_list(payload.get("next_focus_claim_ids")))
+
+    unknown_ids = sorted({cid for cid in referenced_ids if cid not in known_claim_ids})
+    if unknown_ids:
+        return (
+            False,
+            "invalid_protocol",
+            f"Bear Analyst 命题引用包含不存在于当前 claim 账本的未知 claim ID: {unknown_ids} "
+            f"(当前账本现有 claim: {sorted(known_claim_ids)})，违反 fail-closed 契约",
+        )
+
+    return True, "valid", ""
 
 
 def create_bear_researcher(llm, memory, custom_prompt: str = "", placement: Placement = DEFAULT_PLACEMENT):
@@ -133,6 +250,7 @@ def create_bear_researcher(llm, memory, custom_prompt: str = "", placement: Plac
                         f"  3. 每一项 new_claims 必须包含 battlefield 字段（属于五大战场之一），且 target_claim_ids 必须为空数组 []。\n"
                         f"  4. confidence 必须是 0.00-1.00 之间的有限数值，严禁百分比。\n"
                         f"  5. resolved_claim_ids 必须为空数组 []。\n"
+                        f"  6. 独立双盲立论严禁引用或占位任何对手 claim ID，challenges、resolved_claim_ids、unresolved_claim_ids、next_focus_claim_ids 均必须为空数组 []。\n"
                         f"请立即修正并重新输出完整发言及合规机器块！"
                     )
                 elif is_challenge_stage:
@@ -178,6 +296,11 @@ def create_bear_researcher(llm, memory, custom_prompt: str = "", placement: Plac
                         if same_side_prev_claims
                         else ""
                     )
+                    target_hint = (
+                        f" (如 target_claim_ids: {opponent_all_claims[:1]})"
+                        if opponent_all_claims
+                        else ""
+                    )
                     retry_instruction = (
                         f"\n\n【协议重试警告 (Attempt {attempt_num})】：\n"
                         f"你上一次输出的 DEBATE_STATE 机器块未通过协议校验，错误原因：{last_error_detail}。\n"
@@ -186,7 +309,7 @@ def create_bear_researcher(llm, memory, custom_prompt: str = "", placement: Plac
                         f"  1. 信息增量硬闸：本轮必须提出至少一条具有实质信息增量的新 Claim，必须包含历史未出现过的具体数值/新证据实体/新因果链，严禁复读或轻微改写前几轮观点。\n"
                         f"     {prev_claims_hint}\n"
                         f"  2. responded_claim_ids 必须包含至少一条对手未解决 Claim ID。当前可选合法未解决对手 Claim: {opponent_open_claims or opponent_all_claims}。\n"
-                        f"  3. new_claims 中的每一项必须包含 target_claim_ids 字段，且 target_claim_ids 必须指定至少一条对手 Claim ID (如 target_claim_ids: {opponent_all_claims[:1] if opponent_all_claims else ['INV-1']})。\n"
+                        f"  3. new_claims 中的每一项必须包含 target_claim_ids 字段，且 target_claim_ids 必须指定至少一条对手 Claim ID{target_hint}。\n"
                         f"  4. confidence 必须是 0.00-1.00 之间的有限数值，严禁百分比。\n"
                         f"  5. 严禁擅自 resolve 对手的 Claim。\n"
                         f"请立即修正并重新输出完整发言及合规机器块！"
@@ -212,6 +335,13 @@ def create_bear_researcher(llm, memory, custom_prompt: str = "", placement: Plac
                 marker="DEBATE_STATE",
                 domain="investment",
             )
+
+            if is_valid and parsed_payload is not None:
+                is_valid, parse_status, error_detail = _validate_bear_claim_references(
+                    state=investment_debate_state,
+                    payload=parsed_payload,
+                    is_opening_stage=is_opening_stage,
+                )
 
             attempt_record = {
                 "attempt_index": attempt_num,

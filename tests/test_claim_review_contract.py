@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tradingagents.agents.researchers.bull_researcher import create_bull_researcher
+from tradingagents.agents.researchers.bear_researcher import create_bear_researcher
 from tradingagents.agents.utils.agent_states import (
     PROTOCOL_VERSION_V2_STRUCTURED,
 )
@@ -157,6 +158,132 @@ def _make_challenge_state() -> dict[str, Any]:
             "feature_flags": {"v2_debate_enabled": True},
         },
     }
+
+
+def _make_bear_opening_state() -> dict[str, Any]:
+    state = _make_opening_state()
+    inv_state = state["investment_debate_state"]
+    inv_state["count"] = 1
+    inv_state["current_speaker"] = "Bull"
+    inv_state["current_response"] = "多头立论发言正文"
+    inv_state["bull_history"] = "Bull Analyst: 多头立论发言正文"
+    inv_state["round_goal"] = "建立核心空头立论"
+    inv_state["claims"] = [
+        {"claim_id": "INV-1", "speaker_key": "Bull", "speaker": "Bull Analyst", "stance": "bullish", "claim": "主力资金持续净流入", "evidence": ["流入1.2亿"], "confidence": 0.85, "battlefield": "capital_flow", "debate_round": 1, "message_index": 1, "stage": "opening", "status": "open", "target_claim_ids": []},
+        {"claim_id": "INV-2", "speaker_key": "Bull", "speaker": "Bull Analyst", "stance": "bullish", "claim": "行业题材景气度高", "evidence": ["政策密集落地"], "confidence": 0.80, "battlefield": "sentiment_theme", "debate_round": 1, "message_index": 1, "stage": "opening", "status": "open", "target_claim_ids": []},
+        {"claim_id": "INV-3", "speaker_key": "Bull", "speaker": "Bull Analyst", "stance": "bullish", "claim": "量价突破均线多头", "evidence": ["突破60日线"], "confidence": 0.78, "battlefield": "price_volume", "debate_round": 1, "message_index": 1, "stage": "opening", "status": "open", "target_claim_ids": []},
+    ]
+    inv_state["claim_counter"] = 3
+    inv_state["open_claim_ids"] = ["INV-1", "INV-2", "INV-3"]
+    inv_state["round_messages"] = [
+        {
+            "message_index": 1,
+            "debate_round": 1,
+            "stage": "opening",
+            "protocol_stage": "opening",
+            "speaker": "Bull Analyst",
+            "speaker_key": "Bull",
+            "new_claim_ids": ["INV-1", "INV-2", "INV-3"],
+            "responded_claim_ids": [],
+            "target_claim_ids": [],
+            "parse_status": "valid",
+            "accepted": True,
+        }
+    ]
+    return state
+
+
+def _make_bear_challenge_state() -> dict[str, Any]:
+    state = _make_challenge_state()
+    inv_state = state["investment_debate_state"]
+    inv_state["count"] = 3
+    inv_state["current_speaker"] = "Bull"
+    inv_state["current_response"] = "多头盘问空头"
+    inv_state["challenges"] = [
+        {
+            "challenge_id": "CH-1",
+            "target_claim_id": "INV-4",
+            "challenger_speaker": "Bull Analyst",
+            "challenger_stance": "bullish",
+            "weakest_point": "三季度大额计提已完毕",
+            "evidence": ["计提充分"],
+            "severity": "major",
+            "debate_round": 2,
+            "message_index": 3,
+        }
+    ]
+    inv_state["challenge_counter"] = 1
+    inv_state["round_messages"].append(
+        {
+            "message_index": 3,
+            "debate_round": 2,
+            "stage": "challenge",
+            "protocol_stage": "challenge",
+            "speaker": "Bull Analyst",
+            "speaker_key": "Bull",
+            "new_claim_ids": [],
+            "responded_claim_ids": ["INV-4"],
+            "target_claim_ids": [],
+            "challenge_ids": ["CH-1"],
+            "parse_status": "valid",
+            "accepted": True,
+        }
+    )
+    return state
+
+
+def _make_bear_tiebreak_state() -> dict[str, Any]:
+    state = _make_bear_challenge_state()
+    inv_state = state["investment_debate_state"]
+    inv_state["count"] = 5
+    inv_state["protocol_stage"] = "tiebreak"
+    inv_state["round_messages"].extend([
+        {
+            "message_index": 4,
+            "debate_round": 2,
+            "stage": "challenge",
+            "protocol_stage": "challenge",
+            "speaker": "Bear Analyst",
+            "speaker_key": "Bear",
+            "new_claim_ids": [],
+            "responded_claim_ids": ["INV-1"],
+            "target_claim_ids": [],
+            "challenge_ids": ["CH-2"],
+            "parse_status": "valid",
+            "accepted": True,
+        },
+        {
+            "message_index": 5,
+            "debate_round": 3,
+            "stage": "tiebreak",
+            "protocol_stage": "tiebreak",
+            "speaker": "Bull Analyst",
+            "speaker_key": "Bull",
+            "new_claim_ids": ["INV-7"],
+            "responded_claim_ids": ["INV-4"],
+            "target_claim_ids": ["INV-4"],
+            "parse_status": "valid",
+            "accepted": True,
+        },
+    ])
+    inv_state["claims"].append({
+        "claim_id": "INV-7",
+        "speaker_key": "Bull",
+        "speaker": "Bull Analyst",
+        "stance": "bullish",
+        "claim": "多头终局决胜立论",
+        "evidence": ["终局证据"],
+        "confidence": 0.88,
+        "battlefield": "capital_flow",
+        "debate_round": 3,
+        "message_index": 5,
+        "stage": "tiebreak",
+        "status": "open",
+        "target_claim_ids": ["INV-4"],
+    })
+    inv_state["claim_counter"] = 7
+    inv_state["open_claim_ids"].append("INV-7")
+    return state
 
 
 class TestBullOpeningDoubleBlind:
@@ -525,3 +652,417 @@ class TestBullValidOpponentClaimAllowed:
         assert msg["stage"] == "tiebreak"
         assert msg["responded_claim_ids"] == ["INV-4"]
         assert msg["target_claim_ids"] == ["INV-4"]
+
+
+class TestBearOpeningDoubleBlind:
+    """1. v2 Opening 的 Bear 首次发言没有对手命题可引用。双盲约束与占位符防范。"""
+
+    def test_bear_v2_opening_prompt_has_no_placeholder_claim_ids(self):
+        """Bear v2 Opening prompt has responded_claim_ids=[] and new_claims[].target_claim_ids=[] with no placeholder opponent IDs."""
+        state = _make_bear_opening_state()
+        llm = FakeStreamingLLM()
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        asyncio.run(node(state))
+
+        assert len(llm.captured_prompts) >= 1
+        prompt = llm.captured_prompts[0]
+        # In Opening prompt, responded_claim_ids must be [] and target_claim_ids must be []
+        assert '"responded_claim_ids": []' in prompt
+        assert '"target_claim_ids": []' in prompt
+        # No placeholder opponent claim IDs
+        assert "INV-1" not in prompt
+        assert "OPPONENT_CLAIM_ID" not in prompt
+        assert "INV-4" not in prompt
+
+    def test_bear_v2_opening_retry_prompt_has_no_placeholder_claim_ids(self):
+        """When attempt 1 fails Opening validation, retry prompt retains double-blind with no placeholder opponent IDs."""
+        state = _make_bear_opening_state()
+        bad_opening = (
+            "空头立论发言\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": ["INV-1"], "new_claims": ['
+            '{"claim": "应收账款恶化现金流承压", "evidence": ["经营现金流同比下滑30%"], "confidence": 0.82, "battlefield": "fundamentals", "target_claim_ids": []}, '
+            '{"claim": "外需降温出口面临逆风", "evidence": ["出口交货值同比下降"], "confidence": 0.75, "battlefield": "macro_policy", "target_claim_ids": []}, '
+            '{"claim": "高位筹码松动获利盘兑现", "evidence": ["高位换手率超过25%"], "confidence": 0.70, "battlefield": "capital_flow", "target_claim_ids": []}'
+            '], "resolved_claim_ids": [], "unresolved_claim_ids": [], "next_focus_claim_ids": [], '
+            '"round_summary": "空头立论", "round_goal": "建立空头核心立论"} -->'
+        )
+        good_opening = (
+            "合规空头立论发言\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": [], "new_claims": ['
+            '{"claim": "应收账款恶化现金流承压", "evidence": ["经营现金流同比下滑30%"], "confidence": 0.82, "battlefield": "fundamentals", "target_claim_ids": []}, '
+            '{"claim": "外需降温出口面临逆风", "evidence": ["出口交货值同比下降"], "confidence": 0.75, "battlefield": "macro_policy", "target_claim_ids": []}, '
+            '{"claim": "高位筹码松动获利盘兑现", "evidence": ["高位换手率超过25%"], "confidence": 0.70, "battlefield": "capital_flow", "target_claim_ids": []}'
+            '], "resolved_claim_ids": [], "unresolved_claim_ids": [], "next_focus_claim_ids": [], '
+            '"round_summary": "空头立论", "round_goal": "建立空头核心立论"} -->'
+        )
+        llm = FakeStreamingLLM([bad_opening, good_opening])
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        res = asyncio.run(node(state))
+
+        assert len(llm.captured_prompts) == 2
+        retry_prompt = llm.captured_prompts[1]
+        assert "【协议重试警告 (Attempt 2)】" in retry_prompt
+        assert "responded_claim_ids 必须为空数组 []" in retry_prompt
+        assert "target_claim_ids 必须为空数组 []" in retry_prompt
+        assert "INV-1" not in retry_prompt.split("【协议重试警告")[1].split("错误原因")[0]  # instruction itself has no INV-1
+
+        # Res succeeds
+        inv_state = res["investment_debate_state"]
+        assert inv_state["count"] == 2
+        accepted_msgs = [m for m in inv_state["round_messages"] if m.get("accepted") is True]
+        assert len(accepted_msgs) == 2
+        assert len(inv_state["claims"]) == 6
+
+    def test_bear_v2_opening_valid_response_accepted_and_enters_ledger(self):
+        """Valid v2 Opening response without opponent reference is accepted and enters ledger."""
+        state = _make_bear_opening_state()
+        good_opening = (
+            "合规空头立论发言\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": [], "new_claims": ['
+            '{"claim": "应收账款恶化现金流承压", "evidence": ["经营现金流同比下滑30%"], "confidence": 0.82, "battlefield": "fundamentals", "target_claim_ids": []}, '
+            '{"claim": "外需降温出口面临逆风", "evidence": ["出口交货值同比下降"], "confidence": 0.75, "battlefield": "macro_policy", "target_claim_ids": []}, '
+            '{"claim": "高位筹码松动获利盘兑现", "evidence": ["高位换手率超过25%"], "confidence": 0.70, "battlefield": "capital_flow", "target_claim_ids": []}'
+            '], "resolved_claim_ids": [], "unresolved_claim_ids": [], "next_focus_claim_ids": [], '
+            '"round_summary": "空头立论", "round_goal": "建立空头核心立论"} -->'
+        )
+        llm = FakeStreamingLLM([good_opening])
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        res = asyncio.run(node(state))
+
+        inv_state = res["investment_debate_state"]
+        assert inv_state["count"] == 2
+        assert len(inv_state["claims"]) == 6
+        bear_claims = [c for c in inv_state["claims"] if c["speaker_key"] == "Bear"]
+        assert len(bear_claims) == 3
+        for c in bear_claims:
+            assert c["stage"] == "opening"
+            assert c["target_claim_ids"] == []
+        assert len(inv_state["round_messages"]) == 2
+        latest_msg = inv_state["round_messages"][-1]
+        assert latest_msg["accepted"] is True
+        assert latest_msg["speaker_key"] == "Bear"
+        assert latest_msg["responded_claim_ids"] == []
+        assert latest_msg["target_claim_ids"] == []
+
+    def test_bear_v2_opening_with_placeholder_responded_claim_id_rejected(self):
+        """Opening response with opponent claim ID in responded_claim_ids is rejected."""
+        state = _make_bear_opening_state()
+        bad_opening = (
+            "空头立论发言（违规引用多头INV-1）\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": ["INV-1"], "new_claims": ['
+            '{"claim": "应收账款恶化现金流承压", "evidence": ["经营现金流同比下滑30%"], "confidence": 0.82, "battlefield": "fundamentals", "target_claim_ids": []}, '
+            '{"claim": "外需降温出口面临逆风", "evidence": ["出口交货值同比下降"], "confidence": 0.75, "battlefield": "macro_policy", "target_claim_ids": []}, '
+            '{"claim": "高位筹码松动获利盘兑现", "evidence": ["高位换手率超过25%"], "confidence": 0.70, "battlefield": "capital_flow", "target_claim_ids": []}'
+            '], "resolved_claim_ids": [], "unresolved_claim_ids": [], "next_focus_claim_ids": [], '
+            '"round_summary": "空头立论", "round_goal": "建立空头核心立论"} -->'
+        )
+        llm = FakeStreamingLLM([bad_opening, bad_opening])
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        with pytest.raises(DebateProtocolError) as exc_info:
+            asyncio.run(node(state))
+
+        assert exc_info.value.message_index == 2
+        assert exc_info.value.speaker == "Bear Analyst"
+        assert all(a["accepted"] is False for a in exc_info.value.attempts)
+        # Original state is unchanged (never entered state ledger)
+        assert state["investment_debate_state"]["count"] == 1
+        assert len(state["investment_debate_state"]["claims"]) == 3
+
+    def test_bear_v2_opening_with_placeholder_target_claim_id_rejected(self):
+        """Opening response with placeholder target_claim_ids on new_claims is rejected."""
+        state = _make_bear_opening_state()
+        bad_opening = (
+            "空头立论发言（违规包含target_claim_ids）\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": [], "new_claims": ['
+            '{"claim": "应收账款恶化现金流承压", "evidence": ["经营现金流同比下滑30%"], "confidence": 0.82, "battlefield": "fundamentals", "target_claim_ids": ["INV-1"]}, '
+            '{"claim": "外需降温出口面临逆风", "evidence": ["出口交货值同比下降"], "confidence": 0.75, "battlefield": "macro_policy", "target_claim_ids": []}, '
+            '{"claim": "高位筹码松动获利盘兑现", "evidence": ["高位换手率超过25%"], "confidence": 0.70, "battlefield": "capital_flow", "target_claim_ids": []}'
+            '], "resolved_claim_ids": [], "unresolved_claim_ids": [], "next_focus_claim_ids": [], '
+            '"round_summary": "空头立论", "round_goal": "建立空头核心立论"} -->'
+        )
+        llm = FakeStreamingLLM([bad_opening, bad_opening])
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        with pytest.raises(DebateProtocolError) as exc_info:
+            asyncio.run(node(state))
+
+        assert exc_info.value.message_index == 2
+        assert state["investment_debate_state"]["count"] == 1
+        assert len(state["investment_debate_state"]["claims"]) == 3
+
+    def test_bear_v2_opening_with_challenges_rejected(self):
+        """Opening response with challenges payload is rejected fail-closed."""
+        state = _make_bear_opening_state()
+        bad_opening = (
+            "空头立论发言（违规包含challenges）\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": [], "new_claims": ['
+            '{"claim": "应收账款恶化现金流承压", "evidence": ["经营现金流同比下滑30%"], "confidence": 0.82, "battlefield": "fundamentals", "target_claim_ids": []}, '
+            '{"claim": "外需降温出口面临逆风", "evidence": ["出口交货值同比下降"], "confidence": 0.75, "battlefield": "macro_policy", "target_claim_ids": []}, '
+            '{"claim": "高位筹码松动获利盘兑现", "evidence": ["高位换手率超过25%"], "confidence": 0.70, "battlefield": "capital_flow", "target_claim_ids": []}'
+            '], "challenges": [{"target_claim_id": "INV-1", "weakest_point": "假设脆弱", "evidence": ["数据"], "severity": "major"}], '
+            '"resolved_claim_ids": [], "unresolved_claim_ids": [], "next_focus_claim_ids": [], '
+            '"round_summary": "空头立论", "round_goal": "建立空头核心立论"} -->'
+        )
+        llm = FakeStreamingLLM([bad_opening, bad_opening])
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        with pytest.raises(DebateProtocolError):
+            asyncio.run(node(state))
+
+        assert state["investment_debate_state"]["count"] == 1
+        assert len(state["investment_debate_state"]["claims"]) == 3
+
+    def test_bear_v2_opening_with_resolved_or_unresolved_claim_ids_rejected(self):
+        """Opening response with resolved_claim_ids or unresolved_claim_ids is rejected fail-closed."""
+        state = _make_bear_opening_state()
+        bad_opening = (
+            "空头立论发言（违规包含resolved_claim_ids）\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": [], "new_claims": ['
+            '{"claim": "应收账款恶化现金流承压", "evidence": ["经营现金流同比下滑30%"], "confidence": 0.82, "battlefield": "fundamentals", "target_claim_ids": []}, '
+            '{"claim": "外需降温出口面临逆风", "evidence": ["出口交货值同比下降"], "confidence": 0.75, "battlefield": "macro_policy", "target_claim_ids": []}, '
+            '{"claim": "高位筹码松动获利盘兑现", "evidence": ["高位换手率超过25%"], "confidence": 0.70, "battlefield": "capital_flow", "target_claim_ids": []}'
+            '], "resolved_claim_ids": ["INV-1"], "unresolved_claim_ids": [], "next_focus_claim_ids": [], '
+            '"round_summary": "空头立论", "round_goal": "建立空头核心立论"} -->'
+        )
+        llm = FakeStreamingLLM([bad_opening, bad_opening])
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        with pytest.raises(DebateProtocolError):
+            asyncio.run(node(state))
+
+        assert state["investment_debate_state"]["count"] == 1
+
+
+class TestBearUnknownClaimFailClosed:
+    """2. 任一命题引用字段若带有当前 claim ledger 不存在的 ID，必须 fail-closed。"""
+
+    def test_bear_unknown_responded_claim_id_rejected_in_challenge_stage(self):
+        """Unknown responded_claim_ids in Challenge stage is rejected and does not enter accepted ledger."""
+        state = _make_bear_challenge_state()
+        bad_challenge = (
+            "空头盘问（含未知ID）\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": ["INV-1", "INV-999"], "new_claims": [], '
+            '"challenges": [{"target_claim_id": "INV-1", "weakest_point": "假设存疑", "evidence": ["数据支撑"], "severity": "major"}], '
+            '"self_win_prob": 0.75, "resolved_claim_ids": [], "unresolved_claim_ids": ["INV-1"], "next_focus_claim_ids": ["INV-1"], '
+            '"round_summary": "盘问", "round_goal": "击穿多头"} -->'
+        )
+        llm = FakeStreamingLLM([bad_challenge, bad_challenge])
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        with pytest.raises(DebateProtocolError) as exc_info:
+            asyncio.run(node(state))
+
+        assert exc_info.value.message_index == 4
+        assert any("INV-999" in a["error_detail"] for a in exc_info.value.attempts)
+        assert state["investment_debate_state"]["count"] == 3
+        assert len(state["investment_debate_state"]["challenges"]) == 1
+
+    def test_bear_unknown_challenge_target_rejected_in_challenge_stage(self):
+        """Unknown challenge target_claim_id is rejected fail-closed."""
+        state = _make_bear_challenge_state()
+        bad_challenge = (
+            "空头盘问（未知challenge目标）\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": ["INV-999"], "new_claims": [], '
+            '"challenges": [{"target_claim_id": "INV-999", "weakest_point": "假设存疑", "evidence": ["数据支撑"], "severity": "major"}], '
+            '"self_win_prob": 0.75, "resolved_claim_ids": [], "unresolved_claim_ids": ["INV-1"], "next_focus_claim_ids": ["INV-1"], '
+            '"round_summary": "盘问", "round_goal": "击穿多头"} -->'
+        )
+        llm = FakeStreamingLLM([bad_challenge, bad_challenge])
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        with pytest.raises(DebateProtocolError) as exc_info:
+            asyncio.run(node(state))
+
+        assert exc_info.value.message_index == 4
+        assert any("INV-999" in a["error_detail"] for a in exc_info.value.attempts)
+        assert state["investment_debate_state"]["count"] == 3
+        assert len(state["investment_debate_state"]["challenges"]) == 1
+
+    def test_bear_unknown_target_claim_id_rejected_in_tiebreak_stage(self):
+        """Unknown target_claim_ids in new_claims during Tiebreak stage is rejected fail-closed."""
+        state = _make_bear_tiebreak_state()
+
+        bad_tiebreak = (
+            "空头收官（未知target_claim_ids）\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": ["INV-1"], "new_claims": ['
+            '{"claim": "宏观基本面双杀风险依然极高", "evidence": ["新证据行业库存周期主动去化"], "confidence": 0.86, "target_claim_ids": ["INV-999"]}'
+            '], "self_win_prob": 0.80, "resolved_claim_ids": [], "unresolved_claim_ids": ["INV-1"], "next_focus_claim_ids": ["INV-1"], '
+            '"round_summary": "收官", "round_goal": "决胜"} -->'
+        )
+        llm = FakeStreamingLLM([bad_tiebreak, bad_tiebreak])
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        with pytest.raises(DebateProtocolError) as exc_info:
+            asyncio.run(node(state))
+
+        assert exc_info.value.message_index == 6
+        assert any("INV-999" in a["error_detail"] for a in exc_info.value.attempts)
+        assert state["investment_debate_state"]["count"] == 5
+
+    def test_bear_unknown_resolved_or_unresolved_claim_id_rejected(self):
+        """Unknown claim IDs in resolved_claim_ids or unresolved_claim_ids are rejected fail-closed."""
+        state = _make_bear_challenge_state()
+        bad_resolved = (
+            "空头盘问（含未知resolved_claim_ids）\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": ["INV-1"], "new_claims": [], '
+            '"challenges": [{"target_claim_id": "INV-1", "weakest_point": "假设存疑", "evidence": ["数据支撑"], "severity": "major"}], '
+            '"self_win_prob": 0.75, "resolved_claim_ids": ["INV-888"], "unresolved_claim_ids": ["INV-1"], "next_focus_claim_ids": ["INV-1"], '
+            '"round_summary": "盘问", "round_goal": "击穿多头"} -->'
+        )
+        llm = FakeStreamingLLM([bad_resolved, bad_resolved])
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        with pytest.raises(DebateProtocolError) as exc_info:
+            asyncio.run(node(state))
+
+        assert any("INV-888" in a["error_detail"] for a in exc_info.value.attempts)
+
+    def test_bear_retry_recovery_from_unknown_claim_id(self):
+        """Attempt 1 with unknown claim ID fails, attempt 2 with valid claim ID succeeds; unknown ID never enters state."""
+        state = _make_bear_challenge_state()
+        bad_challenge = (
+            "空头盘问（首次坏块含未知ID）\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": ["INV-1", "INV-999"], "new_claims": [], '
+            '"challenges": [{"target_claim_id": "INV-1", "weakest_point": "假设存疑", "evidence": ["数据支撑"], "severity": "major"}], '
+            '"self_win_prob": 0.75, "resolved_claim_ids": [], "unresolved_claim_ids": ["INV-1"], "next_focus_claim_ids": ["INV-1"], '
+            '"round_summary": "盘问", "round_goal": "击穿多头"} -->'
+        )
+        good_challenge = (
+            "空头盘问（修正后仅引用合法INV-1）\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": ["INV-1"], "new_claims": [], '
+            '"challenges": [{"target_claim_id": "INV-1", "weakest_point": "主力净流入缺乏持续性，尾盘集中流出", "evidence": ["尾盘大单净卖出8000万"], "severity": "major"}], '
+            '"self_win_prob": 0.72, "resolved_claim_ids": [], "unresolved_claim_ids": ["INV-1"], "next_focus_claim_ids": ["INV-1"], '
+            '"round_summary": "盘问多头主力资金漏洞", "round_goal": "击穿多头核心立论"} -->'
+        )
+        llm = FakeStreamingLLM([bad_challenge, good_challenge])
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        res = asyncio.run(node(state))
+
+        inv_state = res["investment_debate_state"]
+        # count advances by exactly 1 (3 -> 4)
+        assert inv_state["count"] == 4
+        # Exactly 1 new accepted message
+        accepted_msgs = [m for m in inv_state["round_messages"] if m.get("accepted") is True]
+        assert len(accepted_msgs) == 4
+        latest_msg = inv_state["round_messages"][-1]
+        assert latest_msg["accepted"] is True
+        assert latest_msg["responded_claim_ids"] == ["INV-1"]
+        assert "INV-999" not in latest_msg["responded_claim_ids"]
+        # Attempts trace tracks attempt 1 failure and attempt 2 success
+        assert len(inv_state["attempts"]) == 2
+        assert inv_state["attempts"][0]["accepted"] is False
+        assert "INV-999" in inv_state["attempts"][0]["error_detail"]
+        assert inv_state["attempts"][1]["accepted"] is True
+        # challenges ledger only contains valid CH-2 targeting INV-1
+        assert len(inv_state["challenges"]) == 2
+        assert inv_state["challenges"][-1]["target_claim_id"] == "INV-1"
+
+    def test_bear_consecutive_invalid_attempts_raises_debate_protocol_error(self):
+        """Consecutive invalid attempts with unknown claim ID raise DebateProtocolError, preventing state mutation."""
+        state = _make_bear_challenge_state()
+        bad_challenge = (
+            "空头盘问坏块\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": ["INV-999"], "new_claims": [], '
+            '"challenges": [{"target_claim_id": "INV-999", "weakest_point": "存疑", "evidence": ["无"], "severity": "major"}], '
+            '"self_win_prob": 0.75, "resolved_claim_ids": [], "unresolved_claim_ids": ["INV-1"], "next_focus_claim_ids": ["INV-1"], '
+            '"round_summary": "盘问", "round_goal": "击穿多头"} -->'
+        )
+        llm = FakeStreamingLLM([bad_challenge, bad_challenge])
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        with pytest.raises(DebateProtocolError) as exc_info:
+            asyncio.run(node(state))
+
+        assert exc_info.value.message_index == 4
+        assert exc_info.value.speaker == "Bear Analyst"
+        assert len(exc_info.value.attempts) == 2
+        assert all(not a["accepted"] for a in exc_info.value.attempts)
+        assert state["investment_debate_state"]["count"] == 3
+        assert len(state["investment_debate_state"]["challenges"]) == 1
+
+
+class TestBearValidOpponentClaimAllowed:
+    """3. 已存在的合法对手 Bull claim 在非 Opening 阶段仍可引用。"""
+
+    def test_bear_valid_opponent_claim_accepted_in_challenge_stage(self):
+        """In Challenge stage (message 4), referencing legal opponent claim INV-1 is accepted."""
+        state = _make_bear_challenge_state()
+        valid_challenge = (
+            "空头合规盘问多头INV-1\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": ["INV-1"], "new_claims": [], '
+            '"challenges": [{"target_claim_id": "INV-1", "weakest_point": "主力大单呈现假拉真出净流出隐蔽特征", "evidence": ["尾盘超大单集中抛售8000万"], "severity": "major"}], '
+            '"self_win_prob": 0.72, "resolved_claim_ids": [], "unresolved_claim_ids": ["INV-1"], "next_focus_claim_ids": ["INV-1"], '
+            '"round_summary": "击穿主力流入论点", "round_goal": "击穿多头立论"} -->'
+        )
+        llm = FakeStreamingLLM([valid_challenge])
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        res = asyncio.run(node(state))
+
+        inv_state = res["investment_debate_state"]
+        assert inv_state["count"] == 4
+        msg = inv_state["round_messages"][-1]
+        assert msg["accepted"] is True
+        assert msg["stage"] == "challenge"
+        assert msg["responded_claim_ids"] == ["INV-1"]
+        assert len(inv_state["challenges"]) == 2
+        assert inv_state["challenges"][-1]["target_claim_id"] == "INV-1"
+
+    def test_bear_valid_opponent_claim_accepted_in_tiebreak_stage(self):
+        """In Tiebreak stage (message 6), referencing legal opponent claim INV-1 in target_claim_ids is accepted."""
+        state = _make_bear_tiebreak_state()
+
+        valid_tiebreak = (
+            "空头合规决胜收官\n"
+            '<!-- DEBATE_STATE: {"responded_claim_ids": ["INV-1"], "new_claims": ['
+            '{"claim": "基本面与宏观周期双重下行难以逆转", "evidence": ["行业库存周期仍处主动去库阶段"], "confidence": 0.85, "target_claim_ids": ["INV-1"]}'
+            '], "self_win_prob": 0.78, "resolved_claim_ids": [], "unresolved_claim_ids": ["INV-1"], "next_focus_claim_ids": ["INV-1"], '
+            '"round_summary": "决胜收官", "round_goal": "空头决胜"} -->'
+        )
+        llm = FakeStreamingLLM([valid_tiebreak])
+        memory = MagicMock()
+        memory.get_memories.return_value = []
+
+        node = create_bear_researcher(llm, memory)
+        res = asyncio.run(node(state))
+
+        new_inv_state = res["investment_debate_state"]
+        assert new_inv_state["count"] == 6
+        msg = new_inv_state["round_messages"][-1]
+        assert msg["accepted"] is True
+        assert msg["stage"] == "tiebreak"
+        assert msg["responded_claim_ids"] == ["INV-1"]
+        assert msg["target_claim_ids"] == ["INV-1"]
