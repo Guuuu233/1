@@ -451,7 +451,7 @@ def test_T14_both_save_branches_call_attach_snapshot():
 
     source = inspect.getsource(main_module._run_job_inner)
     call = "_attach_custom_prompt_snapshot(result, _prompt_snapshot)"
-    assert source.count(call) >= 3, (
+    assert source.count(call) == 3, (
         "dual-horizon, single-horizon, and regular graph paths must all attach snapshots"
     )
 
@@ -460,6 +460,35 @@ def test_T14_both_save_branches_call_attach_snapshot():
     for result in ({"final_trade_decision": "BUY"}, {"final_trade_decision": "HOLD"}):
         main_module._attach_custom_prompt_snapshot(result, snapshot)
         assert result["custom_prompt_snapshot"]["placement"] == "after_data"
+
+
+def test_T14b_guard_fail_closed_branch_calls_attach_snapshot():
+    """E-02 prompt guard fail-closed branch must independently call attach snapshot."""
+    import inspect
+    import api.main as main_module
+
+    source = inspect.getsource(main_module._handle_prompt_guard_interception)
+    call = "_attach_custom_prompt_snapshot(result, prompt_snapshot)"
+    assert call in source, (
+        "_handle_prompt_guard_interception must call _attach_custom_prompt_snapshot"
+    )
+
+    # Also verify that when the guard failure handler attaches snapshot, the payload preserves snapshot fields
+    snapshot = {
+        "enabled": True,
+        "placement": "after_data",
+        "roles": {
+            rk: {"resolved_text": "", "injected": False}
+            for rk in ("bull_researcher", "bear_researcher", "research_manager", "trader", "risk_manager")
+        },
+    }
+    result = {"final_trade_decision": "【系统阻断】E-02 自定义提示词守卫拦截"}
+    main_module._attach_custom_prompt_snapshot(result, snapshot)
+    assert "custom_prompt_snapshot" in result
+    assert result["custom_prompt_snapshot"]["enabled"] is True
+    assert result["custom_prompt_snapshot"]["placement"] == "after_data"
+    for rk in snapshot["roles"]:
+        assert result["custom_prompt_snapshot"]["roles"][rk]["injected"] is False
 
 
 # ---------------------------------------------------------------------------
