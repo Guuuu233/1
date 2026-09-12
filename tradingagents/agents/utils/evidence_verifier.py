@@ -14,6 +14,16 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping, Sequence
 
+from tradingagents.agents.utils.claim_specs import (
+    ClaimApplicability,
+    ClaimInvalidationCondition,
+    ClaimReviewContract,
+    ERR_SPEC_LOOKAHEAD_PIT,
+    validate_applicability,
+    validate_claim_review_contract,
+    validate_invalidation_condition,
+)
+
 logger = logging.getLogger(__name__)
 
 # Status constants
@@ -1024,14 +1034,128 @@ class EvidenceFactualTruthEvaluator:
         self,
         claims: Sequence[Mapping[str, Any]] | None = None,
         claims_verification: Sequence[Mapping[str, Any]] | None = None,
+        *,
+        analysis_baseline_date: str | None = None,
+        expected_symbol: str | None = None,
+        market_data_context: Mapping[str, Any] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Aggregate evidence verification by claim and compute coverage ratio and adoption decisions."""
-        return aggregate_claim_evidence(claims=claims, claims_verification=claims_verification)
+        return aggregate_claim_evidence(
+            claims=claims,
+            claims_verification=claims_verification,
+            analysis_baseline_date=analysis_baseline_date,
+            expected_symbol=expected_symbol,
+            market_data_context=market_data_context,
+        )
+
+
+_OBSERVATION_HYPOTHESIS_PATTERN = re.compile(
+    r"(?:^|[\[\(【（])\s*(?:观察|假设|假说|推测|情景假设|hypothesis|observation)\s*(?:[\]\)】）]|$|:|\s)",
+    re.IGNORECASE,
+)
+_OBSERVATION_HYPOTHESIS_TYPES = frozenset(
+    {
+        "observation",
+        "hypothesis",
+        "hypothetical",
+        "assumption",
+        "observational",
+        "conjecture",
+        "scenario",
+    }
+)
+
+
+def is_observation_or_hypothesis_claim(claim: Mapping[str, Any] | Any) -> bool:
+    """Check if a claim is an observation or hypothesis rather than a verified fact assertion (E-03c)."""
+    if not isinstance(claim, Mapping):
+        if isinstance(claim, str):
+            return bool(_OBSERVATION_HYPOTHESIS_PATTERN.search(claim))
+        return False
+    if bool(claim.get("is_observation")) or bool(claim.get("is_hypothesis")):
+        return True
+    for k in ("claim_type", "type", "epistemic_status", "claim_nature", "nature"):
+        val = str(claim.get(k) or "").strip().lower()
+        if val in _OBSERVATION_HYPOTHESIS_TYPES:
+            return True
+    claim_text = str(claim.get("claim") or "").strip()
+    if _OBSERVATION_HYPOTHESIS_PATTERN.search(claim_text):
+        return True
+    if claim_text.startswith(("观察：", "假设：", "推测：", "情景：", "Observation:", "Hypothesis:")):
+        return True
+    status_val = str(claim.get("status") or "").strip().lower()
+    if status_val in {"observation", "hypothesis"}:
+        return True
+    return False
+
+
+def _check_invalidation_condition_triggered(
+    cond: Mapping[str, Any],
+    market_data_context: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Check whether a machine-checkable invalidation condition has triggered (E-03c)."""
+    metric = str(cond.get("metric") or "").strip().lower()
+    op = str(cond.get("operator") or "").strip()
+    threshold = cond.get("threshold")
+    if threshold is None or not op:
+        return False, ""
+    try:
+        th_val = float(threshold)
+    except (ValueError, TypeError):
+        return False, ""
+
+    actual_val = None
+    for k in (metric, metric.replace(" ", "_"), f"current_{metric}", f"last_{metric}"):
+        if k in market_data_context:
+            v = market_data_context[k]
+            if v is not None and not isinstance(v, bool):
+                try:
+                    actual_val = float(v)
+                    break
+                except (ValueError, TypeError):
+                    pass
+    if actual_val is None:
+        for sub_key in ("indicators", "quotes", "daily", "realtime"):
+            sub = market_data_context.get(sub_key)
+            if isinstance(sub, Mapping) and metric in sub:
+                v = sub[metric]
+                if v is not None and not isinstance(v, bool):
+                    try:
+                        actual_val = float(v)
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+    if actual_val is None:
+        return False, ""
+
+    triggered = False
+    if op == "<":
+        triggered = (actual_val < th_val)
+    elif op == "<=":
+        triggered = (actual_val <= th_val)
+    elif op == ">":
+        triggered = (actual_val > th_val)
+    elif op == ">=":
+        triggered = (actual_val >= th_val)
+    elif op == "==":
+        triggered = math.isclose(actual_val, th_val, abs_tol=1e-5)
+    elif op == "!=":
+        triggered = not math.isclose(actual_val, th_val, abs_tol=1e-5)
+
+    if triggered:
+        cid = cond.get("condition_id", "cond")
+        return True, f"失效条件 [{cid}] 已触发: 实际指标 {metric}={actual_val} 满足 {op} 阈值 {th_val}"
+    return False, ""
 
 
 def aggregate_claim_evidence(
     claims: Sequence[Mapping[str, Any]] | None = None,
     claims_verification: Sequence[Mapping[str, Any]] | None = None,
+    *,
+    analysis_baseline_date: str | None = None,
+    expected_symbol: str | None = None,
+    market_data_context: Mapping[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Aggregate evidence verification results by claim_id and evaluate deterministic decisions.
 
@@ -1057,10 +1181,31 @@ def aggregate_claim_evidence(
             "contradicted_evidence": list[str],
             "source_unavailable_evidence": list[str],
             "excluded_evidence": list[str],
+            "is_observation_or_hypothesis": bool,
+            "applicability": dict | None,
+            "invalidation_conditions": list[dict],
+            "pit_failed": bool,
         }
     """
     claims_list = list(claims or [])
     ver_list = list(claims_verification or [])
+
+    effective_baseline_date = analysis_baseline_date
+    if not effective_baseline_date and isinstance(market_data_context, Mapping):
+        effective_baseline_date = str(
+            market_data_context.get("analysis_baseline_date")
+            or market_data_context.get("data_as_of")
+            or market_data_context.get("trade_date")
+            or ""
+        ).strip() or None
+
+    effective_expected_symbol = expected_symbol
+    if not effective_expected_symbol and isinstance(market_data_context, Mapping):
+        effective_expected_symbol = str(
+            market_data_context.get("symbol")
+            or market_data_context.get("ticker")
+            or ""
+        ).strip() or None
 
     # Map verification items by claim_id
     ver_by_cid: dict[str, list[Mapping[str, Any]]] = {}
@@ -1087,6 +1232,67 @@ def aggregate_claim_evidence(
         claim_obj = known_claims.get(cid, {})
         claim_ver_items = ver_by_cid.get(cid, [])
 
+        is_obs_hypo = is_observation_or_hypothesis_claim(claim_obj)
+
+        # 1. Applicability validation
+        norm_applicability: dict[str, Any] | None = None
+        applicability_pit_failed = False
+        applicability_failed = False
+        app_error_msg = ""
+        if "applicability" in claim_obj and claim_obj["applicability"] is not None:
+            app_val = claim_obj["applicability"]
+            if isinstance(app_val, ClaimApplicability):
+                app_val = app_val.to_dict()
+            ok_app, err_app, norm_app = validate_applicability(
+                app_val,
+                expected_symbol=effective_expected_symbol,
+                current_trade_date=effective_baseline_date,
+            )
+            if not ok_app:
+                if err_app == ERR_SPEC_LOOKAHEAD_PIT:
+                    applicability_pit_failed = True
+                    app_error_msg = f"适用性规格存在前视偏差/PIT失败 (pit_date={app_val.get('pit_date')} > baseline={effective_baseline_date})"
+                else:
+                    applicability_failed = True
+                    app_error_msg = f"适用性规格校验失败: {err_app}"
+            else:
+                norm_applicability = norm_app
+
+        # 2. Invalidation conditions validation
+        norm_conditions: list[dict[str, Any]] = []
+        conditions_pit_failed = False
+        conditions_failed = False
+        conditions_triggered = False
+        cond_error_msgs: list[str] = []
+        if "invalidation_conditions" in claim_obj and claim_obj["invalidation_conditions"] is not None:
+            raw_conds = claim_obj["invalidation_conditions"]
+            if isinstance(raw_conds, (list, tuple, Sequence)) and not isinstance(raw_conds, (str, bytes, Mapping)):
+                cond_baseline = effective_baseline_date or (norm_applicability.get("pit_date") if norm_applicability else None)
+                for idx, cond in enumerate(raw_conds, start=1):
+                    if isinstance(cond, ClaimInvalidationCondition):
+                        cond = cond.to_dict()
+                    ok_c, err_c, norm_c = validate_invalidation_condition(
+                        cond,
+                        index=idx,
+                        current_trade_date=cond_baseline,
+                    )
+                    if not ok_c:
+                        if err_c == ERR_SPEC_LOOKAHEAD_PIT:
+                            conditions_pit_failed = True
+                            cond_error_msgs.append(f"失效条件 [{cond.get('condition_id', idx)}] 存在前视偏差/PIT失败 ({err_c})")
+                        else:
+                            conditions_failed = True
+                            cond_error_msgs.append(f"失效条件 [{cond.get('condition_id', idx)}] 规格校验失败 ({err_c})")
+                    else:
+                        norm_conditions.append(norm_c)
+                        if market_data_context and isinstance(market_data_context, Mapping):
+                            is_trig, trig_msg = _check_invalidation_condition_triggered(norm_c, market_data_context)
+                            if is_trig:
+                                conditions_triggered = True
+                                cond_error_msgs.append(trig_msg)
+
+        pit_failed = applicability_pit_failed or conditions_pit_failed
+
         verified_items = [v for v in claim_ver_items if v.get("status") == STATUS_VERIFIED]
         unsupported_items = [v for v in claim_ver_items if v.get("status") == STATUS_UNSUPPORTED]
         contradicted_items = [v for v in claim_ver_items if v.get("status") == STATUS_CONTRADICTED]
@@ -1106,6 +1312,9 @@ def aggregate_claim_evidence(
         unsupported_count = len(unsupported_items)
         contradicted_count = len(contradicted_items)
         source_unavail_count = len(source_unavail_items)
+
+        if pit_failed:
+            contradicted_count = max(contradicted_count, 1)
 
         counts = {
             "total": total_count,
@@ -1127,7 +1336,28 @@ def aggregate_claim_evidence(
             if v.get("status") != STATUS_VERIFIED and str(v.get("raw", "")).strip()
         ]
 
-        if contradicted_count > 0:
+        if pit_failed:
+            decision = DECISION_REJECT
+            all_pit_reasons = []
+            if applicability_pit_failed:
+                all_pit_reasons.append(app_error_msg)
+            if conditions_pit_failed:
+                all_pit_reasons.extend(cond_error_msgs)
+            reason = f"命题规格契约存在前视偏差/PIT失败 (contradicted): {'; '.join(all_pit_reasons)}"
+        elif applicability_failed or conditions_failed:
+            decision = DECISION_REJECT
+            all_spec_reasons = []
+            if applicability_failed:
+                all_spec_reasons.append(app_error_msg)
+            if conditions_failed:
+                all_spec_reasons.extend(cond_error_msgs)
+            reason = f"命题规格契约校验失败: {'; '.join(all_spec_reasons)}"
+        elif conditions_triggered:
+            decision = DECISION_REJECT
+            reason = f"命题失效条件已触发证伪 (contradicted): {'; '.join(cond_error_msgs)}"
+            contradicted_count = max(contradicted_count, 1)
+            counts["contradicted"] = contradicted_count
+        elif contradicted_count > 0:
             decision = DECISION_REJECT
             reason = f"存在 {contradicted_count} 条与报告事实冲突/前视偏差证据 (contradicted)"
         elif source_unavail_count > 0:
@@ -1137,8 +1367,12 @@ def aggregate_claim_evidence(
             decision = DECISION_REJECT
             reason = "未提供有效证据或全部证据未获验证 (unsupported)"
         elif verified_count == total_count:
-            decision = DECISION_ADOPT
-            reason = f"全部证据核验通过 (verified {verified_count}/{total_count}, coverage=100.0%)"
+            if is_obs_hypo:
+                decision = DECISION_PARTIAL
+                reason = f"观察/假设类命题 (observation/hypothesis) 核验通过但须留在可审计的观察状态 (verified {verified_count}/{total_count})，不升级为已验证事实 (adopt)"
+            else:
+                decision = DECISION_ADOPT
+                reason = f"全部证据核验通过 (verified {verified_count}/{total_count}, coverage=100.0%)"
         elif coverage >= MIN_COVERAGE_THRESHOLD or round(coverage, 2) >= MIN_COVERAGE_THRESHOLD or math.isclose(coverage, 2 / 3, abs_tol=1e-3):
             decision = DECISION_PARTIAL
             reason = f"混合证据部分通过核验 (verified {verified_count}/{total_count}, coverage={coverage:.1%})，仅可采纳 verified 子结论并剔除未验证项"
@@ -1161,6 +1395,10 @@ def aggregate_claim_evidence(
             "contradicted_evidence": contradicted_ev,
             "source_unavailable_evidence": source_unavail_ev,
             "excluded_evidence": excluded_ev,
+            "is_observation_or_hypothesis": is_obs_hypo,
+            "applicability": norm_applicability,
+            "invalidation_conditions": norm_conditions,
+            "pit_failed": pit_failed,
         }
 
     return summary_map
@@ -1212,7 +1450,8 @@ def format_claims_with_verification_for_prompt(
             continue
 
         decision = sum_info.get("decision", DECISION_REJECT)
-        badge = badge_map.get(decision, "待核验")
+        is_obs = sum_info.get("is_observation_or_hypothesis", False)
+        badge = "观察/假设类命题 (可审计未验证/部分采纳)" if is_obs else badge_map.get(decision, "待核验")
         cov = sum_info.get("coverage", 0.0)
         counts = sum_info.get("counts", {})
         total = counts.get("total", 0)
@@ -1222,6 +1461,12 @@ def format_claims_with_verification_for_prompt(
         lines.append(f"{prefix}{cid} [{status}] {speaker}{stance_str}: {summary_text}")
         lines.append(f"  * 核验评级: 【{badge}】 覆盖率={cov:.1%} ({verified}/{total} verified) | 规则判定: {decision}")
         lines.append(f"  * 判定说明: {reason}")
+        if sum_info.get("applicability"):
+            app = sum_info["applicability"]
+            lines.append(f"  * 适用档规格: 标的={app.get('symbol')}, 观察窗={app.get('horizon')}, 计量基准={app.get('metric_basis')}, PIT截止日={app.get('pit_date')}")
+        if sum_info.get("invalidation_conditions"):
+            for cond in sum_info["invalidation_conditions"]:
+                lines.append(f"  * 证伪/失效条件 [{cond.get('condition_id')}]: {cond.get('metric')} {cond.get('operator')} {cond.get('threshold')} {cond.get('unit')} (周期: {cond.get('period')}, 来源: {cond.get('source')}, PIT={cond.get('pit_date')})")
 
         ver_ev = sum_info.get("verified_evidence", [])
         unsupp_ev = sum_info.get("unsupported_evidence", [])
@@ -1584,8 +1829,26 @@ def extract_and_validate_manager_verdict(
     # ── Deterministic Claim Evidence Summary Computation ──────────────────
     claim_evidence_summary: dict[str, dict[str, Any]] = {}
     if claims is not None or claims_verification is not None:
+        b_date = None
+        exp_sym = None
+        if isinstance(market_data_context, Mapping):
+            b_date = str(
+                market_data_context.get("analysis_baseline_date")
+                or market_data_context.get("data_as_of")
+                or market_data_context.get("trade_date")
+                or ""
+            ).strip() or None
+            exp_sym = str(
+                market_data_context.get("symbol")
+                or market_data_context.get("ticker")
+                or ""
+            ).strip() or None
         claim_evidence_summary = aggregate_claim_evidence(
-            claims=claims, claims_verification=claims_verification
+            claims=claims,
+            claims_verification=claims_verification,
+            analysis_baseline_date=b_date,
+            expected_symbol=exp_sym,
+            market_data_context=market_data_context,
         )
     elif payload and isinstance(payload.get("claim_evidence_summary"), dict):
         claim_evidence_summary = payload["claim_evidence_summary"]
@@ -1679,10 +1942,13 @@ def extract_and_validate_manager_verdict(
                 cnt = s.get("counts", {})
                 cov = s.get("coverage", 0.0)
                 dec = s.get("decision")
-                if cnt.get("contradicted", 0) > 0:
+                is_obs = s.get("is_observation_or_hypothesis", False)
+                if s.get("pit_failed") or cnt.get("contradicted", 0) > 0:
                     failed_checks.append(f"裁决采纳了存在事实冲突/前视偏差的矛盾 claim: {cid}")
                 elif cnt.get("source_unavailable", 0) > 0:
                     failed_checks.append(f"裁决采纳了不可用数据源的严重幻觉 claim: {cid}")
+                elif is_obs:
+                    failed_checks.append(f"裁决全额采纳了观察/假设类 claim: {cid}，观察/假设类命题不得升级为已验证事实 (adopt)")
                 elif cnt.get("verified", 0) == 0 or cnt.get("total", 0) == 0:
                     failed_checks.append(f"裁决采纳了全部证据未获验证 (unsupported) 的 claim: {cid}")
                 elif cov < MIN_COVERAGE_THRESHOLD and not math.isclose(cov, 2 / 3, abs_tol=1e-3):
@@ -1697,13 +1963,14 @@ def extract_and_validate_manager_verdict(
                 s = claim_evidence_summary[cid]
                 cnt = s.get("counts", {})
                 cov = s.get("coverage", 0.0)
-                if cnt.get("contradicted", 0) > 0:
+                is_obs = s.get("is_observation_or_hypothesis", False)
+                if s.get("pit_failed") or cnt.get("contradicted", 0) > 0:
                     failed_checks.append(f"部分采纳列表中包含了存在事实冲突/前视偏差的矛盾 claim: {cid}")
                 elif cnt.get("source_unavailable", 0) > 0:
                     failed_checks.append(f"部分采纳列表中包含了不可用数据源的严重幻觉 claim: {cid}")
-                elif cnt.get("verified", 0) == 0 or cnt.get("total", 0) == 0:
+                elif not is_obs and (cnt.get("verified", 0) == 0 or cnt.get("total", 0) == 0):
                     failed_checks.append(f"部分采纳列表中包含了全部证据未获验证 (unsupported) 的 claim: {cid}")
-                elif cov < MIN_COVERAGE_THRESHOLD and not math.isclose(cov, 2 / 3, abs_tol=1e-3):
+                elif not is_obs and (cov < MIN_COVERAGE_THRESHOLD and not math.isclose(cov, 2 / 3, abs_tol=1e-3)):
                     failed_checks.append(f"部分采纳列表中包含了证据覆盖率不足 ({cov:.1%} < 67%) 的 claim: {cid}")
 
         # Check prose consistency against claim verification

@@ -229,3 +229,240 @@ def test_true_conflict_positive_case(evaluator):
     )
     assert res_conflict["status"] == STATUS_CONTRADICTED
     assert "毛利率" in res_conflict.get("details", "")
+
+
+# =====================================================================
+# E-03c Deterministic Verification Scenarios
+# =====================================================================
+
+def test_e03c_adopt_partial_reject_exact_coverage_boundaries(evaluator):
+    """E-03c: Exact boundaries for adopt (100%), partial (>=67% mixed), and reject (<67% or conflict)."""
+    from tradingagents.agents.utils.evidence_verifier import (
+        aggregate_claim_evidence,
+        DECISION_ADOPT,
+        DECISION_PARTIAL,
+        DECISION_REJECT,
+    )
+
+    # 1. 3/3 verified -> adopt
+    s1 = aggregate_claim_evidence(
+        claims=[{"claim_id": "C-1", "claim": "论点1", "evidence": ["E1", "E2", "E3"]}],
+        claims_verification=[
+            {"claim_id": "C-1", "raw": "E1", "status": "verified"},
+            {"claim_id": "C-1", "raw": "E2", "status": "verified"},
+            {"claim_id": "C-1", "raw": "E3", "status": "verified"},
+        ],
+    )["C-1"]
+    assert s1["decision"] == DECISION_ADOPT
+    assert s1["coverage"] == 1.0
+
+    # 2. 2/3 verified (66.7%) -> partial
+    s2 = aggregate_claim_evidence(
+        claims=[{"claim_id": "C-2", "claim": "论点2", "evidence": ["E1", "E2", "E3"]}],
+        claims_verification=[
+            {"claim_id": "C-2", "raw": "E1", "status": "verified"},
+            {"claim_id": "C-2", "raw": "E2", "status": "verified"},
+            {"claim_id": "C-2", "raw": "E3", "status": "unsupported"},
+        ],
+    )["C-2"]
+    assert s2["decision"] == DECISION_PARTIAL
+    assert len(s2["verified_evidence"]) == 2
+    assert s2["unsupported_evidence"] == ["E3"]
+    assert s2["excluded_evidence"] == ["E3"]
+
+    # 3. 1/2 verified (50%) -> reject (coverage < 67%)
+    s3 = aggregate_claim_evidence(
+        claims=[{"claim_id": "C-3", "claim": "论点3", "evidence": ["E1", "E2"]}],
+        claims_verification=[
+            {"claim_id": "C-3", "raw": "E1", "status": "verified"},
+            {"claim_id": "C-3", "raw": "E2", "status": "unsupported"},
+        ],
+    )["C-3"]
+    assert s3["decision"] == DECISION_REJECT
+    assert "覆盖率不足" in s3["reason"]
+
+    # 4. 0/2 verified -> reject (unsupported)
+    s4 = aggregate_claim_evidence(
+        claims=[{"claim_id": "C-4", "claim": "论点4", "evidence": ["E1", "E2"]}],
+        claims_verification=[
+            {"claim_id": "C-4", "raw": "E1", "status": "unsupported"},
+            {"claim_id": "C-4", "raw": "E2", "status": "unsupported"},
+        ],
+    )["C-4"]
+    assert s4["decision"] == DECISION_REJECT
+    assert "未提供有效证据" in s4["reason"]
+
+    # 5. Contradicted evidence -> reject even with verified items
+    s5 = aggregate_claim_evidence(
+        claims=[{"claim_id": "C-5", "claim": "论点5", "evidence": ["E1", "E2", "E3"]}],
+        claims_verification=[
+            {"claim_id": "C-5", "raw": "E1", "status": "verified"},
+            {"claim_id": "C-5", "raw": "E2", "status": "verified"},
+            {"claim_id": "C-5", "raw": "E3", "status": "contradicted"},
+        ],
+    )["C-5"]
+    assert s5["decision"] == DECISION_REJECT
+    assert "事实冲突" in s5["reason"]
+
+    # 6. Source unavailable -> reject
+    s6 = aggregate_claim_evidence(
+        claims=[{"claim_id": "C-6", "claim": "论点6", "evidence": ["E1", "E2", "E3"]}],
+        claims_verification=[
+            {"claim_id": "C-6", "raw": "E1", "status": "verified"},
+            {"claim_id": "C-6", "raw": "E2", "status": "verified"},
+            {"claim_id": "C-6", "raw": "E3", "status": "source_unavailable", "is_fatal": True},
+        ],
+    )["C-6"]
+    assert s6["decision"] == DECISION_REJECT
+    assert "不可用数据源" in s6["reason"]
+
+
+def test_e03c_pit_anti_lookahead_date_failure(evaluator):
+    """E-03c: Anti-lookahead date check fails closed when evidence date exceeds baseline date."""
+    seven_reports = {
+        "market_report": "2026-08-20收盘价为1500元，放量突破均线。",
+    }
+    # 1. Past date matches -> verified
+    res_past = evaluator.evaluate_single_evidence(
+        raw_evidence="2026-08-20收盘价为1500元",
+        seven_reports=seven_reports,
+        analysis_baseline_date="2026-08-25",
+    )
+    assert res_past["status"] == STATUS_VERIFIED
+
+    # 2. Future date without forward keywords -> contradicted (lookahead bias)
+    res_future = evaluator.evaluate_single_evidence(
+        raw_evidence="2026-09-02收盘价创出新高突破1600元",
+        seven_reports=seven_reports,
+        analysis_baseline_date="2026-08-25",
+    )
+    assert res_future["status"] == STATUS_CONTRADICTED
+    assert "前视偏差" in res_future["details"]
+
+    # 3. Future date with forward target/prediction keyword -> allowed to not be contradicted
+    res_pred = evaluator.evaluate_single_evidence(
+        raw_evidence="目标2026-09-02前收盘价有望冲击1600元",
+        seven_reports=seven_reports,
+        analysis_baseline_date="2026-08-25",
+    )
+    assert res_pred["status"] != STATUS_CONTRADICTED
+
+
+def test_e03c_source_unavailable_provider_failure(evaluator):
+    """E-03c: Citation of failed data source must be marked source_unavailable, not missing or absent in fact."""
+    from tradingagents.agents.utils.evidence_verifier import STATUS_SOURCE_UNAVAILABLE
+
+    market_data_context = {
+        "data_failure_ledger": [
+            {
+                "source": "smart_money",
+                "name": "主力资金数据流",
+                "status": "failed",
+                "provenance_status": "unverified",
+            }
+        ],
+        "source_provenance": {
+            "smart_money": {"status": "failed"},
+        },
+    }
+    seven_reports = {
+        "smart_money_report": "【数据获取失败】smart_money",
+    }
+    res = evaluator.evaluate_single_evidence(
+        raw_evidence="smart_money主力资金净流入2.5亿元",
+        seven_reports=seven_reports,
+        market_data_context=market_data_context,
+    )
+    assert res["status"] == STATUS_SOURCE_UNAVAILABLE
+    assert res["is_fatal"] is True
+    assert "严重幻觉" in res["details"] or "不可用" in res["details"]
+
+
+def test_e03c_valid_zero_and_decimal_zero_matching(evaluator):
+    """E-03c: Zero values (0, 0.0, Decimal(0)) are valid financial metrics and must match reports."""
+    seven_reports = {
+        "fundamentals_report": "2026年Q2归母净利润同比增长0.0%，营业收入增长0.0%，资产负债率为0%。",
+        "smart_money_report": "主力净流入0亿元，超大单净流出0万元。",
+    }
+    # 1. 0.0% match
+    res_profit = evaluator.evaluate_single_evidence(
+        raw_evidence="2026年Q2归母净利润同比增长0%",
+        seven_reports=seven_reports,
+    )
+    assert res_profit["status"] == STATUS_VERIFIED
+
+    # 2. 0亿元 match
+    res_flow = evaluator.evaluate_single_evidence(
+        raw_evidence="主力净流入0亿元",
+        seven_reports=seven_reports,
+    )
+    assert res_flow["status"] == STATUS_VERIFIED
+
+    # 3. Disagreeing with 0% triggers contradiction
+    res_diff = evaluator.evaluate_single_evidence(
+        raw_evidence="2026年Q2归母净利润同比增长10.0%",
+        seven_reports=seven_reports,
+    )
+    assert res_diff["status"] == STATUS_CONTRADICTED
+
+
+def test_e03c_observation_and_hypothesis_never_upgraded_to_adopt():
+    """E-03c: Observation and hypothesis claims stay in audited partial state and never upgrade to adopt."""
+    from tradingagents.agents.utils.evidence_verifier import (
+        aggregate_claim_evidence,
+        is_observation_or_hypothesis_claim,
+        DECISION_PARTIAL,
+        DECISION_ADOPT,
+    )
+
+    claims = [
+        {"claim_id": "CLM-1", "claim": "主力大单净买入", "evidence": ["净流入1亿"], "is_observation": True},
+        {"claim_id": "CLM-2", "claim": "【假设】若下周放量突破3000点将加速上涨", "evidence": ["突破60日线"]},
+        {"claim_id": "CLM-3", "claim": "题材情绪向好", "claim_type": "hypothesis", "evidence": ["政策支持"]},
+        {"claim_id": "CLM-4", "claim": "确凿基本面事实", "claim_type": "fact", "evidence": ["营收2000亿"]},
+    ]
+    assert is_observation_or_hypothesis_claim(claims[0]) is True
+    assert is_observation_or_hypothesis_claim(claims[1]) is True
+    assert is_observation_or_hypothesis_claim(claims[2]) is True
+    assert is_observation_or_hypothesis_claim(claims[3]) is False
+
+    ver_items = [
+        {"claim_id": "CLM-1", "raw": "净流入1亿", "status": "verified"},
+        {"claim_id": "CLM-2", "raw": "突破60日线", "status": "verified"},
+        {"claim_id": "CLM-3", "raw": "政策支持", "status": "verified"},
+        {"claim_id": "CLM-4", "raw": "营收2000亿", "status": "verified"},
+    ]
+    summary = aggregate_claim_evidence(claims=claims, claims_verification=ver_items)
+
+    assert summary["CLM-1"]["decision"] == DECISION_PARTIAL
+    assert summary["CLM-2"]["decision"] == DECISION_PARTIAL
+    assert summary["CLM-3"]["decision"] == DECISION_PARTIAL
+    assert summary["CLM-4"]["decision"] == DECISION_ADOPT
+
+
+def test_e03c_preserves_raw_evidence_source_and_state_change_reasons():
+    """E-03c: Verifier retains raw evidence, sources, and state change reasons for auditability."""
+    from tradingagents.agents.utils.evidence_verifier import aggregate_claim_evidence
+
+    claim = {
+        "claim_id": "INV-AUDIT",
+        "speaker": "Bull Analyst",
+        "speaker_key": "Bull",
+        "stance": "bullish",
+        "claim": "量价综合立论",
+        "evidence": ["放量突破", "虚假指标", "冲突数据"],
+    }
+    ver_items = [
+        {"claim_id": "INV-AUDIT", "raw": "放量突破", "status": "verified", "matched_role": "market_report"},
+        {"claim_id": "INV-AUDIT", "raw": "虚假指标", "status": "unsupported"},
+        {"claim_id": "INV-AUDIT", "raw": "冲突数据", "status": "contradicted"},
+    ]
+    summary = aggregate_claim_evidence(claims=[claim], claims_verification=ver_items)
+    s = summary["INV-AUDIT"]
+
+    assert s["verified_evidence"] == ["放量突破"]
+    assert s["unsupported_evidence"] == ["虚假指标"]
+    assert s["contradicted_evidence"] == ["冲突数据"]
+    assert "冲突数据" in s["excluded_evidence"]
+    assert "虚假指标" in s["excluded_evidence"]
+    assert "存在 1 条与报告事实冲突/前视偏差证据" in s["reason"]

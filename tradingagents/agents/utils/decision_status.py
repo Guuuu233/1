@@ -319,7 +319,7 @@ def evaluate_confirmation_state(
     summary_map: dict[str, Mapping[str, Any]] = {}
     if claim_evidence_summary:
         summary_map = {str(k).strip(): v for k, v in claim_evidence_summary.items() if str(k).strip()}
-    elif claims_verification:
+    elif claims_verification or claims:
         from tradingagents.agents.utils.evidence_verifier import aggregate_claim_evidence
 
         summary_map = aggregate_claim_evidence(claims=claims, claims_verification=claims_verification)
@@ -330,9 +330,27 @@ def evaluate_confirmation_state(
         if cid:
             ver_by_cid.setdefault(cid, []).append(v)
 
+    known_claims = {
+        str(c.get("claim_id", "") or "").strip(): c
+        for c in (claims or [])
+        if isinstance(c, Mapping) and str(c.get("claim_id", "") or "").strip()
+    }
+
+    def _is_claim_obs_hypo(cid: str) -> bool:
+        sm = summary_map.get(cid)
+        if sm and sm.get("is_observation_or_hypothesis"):
+            return True
+        cl = known_claims.get(cid)
+        if cl:
+            from tradingagents.agents.utils.evidence_verifier import is_observation_or_hypothesis_claim
+            return is_observation_or_hypothesis_claim(cl)
+        return False
+
     def _is_claim_fatal(cid: str) -> bool:
         sm = summary_map.get(cid)
         if sm:
+            if sm.get("pit_failed"):
+                return True
             cnt = sm.get("counts") or {}
             if cnt.get("contradicted", 0) > 0 or cnt.get("source_unavailable", 0) > 0:
                 return True
@@ -430,12 +448,15 @@ def evaluate_confirmation_state(
     adopted_fatal = [cid for cid in adopted_ids if _is_claim_fatal(cid)]
     partially_adopted_fatal = [cid for cid in partially_adopted_ids if _is_claim_fatal(cid)]
 
-    if core_fatal:
-        return CONFIRM_UNRESOLVED, [f"fatal_core_claims:{','.join(sorted(core_fatal))}"]
+    fatal_codes: list[str] = []
     if adopted_fatal:
-        return CONFIRM_UNRESOLVED, [f"fatal_adopted_claims:{','.join(sorted(adopted_fatal))}"]
+        fatal_codes.append(f"fatal_adopted_claims:{','.join(sorted(adopted_fatal))}")
+    if core_fatal:
+        fatal_codes.append(f"fatal_core_claims:{','.join(sorted(core_fatal))}")
     if partially_adopted_fatal:
-        return CONFIRM_UNRESOLVED, [f"fatal_partially_adopted_claims:{','.join(sorted(partially_adopted_fatal))}"]
+        fatal_codes.append(f"fatal_partially_adopted_claims:{','.join(sorted(partially_adopted_fatal))}")
+    if fatal_codes:
+        return CONFIRM_UNRESOLVED, fatal_codes
 
     # If neither core claims nor adopted claims exist
     if not core_claim_ids and not adopted_ids:
@@ -472,10 +493,14 @@ def evaluate_confirmation_state(
         core_unverified = [cid for cid in core_claim_ids if not _is_claim_verified(cid) and not _is_claim_fatal(cid)]
         if len(core_verified) == 0:
             return CONFIRM_UNRESOLVED, [f"unverified_core_claims:{','.join(core_claim_ids)}"]
-        core_has_partial = len(core_verified) < len(core_claim_ids)
+        core_unverified_factual = [cid for cid in core_unverified if not _is_claim_obs_hypo(cid)]
+        core_unverified_obs = [cid for cid in core_unverified if _is_claim_obs_hypo(cid)]
+        core_has_partial = len(core_unverified_factual) > 0
     else:
         core_verified = []
         core_unverified = []
+        core_unverified_factual = []
+        core_unverified_obs = []
         core_has_partial = False
 
     # Adopted claims verification
@@ -486,34 +511,77 @@ def evaluate_confirmation_state(
 
     # Assemble partial reasons
     partial_codes: list[str] = []
+    audit_obs_codes: list[str] = []
+
     if core_has_partial:
         partial_codes.append(
-            f"partial_core_claims:verified={','.join(core_verified)};unverified={','.join(core_unverified)}"
+            f"partial_core_claims:verified={','.join(core_verified)};unverified={','.join(core_unverified_factual)}"
         )
-    if adopted_partial:
-        partial_codes.append(
-            f"partial_adopted_claims:{','.join(sorted(adopted_partial))}"
-        )
-    if partially_adopted_ids:
-        partial_codes.append(
-            f"partially_adopted_claims:{','.join(sorted(partially_adopted_ids))}"
-        )
-    if rejected_partial_cids:
-        partial_codes.append(
-            f"rejected_partial_claims:{','.join(sorted(rejected_partial_cids))}"
-        )
-    if unadjudicated_partial_cids:
-        partial_codes.append(
-            f"unadjudicated_partial_claims:{','.join(sorted(unadjudicated_partial_cids))}"
+    if core_unverified_obs:
+        audit_obs_codes.append(
+            f"audited_observation_claims:{','.join(sorted(core_unverified_obs))}"
         )
 
+    adopted_partial_factual = [cid for cid in adopted_partial if not _is_claim_obs_hypo(cid)]
+    adopted_partial_obs = [cid for cid in adopted_partial if _is_claim_obs_hypo(cid)]
+    if adopted_partial_factual:
+        partial_codes.append(
+            f"partial_adopted_claims:{','.join(sorted(adopted_partial_factual))}"
+        )
+    if adopted_partial_obs:
+        audit_obs_codes.append(
+            f"audited_observation_claims:{','.join(sorted(adopted_partial_obs))}"
+        )
+
+    partially_adopted_factual = [cid for cid in partially_adopted_ids if not _is_claim_obs_hypo(cid)]
+    partially_adopted_obs = [cid for cid in partially_adopted_ids if _is_claim_obs_hypo(cid)]
+    if partially_adopted_factual:
+        partial_codes.append(
+            f"partially_adopted_claims:{','.join(sorted(partially_adopted_factual))}"
+        )
+    if partially_adopted_obs:
+        audit_obs_codes.append(
+            f"audited_observation_claims:{','.join(sorted(partially_adopted_obs))}"
+        )
+
+    rejected_partial_factual = [cid for cid in rejected_partial_cids if not _is_claim_obs_hypo(cid)]
+    rejected_partial_obs = [cid for cid in rejected_partial_cids if _is_claim_obs_hypo(cid)]
+    if rejected_partial_factual:
+        partial_codes.append(
+            f"rejected_partial_claims:{','.join(sorted(rejected_partial_factual))}"
+        )
+    if rejected_partial_obs:
+        audit_obs_codes.append(
+            f"audited_observation_claims:{','.join(sorted(rejected_partial_obs))}"
+        )
+
+    unadjudicated_partial_factual = [cid for cid in unadjudicated_partial_cids if not _is_claim_obs_hypo(cid)]
+    unadjudicated_partial_obs = [cid for cid in unadjudicated_partial_cids if _is_claim_obs_hypo(cid)]
+    if unadjudicated_partial_factual:
+        partial_codes.append(
+            f"unadjudicated_partial_claims:{','.join(sorted(unadjudicated_partial_factual))}"
+        )
+    if unadjudicated_partial_obs:
+        audit_obs_codes.append(
+            f"audited_observation_claims:{','.join(sorted(unadjudicated_partial_obs))}"
+        )
+
+    # Consolidate unique observation codes
+    all_obs_cids = sorted(list(set(
+        core_unverified_obs + adopted_partial_obs + partially_adopted_obs + rejected_partial_obs + unadjudicated_partial_obs
+    )))
+    consolidated_obs_codes = [f"audited_observation_claims:{','.join(all_obs_cids)}"] if all_obs_cids else []
+
     if partial_codes:
-        return CONFIRM_PARTIAL, partial_codes + audit_rejected_codes
+        return CONFIRM_PARTIAL, partial_codes + consolidated_obs_codes + audit_rejected_codes
 
     # Everything confirmed
     verified_core = core_verified if core_claim_ids else [cid for cid in adopted_ids if _is_claim_verified(cid)]
     if verified_core:
-        return CONFIRM_CONFIRMED, [f"all_core_claims_verified:{','.join(verified_core)}"] + audit_rejected_codes
+        return CONFIRM_CONFIRMED, [f"all_core_claims_verified:{','.join(verified_core)}"] + consolidated_obs_codes + audit_rejected_codes
+    elif all_obs_cids:
+        # If ONLY observations exist and NO verified factual claims exist, cannot confirm
+        return CONFIRM_UNRESOLVED, [f"observation_hypotheses_unverified_without_factual_core:{','.join(all_obs_cids)}"] + audit_rejected_codes
     return CONFIRM_CONFIRMED, audit_rejected_codes
 
 
@@ -533,16 +601,19 @@ def status_from_manager_verdict(
     """Build canonical status for a completed Research Manager path."""
     mv = manager_verdict if isinstance(manager_verdict, Mapping) else {}
     nested = mv.get("decision_status")
-    if isinstance(nested, Mapping):
+    from_nested = None
+    if isinstance(nested, DecisionStatus):
+        from_nested = nested
+    elif isinstance(nested, Mapping):
         from_nested = decision_status_from_mapping(nested)
-        if from_nested is not None:
-            # Nested ABSTAIN/INVALID from earlier gates wins.
-            if from_nested.analysis_status in {
-                ANALYSIS_INVALID_RUN,
-                ANALYSIS_DATA_ERROR,
-                ANALYSIS_ABSTAIN,
-            }:
-                return from_nested
+    if from_nested is not None:
+        # Nested ABSTAIN/INVALID from earlier gates wins.
+        if from_nested.analysis_status in {
+            ANALYSIS_INVALID_RUN,
+            ANALYSIS_DATA_ERROR,
+            ANALYSIS_ABSTAIN,
+        }:
+            return from_nested
 
     # Consistency hard gate: never emit VALID/BUY when the plan is blocked.
     if mv.get("consistency_check_passed") is False:
@@ -608,10 +679,12 @@ def status_from_manager_verdict(
         rejected_claim_ids=rejected_ids,
     )
 
-    # Consistency hard gate: rejected + adopt or unadjudicated material claim with adopt
+    # Consistency hard gate: rejected + adopt or unadjudicated material claim with adopt or fatal in adopted/partially adopted
     if any(
         code.startswith("verdict_consistency_rejected_adopt:")
         or code.startswith("unadjudicated_material_claims_adopt:")
+        or code.startswith("fatal_adopted_claims:")
+        or code.startswith("fatal_partially_adopted_claims:")
         for code in confirm_codes
     ):
         return abstain_status(
@@ -1150,6 +1223,22 @@ def decision_status_from_mapping(
     else:
         confirm_val = CONFIRM_UNRESOLVED
 
+    raw_conf = raw.get("confidence")
+    raw_prob = raw.get("probability")
+    conf_val: Optional[int] = None
+    prob_val: Optional[float] = None
+    if analysis_status == ANALYSIS_VALID and trade_action not in NON_DIRECTIONAL_TRADE_ACTIONS:
+        if raw_conf is not None and not isinstance(raw_conf, bool):
+            try:
+                conf_val = int(raw_conf)
+            except (ValueError, TypeError):
+                conf_val = None
+        if raw_prob is not None and not isinstance(raw_prob, bool):
+            try:
+                prob_val = float(raw_prob)
+            except (ValueError, TypeError):
+                prob_val = None
+
     return DecisionStatus(
         analysis_status=analysis_status,
         direction=str(raw.get("direction") or DIRECTION_NA).upper()
@@ -1162,8 +1251,8 @@ def decision_status_from_mapping(
         confirmation_state=confirm_val,
         failure_class=raw.get("failure_class"),
         reason_codes=list(raw.get("reason_codes") or []),
-        confidence=raw.get("confidence"),
-        probability=raw.get("probability"),
+        confidence=conf_val,
+        probability=prob_val,
     )
 
 
@@ -1198,8 +1287,11 @@ def decision_status_from_state(
     """Read decision_status from graph state (top-level or manager_verdict)."""
     if not isinstance(state, Mapping):
         return None
+    raw_top = state.get("decision_status")
+    if isinstance(raw_top, DecisionStatus):
+        return raw_top
     parsed = decision_status_from_mapping(
-        state.get("decision_status") if isinstance(state.get("decision_status"), Mapping) else None
+        raw_top if isinstance(raw_top, Mapping) else None
     )
     if parsed is not None:
         return parsed
@@ -1216,24 +1308,32 @@ def decision_status_from_state(
                 "confirmation_state": state.get("confirmation_state"),
                 "failure_class": state.get("failure_class"),
                 "reason_codes": state.get("reason_codes") or [],
+                "confidence": state.get("confidence"),
+                "probability": state.get("probability"),
             }
         )
         if parsed is not None:
             return parsed
 
-    for container_key in ("manager_verdict", "investment_debate_state"):
+    for container_key in ("manager_verdict", "investment_debate_state", "result_data"):
         container = state.get(container_key)
         if not isinstance(container, Mapping):
             continue
-        nested = container.get("decision_status")
-        if isinstance(nested, Mapping):
-            parsed = decision_status_from_mapping(nested)
+        raw_container = container.get("decision_status")
+        if isinstance(raw_container, DecisionStatus):
+            return raw_container
+        if isinstance(raw_container, Mapping):
+            parsed = decision_status_from_mapping(raw_container)
             if parsed is not None:
                 return parsed
         if container_key == "investment_debate_state":
             mv = container.get("manager_verdict")
-            if isinstance(mv, Mapping) and isinstance(mv.get("decision_status"), Mapping):
-                parsed = decision_status_from_mapping(mv.get("decision_status"))
-                if parsed is not None:
-                    return parsed
+            if isinstance(mv, Mapping):
+                raw_mv = mv.get("decision_status")
+                if isinstance(raw_mv, DecisionStatus):
+                    return raw_mv
+                if isinstance(raw_mv, Mapping):
+                    parsed = decision_status_from_mapping(raw_mv)
+                    if parsed is not None:
+                        return parsed
     return None

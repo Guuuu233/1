@@ -1066,3 +1066,275 @@ class TestBearValidOpponentClaimAllowed:
         assert msg["stage"] == "tiebreak"
         assert msg["responded_claim_ids"] == ["INV-1"]
         assert msg["target_claim_ids"] == ["INV-1"]
+
+
+class TestClaimReviewContractConsumers:
+    """E-03c: Tests for evidence_verifier and decision_status consumer contracts."""
+
+    def test_consumer_claim_with_valid_applicability_and_conditions_adopted(self):
+        """Valid applicability and invalidation conditions pass consumer validation and claim is adopted."""
+        from tradingagents.agents.utils.evidence_verifier import (
+            aggregate_claim_evidence,
+            DECISION_ADOPT,
+        )
+
+        claim = {
+            "claim_id": "CLM-001",
+            "speaker": "Bull Analyst",
+            "speaker_key": "Bull",
+            "claim": "主力资金净流入1.2亿",
+            "evidence": ["主力净流入1.2亿"],
+            "applicability": {
+                "symbol": "600519",
+                "horizon": "short",
+                "metric_basis": "vendor_qfq",
+                "pit_date": "2026-09-08",
+                "preconditions": ["above_ma20"],
+            },
+            "invalidation_conditions": [
+                {
+                    "condition_id": "inv-1",
+                    "metric": "close_price",
+                    "operator": "<",
+                    "threshold": 1600.0,
+                    "unit": "cny",
+                    "period": "1d_close",
+                    "source": "daily_price",
+                    "pit_date": "2026-09-08",
+                }
+            ],
+        }
+        ver_items = [
+            {
+                "claim_id": "CLM-001",
+                "raw": "主力净流入1.2亿",
+                "status": "verified",
+                "matched_role": "smart_money_report",
+                "matched_source": "smart_money",
+            }
+        ]
+        summary = aggregate_claim_evidence(
+            claims=[claim],
+            claims_verification=ver_items,
+            analysis_baseline_date="2026-09-08",
+            expected_symbol="600519",
+        )
+        assert "CLM-001" in summary
+        s = summary["CLM-001"]
+        assert s["decision"] == DECISION_ADOPT
+        assert s["applicability"] is not None
+        assert s["applicability"]["symbol"] == "600519"
+        assert len(s["invalidation_conditions"]) == 1
+        assert s["invalidation_conditions"][0]["condition_id"] == "inv-1"
+        assert s["pit_failed"] is False
+        assert "全部证据核验通过" in s["reason"]
+
+    def test_consumer_claim_applicability_pit_lookahead_fails_closed(self):
+        """Claim applicability with PIT date later than baseline date fails closed (reject)."""
+        from tradingagents.agents.utils.evidence_verifier import (
+            aggregate_claim_evidence,
+            DECISION_REJECT,
+        )
+
+        claim = {
+            "claim_id": "CLM-002",
+            "claim": "主力资金净流入1.2亿",
+            "evidence": ["主力净流入1.2亿"],
+            "applicability": {
+                "symbol": "600519",
+                "horizon": "short",
+                "metric_basis": "vendor_qfq",
+                "pit_date": "2026-09-15",  # Future PIT date
+            },
+        }
+        ver_items = [
+            {
+                "claim_id": "CLM-002",
+                "raw": "主力净流入1.2亿",
+                "status": "verified",
+            }
+        ]
+        summary = aggregate_claim_evidence(
+            claims=[claim],
+            claims_verification=ver_items,
+            analysis_baseline_date="2026-09-08",
+            expected_symbol="600519",
+        )
+        s = summary["CLM-002"]
+        assert s["decision"] == DECISION_REJECT
+        assert s["pit_failed"] is True
+        assert "前视偏差/PIT失败" in s["reason"]
+        assert s["counts"]["contradicted"] >= 1
+
+    def test_consumer_claim_invalidation_condition_pit_lookahead_fails_closed(self):
+        """Invalidation condition with future PIT date fails closed."""
+        from tradingagents.agents.utils.evidence_verifier import (
+            aggregate_claim_evidence,
+            DECISION_REJECT,
+        )
+
+        claim = {
+            "claim_id": "CLM-003",
+            "claim": "主力资金净流入1.2亿",
+            "evidence": ["主力净流入1.2亿"],
+            "invalidation_conditions": [
+                {
+                    "condition_id": "inv-2",
+                    "metric": "close_price",
+                    "operator": "<",
+                    "threshold": 1500.0,
+                    "unit": "cny",
+                    "period": "1d_close",
+                    "source": "daily_price",
+                    "pit_date": "2026-09-20",  # Future
+                }
+            ],
+        }
+        ver_items = [
+            {
+                "claim_id": "CLM-003",
+                "raw": "主力净流入1.2亿",
+                "status": "verified",
+            }
+        ]
+        summary = aggregate_claim_evidence(
+            claims=[claim],
+            claims_verification=ver_items,
+            analysis_baseline_date="2026-09-08",
+        )
+        s = summary["CLM-003"]
+        assert s["decision"] == DECISION_REJECT
+        assert s["pit_failed"] is True
+        assert "前视偏差/PIT失败" in s["reason"]
+
+    def test_consumer_claim_invalidation_condition_triggered_rejects_claim(self):
+        """When an invalidation condition is triggered by market data, the claim is falsified and rejected."""
+        from tradingagents.agents.utils.evidence_verifier import (
+            aggregate_claim_evidence,
+            DECISION_REJECT,
+        )
+
+        claim = {
+            "claim_id": "CLM-004",
+            "claim": "股价保持在1600元上方",
+            "evidence": ["当前收盘价1620元"],
+            "invalidation_conditions": [
+                {
+                    "condition_id": "inv-break-1600",
+                    "metric": "close_price",
+                    "operator": "<",
+                    "threshold": 1600.0,
+                    "unit": "cny",
+                    "period": "1d_close",
+                    "source": "daily_price",
+                    "pit_date": "2026-09-08",
+                }
+            ],
+        }
+        ver_items = [
+            {
+                "claim_id": "CLM-004",
+                "raw": "当前收盘价1620元",
+                "status": "verified",
+            }
+        ]
+        market_ctx = {
+            "symbol": "600519",
+            "close_price": 1580.0,
+            "trade_date": "2026-09-08",
+        }
+        summary = aggregate_claim_evidence(
+            claims=[claim],
+            claims_verification=ver_items,
+            market_data_context=market_ctx,
+            analysis_baseline_date="2026-09-08",
+        )
+        s = summary["CLM-004"]
+        assert s["decision"] == DECISION_REJECT
+        assert "失效条件已触发证伪" in s["reason"]
+        assert s["counts"]["contradicted"] >= 1
+
+    def test_consumer_claim_valid_zero_and_decimal_zero_threshold(self):
+        """Conditions with threshold=0 or Decimal(0) are accepted as valid numbers, not missing."""
+        from decimal import Decimal
+        from tradingagents.agents.utils.evidence_verifier import (
+            aggregate_claim_evidence,
+            DECISION_ADOPT,
+        )
+
+        claim = {
+            "claim_id": "CLM-005",
+            "claim": "净利润保持正增长",
+            "evidence": ["净利润增速为0%"],
+            "invalidation_conditions": [
+                {
+                    "condition_id": "inv-zero",
+                    "metric": "profit_growth",
+                    "operator": "<",
+                    "threshold": Decimal("0.0"),
+                    "unit": "pct",
+                    "period": "quarterly",
+                    "source": "financial_report",
+                    "pit_date": "2026-09-08",
+                }
+            ],
+        }
+        ver_items = [
+            {
+                "claim_id": "CLM-005",
+                "raw": "净利润增速为0%",
+                "status": "verified",
+            }
+        ]
+        market_ctx = {
+            "profit_growth": 0.0,
+            "trade_date": "2026-09-08",
+        }
+        summary = aggregate_claim_evidence(
+            claims=[claim],
+            claims_verification=ver_items,
+            market_data_context=market_ctx,
+            analysis_baseline_date="2026-09-08",
+        )
+        s = summary["CLM-005"]
+        assert s["decision"] == DECISION_ADOPT
+        assert len(s["invalidation_conditions"]) == 1
+        assert s["invalidation_conditions"][0]["threshold"] == 0.0
+
+    def test_consumer_observation_hypothesis_claim_contract_not_upgraded_to_adopt(self):
+        """Observation / hypothesis claim review contract stays in audited partial state and cannot be adopted."""
+        from tradingagents.agents.utils.evidence_verifier import (
+            aggregate_claim_evidence,
+            DECISION_PARTIAL,
+            DECISION_ADOPT,
+        )
+
+        obs_claim = {
+            "claim_id": "CLM-OBS-1",
+            "claim": "【观察】当前处于Wyckoff吸筹阶段，主力持续试盘",
+            "claim_type": "observation",
+            "evidence": ["缩量回踩不破前低"],
+            "applicability": {
+                "symbol": "600519",
+                "horizon": "short",
+                "metric_basis": "vendor_qfq",
+                "pit_date": "2026-09-08",
+            },
+        }
+        ver_items = [
+            {
+                "claim_id": "CLM-OBS-1",
+                "raw": "缩量回踩不破前低",
+                "status": "verified",
+            }
+        ]
+        summary = aggregate_claim_evidence(
+            claims=[obs_claim],
+            claims_verification=ver_items,
+            analysis_baseline_date="2026-09-08",
+        )
+        s = summary["CLM-OBS-1"]
+        assert s["is_observation_or_hypothesis"] is True
+        assert s["decision"] == DECISION_PARTIAL
+        assert s["decision"] != DECISION_ADOPT
+        assert "不升级为已验证事实" in s["reason"]
