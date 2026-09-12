@@ -136,7 +136,7 @@ def test_rt1_normal_inputs_produce_report_and_signals():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_rt2_missing_inputs_explicit_unavailability():
-    """RT-2: 对手方数据缺失时，显式标注该项不可用，不得返回空串、填默认值或编造指标."""
+    """RT-2: 对手方数据全部缺失时，显式降级为约定返回形态，不得返回空串、填默认值或编造指标."""
     raw_empty = {
         "fund_flow_individual": "【数据获取失败】接口超时，该项不可用",
         "fund_flow_evidence": None,
@@ -154,17 +154,11 @@ def test_rt2_missing_inputs_explicit_unavailability():
         raw_data=raw_empty,
     )
 
-    # 显式标明不可用，不为空串
+    # 显式标明不可用，符合约定降级形态 (RT-8 / RT-2)
     assert report_text != ""
-    assert "【数据获取失败】" in report_text
-    assert "不可用" in report_text
-    assert "严禁伪造默认值" in report_text or "不得据此判断无博弈风险" in report_text
-
-    # 信号字段显式表示不可用，置信度为 0
-    assert signals["data_status"] == "unavailable"
-    assert signals["confidence"] == 0.0
-    assert signals["dominant_strategy"] == "数据缺失/保持观望"
-    assert all("不可用" in v or "缺失" in v for v in signals["player_states"].values())
+    assert report_text.startswith("【博弈论分析不可用】")
+    assert "严禁编造默认指标" in report_text or "无法建立确定性博弈矩阵" in report_text
+    assert signals is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,7 +166,7 @@ def test_rt2_missing_inputs_explicit_unavailability():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_rt3_node_exception_isolation_and_traceability():
-    """RT-3: 节点执行抛出异常时，不得中断整条分析流程，且必须留可查痕迹."""
+    """RT-3: 节点执行抛出异常时，不得中断整条分析流程，且必须留可查痕迹并按约定降级."""
     # 创建一个内部触发异常的节点
     node = create_game_theory_node()
 
@@ -192,9 +186,10 @@ def test_rt3_node_exception_isolation_and_traceability():
     assert REPORT_KEY in res
     assert SIGNALS_KEY in res
 
-    # 2. 报告为缺失而非空串
-    assert res[REPORT_KEY].startswith("【数据获取失败】")
+    # 2. 约定降级形态：{"game_theory_report": "【博弈论分析不可用】原因：...", "game_theory_signals": None}
+    assert res[REPORT_KEY].startswith("【博弈论分析不可用】")
     assert "模拟网络严重异常" in res[REPORT_KEY]
+    assert res[SIGNALS_KEY] is None
 
     # 3. 留可查痕迹（analyst_traces）
     assert "analyst_traces" in res
@@ -440,3 +435,235 @@ def test_acceptance_fill_rate_measured_non_zero_and_final_state_not_none():
     # 实测非零断言 (1.0 = 100%)
     assert fill_rate > 0.0
     assert fill_rate == 1.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RT-8: 节点部分成功 / 半写入状态原子性与严格 JSON 安全
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_rt8_atomic_consistency_and_strict_json_safety():
+    """RT-8:
+    1. 节点严重故障时，保持原子性约定形态降级，严禁文本存在但 signals 缺失或脱节；
+    2. signals 必须严格 JSON 安全（无 NaN, Inf, numpy 类型，否则序列化崩溃）；
+    3. 不可用指标显式标为缺失，严禁填补 0.0/默认值。
+    """
+    import json
+    from decimal import Decimal
+    from tradingagents.graph.game_theory_node import ensure_json_safe
+
+    # 1. 验证 ensure_json_safe 处理各类极端数值与特殊结构
+    test_signals = {
+        "float_nan": float("nan"),
+        "float_inf": float("inf"),
+        "float_neg_inf": float("-inf"),
+        "decimal_val": Decimal("123.45"),
+        "nested_dict": {"inner_nan": float("nan"), "valid_val": 42},
+        "nested_list": [1.0, float("nan"), "text"],
+    }
+    sanitized = ensure_json_safe(test_signals)
+
+    # 验证可无容错安全序列化为标准 JSON（allow_nan=False）
+    serialized = json.dumps(sanitized, allow_nan=False)
+    assert serialized is not None
+    assert "NaN" not in serialized
+    assert "Infinity" not in serialized
+    assert sanitized["float_nan"] is None
+    assert sanitized["float_inf"] is None
+
+    # 2. 验证计算产出的 signals 全量 JSON 序列化安全
+    raw = _make_sample_raw_data()
+    _, signals = compute_game_theory_signals("600519.SH", "2026-08-20", raw)
+    assert signals is not None
+    # 严格检验 allow_nan=False 序列化无异常
+    json_str = json.dumps(signals, allow_nan=False)
+    assert json_str is not None
+
+    # 3. 验证严禁填补 0.0 或默认数值作为缺失指标
+    raw_sparse = {
+        "fund_flow_individual": "主力资金净流入 +5000.00 万元",
+        "margin_trading": None,
+        "shareholder_count": None,
+        "northbound_flow": None,
+        "fund_flow_board": None,
+        "lhb": None,
+    }
+    sparse_report, sparse_signals = compute_game_theory_signals("600519.SH", "2026-08-20", raw_sparse)
+    assert sparse_signals is not None
+    states = sparse_signals["player_states"]
+    assert "非两融" in states["杠杆资金"] or "未纳入" in states["杠杆资金"] or "不可用" in states["杠杆资金"]
+    assert "不可用" in states["散户群体"] or "未披露" in states["散户群体"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RT-9: 历史回测模式与标的特异性无数据（业务正常形态）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_rt9_historical_backtest_mode_and_asset_specific_normal_absence():
+    """RT-9:
+    1. 历史分析时，即时快照类工具（get_board_fund_flow、get_hot_stocks_xq、get_zt_pool）
+       须正确识别并显式标明不可用（正常规则约束，非服务崩溃）；
+    2. 非两融标的、非陆股通标的、非异动日返回空数据属正常业务状态，不得被当作服务崩溃抛出未捕获异常；
+    3. 其余可用指标正常参与确定性推导。
+    """
+    raw_historical_normal = {
+        "fund_flow_individual": "个股资金流数据：主力净流出: -4500.00 万元",
+        "fund_flow_evidence": {
+            "selection": {
+                "selection_status": "single_source_valid",
+                "selected_value": -4500.00,
+                "selected_unit": "万元",
+            }
+        },
+        "shareholder_count": "【股东户数】截止日: 2023-12-31 | 股东户数: 82000 | 较上期变动: +5.20%",
+        "margin_trading": None,  # 非两融标的
+        "northbound_flow": "【数据获取失败】沪深港通个股每日持股明细自 2024 年 8 月起停止披露",  # 非陆股通/停更
+        "lhb": "无数据",  # 非异动日
+        "fund_flow_board": "【数据获取失败】该数据源仅提供当前快照，无法用于历史日期分析，本项不可用",  # 快照历史不可用
+        "zt_pool": "【数据获取失败】涨停板情绪池：该数据源仅提供当前快照，无法用于历史日期分析，本项不可用",  # 快照历史不可用
+        "hot_stocks": "【数据获取失败】雪球热搜仅提供当前快照，无法用于历史日期分析，本项不可用",  # 快照历史不可用
+    }
+
+    report_text, signals = compute_game_theory_signals(
+        ticker="002999.SZ",
+        trade_date="2024-01-02",
+        raw_data=raw_historical_normal,
+        consensus_direction="SELL",
+    )
+
+    # 1. 节点必须成功产出，不得因正常无数据而抛出异常或返回 None 信号
+    assert report_text is not None and len(report_text) > 100
+    assert signals is not None
+
+    # 2. 非两融标的、非陆股通标的、非异动日均被明确识别为正常业务状态，未被误判为服务崩溃
+    assert "非两融标的" in signals["player_states"]["杠杆资金"]
+    assert "非两融标的" in report_text or "正常业务状态" in report_text
+    assert "非异动日" in report_text or "无龙虎榜上榜记录" in report_text
+    assert "非陆股通标的" in signals["player_states"]["北向资金"] or "停更" in signals["player_states"]["北向资金"]
+
+    # 3. 即时快照类工具正确显式标明为历史分析不可用
+    assert "行业板块" in report_text or "资金流向" in report_text
+    assert "历史" in report_text and ("不可用" in report_text or "正常业务约束" in report_text)
+
+    # 4. 可用核心指标（主力流出 -4500 万 + 股东户数增加 5.20% 筹码分散）正常完成确定性计算
+    assert signals["player_states"]["主力机构"] == "主力净流出"
+    assert signals["player_states"]["散户群体"] == "筹码分散"
+    assert "严格防守" in signals["dominant_strategy"]
+
+
+def test_rt8_partial_success_half_written_atomicity_and_numpy_safety():
+    """RT-8 专项回归：
+    1. 报告生成成功但 signals 缺失 -> 原子性降级为不可用，严禁孤立文本；
+    2. signals 产生但报告生成失败 -> 原子性降级为不可用，严禁孤立 signals；
+    3. 节点执行抛出异常 -> 降级 state 为 (【博弈论分析不可用】..., None)，失败留痕 analyst_traces；
+    4. 严格拒绝与过滤 NaN、Inf、numpy 标量与 ndarray，确保 JSON 安全；
+    5. 不可用指标显式标缺失，绝不填补 0.0 或编造数值。
+    """
+    import json
+    import numpy as np
+    from tradingagents.graph.game_theory_node import ensure_json_safe
+
+    # 1. 验证 numpy 标量与数组等类型的严格递归安全转换
+    raw_np_payload = {
+        "float_val": np.float64(88.88),
+        "int_val": np.int64(100),
+        "bool_val": np.bool_(True),
+        "nan_val": np.nan,
+        "inf_val": np.float64("inf"),
+        "arr_val": np.array([10.0, np.nan, 30.0]),
+        "nested": {
+            "inner_np": np.float32(3.14),
+            "inner_nan": float("nan"),
+        },
+    }
+    safe_payload = ensure_json_safe(raw_np_payload)
+    # 严格检验 allow_nan=False 序列化无异常
+    dumped = json.dumps(safe_payload, allow_nan=False)
+    assert dumped is not None
+    assert "NaN" not in dumped
+    assert "Infinity" not in dumped
+    assert safe_payload["float_val"] == 88.88
+    assert safe_payload["int_val"] == 100
+    assert safe_payload["bool_val"] is True
+    assert safe_payload["nan_val"] is None
+    assert safe_payload["inf_val"] is None
+    assert safe_payload["arr_val"] == [10.0, None, 30.0]
+    assert safe_payload["nested"]["inner_nan"] is None
+
+    # 2. 模拟三类半写入故障，验证原子性保障（无语义断裂）
+    node = create_game_theory_node()
+    state: AgentState = {
+        "company_of_interest": "600519.SH",
+        "trade_date": "2026-08-20",
+        "horizon": "short",
+    }
+
+    # 故障 A：模拟仅文本产生但 signals 为 None
+    with patch("tradingagents.graph.game_theory_node.compute_game_theory_signals", return_value=("孤立报告文本", None)):
+        res_a = node.invoke(state)
+        # 必须原子性降级，严禁向下游暴露孤立报告
+        assert res_a[REPORT_KEY].startswith("【博弈论分析不可用】")
+        assert res_a[SIGNALS_KEY] is None
+        assert res_a["analyst_traces"][0]["source_status"] == "unavailable"
+
+    # 故障 B：模拟仅 signals 产生但文本报告为空
+    mock_valid_signals = {"confidence": 0.9, "player_states": {}}
+    with patch("tradingagents.graph.game_theory_node.compute_game_theory_signals", return_value=("", mock_valid_signals)):
+        res_b = node.invoke(state)
+        assert res_b[REPORT_KEY].startswith("【博弈论分析不可用】")
+        assert res_b[SIGNALS_KEY] is None
+
+    # 故障 C：节点底层抛出非预期异常（如 TypeError/AttributeError）
+    with patch("tradingagents.graph.game_theory_node.compute_game_theory_signals", side_effect=TypeError("极端数据类型解析错误")):
+        res_c = node.invoke(state)
+        assert res_c[REPORT_KEY].startswith("【博弈论分析不可用】")
+        assert "极端数据类型解析错误" in res_c[REPORT_KEY]
+        assert res_c[SIGNALS_KEY] is None
+        assert len(res_c["analyst_traces"]) == 1
+        assert res_c["analyst_traces"][0]["source_status"] == "failed"
+
+
+def test_rt9_snapshot_refusal_and_business_normal_absence_comprehensive():
+    """RT-9 专项回归：
+    1. 历史日期对即时快照工具（get_board_fund_flow、get_hot_stocks_xq、get_zt_pool）的显式不可用结果；
+    2. 覆盖非两融标的、无北向持股、非龙虎榜日的正常空数据，证明不被当作服务崩溃，其他可用信号仍正常处理。
+    """
+    from tradingagents.dataflows.trade_calendar import SNAPSHOT_ONLY_REFUSAL
+
+    # 1. 验证即时快照类工具在历史日分析时的显式不可用识别
+    hist_raw = {
+        "fund_flow_individual": "主力资金净流入 +3000.00 万元",
+        "fund_flow_board": f"【数据获取失败】行业板块：{SNAPSHOT_ONLY_REFUSAL}",
+        "hot_stocks": f"【数据获取失败】雪球热搜：{SNAPSHOT_ONLY_REFUSAL}",
+        "zt_pool": f"【数据获取失败】涨停板：{SNAPSHOT_ONLY_REFUSAL}",
+        "margin_trading": None,  # 非两融标的正常空数据
+        "northbound_flow": None,  # 非陆股通标的正常空数据
+        "lhb": "无数据",  # 非异动日正常空数据
+        "shareholder_count": "【股东户数】截止日: 2023-12-31 | 股东户数: 50000 | 较上期变动: -2.00%",
+    }
+
+    report, signals = compute_game_theory_signals(
+        ticker="300001.SZ",
+        trade_date="2023-12-31",
+        raw_data=hist_raw,
+    )
+
+    # 验证未被误判为全挂/崩溃，报告成功产出
+    assert report is not None and len(report) > 100
+    assert signals is not None
+    assert signals["data_status"] in ("available", "partial")
+
+    # 快照工具显式标明历史分析不可用，而非误判为网络崩溃
+    assert "快照" in report
+    assert "历史" in report
+
+    # 非两融与非陆股通正常业务形态在 player_states 中准确呈现
+    assert "非两融标的" in signals["player_states"]["杠杆资金"]
+    assert "非陆股通标的" in signals["player_states"]["北向资金"] or "停更" in signals["player_states"]["北向资金"]
+
+    # 龙虎榜非异动日正常呈现
+    assert "非异动日" in report or "无龙虎榜" in report
+
+    # 核心可用指标（主力 +3000万，股东户数 -2.00% 筹码集中）正常计算推导出顺势做多
+    assert signals["player_states"]["主力机构"] == "主力净流入"
+    assert signals["player_states"]["散户群体"] == "筹码集中"
+    assert "顺势进攻" in signals["dominant_strategy"]
