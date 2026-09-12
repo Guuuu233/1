@@ -287,6 +287,10 @@ def _blocked_manager_payload(
             relation_graph_status=relation_graph_status,
             relation_graph_reason=relation_graph_reason,
         )
+    summary_dict = dict(claim_evidence_summary) if isinstance(claim_evidence_summary, dict) else {}
+    if not summary_dict and isinstance(investment_debate_state.get("claim_evidence_summary"), dict):
+        summary_dict = dict(investment_debate_state["claim_evidence_summary"])
+    ev_list = list(evidence_verification if evidence_verification is not None else (claims_verification or []))
     manager_verdict = {
         "direction": DIRECTION_NA,
         "winner": "tie",
@@ -302,7 +306,7 @@ def _blocked_manager_payload(
         "partially_adopted_claims": [],
         "rejected_claim_ids": [],
         "excluded_evidence": [],
-        "claim_evidence_summary": claim_evidence_summary or {},
+        "claim_evidence_summary": summary_dict,
         "consistency_check_passed": consistency_check_passed,
         "failed_checks": list(failed_checks or []),
         "decision_status": decision_status,
@@ -319,7 +323,8 @@ def _blocked_manager_payload(
         "fund_flow_consensus_guard": fund_flow_guard,
         "investment_plan": blocked_plan,
         "manager_verdict": manager_verdict,
-        "evidence_verification": list(evidence_verification or []),
+        "evidence_verification": ev_list,
+        "claim_evidence_summary": summary_dict,
         "report_manifest": report_manifest,
         "decision_status": decision_status,
         "analysis_status": decision_status.get("analysis_status"),
@@ -332,7 +337,8 @@ def _blocked_manager_payload(
             "judge_decision": blocked_plan,
             "current_response": blocked_plan,
             "manager_verdict": manager_verdict,
-            "evidence_verification": list(evidence_verification or []),
+            "evidence_verification": ev_list,
+            "claim_evidence_summary": summary_dict,
             "report_manifest": report_manifest,
             "claim_cluster_metrics": claim_cluster_metrics,
             "evidence_relation_status": claim_cluster_metrics.get("relation_graph_status", "pending"),
@@ -376,6 +382,17 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             or (market_data_context.get("data_as_of") if isinstance(market_data_context, dict) else "")
             or ""
         )
+        expected_symbol = (
+            (market_data_context.get("symbol") if isinstance(market_data_context, dict) else None)
+            or state.get("symbol")
+            or state.get("ticker")
+        )
+        symbol_val = expected_symbol
+        effective_market_data_context = dict(market_data_context) if isinstance(market_data_context, dict) else {}
+        if analysis_baseline_date and not effective_market_data_context.get("analysis_baseline_date"):
+            effective_market_data_context["analysis_baseline_date"] = analysis_baseline_date
+        if expected_symbol and not effective_market_data_context.get("symbol"):
+            effective_market_data_context["symbol"] = expected_symbol
         data_gaps = state.get("data_gaps") or (market_data_context.get("data_gaps") if isinstance(market_data_context, dict) else []) or []
 
         investment_debate_state = state["investment_debate_state"]
@@ -559,13 +576,16 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             claims_verification = truth_evaluator.evaluate_claims(
                 claims=claims,
                 seven_reports=seven_reports,
-                market_data_context=market_data_context,
+                market_data_context=effective_market_data_context,
                 analysis_baseline_date=analysis_baseline_date,
                 social_data_context=social_data_context,
             )
             claim_evidence_summary = truth_evaluator.aggregate_claim_evidence(
                 claims=claims,
                 claims_verification=claims_verification,
+                analysis_baseline_date=analysis_baseline_date or None,
+                expected_symbol=expected_symbol or None,
+                market_data_context=effective_market_data_context,
             )
             from tradingagents.agents.utils.decision_status import abstain_status
 
@@ -616,6 +636,8 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
                     "round_summary": round_summary,
                     "round_goal": investment_debate_state.get("round_goal", ""),
                     "claim_counter": investment_debate_state.get("claim_counter", 0),
+                    "claim_evidence_summary": claim_evidence_summary,
+                    "evidence_verification": claims_verification,
                 }
             )
             return payload
@@ -625,20 +647,18 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
         claims_verification = truth_evaluator.evaluate_claims(
             claims=claims,
             seven_reports=seven_reports,
-            market_data_context=market_data_context,
+            market_data_context=effective_market_data_context,
             analysis_baseline_date=analysis_baseline_date,
             social_data_context=social_data_context,
         )
         claim_evidence_summary = truth_evaluator.aggregate_claim_evidence(
             claims=claims,
             claims_verification=claims_verification,
+            analysis_baseline_date=analysis_baseline_date or None,
+            expected_symbol=expected_symbol or None,
+            market_data_context=effective_market_data_context,
         )
 
-        symbol_val = (
-            (market_data_context.get("symbol") if isinstance(market_data_context, dict) else None)
-            or state.get("symbol")
-            or state.get("ticker")
-        )
         claims = cluster_claims(
             claims,
             symbol=symbol_val,
@@ -701,7 +721,7 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
         challenges_verification = truth_evaluator.evaluate_challenges(
             challenges=challenges,
             seven_reports=seven_reports,
-            market_data_context=market_data_context,
+            market_data_context=effective_market_data_context,
             analysis_baseline_date=analysis_baseline_date,
             social_data_context=social_data_context,
         )
@@ -863,7 +883,7 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
         claims_verification = truth_evaluator.evaluate_claims(
             claims=claims,
             seven_reports=seven_reports,
-            market_data_context=market_data_context,
+            market_data_context=effective_market_data_context,
             analysis_baseline_date=analysis_baseline_date,
             social_data_context=social_data_context,
         )
@@ -874,8 +894,16 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             claims=claims,
             challenges=challenges,
             challenges_verification=challenges_verification,
-            market_data_context=market_data_context if isinstance(market_data_context, dict) else None,
+            market_data_context=effective_market_data_context,
         )
+        claim_evidence_summary = truth_evaluator.aggregate_claim_evidence(
+            claims=claims,
+            claims_verification=claims_verification,
+            analysis_baseline_date=analysis_baseline_date or None,
+            expected_symbol=expected_symbol or None,
+            market_data_context=effective_market_data_context,
+        )
+        manager_verdict["claim_evidence_summary"] = claim_evidence_summary
         manager_verdict["horizon"] = research_horizon
         manager_verdict["research_horizon"] = research_horizon
         manager_verdict["evidence_relation_status"] = claim_cluster_metrics.get("relation_graph_status", "pending")
@@ -953,6 +981,7 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             "claim_counter": investment_debate_state.get("claim_counter", 0),
             "manager_verdict": manager_verdict,
             "evidence_verification": claims_verification,
+            "claim_evidence_summary": claim_evidence_summary,
             "challenge_verification": challenges_verification,
             "report_manifest": report_manifest,
             "claim_cluster_metrics": claim_cluster_metrics,
@@ -968,7 +997,7 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             new_investment_debate_state["credit_weight_audit"] = credit_weight_audit
 
         # D-009 P0-1/P0-5b/P1-2: every successful terminal path emits canonical decision_status.
-        vpa_ctx = market_data_context.get("vpa_context") if isinstance(market_data_context, dict) else None
+        vpa_ctx = effective_market_data_context.get("vpa_context") if isinstance(effective_market_data_context, dict) else None
         if (
             manager_verdict.get("position_pct") is not None
             and isinstance(vpa_ctx, dict)
@@ -989,7 +1018,7 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             focus_claim_ids=new_investment_debate_state.get("focus_claim_ids"),
             unresolved_claim_ids=unresolved_claim_ids,
             claims=claims,
-            market_data_context=market_data_context,
+            market_data_context=effective_market_data_context,
             vpa_context=vpa_ctx,
         )
         status_dict = terminal_status.to_dict()
@@ -1010,6 +1039,7 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             "investment_plan": final_plan,
             "manager_verdict": manager_verdict,
             "evidence_verification": claims_verification,
+            "claim_evidence_summary": claim_evidence_summary,
             "challenge_verification": challenges_verification,
             "report_manifest": report_manifest,
             "decision_status": status_dict,
