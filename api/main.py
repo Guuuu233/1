@@ -72,7 +72,11 @@ def _get_real_ip(request: Request) -> Optional[str]:
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.graph.data_collector import DataCollector
-from tradingagents.agents.utils.prompt_injection import DEFAULT_PLACEMENT
+from tradingagents.agents.utils.prompt_injection import (
+    DEFAULT_PLACEMENT,
+    PromptGuardVerdict,
+    lint_custom_prompt,
+)
 
 # 全局共享 DataCollector：同一 ticker+date 的数据只拉一次，所有 job 复用缓存
 _shared_data_collector = DataCollector()
@@ -2755,6 +2759,37 @@ def _resolve_and_freeze_custom_prompts(
         for rk in _INJECT_ROLES:
             if rk not in raw_bundle:
                 raw_bundle[rk] = {"resolved_text": "", "resolved_hash": None, "resolved_length": 0, "injected": False}
+
+        # D-015 Contract 2, 3, 4, 5: E-02 prompt guard check on all 5 injectable roles
+        guard_violations = []
+        for rk in _INJECT_ROLES:
+            entry = raw_bundle[rk]
+            text = entry["resolved_text"]
+            if text:
+                res = lint_custom_prompt(text)
+                if res.verdict in (PromptGuardVerdict.VIOLATION, PromptGuardVerdict.AMBIGUOUS):
+                    guard_violations.append((rk, res))
+
+        if guard_violations:
+            first_role, first_res = guard_violations[0]
+            _log(
+                f"[custom_prompt] E-02 guard intercepted: role={first_role} "
+                f"verdict={first_res.verdict.value} reason={first_res.reason_code} "
+                f"hash={raw_bundle[first_role]['resolved_hash']}"
+            )
+            violation_map = dict(guard_violations)
+            for rk in _INJECT_ROLES:
+                raw_entry = raw_bundle[rk]
+                v_res = violation_map.get(rk)
+                raw_bundle[rk] = {
+                    "resolved_text": "",
+                    "resolved_hash": raw_entry["resolved_hash"],
+                    "resolved_length": 0,
+                    "injected": False,
+                    "guard_verdict": v_res.verdict.value if v_res else None,
+                    "guard_reason": v_res.reason_code if v_res else None,
+                    "guard_detail": v_res.detail if v_res else None,
+                }
         return deepcopy(raw_bundle), True
     else:
         frozen_bundle = {
@@ -2849,6 +2884,137 @@ async def _run_job_inner(
     _emit_job_event(job_id, "agent.snapshot", tracker.snapshot())
 
     try:
+        # D-015 Contract 3 & 5: Check if E-02 prompt guard intercepted any role at launch freeze
+        prompt_guard_violation = next(
+            (
+                (rk, v)
+                for rk, v in _frozen_bundle.items()
+                if isinstance(v, dict) and v.get("guard_verdict") in (
+                    PromptGuardVerdict.VIOLATION.value,
+                    PromptGuardVerdict.AMBIGUOUS.value,
+                )
+            ),
+            None,
+        )
+        if prompt_guard_violation is not None:
+            failed_role, failed_meta = prompt_guard_violation
+            failed_verdict = failed_meta.get("guard_verdict")
+            failed_reason = failed_meta.get("guard_reason")
+            failed_hash = failed_meta.get("resolved_hash")
+
+            reason_codes = [
+                "e02_custom_prompt_guard_failed",
+                f"custom_prompt_guard:{failed_role}:{str(failed_verdict).lower()}",
+            ]
+            if failed_hash:
+                reason_codes.append(f"prompt_hash:{failed_hash}")
+
+            from tradingagents.agents.utils.decision_status import (
+                abstain_status,
+                apply_decision_status_to_result,
+            )
+
+            status_obj = abstain_status(
+                reason_codes=reason_codes,
+                trade_action="NO_TRADE",
+                risk_status="BLOCKED",
+            )
+
+            guard_msg = (
+                f"E-02 自定义提示词守卫拦截：角色 {failed_role} 提示词判定为 {failed_verdict}（{failed_reason}）。"
+                f"整单终止，五个可注入角色一律不注入，不构建后续模型链路。"
+            )
+            result = {
+                "symbol": request.symbol,
+                "trade_date": request.trade_date,
+                "status": "completed",
+                "decision": "NO_TRADE",
+                "trade_action": "NO_TRADE",
+                "direction": "N/A",
+                "analysis_status": "ABSTAIN",
+                "risk_status": "BLOCKED",
+                "confirmation_state": "UNRESOLVED",
+                "reason_codes": reason_codes,
+                "guard_failure": guard_msg,
+                "failed_checks": [guard_msg],
+                "consistency_check_passed": False,
+                "final_trade_decision": f"【系统阻断】{guard_msg}",
+                "investment_plan": f"{guard_msg} 状态=ABSTAIN，动作=NO_TRADE；已阻断全部模型调用。",
+                "manager_verdict": {
+                    "decision": "NO_TRADE",
+                    "trade_action": "NO_TRADE",
+                    "direction": "N/A",
+                    "analysis_status": "ABSTAIN",
+                    "risk_status": "BLOCKED",
+                    "reason": guard_msg,
+                    "reason_codes": reason_codes,
+                },
+                "data_gaps": [],
+                "falsification_conditions": [],
+                "not_applicable": True,
+                "confidence": None,
+                "probability": None,
+                "target_price": None,
+                "stop_loss_price": None,
+                "prompt_guard_failure": {
+                    "role": failed_role,
+                    "verdict": failed_verdict,
+                    "reason_code": failed_reason,
+                    "prompt_hash": failed_hash,
+                },
+            }
+            apply_decision_status_to_result(result, status_obj)
+            _mount_or_refresh_protocol_metadata_and_metrics(result)
+            _attach_custom_prompt_snapshot(result, _prompt_snapshot)
+
+            if save_report:
+                def _save_blocked_report_sync():
+                    with get_db_ctx() as save_db:
+                        report_service.create_report(
+                            db=save_db,
+                            symbol=request.symbol,
+                            trade_date=request.trade_date,
+                            decision="NO_TRADE",
+                            result_data=result,
+                            user_id=user_id,
+                            risk_items=[],
+                            key_metrics=[],
+                            probability=None,
+                            data_gaps=[],
+                            falsification_conditions=[],
+                            not_applicable=True,
+                            confidence_override=None,
+                            target_price_override=None,
+                            stop_loss_override=None,
+                            report_id=job_id,
+                            status="completed",
+                        )
+                        save_db.commit()
+
+                await _save_report_or_raise(job_id, _save_blocked_report_sync, stage="finalize")
+
+            _set_job(
+                job_id,
+                status="completed",
+                decision="NO_TRADE",
+                result=result,
+                error=None,
+                overtime=False,
+                overtime_at=None,
+                finished_at=_utcnow_iso(),
+            )
+            _emit_job_event(
+                job_id,
+                "job.completed",
+                {
+                    "job_id": job_id,
+                    "decision": "NO_TRADE",
+                    "direction": "N/A",
+                    "result": result,
+                },
+            )
+            return
+
         if request.dry_run:
             result = {
                 "mode": "dry_run",

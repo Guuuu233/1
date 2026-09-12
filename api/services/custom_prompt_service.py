@@ -25,6 +25,11 @@ from sqlalchemy.orm import Session
 
 from api.database import UserCustomPromptDB, UserDB
 from api.services.role_routing_service import ALL_ROLES, ROLE_GROUPS, ROLE_TO_GROUP
+from tradingagents.agents.utils.prompt_injection import (
+    INJECTABLE_ROLES,
+    PromptGuardVerdict,
+    lint_custom_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +240,24 @@ def replace_custom_prompts(db: Session, user_id: str, items: List[Dict[str, Any]
                 f"超过 {RESOLVED_PROMPT_MAX_CHARS} 字符上限"
             )
 
+    # D-015 Contract 5: Validate final resolved text across the 5 injectable roles
+    # (global + group + role combination) before any DB mutation
+    for role_key in INJECTABLE_ROLES:
+        resolved = _resolve_for_role(role_key, candidate_global_lite, candidate_role_lites, candidate_group_lites)
+        text = resolved.get("resolved_text") or ""
+        if text:
+            linter_res = lint_custom_prompt(text)
+            if linter_res.verdict == PromptGuardVerdict.VIOLATION:
+                raise ValueError(
+                    f"角色 {role_key} 最终组合提示词违反 E-02 证据独立性硬约束：{linter_res.detail}。"
+                    f"禁止按分析师、命题或证据簇计票/加权/汇总/排序，亦禁止使用机读标识"
+                )
+            elif linter_res.verdict == PromptGuardVerdict.AMBIGUOUS:
+                raise ValueError(
+                    f"角色 {role_key} 最终组合提示词语义不确定：{linter_res.detail}。"
+                    f"无法判定是否符合 E-02 约束。请明确是否涉及计票，若为仓位/行业/因子权重请改写为明确的「仓位权重」或「因子权重」"
+                )
+
     now = _utcnow()
     try:
         db.query(UserCustomPromptDB).filter(UserCustomPromptDB.user_id == user_id).delete(synchronize_session=False)
@@ -286,6 +309,19 @@ def migrate_legacy_prompt(db: Session, user_id: str, legacy_text: str) -> List[D
         raise ValueError(
             f"待迁移的提示词为 {len(legacy_text)} 字符，超过 {GLOBAL_PROMPT_MAX_CHARS} 字符上限，"
             "请先在前端缩短后再迁移"
+        )
+
+    # D-015 Contract 2 & 3: Migration entry point E-02 prompt guard
+    linter_res = lint_custom_prompt(legacy_text)
+    if linter_res.verdict == PromptGuardVerdict.VIOLATION:
+        raise ValueError(
+            f"待迁移的全局提示词违反 E-02 证据独立性硬约束：{linter_res.detail}。"
+            f"禁止按分析师、命题或证据簇计票/加权/汇总/排序，亦禁止使用机读标识"
+        )
+    elif linter_res.verdict == PromptGuardVerdict.AMBIGUOUS:
+        raise ValueError(
+            f"待迁移的全局提示词语义不确定：{linter_res.detail}。"
+            f"无法判定是否符合 E-02 约束。请先修改消除歧义后再进行迁移"
         )
 
     now = _utcnow()

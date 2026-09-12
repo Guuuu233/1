@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import re
 import time
@@ -37,7 +38,13 @@ from tradingagents.agents.utils.claim_cluster import (
     format_claim_cluster_summary_for_prompt,
     tally_cluster_votes,
 )
-from tradingagents.agents.utils.prompt_injection import build_injection_slots, Placement, DEFAULT_PLACEMENT
+from tradingagents.agents.utils.prompt_injection import (
+    DEFAULT_PLACEMENT,
+    Placement,
+    PromptGuardVerdict,
+    build_injection_slots,
+    lint_custom_prompt,
+)
 from tradingagents.agents.utils.decision_status import (
     ACTION_NO_TRADE,
     DIRECTION_NA,
@@ -453,6 +460,56 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
         }
         report_manifest = build_debate_report_manifest(seven_reports, pass_info=pass_info)
 
+        # ── D-015 Layer 3: Research manager assembly fail-closed guard ───────────
+        if custom_prompt:
+            custom_linter_res = lint_custom_prompt(custom_prompt)
+            if custom_linter_res.verdict in (PromptGuardVerdict.VIOLATION, PromptGuardVerdict.AMBIGUOUS):
+                prompt_hash = hashlib.sha256(custom_prompt.encode("utf-8")).hexdigest()[:12]
+                guard_failure = (
+                    f"E-02 自定义提示词守卫未通过：判定为 {custom_linter_res.verdict.value}"
+                    f"（{custom_linter_res.detail}）"
+                )
+                _logger.error(
+                    "[research_manager] E-02 custom prompt guard intercepted: verdict=%s reason=%s hash=%s",
+                    custom_linter_res.verdict.value,
+                    custom_linter_res.reason_code,
+                    prompt_hash,
+                )
+                from tradingagents.agents.utils.decision_status import abstain_status
+
+                decision_status = abstain_status(
+                    reason_codes=[
+                        "e02_custom_prompt_guard_failed",
+                        "e02_relation_prompt_guard_failed",
+                        f"prompt_hash:{prompt_hash}",
+                    ],
+                    trade_action="NO_TRADE",
+                    risk_status="BLOCKED",
+                ).to_dict()
+                blocked_plan = f"{guard_failure}。状态=ABSTAIN，动作=NO_TRADE；已阻断进入 Trader 执行阶段。"
+                tracker = current_tracker_var.get()
+                if tracker:
+                    tracker.emit_debate_message(
+                        debate="research", agent="Research Manager",
+                        round_num=-1, content=blocked_plan, is_verdict=True,
+                    )
+                return _blocked_manager_payload(
+                    investment_debate_state=investment_debate_state,
+                    report_manifest=report_manifest,
+                    fund_flow_guard=fund_flow_guard,
+                    decision_status=decision_status,
+                    blocked_plan=blocked_plan,
+                    manager_reason=guard_failure,
+                    run_integrity={},
+                    consistency_check_passed=False,
+                    failed_checks=[guard_failure],
+                    research_horizon=research_horizon,
+                    reports=seven_reports,
+                    relation_graph=relation_graph,
+                    relation_graph_status=relation_graph_status,
+                    relation_graph_reason=relation_graph_reason,
+                )
+
         # ── P0-1: Run integrity before any Neutral/HOLD collapse ────────────
         run_integrity = evaluate_state_integrity(state)
         if run_integrity.all_required_failed and run_integrity.decision_status:
@@ -743,6 +800,47 @@ def create_research_manager(llm, memory, custom_prompt: str = "", placement: Pla
             agent_type="research_manager",
             research_horizon=research_horizon,
         )
+
+        # D-015 Contract 2 & Layer 3: Research manager assembly fail-closed guard
+        if custom_prompt:
+            custom_linter_res = lint_custom_prompt(custom_prompt)
+            if custom_linter_res.verdict in (PromptGuardVerdict.VIOLATION, PromptGuardVerdict.AMBIGUOUS):
+                prompt_hash = hashlib.sha256(custom_prompt.encode("utf-8")).hexdigest()[:12]
+                guard_failure = (
+                    f"E-02 自定义提示词守卫未通过：判定为 {custom_linter_res.verdict.value}"
+                    f"（{custom_linter_res.detail}）"
+                )
+                _logger.error(
+                    "[research_manager] E-02 custom prompt guard intercepted: verdict=%s reason=%s hash=%s",
+                    custom_linter_res.verdict.value,
+                    custom_linter_res.reason_code,
+                    prompt_hash,
+                )
+                from tradingagents.agents.utils.decision_status import abstain_status
+
+                return _blocked_manager_payload(
+                    investment_debate_state=investment_debate_state,
+                    report_manifest=report_manifest,
+                    fund_flow_guard=fund_flow_guard,
+                    decision_status=abstain_status(
+                        reason_codes=[
+                            "e02_custom_prompt_guard_failed",
+                            "e02_relation_prompt_guard_failed",
+                            f"prompt_hash:{prompt_hash}",
+                        ],
+                        trade_action="NO_TRADE",
+                        risk_status="BLOCKED",
+                    ).to_dict(),
+                    blocked_plan=f"{guard_failure}。状态=ABSTAIN，动作=NO_TRADE；已阻断进入 Trader 执行阶段。",
+                    manager_reason=guard_failure,
+                    run_integrity=run_integrity.to_dict() if hasattr(run_integrity, "to_dict") else (run_integrity or {}),
+                    claim_evidence_summary=claim_evidence_summary,
+                    consistency_check_passed=False,
+                    failed_checks=[guard_failure],
+                    evidence_verification=claims_verification,
+                    claim_cluster_metrics=claim_cluster_metrics,
+                    research_horizon=research_horizon,
+                )
 
         injection_slots = build_injection_slots(custom_prompt, placement, role_key="research_manager")
         prompt_language = _resolve_language(config)
